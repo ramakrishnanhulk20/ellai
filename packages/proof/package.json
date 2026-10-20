@@ -7,7 +7,8 @@
     "typecheck": "tsc --noEmit",
     "setup": "tsx scripts/setup-keys.ts",
     "probe": "tsx --env-file-if-exists=../../.env scripts/probe-chain.ts",
-    "probe:sellers": "tsx scripts/probe-sellers.ts"
+    "probe:sellers": "tsx scripts/probe-sellers.ts",
+    "probe:pay": "tsx --env-file-if-exists=../../.env scripts/probe-pay.ts"
   },
   "dependencies": {
     "@grpc/grpc-js": "1.14.6",
@@ -19,6 +20,7 @@
     "zod": "4.6.7"
   },
   "devDependencies": {
+    "@t2000/sui-x402": "11.7.0",
     "@types/node": "26.6.5",
     "tsx": "4.23.15",
     "typescript": "7.0.2",

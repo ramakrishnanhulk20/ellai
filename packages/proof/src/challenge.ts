@@ -44,7 +44,8 @@ export type ChallengeErrorCode =
   | 'BAD_ASSET'
   | 'BAD_NETWORK'
   | 'EXPIRED'
-  | 'TOO_LARGE';
+  | 'TOO_LARGE'
+  | 'UNSUPPORTED';
 
 /**
  * Every refusal from parseChallenge. The message is fixed text: nothing the seller
@@ -343,6 +344,11 @@ interface Terms {
 }
 
 function termsFrom(option: JsonRecord, rawAmount: unknown, resource: string | null): Terms {
+  // t2000 marks a job-class entry, paid into an escrow object instead of by a plain
+  // send, with extra.escrow. The key refuses whatever its shape, so a half-formed escrow
+  // entry is never paid as a per-call payment.
+  const extra = field(option, 'extra');
+  if (isRecord(extra) && Object.hasOwn(extra, 'escrow')) refuse('UNSUPPORTED', 'escrow jobs are not paid, only per-call sellers');
   if (field(option, 'scheme') !== 'exact') refuse('MALFORMED', 'scheme is not exact');
   const amount = amountFrom(rawAmount, 0, 'amount');
   if (amount < BigInt(LIMITS.minPaymentAtomic) || amount > BigInt(LIMITS.maxPaymentAtomic)) {
@@ -475,7 +481,8 @@ function sellerOf(res: SafeResponse): { url: string; host: string } {
  *
  * Throws ChallengeError with one of: NOT_402, NO_DIALECT (including MPP, not supported
  * yet), TWO_DIALECTS, MALFORMED, NO_PAYABLE_OPTION, MANY_PAYABLE_OPTIONS,
- * COPIES_DISAGREE, BAD_AMOUNT, BAD_ASSET, BAD_NETWORK, EXPIRED, TOO_LARGE.
+ * COPIES_DISAGREE, BAD_AMOUNT, BAD_ASSET, BAD_NETWORK, EXPIRED, TOO_LARGE, UNSUPPORTED
+ * (a t2000 escrow job entry).
  */
 export function parseChallenge(res: SafeResponse, nowMs: number): CanonicalPayment {
   if (!isRecord(res)) refuse('MALFORMED', 'response is missing');

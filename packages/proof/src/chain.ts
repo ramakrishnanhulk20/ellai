@@ -1,7 +1,7 @@
 import { ChannelCredentials } from '@grpc/grpc-js';
 import { bcs } from '@mysten/sui/bcs';
 import { SuiGraphQLClient } from '@mysten/sui/graphql';
-import { SuiGrpcClient } from '@mysten/sui/grpc';
+import { GrpcTypes, SuiGrpcClient } from '@mysten/sui/grpc';
 import {
   isValidStructTag,
   isValidSuiAddress,
@@ -26,6 +26,17 @@ const SUI_TYPE = normalizeStructTag(SUI_TYPE_ARG);
 export const WALRUS_BLOB_TYPE = normalizeStructTag(
   '0xfdc88f7d7cf30afab2f82e8380d11ee8f70efb90e863d1de8616fae1bb09ea77::blob::Blob',
 );
+
+const { ExecutionError_ExecutionErrorKind: ExecutionErrorKind, SimulateTransactionRequest_TransactionChecks: SimulationChecks } =
+  GrpcTypes;
+
+// grpc-js reports a message over grpc.max_receive_message_length as RESOURCE_EXHAUSTED,
+// the same code a rate limit uses, so its own fixed wording is what tells the two apart.
+const GRPC_SIZE_CAP_PHRASE = 'Received message larger than max';
+// A sender whose address balance is too small is refused before execution with only
+// this fixed phrase and no structured reason. Matching it lets a probe tell "the purse
+// is empty" from "the bytes are malformed". The phrase itself is never passed on.
+const INSUFFICIENT_BALANCE_PHRASE = 'Insufficient address balance';
 
 const U32_MAX = 0xffff_ffff;
 const HTTP_UNAUTHORIZED = 401;
@@ -76,6 +87,21 @@ export interface BalanceChange {
   amount: bigint;
 }
 
+export type ExecutionOutcome = 'success' | 'failure';
+
+export interface TransactionResult {
+  /** Read from the transaction's effects. A failed transaction's balance changes are its gas charges, never a payment. */
+  status: ExecutionOutcome;
+  balanceChanges: BalanceChange[];
+}
+
+export interface SimulationResult {
+  status: ExecutionOutcome;
+  /** Null on success. Otherwise a fixed upper-case code, never text written by the node. */
+  errorCode: string | null;
+  balanceChanges: BalanceChange[];
+}
+
 export interface WalrusBlob {
   objectId: string;
   /** Walrus's own text form (URL-safe base64 of the little-endian u256), the form Walrus Memory reports. */
@@ -93,6 +119,9 @@ export interface Chain {
   getReferenceGasPrice(): Promise<bigint>;
   getBalances(address: string): Promise<Balances>;
   getTransactionBalanceChanges(digest: string): Promise<BalanceChange[]>;
+  getTransactionResult(digest: string): Promise<TransactionResult>;
+  getCurrentEpoch(): Promise<bigint>;
+  simulate(txBytes: Uint8Array): Promise<SimulationResult>;
   listOwnedWalrusBlobs(owner: string): Promise<WalrusBlob[]>;
   /** Closes the gRPC channel so a script can exit. */
   close(): void;
@@ -112,6 +141,9 @@ function grpcFailure(code: string, details: string): ChainError {
     case 'UNIMPLEMENTED':
       return new ChainError('UPSTREAM', 'method not served by the gateway (gRPC UNIMPLEMENTED)');
     case 'RESOURCE_EXHAUSTED':
+      if (details.startsWith(GRPC_SIZE_CAP_PHRASE)) {
+        return new ChainError('LIMIT_EXCEEDED', `gRPC message is over ${LIMITS.grpcMaxReceiveBytes} bytes`);
+      }
       return new ChainError('RATE_LIMITED', 'rate limited (gRPC RESOURCE_EXHAUSTED)', true);
     case 'DEADLINE_EXCEEDED':
     case 'CANCELLED':
@@ -194,6 +226,63 @@ function inputAddress(address: string): string {
   }
 }
 
+function parseBalanceChanges(changes: ReadonlyArray<{ address?: string; coinType?: string; amount?: string }>): BalanceChange[] {
+  return changes.map((change) => ({
+    address: chainAddress(change.address, 'balance change address'),
+    coinType: chainStructTag(change.coinType, 'balance change coin type'),
+    amount: parseSigned(change.amount, 'balance change amount'),
+  }));
+}
+
+/** Absent or contradictory status fails closed: a transaction is never assumed to have succeeded. */
+function executionOutcome(status: { success?: boolean; error?: unknown } | undefined): ExecutionOutcome {
+  if (status?.success === true && status.error === undefined) return 'success';
+  if (status?.success === false) return 'failure';
+  throw badResponse('execution status is missing or contradictory');
+}
+
+function executionErrorCode(kind: number | undefined): string {
+  const name: string | undefined = kind === undefined ? undefined : ExecutionErrorKind[kind];
+  return name ?? ExecutionErrorKind[ExecutionErrorKind.EXECUTION_ERROR_KIND_UNKNOWN];
+}
+
+/**
+ * A gRPC refusal that is about the transaction itself (the same codes classify reads as
+ * INVALID_INPUT) becomes a short code: the gRPC code name, or INSUFFICIENT_ADDRESS_BALANCE
+ * when the node says the sender's address balance cannot cover it. Anything else, such
+ * as a timeout or a rate limit, returns null and stays an error.
+ */
+function simulationRefusal(error: unknown): string | null {
+  if (classify(error).code !== 'INVALID_INPUT') return null;
+  const { code, message } = error as { code: string; message?: unknown };
+  if (typeof message === 'string' && message.includes(INSUFFICIENT_BALANCE_PHRASE)) return 'INSUFFICIENT_ADDRESS_BALANCE';
+  return code;
+}
+
+/** Reads a response body, refusing it once it passes LIMITS.graphqlMaxResponseBytes, declared or streamed. */
+async function cappedBody(response: Response): Promise<Uint8Array<ArrayBuffer>> {
+  const tooLarge = () => new ChainError('LIMIT_EXCEEDED', `GraphQL response is over ${LIMITS.graphqlMaxResponseBytes} bytes`);
+  const declared = Number(response.headers.get('content-length'));
+  if (Number.isFinite(declared) && declared > LIMITS.graphqlMaxResponseBytes) {
+    await response.body?.cancel();
+    throw tooLarge();
+  }
+  if (!response.body) return new Uint8Array();
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) return Buffer.concat(chunks);
+    total += value.byteLength;
+    if (total > LIMITS.graphqlMaxResponseBytes) {
+      await reader.cancel();
+      throw tooLarge();
+    }
+    chunks.push(value);
+  }
+}
+
 /** Walrus prints a blob id as URL-safe base64, without padding, of the u256 in little-endian bytes. */
 function walrusBlobId(decimal: string): string {
   try {
@@ -247,7 +336,9 @@ const BLOBS_QUERY = `
  * Server only. The key, when given, is sent as the x-api-key header and nowhere else.
  * Every function below has a timeout of LIMITS.tatumTimeoutMs per attempt and at most
  * LIMITS.tatumRetries retries, used only for errors that can clear on their own, and
- * throws ChainError on any failure.
+ * throws ChainError on any failure. Responses are size-capped: a GraphQL body at
+ * LIMITS.graphqlMaxResponseBytes and a gRPC message at LIMITS.grpcMaxReceiveBytes; going
+ * over either is LIMIT_EXCEEDED and is not retried.
  */
 export function createChain(opts: { apiKey?: string }): Chain {
   const apiKey = opts.apiKey === '' ? undefined : opts.apiKey;
@@ -256,6 +347,7 @@ export function createChain(opts: { apiKey?: string }): Chain {
     host: TATUM_GRPC_HOST,
     channelCredentials: ChannelCredentials.createSsl(),
     timeout: LIMITS.tatumTimeoutMs,
+    clientOptions: { 'grpc.max_receive_message_length': LIMITS.grpcMaxReceiveBytes },
     ...(apiKey ? { meta: { [API_KEY_HEADER]: apiKey } } : {}),
   });
   const grpc = new SuiGrpcClient({ network: 'mainnet', transport });
@@ -268,7 +360,8 @@ export function createChain(opts: { apiKey?: string }): Chain {
       await response.body?.cancel();
       throw httpFailure(response.status);
     }
-    return response;
+    const body = await cappedBody(response);
+    return new Response(body, { status: response.status, statusText: response.statusText, headers: response.headers });
   };
   const graphql = new SuiGraphQLClient({
     network: 'mainnet',
@@ -362,26 +455,93 @@ export function createChain(opts: { apiKey?: string }): Chain {
     throw new ChainError('LIMIT_EXCEEDED', `Tatum getBalances: more than ${LIMITS.balanceMaxPages} pages of coin types`);
   }
 
-  async function getTransactionBalanceChanges(digest: string): Promise<BalanceChange[]> {
+  async function fetchTransaction(operation: string, digest: string, paths: string[]) {
     if (!isValidTransactionDigest(digest)) {
       throw new ChainError('INVALID_INPUT', 'not a valid transaction digest');
     }
     // The digest is echoed only after the base58 check above, so it is safe to print.
     const notFound = () => new ChainError('NOT_FOUND', `Transaction ${digest} was not found on Sui mainnet`);
-    const { response } = await bounded('getTransactionBalanceChanges', (abort) =>
-      grpc.ledgerService.getTransaction({ digest, readMask: { paths: ['digest', 'balance_changes'] } }, { abort }),
+    const { response } = await bounded(operation, (abort) =>
+      grpc.ledgerService.getTransaction({ digest, readMask: { paths: ['digest', ...paths] } }, { abort }),
     ).catch((error: unknown) => {
       throw error instanceof ChainError && error.code === 'NOT_FOUND' ? notFound() : error;
     });
     const transaction = response.transaction;
     if (!transaction) throw notFound();
     if (transaction.digest !== digest) throw badResponse('transaction digest does not match the request');
+    return transaction;
+  }
 
-    return transaction.balanceChanges.map((change) => ({
-      address: chainAddress(change.address, 'balance change address'),
-      coinType: chainStructTag(change.coinType, 'balance change coin type'),
-      amount: parseSigned(change.amount, 'balance change amount'),
-    }));
+  async function getTransactionBalanceChanges(digest: string): Promise<BalanceChange[]> {
+    const transaction = await fetchTransaction('getTransactionBalanceChanges', digest, ['balance_changes']);
+    return parseBalanceChanges(transaction.balanceChanges);
+  }
+
+  /**
+   * Reads a settled transaction's execution status together with its balance changes,
+   * so a caller can never take the changes of a failed transaction as a payment.
+   * Throws ChainError: INVALID_INPUT for a malformed digest, NOT_FOUND, BAD_RESPONSE when
+   * the status is missing or contradictory, or any transport code.
+   */
+  async function getTransactionResult(digest: string): Promise<TransactionResult> {
+    const transaction = await fetchTransaction('getTransactionResult', digest, ['effects.status', 'balance_changes']);
+    return {
+      status: executionOutcome(transaction.effects?.status),
+      balanceChanges: parseBalanceChanges(transaction.balanceChanges),
+    };
+  }
+
+  /** The epoch the chain is in now. Throws ChainError on any failure or a missing epoch. */
+  async function getCurrentEpoch(): Promise<bigint> {
+    const { response } = await bounded('getCurrentEpoch', (abort) =>
+      grpc.ledgerService.getEpoch({ readMask: { paths: ['epoch'] } }, { abort }),
+    );
+    return parseUnsigned(response.epoch?.epoch, 'current epoch');
+  }
+
+  /**
+   * Dry-runs exactly these bytes on Sui Mainnet through Tatum. Nothing is signed or
+   * sent. Gas selection is off, because a gasless payment carries no gas on purpose,
+   * and the node's own checks are on, so a refusal here is the one the network gives.
+   *
+   * A transaction the node refuses before running it, or that fails while running,
+   * returns status "failure" with a fixed code: the chain's execution error kind, the
+   * gRPC refusal code, or INSUFFICIENT_ADDRESS_BALANCE. Throws ChainError only when
+   * there is no verdict on the transaction: INVALID_INPUT for empty bytes, TIMEOUT,
+   * RATE_LIMITED, UNAUTHORIZED, UPSTREAM, LIMIT_EXCEEDED or BAD_RESPONSE.
+   */
+  async function simulate(txBytes: Uint8Array): Promise<SimulationResult> {
+    if (!(txBytes instanceof Uint8Array) || txBytes.length === 0) {
+      throw new ChainError('INVALID_INPUT', 'transaction bytes are empty');
+    }
+    const outcome = await bounded('simulate', async (abort) => {
+      try {
+        const { response } = await grpc.transactionExecutionService.simulateTransaction(
+          {
+            transaction: { bcs: { value: txBytes } },
+            readMask: { paths: ['transaction.effects.status', 'transaction.balance_changes'] },
+            checks: SimulationChecks.ENABLED,
+            doGasSelection: false,
+          },
+          { abort },
+        );
+        return { refusal: null, response };
+      } catch (error) {
+        const refusal = simulationRefusal(error);
+        if (refusal === null) throw error;
+        return { refusal, response: null };
+      }
+    });
+    if (outcome.refusal !== null) return { status: 'failure', errorCode: outcome.refusal, balanceChanges: [] };
+
+    const transaction = outcome.response.transaction;
+    if (!transaction) throw badResponse('simulation returned no transaction');
+    const status = executionOutcome(transaction.effects?.status);
+    return {
+      status,
+      errorCode: status === 'success' ? null : executionErrorCode(transaction.effects?.status?.error?.kind),
+      balanceChanges: parseBalanceChanges(transaction.balanceChanges),
+    };
   }
 
   async function listOwnedWalrusBlobs(owner: string): Promise<WalrusBlob[]> {
@@ -439,6 +599,9 @@ export function createChain(opts: { apiKey?: string }): Chain {
     getReferenceGasPrice,
     getBalances,
     getTransactionBalanceChanges,
+    getTransactionResult,
+    getCurrentEpoch,
+    simulate,
     listOwnedWalrusBlobs,
     close: () => transport.close(),
   };

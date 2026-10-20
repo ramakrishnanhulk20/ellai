@@ -17,6 +17,18 @@ export const LIMITS = {
   balancePageSize: 1_000,
   /** ListBalances pages read before giving up on finding USDC and SUI. */
   balanceMaxPages: 5,
+  /**
+   * Largest GraphQL response body read from Tatum. A full page of Walrus blobs is
+   * about 25 KB, so 1 MiB leaves room without letting a broken gateway fill memory.
+   */
+  graphqlMaxResponseBytes: 1_048_576,
+  /**
+   * Largest single gRPC message accepted from Tatum. A full ListBalances page of 1,000
+   * coin types is about 250 KB; grpc-js would otherwise allow 4 MiB.
+   */
+  grpcMaxReceiveBytes: 1_048_576,
+  /** Requests a minute Tatum allows without an API key. The probes and live tests pace themselves to it. */
+  tatumAnonymousRequestsPerMinute: 5,
   /** Ceiling on one request to a seller, from DNS lookup to the last body byte. */
   netTimeoutMs: 10_000,
   /** Bytes read from a seller's response before the request is abandoned. */
@@ -35,4 +47,9 @@ export const LIMITS = {
   maxPaymentAtomic: 1_000_000,
   /** How long a parsed payment stays usable, whatever expiry the seller asks for. */
   paymentValidityMs: 60_000,
+  /**
+   * Widest epoch window a signed payment may carry. Sui refuses a payment with no gas
+   * coins unless maxEpoch is at most minEpoch + 1, so a wider window is never valid.
+   */
+  paymentMaxEpochSpan: 1,
 } as const;

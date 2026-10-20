@@ -2,8 +2,8 @@
 // DrVelvetFog testnet demo, and two POST sellers captured by probe:sellers whose header
 // copy is broken) and on adversarial challenges. Each adversarial fixture is a live 402
 // with one thing changed, named in its "note": ambiguity, disagreeing copies, bad
-// amounts, assets, networks and ids, expiry, size and depth caps, mixed dialects, and
-// __proto__ keys.
+// amounts, assets, networks and ids, expiry, size and depth caps, mixed dialects,
+// __proto__ keys, and a t2000 escrow job entry.
 // Does NOT cover: whether the seller is honest, whether the recipient belongs to the
 // host (trust is keyed on the recipient elsewhere), the epoch window against the live
 // chain, or the network fetch itself (net.test.ts covers that).
@@ -140,6 +140,7 @@ describe('parseChallenge on adversarial challenges', () => {
       'nested-40-deep',
       'v1-and-v2-in-one-body',
       'proto-key',
+      'escrow-terms',
     ]) {
       expect(names).toContain(required);
     }

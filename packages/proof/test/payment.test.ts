@@ -1,0 +1,241 @@
+// Covers: building the t2000 gasless USDC send from a canonical payment parsed out of a
+// saved live 402, offline and deterministically; assertPlainUsdcSend refusing every
+// hand-built variant the work order names; signPayment's expiry and epoch refusals and
+// what it signs; and t2000's own seller verifier, run offline, accepting Ellai's header
+// (byte for byte the header t2000's payer makes) and rejecting tampered bytes.
+// Does NOT cover: the live epoch or a dry run through Tatum (probe:pay does both),
+// settlement, whether the seller is honest, multisig payers, or x402 v2 payments.
+import { readFileSync } from 'node:fs';
+import { Ed25519Keypair } from '@mysten/sui/keypairs/ed25519';
+import { Transaction, TransactionDataBuilder } from '@mysten/sui/transactions';
+import { fromBase64, normalizeStructTag, toBase58, toBase64 } from '@mysten/sui/utils';
+import { verifyTransactionSignature } from '@mysten/sui/verify';
+import {
+  buildX402SignedPayment,
+  encodeX402Header,
+  parseX402Header,
+  USDC,
+  verifyX402Payment,
+  type X402Requirements,
+} from '@t2000/sui-x402';
+import { describe, expect, it } from 'vitest';
+import { type CanonicalPayment, parseChallenge } from '../src/challenge.js';
+import type { SafeResponse } from '../src/net.js';
+import {
+  assertPlainUsdcSend,
+  buildPaymentBytes,
+  PaymentError,
+  paymentHeader,
+  signPayment,
+} from '../src/payment.js';
+import { USDC_TYPE_MAINNET } from '../src/usdc.js';
+
+interface Fixture {
+  url: string;
+  status: number;
+  headers: Record<string, string>;
+  body: string;
+}
+
+const FIXTURES = new URL('./fixtures/', import.meta.url);
+// The moment the live 402s were captured, so their epochs and timeouts read as fresh.
+const NOW = Date.parse('2026-10-20T14:04:00Z');
+const EPOCH_AT_CAPTURE = 1286n;
+
+function load(dir: 'live' | 'adversarial', name: string): Fixture {
+  return JSON.parse(readFileSync(new URL(`${dir}/${name}.json`, FIXTURES), 'utf8')) as Fixture;
+}
+
+function paymentFrom(dir: 'live' | 'adversarial', name: string): CanonicalPayment {
+  const fixture = load(dir, name);
+  const response: SafeResponse = {
+    status: fixture.status,
+    headers: fixture.headers,
+    bodyText: fixture.body,
+    url: fixture.url,
+    host: new URL(fixture.url).hostname,
+  };
+  return parseChallenge(response, NOW);
+}
+
+function liveRequirements(name: string): X402Requirements {
+  return (JSON.parse(load('live', name).body) as { accepts: [X402Requirements] }).accepts[0];
+}
+
+async function refusalOf(call: Promise<unknown>): Promise<PaymentError> {
+  try {
+    await call;
+  } catch (error) {
+    if (error instanceof PaymentError) return error;
+    throw error;
+  }
+  throw new Error('expected a PaymentError');
+}
+
+const LIVE = 'agentproof-preflight';
+const payment = paymentFrom('live', LIVE);
+const payer = Ed25519Keypair.generate();
+const ATTACKER = `0x${'a7'.repeat(32)}`;
+const SUI = normalizeStructTag('0x2::sui::SUI');
+
+interface Tamper {
+  sender?: string;
+  recipient?: string;
+  amount?: bigint;
+  coinType?: string;
+  extraCommand?: boolean;
+  gasPrice?: number;
+  gasCoin?: boolean;
+  nonce?: number;
+  epochShift?: bigint;
+}
+
+/** The same build as Ellai's, by hand, with one thing changed: what an attacker would hand in. */
+async function handBuilt(tamper: Tamper): Promise<Uint8Array> {
+  const coinType = tamper.coinType ?? USDC_TYPE_MAINNET;
+  const shift = tamper.epochShift ?? 0n;
+  const tx = new Transaction();
+  tx.setSender(tamper.sender ?? payer.toSuiAddress());
+  const [balance] = tx.moveCall({
+    target: '0x2::balance::redeem_funds',
+    typeArguments: [coinType],
+    arguments: [tx.withdrawal({ amount: tamper.amount ?? payment.amount, type: coinType })],
+  });
+  if (balance === undefined) throw new Error('redeem_funds returned nothing');
+  tx.moveCall({
+    target: '0x2::balance::send_funds',
+    typeArguments: [coinType],
+    arguments: [balance, tx.pure.address(tamper.recipient ?? payment.recipient)],
+  });
+  if (tamper.extraCommand) tx.moveCall({ target: '0x2::coin::zero', typeArguments: [coinType] });
+  tx.setGasPrice(tamper.gasPrice ?? 0);
+  tx.setGasBudget(0);
+  tx.setGasPayment(
+    tamper.gasCoin ? [{ objectId: `0x${'0b'.repeat(32)}`, version: '7', digest: toBase58(new Uint8Array(32).fill(9)) }] : [],
+  );
+  tx.setExpiration({
+    ValidDuring: {
+      minEpoch: String((payment.minEpoch ?? 0n) + shift),
+      maxEpoch: String((payment.maxEpoch ?? 0n) + shift),
+      minTimestamp: null,
+      maxTimestamp: null,
+      chain: '4btiuiMPvEENsttpZC7CZ53DruC3MAgfznDbASZ7DR6S',
+      nonce: tamper.nonce ?? Number(payment.nonce),
+    },
+  });
+  return tx.build();
+}
+
+describe('buildPaymentBytes', () => {
+  it('gives identical bytes for the same canonical payment, twice', async () => {
+    const first = await buildPaymentBytes(payment, payer.toSuiAddress());
+    const second = await buildPaymentBytes(paymentFrom('live', LIVE), payer.toSuiAddress());
+    expect(toBase64(second)).toBe(toBase64(first));
+  });
+
+  it("carries the live challenge's own chain id, epoch window and nonce", async () => {
+    type Suimpp = { chain: string; nonce: number; minEpoch: string; maxEpoch: string };
+    const suimpp = (liveRequirements(LIVE).extra as { suimpp: Suimpp }).suimpp;
+    const data = TransactionDataBuilder.fromBytes(await buildPaymentBytes(payment, payer.toSuiAddress())).getData();
+    expect(data.expiration).toMatchObject({
+      ValidDuring: { chain: suimpp.chain, nonce: suimpp.nonce, minEpoch: suimpp.minEpoch, maxEpoch: suimpp.maxEpoch },
+    });
+  });
+
+  it('refuses any dialect but t2000 x402 v1', async () => {
+    const v2 = paymentFrom('adversarial', 'v2-mainnet');
+    expect((await refusalOf(buildPaymentBytes(v2, payer.toSuiAddress()))).code).toBe('UNSUPPORTED_DIALECT');
+  });
+});
+
+describe('assertPlainUsdcSend', () => {
+  it('accepts the bytes buildPaymentBytes made', async () => {
+    const bytes = await buildPaymentBytes(payment, payer.toSuiAddress());
+    await expect(assertPlainUsdcSend(bytes, payment, payer.toSuiAddress())).resolves.toBeUndefined();
+  });
+
+  it.each<[string, Tamper, string]>([
+    ['a different recipient', { recipient: ATTACKER }, 'the recipient is not the canonical payment recipient'],
+    ['the amount plus one', { amount: payment.amount + 1n }, 'the amount is not the canonical payment amount'],
+    ['a different coin type', { coinType: SUI }, 'a coin type is not Sui Mainnet USDC'],
+    ['an extra command', { extraCommand: true }, 'the transaction has 3 commands, a plain USDC send has 2'],
+    ['a non-zero gas price', { gasPrice: 1_000 }, 'the gas price is not zero'],
+    ['a gas coin added', { gasCoin: true }, 'the transaction carries gas coins'],
+    ['a different sender', { sender: Ed25519Keypair.generate().toSuiAddress() }, 'the sender is not the payer'],
+    ['a different nonce', { nonce: Number(payment.nonce) + 1 }, "the nonce is not the challenge's"],
+    ['a different epoch window', { epochShift: 1n }, "the epoch window is not the challenge's"],
+  ])('refuses %s as MISMATCH and says what differs', async (_name, tamper, message) => {
+    const failure = await refusalOf(assertPlainUsdcSend(await handBuilt(tamper), payment, payer.toSuiAddress()));
+    expect(failure.code).toBe('MISMATCH');
+    expect(failure.message).toBe(message);
+  });
+});
+
+describe('signPayment', () => {
+  it('signs exactly the asserted bytes and reports their own digest', async () => {
+    const signed = await signPayment(payment, payer, NOW, EPOCH_AT_CAPTURE);
+    const bytes = fromBase64(signed.txBytesBase64);
+    expect(toBase64(bytes)).toBe(toBase64(await buildPaymentBytes(payment, payer.toSuiAddress())));
+    expect(signed.payer).toBe(payer.toSuiAddress());
+    expect(signed.digest).toBe(TransactionDataBuilder.getDigestFromBytes(bytes));
+    const signer = await verifyTransactionSignature(bytes, signed.signature, { address: signed.payer });
+    expect(signer.toSuiAddress()).toBe(payer.toSuiAddress());
+  });
+
+  it('refuses an expired payment', async () => {
+    expect((await refusalOf(signPayment(payment, payer, payment.expiresAtMs, EPOCH_AT_CAPTURE))).code).toBe('EXPIRED');
+    expect((await refusalOf(signPayment(payment, payer, Number.NaN, EPOCH_AT_CAPTURE))).code).toBe('EXPIRED');
+  });
+
+  it("refuses when the chain is outside the challenge's epoch window", async () => {
+    expect((await refusalOf(signPayment(payment, payer, NOW, EPOCH_AT_CAPTURE - 1n))).code).toBe('WRONG_EPOCH');
+    expect((await refusalOf(signPayment(payment, payer, NOW, EPOCH_AT_CAPTURE + 2n))).code).toBe('WRONG_EPOCH');
+  });
+});
+
+// What a t2000 seller passes as "expected": its own terms, and the challenge id read back
+// from the payment itself (serve route.ts, step 1).
+function sellerExpects(challengeId: string) {
+  return { challengeId, amount: '0.01', currency: USDC, recipient: payment.recipient, network: 'mainnet' as const };
+}
+
+describe("t2000's own seller verifier, run offline", () => {
+  it('accepts the header for a payment built from a saved live challenge', async () => {
+    const signed = await signPayment(payment, payer, NOW, EPOCH_AT_CAPTURE);
+    const header = paymentHeader(payment, signed);
+    expect(header.name).toBe('X-PAYMENT');
+
+    const parsed = parseX402Header(header.value);
+    expect(() => verifyX402Payment({ payment: parsed, expected: sellerExpects(parsed.payload.challengeId) })).not.toThrow();
+
+    // Ed25519 signatures are deterministic, so t2000's own payer, given the same challenge
+    // and key, must produce this exact header.
+    const theirs = await buildX402SignedPayment({ requirements: liveRequirements(LIVE), signer: payer });
+    expect(header.value).toBe(theirs.header);
+  });
+
+  it.each<[string, Tamper, RegExp]>([
+    ['pay another recipient', { recipient: ATTACKER }, /does not pay the expected recipient/],
+    ['carry another nonce', { nonce: Number(payment.nonce) + 1 }, /nonce does not bind/],
+  ])('rejects a hand-built header whose bytes %s', async (_name, tamper, reason) => {
+    const bytes = await handBuilt(tamper);
+    const { signature } = await payer.signTransaction(bytes);
+    const challengeId = payment.challengeId ?? '';
+    const value = encodeX402Header({
+      x402Version: 1,
+      scheme: 'exact',
+      network: 'sui:mainnet',
+      payload: { senderAddress: payer.toSuiAddress(), txBytes: toBase64(bytes), senderSignature: signature, challengeId },
+    });
+    expect(() => verifyX402Payment({ payment: parseX402Header(value), expected: sellerExpects(challengeId) })).toThrow(reason);
+  });
+});
+
+describe('paymentHeader', () => {
+  it('refuses signed material whose digest is not the digest of its bytes', async () => {
+    const signed = await signPayment(payment, payer, NOW, EPOCH_AT_CAPTURE);
+    const other = await signPayment(paymentFrom('live', 'jp-task-policy-classify'), payer, NOW, EPOCH_AT_CAPTURE);
+    const mixed = { ...signed, digest: other.digest };
+    expect((await refusalOf(Promise.resolve().then(() => paymentHeader(payment, mixed)))).code).toBe('MISMATCH');
+  });
+});
