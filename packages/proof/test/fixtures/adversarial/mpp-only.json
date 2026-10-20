@@ -1,0 +1,10 @@
+{
+  "expect": "NO_DIALECT",
+  "note": "MPP WWW-Authenticate challenge, not supported yet",
+  "url": "https://seller.example/mpp",
+  "status": 402,
+  "headers": {
+    "www-authenticate": "Payment id=\"hm4c2Lw\", realm=\"seller.example\", method=\"sui\", intent=\"charge\", request=\"eyJhbW91bnQiOiIxMDAwMCJ9\", expires=\"2026-10-20T14:09:00Z\""
+  },
+  "body": ""
+}

@@ -1,0 +1,11 @@
+{
+  "expect": "COPIES_DISAGREE",
+  "note": "x402 v2 header asks 0.02 USDC, body asks 0.05 USDC",
+  "url": "https://seller.example/v2/data",
+  "status": 402,
+  "headers": {
+    "content-type": "application/json",
+    "payment-required": "eyJ4NDAyVmVyc2lvbiI6MiwiZXJyb3IiOiJQQVlNRU5ULVNJR05BVFVSRSBoZWFkZXIgaXMgcmVxdWlyZWQiLCJyZXNvdXJjZSI6eyJ1cmwiOiJodHRwczovL3NlbGxlci5leGFtcGxlL3YyL2RhdGEiLCJkZXNjcmlwdGlvbiI6IkEgdjIgc2VsbGVyIG9uIFN1aSBNYWlubmV0IiwibWltZVR5cGUiOiJhcHBsaWNhdGlvbi9qc29uIn0sImFjY2VwdHMiOlt7InNjaGVtZSI6ImV4YWN0IiwibmV0d29yayI6InN1aTptYWlubmV0IiwiYW1vdW50IjoiMjAwMDAiLCJhc3NldCI6IjB4ZGJhMzQ2NzJlMzBjYjA2NWIxZjkzZTNhYjU1MzE4NzY4ZmQ2ZmVmNjZjMTU5NDJjOWY3Y2I4NDZlMmY5MDBlNzo6dXNkYzo6VVNEQyIsInBheVRvIjoiMHg0M2E1NzgyODgxZjdhZTQ1ODRmYjdhM2Q5ZDliM2NkMzQ0MGVkNjM0YTY3MzAxZGU1ZTQ1ZjczNDUwNWU4ZTdkIiwibWF4VGltZW91dFNlY29uZHMiOjYwLCJleHRyYSI6e319XX0="
+  },
+  "body": "{\"x402Version\":2,\"error\":\"PAYMENT-SIGNATURE header is required\",\"resource\":{\"url\":\"https://seller.example/v2/data\",\"description\":\"A v2 seller on Sui Mainnet\",\"mimeType\":\"application/json\"},\"accepts\":[{\"scheme\":\"exact\",\"network\":\"sui:mainnet\",\"amount\":\"50000\",\"asset\":\"0xdba34672e30cb065b1f93e3ab55318768fd6fef66c15942c9f7cb846e2f900e7::usdc::USDC\",\"payTo\":\"0x43a5782881f7ae4584fb7a3d9d9b3cd3440ed634a67301de5e45f734505e8e7d\",\"maxTimeoutSeconds\":60,\"extra\":{}}]}"
+}

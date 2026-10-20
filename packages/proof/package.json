@@ -6,13 +6,16 @@
     "test": "vitest run",
     "typecheck": "tsc --noEmit",
     "setup": "tsx scripts/setup-keys.ts",
-    "probe": "tsx --env-file-if-exists=../../.env scripts/probe-chain.ts"
+    "probe": "tsx --env-file-if-exists=../../.env scripts/probe-chain.ts",
+    "probe:sellers": "tsx scripts/probe-sellers.ts"
   },
   "dependencies": {
     "@grpc/grpc-js": "1.14.6",
     "@mysten/sui": "2.37.0",
     "@protobuf-ts/grpc-transport": "2.11.1",
     "@protobuf-ts/runtime-rpc": "2.11.1",
+    "ipaddr.js": "2.5.0",
+    "undici": "8.12.3",
     "zod": "4.6.7"
   },
   "devDependencies": {

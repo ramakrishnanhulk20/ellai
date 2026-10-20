@@ -1,0 +1,20 @@
+{
+  "expect": "BAD_AMOUNT",
+  "note": "amount as a JSON number, not a string",
+  "url": "https://agentproof.vegagaminginc.workers.dev/v1/preflight",
+  "status": 402,
+  "headers": {
+    "access-control-allow-headers": "content-type, X-PAYMENT",
+    "access-control-allow-methods": "GET, POST, PUT, DELETE, OPTIONS",
+    "access-control-allow-origin": "*",
+    "access-control-expose-headers": "X-PAYMENT-RESPONSE, WWW-Authenticate",
+    "alt-svc": "h3=\":443\"; ma=86400",
+    "cf-ray": "a4d891ac8eb2d437-SIN",
+    "content-type": "application/json",
+    "date": "Tue, 20 Oct 2026 14:03:59 GMT",
+    "nel": "{\"report_to\":\"cf-nel\",\"success_fraction\":0.0,\"max_age\":604800}",
+    "report-to": "{\"group\":\"cf-nel\",\"max_age\":604800,\"endpoints\":[{\"url\":\"https://a.nel.cloudflare.com/report/v4?s=gZ70%2BylUpaAIUvnIXWysoUjDxcYqOIRx6hbYdchTFDyWRWIDjqXL8iM7TkXo5aJsTwuRxOVWf9WbIbLGQHY6yhd5OgOHBYPQGifdTVBje%2FVb80%2BBzee8uh92j1wYAdhvvr967%2BGjgvRW951EdJmZlxaH8yhZY849XYIvI7RnaxKFKn8%3D\"}]}",
+    "server": "cloudflare"
+  },
+  "body": "{\"x402Version\":1,\"error\":\"Payment required\",\"accepts\":[{\"scheme\":\"exact\",\"network\":\"sui:mainnet\",\"asset\":\"0xdba34672e30cb065b1f93e3ab55318768fd6fef66c15942c9f7cb846e2f900e7::usdc::USDC\",\"maxAmountRequired\":10000,\"payTo\":\"0x5dd4bd4f04ef4c3913acd4f9837fbb86aef946142aa37195a05af74e627a4f7c\",\"resource\":\"https://agentproof.vegagaminginc.workers.dev/v1/preflight\",\"maxTimeoutSeconds\":60,\"extra\":{\"suimpp\":{\"challengeId\":\"bc10d0ed-9fda-4eab-bc18-d909ed86880c\",\"nonce\":3598947822,\"chain\":\"4btiuiMPvEENsttpZC7CZ53DruC3MAgfznDbASZ7DR6S\",\"minEpoch\":\"1286\",\"maxEpoch\":\"1287\"}}}]}"
+}

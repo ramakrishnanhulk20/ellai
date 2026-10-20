@@ -1,0 +1,23 @@
+{
+  "source": "reference/payments/live/seller-drvelvetfog_signal-whales.headers and .body",
+  "url": "https://sui-facilitator.onrender.com/signal/whales",
+  "status": 402,
+  "headers": {
+    "date": "Tue, 20 Oct 2026 13:52:08 GMT",
+    "content-type": "application/json",
+    "transfer-encoding": "chunked",
+    "connection": "keep-alive",
+    "access-control-allow-headers": "content-type, payment-signature, por-proof",
+    "access-control-allow-origin": "*",
+    "access-control-expose-headers": "PAYMENT-REQUIRED, PAYMENT-RESPONSE",
+    "cf-cache-status": "DYNAMIC",
+    "payment-required": "eyJ4NDAyVmVyc2lvbiI6MiwiZXJyb3IiOiJQQVlNRU5ULVNJR05BVFVSRSBoZWFkZXIgaXMgcmVxdWlyZWQiLCJyZXNvdXJjZSI6eyJ1cmwiOiJodHRwczovL3N1aS1mYWNpbGl0YXRvci5vbnJlbmRlci5jb20vc2lnbmFsL3doYWxlcyIsImRlc2NyaXB0aW9uIjoiUmVjZW50IGxhcmdlIFNVSSB0cmFuc2ZlcnMgb24gU3VpIG1haW5uZXQgKHdoYWxlIHNpZ25hbCkiLCJtaW1lVHlwZSI6ImFwcGxpY2F0aW9uL2pzb24ifSwiYWNjZXB0cyI6W3sic2NoZW1lIjoiZXhhY3QiLCJuZXR3b3JrIjoic3VpOnRlc3RuZXQiLCJhbW91bnQiOiIxMDAwMCIsImFzc2V0IjoiMHhhMWVjN2ZjMDBhNmY0MGRiOTY5M2FkMTQxNWQwYzE5M2FkMzkwNjQ5NDQyOGNmMjUyNjIxMDM3YmQ3MTE3ZTI5Ojp1c2RjOjpVU0RDIiwicGF5VG8iOiIweDQzYTU3ODI4ODFmN2FlNDU4NGZiN2EzZDlkOWIzY2QzNDQwZWQ2MzRhNjczMDFkZTVlNDVmNzM0NTA1ZThlN2QiLCJtYXhUaW1lb3V0U2Vjb25kcyI6NjAsImV4dHJhIjp7fX1dfQ==",
+    "rndr-id": "c79b44c7-092b-44ed",
+    "server": "cloudflare",
+    "vary": "Accept-Encoding",
+    "x-render-origin-server": "Render",
+    "cf-ray": "a4d88053acf56e60-MAA",
+    "alt-svc": "h3=\":443\"; ma=86400"
+  },
+  "body": "{\"x402Version\":2,\"error\":\"PAYMENT-SIGNATURE header is required\",\"resource\":{\"url\":\"https://sui-facilitator.onrender.com/signal/whales\",\"description\":\"Recent large SUI transfers on Sui mainnet (whale signal)\",\"mimeType\":\"application/json\"},\"accepts\":[{\"scheme\":\"exact\",\"network\":\"sui:testnet\",\"amount\":\"10000\",\"asset\":\"0xa1ec7fc00a6f40db9693ad1415d0c193ad3906494428cf252621037bd7117e29::usdc::USDC\",\"payTo\":\"0x43a5782881f7ae4584fb7a3d9d9b3cd3440ed634a67301de5e45f734505e8e7d\",\"maxTimeoutSeconds\":60,\"extra\":{}}]}"
+}

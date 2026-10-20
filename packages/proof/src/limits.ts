@@ -17,4 +17,22 @@ export const LIMITS = {
   balancePageSize: 1_000,
   /** ListBalances pages read before giving up on finding USDC and SUI. */
   balanceMaxPages: 5,
+  /** Ceiling on one request to a seller, from DNS lookup to the last body byte. */
+  netTimeoutMs: 10_000,
+  /** Bytes read from a seller's response before the request is abandoned. */
+  netMaxResponseBytes: 262_144,
+  /** Largest challenge body or header that is parsed. Live 402 bodies are under 1 KB. */
+  challengeMaxBytes: 32_768,
+  /** Deepest JSON nesting accepted in a challenge. Live 402 bodies nest 5 levels. */
+  challengeMaxDepth: 20,
+  /** Longest challengeId or nonce kept. Live challenge ids are 36-character UUIDs. */
+  challengeIdMaxLength: 128,
+  /** Longest resource URL kept from a challenge. It is shown, never fetched. */
+  resourceMaxLength: 2_048,
+  /** Smallest payment in atomic USDC: 0.01 USDC, the floor for a gasless send. */
+  minPaymentAtomic: 10_000,
+  /** Largest single payment in atomic USDC: 1 USDC. */
+  maxPaymentAtomic: 1_000_000,
+  /** How long a parsed payment stays usable, whatever expiry the seller asks for. */
+  paymentValidityMs: 60_000,
 } as const;
