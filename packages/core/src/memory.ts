@@ -2,7 +2,7 @@ import { bcs } from '@mysten/sui/bcs';
 import { decodeSuiPrivateKey } from '@mysten/sui/cryptography';
 import type { Ed25519Keypair } from '@mysten/sui/keypairs/ed25519';
 import { Transaction } from '@mysten/sui/transactions';
-import { deriveDynamicFieldID, normalizeStructTag, normalizeSuiAddress, toBase64 } from '@mysten/sui/utils';
+import { deriveDynamicFieldID, normalizeStructTag, normalizeSuiAddress, toBase64, toHex } from '@mysten/sui/utils';
 import { MemWal } from '@mysten-incubation/memwal';
 import { addDelegateKey, type CreateAccountOpts, createAccount } from '@mysten-incubation/memwal/account';
 import { type Chain, ChainError, classifyChainError } from './chain.js';
@@ -302,6 +302,41 @@ function assertSignable(bytes: Uint8Array, ownerAddress: string, fn: string, exp
   });
 }
 
+type AccountFunction = 'create_account' | 'add_delegate_key';
+
+/** The account helper's transaction, resolved through Tatum with the owner as sender and gas payer, returned only once assertSignable passes. */
+async function buildSignable(
+  chain: Chain,
+  transaction: unknown,
+  ownerAddress: string,
+  fn: AccountFunction,
+  expected: ExpectedArgument[],
+  code: MemoryErrorCode,
+): Promise<Uint8Array> {
+  if (!(transaction instanceof Transaction)) throw new MemoryError(code, 'the account helper did not hand over a transaction');
+  transaction.setSender(ownerAddress);
+  // One simulate call: the gateway resolves the objects, picks the gas and sets the expiry.
+  const bytes = await tatumStep(chain, code, 1, () => transaction.build({ client: chain.grpc }));
+  assertSignable(bytes, ownerAddress, fn, expected, code);
+  return bytes;
+}
+
+/** The arguments create_account must carry, in order. */
+function createAccountArguments(): ExpectedArgument[] {
+  return [{ object: normalizeSuiAddress(WALRUS_MEMORY_REGISTRY_ID) }, { object: SUI_CLOCK_ID }];
+}
+
+/** The arguments add_delegate_key must carry, in order, for this account, key and label. */
+function addDelegateArguments(accountId: string, delegateKey: Uint8Array, label: string): ExpectedArgument[] {
+  return [
+    { object: accountId },
+    { object: normalizeSuiAddress(WALRUS_MEMORY_REGISTRY_ID) },
+    { pure: bcs.byteVector().serialize(delegateKey).toBytes() },
+    { pure: bcs.string().serialize(label).toBytes() },
+    { object: SUI_CLOCK_ID },
+  ];
+}
+
 /**
  * The owner's key as the account helper's wallet. It signs only the one Walrus Memory call
  * it was made for, after assertSignable, and nothing else: personal messages are refused.
@@ -310,18 +345,14 @@ function ownerWallet(
   chain: Chain,
   owner: Ed25519Keypair,
   ownerAddress: string,
-  fn: 'create_account' | 'add_delegate_key',
+  fn: AccountFunction,
   expected: ExpectedArgument[],
   code: MemoryErrorCode,
 ): WalletSigner {
   return {
     address: ownerAddress,
     async signAndExecuteTransaction({ transaction }: { transaction: unknown }) {
-      if (!(transaction instanceof Transaction)) throw new MemoryError(code, 'the account helper did not hand over a transaction');
-      transaction.setSender(ownerAddress);
-      // One simulate call: the gateway resolves the objects, picks the gas and sets the expiry.
-      const bytes = await tatumStep(chain, code, 1, () => transaction.build({ client: chain.grpc }));
-      assertSignable(bytes, ownerAddress, fn, expected, code);
+      const bytes = await buildSignable(chain, transaction, ownerAddress, fn, expected, code);
       const { signature } = await owner.signTransaction(bytes);
       // Sending the same signed bytes again after a rate limit is safe: Sui runs a digest once.
       const result = await tatumStep(chain, code, 1, () =>
@@ -388,7 +419,7 @@ export async function ensureMemoryAccount(args: {
       createAccount({
         packageId: WALRUS_MEMORY_PACKAGE_ID,
         registryId,
-        walletSigner: ownerWallet(chain, owner, ownerAddress, 'create_account', [{ object: registryId }, { object: SUI_CLOCK_ID }], 'ACCOUNT'),
+        walletSigner: ownerWallet(chain, owner, ownerAddress, 'create_account', createAccountArguments(), 'ACCOUNT'),
         suiClient: chain.grpc,
       }),
     );
@@ -420,13 +451,7 @@ export async function ensureMemoryAccount(args: {
       throw new MemoryError('DELEGATE', `the account already holds ${account.delegateKeys.length} delegate keys, the most allowed`);
     }
     if (!registry.open) throw new MemoryError('DELEGATE', 'the Walrus Memory registry is not open for new delegate keys');
-    const expected: ExpectedArgument[] = [
-      { object: knownAccountId },
-      { object: registryId },
-      { pure: bcs.byteVector().serialize(delegateKey).toBytes() },
-      { pure: bcs.string().serialize(DELEGATE_LABEL).toBytes() },
-      { object: SUI_CLOCK_ID },
-    ];
+    const expected = addDelegateArguments(knownAccountId, delegateKey, DELEGATE_LABEL);
     const result = await helperStep('DELEGATE', () =>
       addDelegateKey({
         packageId: WALRUS_MEMORY_PACKAGE_ID,
@@ -445,6 +470,165 @@ export async function ensureMemoryAccount(args: {
   }
 
   return { accountId: knownAccountId, created, delegateAdded, digests };
+}
+
+// The label is stored on chain in the clear, so it is held to plain characters.
+const DELEGATE_LABEL_PATTERN = /^[A-Za-z0-9 ._-]{1,64}$/;
+
+/** Carries the built bytes out of the account helper, which stops it before it could wait for a send. */
+class BuiltTransaction extends Error {
+  readonly bytes: Uint8Array;
+
+  constructor(bytes: Uint8Array) {
+    super('built and not signed');
+    this.name = 'BuiltTransaction';
+    this.bytes = bytes;
+  }
+}
+
+/**
+ * A wallet for the account helper that holds no key. It builds and checks the helper's
+ * transaction exactly as ownerWallet does, then hands the bytes back instead of signing.
+ */
+function unsignedWallet(chain: Chain, ownerAddress: string, fn: AccountFunction, expected: ExpectedArgument[], code: MemoryErrorCode): WalletSigner {
+  return {
+    address: ownerAddress,
+    async signAndExecuteTransaction({ transaction }: { transaction: unknown }) {
+      throw new BuiltTransaction(await buildSignable(chain, transaction, ownerAddress, fn, expected, code));
+    },
+    async signPersonalMessage() {
+      throw new MemoryError(code, 'an unsigned build signs no messages');
+    },
+  };
+}
+
+async function helperBytes(code: MemoryErrorCode, run: () => Promise<unknown>): Promise<Uint8Array> {
+  try {
+    await run();
+  } catch (error) {
+    if (error instanceof BuiltTransaction) return error.bytes;
+    throw tatumFailure(error, code);
+  }
+  throw new MemoryError(code, 'the account helper finished without handing over a transaction');
+}
+
+function suiIdOrFail(value: unknown, what: string): string {
+  try {
+    if (typeof value !== 'string') throw new Error('not text');
+    return canonicalSuiAddress(value);
+  } catch {
+    throw new MemoryError('ACCOUNT', `${what} is not a Sui address`);
+  }
+}
+
+/**
+ * The owner's Walrus Memory account on Sui Mainnet, read through Tatum: its id from the
+ * registry's owner-to-account table, and the public key of every delegate on it as lowercase
+ * hex (64 characters for an Ed25519 key), or null when the owner has no account. The
+ * account's own owner field must be `owner`. Reads only; three Tatum requests.
+ * Throws MemoryError: ACCOUNT for an owner that is not a Sui address, a registry or account
+ * of an unexpected type, or an account that belongs to another owner, is frozen, or is named
+ * by the registry but missing; TIMEOUT, RATE_LIMITED or UPSTREAM for Tatum.
+ */
+export async function findMemoryAccount(chain: Chain, owner: string): Promise<{ accountId: string; delegates: string[] } | null> {
+  const ownerAddress = suiIdOrFail(owner, 'the owner');
+  const registry = await readRegistry(chain);
+  const accountId = await findAccountId(chain, registry.tableId, ownerAddress);
+  if (accountId === null) return null;
+  const account = await readAccount(chain, accountId, ownerAddress);
+  if (account === null) throw new MemoryError('ACCOUNT', 'the registry names an account that Tatum cannot find');
+  if (!account.usable) throw new MemoryError('ACCOUNT', 'the Walrus Memory account is frozen');
+  return { accountId, delegates: account.delegateKeys.map((key) => toHex(key)) };
+}
+
+/**
+ * Builds the owner's create_account transaction without signing it, so the owner's own
+ * wallet signs and sends it. It is the call ensureMemoryAccount makes, through the same
+ * account helper, resolved through Tatum with the owner as sender and gas payer, and its
+ * bytes pass the same assertSignable checks before they are returned: exactly one
+ * create_account on the registry and the clock, gas at most LIMITS.memwalAccountTxMaxGasMist.
+ * The registry is read first, so an owner who already has an account, or a registry closed
+ * to new accounts, is refused before anything is built. The bytes carry the gas Tatum
+ * picked: if the owner's gas changes before signing they go stale and are built again.
+ * Throws MemoryError: ACCOUNT for an owner that is not a Sui address, an owner that already
+ * has an account, a closed registry, or bytes that fail the checks; TIMEOUT, RATE_LIMITED or
+ * UPSTREAM for Tatum.
+ */
+export async function buildCreateAccountTx(args: { chain: Chain; owner: string }): Promise<Uint8Array> {
+  const { chain } = args;
+  const ownerAddress = suiIdOrFail(args.owner, 'the owner');
+  const registry = await readRegistry(chain);
+  if ((await findAccountId(chain, registry.tableId, ownerAddress)) !== null) {
+    throw new MemoryError('ACCOUNT', 'the owner already has a Walrus Memory account');
+  }
+  if (!registry.open) throw new MemoryError('ACCOUNT', 'the Walrus Memory registry is not open for new accounts');
+  return helperBytes('ACCOUNT', () =>
+    createAccount({
+      packageId: WALRUS_MEMORY_PACKAGE_ID,
+      registryId: normalizeSuiAddress(WALRUS_MEMORY_REGISTRY_ID),
+      walletSigner: unsignedWallet(chain, ownerAddress, 'create_account', createAccountArguments(), 'ACCOUNT'),
+      suiClient: chain.grpc,
+    }),
+  );
+}
+
+/**
+ * Builds the owner's add_delegate_key transaction for `delegatePublicKey` named `label` on
+ * account `accountId`, without signing it, so the owner's own wallet signs and sends it. It
+ * is the call ensureMemoryAccount makes, through the same account helper and the same
+ * assertSignable checks as buildCreateAccountTx. The registry and the account are read
+ * first: the registry must name `accountId` as the owner's account, and the account must be
+ * usable, not already hold the key, and have room for one more.
+ * Throws MemoryError: DELEGATE for a key that is not 32 bytes, a label that is not 1 to 64
+ * letters, digits, spaces, dots, dashes or underscores, a key already on the account, an
+ * account holding LIMITS.memwalMaxDelegateKeys keys, a closed registry, or bytes that fail
+ * the checks; ACCOUNT for an owner or account id that is not a Sui address, an account the
+ * registry does not name as the owner's, or one that is missing or frozen; TIMEOUT,
+ * RATE_LIMITED or UPSTREAM for Tatum.
+ */
+export async function buildAddDelegateTx(args: {
+  chain: Chain;
+  owner: string;
+  accountId: string;
+  delegatePublicKey: Uint8Array;
+  label: string;
+}): Promise<Uint8Array> {
+  const { chain } = args;
+  if (!(args.delegatePublicKey instanceof Uint8Array) || args.delegatePublicKey.length !== ED25519_PUBLIC_KEY_BYTES) {
+    throw new MemoryError('DELEGATE', `the delegate public key must be ${ED25519_PUBLIC_KEY_BYTES} bytes`);
+  }
+  if (typeof args.label !== 'string' || !DELEGATE_LABEL_PATTERN.test(args.label)) {
+    throw new MemoryError('DELEGATE', 'the label must be 1 to 64 letters, digits, spaces, dots, dashes or underscores');
+  }
+  const delegateKey = Uint8Array.from(args.delegatePublicKey);
+  const { label } = args;
+  const ownerAddress = suiIdOrFail(args.owner, 'the owner');
+  const accountId = suiIdOrFail(args.accountId, 'the account id');
+
+  const registry = await readRegistry(chain);
+  if ((await findAccountId(chain, registry.tableId, ownerAddress)) !== accountId) {
+    throw new MemoryError('ACCOUNT', "the registry does not name this account as the owner's");
+  }
+  const account = await readAccount(chain, accountId, ownerAddress);
+  if (account === null) throw new MemoryError('ACCOUNT', 'the registry names an account that Tatum cannot find');
+  if (!account.usable) throw new MemoryError('ACCOUNT', 'the Walrus Memory account is frozen');
+  if (account.delegateKeys.some((key) => sameBytes(key, delegateKey))) throw new MemoryError('DELEGATE', 'the key is already on the account');
+  if (account.delegateKeys.length >= LIMITS.memwalMaxDelegateKeys) {
+    throw new MemoryError('DELEGATE', `the account already holds ${account.delegateKeys.length} delegate keys, the most allowed`);
+  }
+  if (!registry.open) throw new MemoryError('DELEGATE', 'the Walrus Memory registry is not open for new delegate keys');
+
+  return helperBytes('DELEGATE', () =>
+    addDelegateKey({
+      packageId: WALRUS_MEMORY_PACKAGE_ID,
+      registryId: normalizeSuiAddress(WALRUS_MEMORY_REGISTRY_ID),
+      accountId,
+      publicKey: delegateKey,
+      label,
+      walletSigner: unsignedWallet(chain, ownerAddress, 'add_delegate_key', addDelegateArguments(accountId, delegateKey, label), 'DELEGATE'),
+      suiClient: chain.grpc,
+    }),
+  );
 }
 
 const cappedRelayerOrigins = new Set<string>();

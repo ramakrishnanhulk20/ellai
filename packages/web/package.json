@@ -6,7 +6,9 @@
     "test": "vitest run",
     "typecheck": "tsc --noEmit",
     "db:generate": "drizzle-kit generate",
-    "prove:loop": "tsx --env-file-if-exists=../../.env scripts/prove-memory-loop.ts"
+    "prove:loop": "tsx --env-file-if-exists=../../.env scripts/prove-memory-loop.ts",
+    "prove:onboarding": "tsx --env-file-if-exists=../../.env scripts/prove-onboarding.ts",
+    "prove:flow": "tsx --env-file-if-exists=../../.env scripts/prove-pay-flow.ts"
   },
   "dependencies": {
     "@electric-sql/pglite": "0.5.11",

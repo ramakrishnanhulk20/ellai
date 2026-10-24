@@ -191,4 +191,18 @@ export const LIMITS = {
   pendingMemoryWriteBatch: 20,
   /** Memory write jobs checked per owner in one confirmation pass. */
   memoryJobConfirmBatch: 50,
+  /** Patience for a paid call to a seller Ellai has no recorded patience for. */
+  netPaidTimeoutDefaultMs: 30_000,
+  /** Characters of a seller's answer handed back to the agent; the rest is cut and marked as cut. */
+  sellerAnswerMaxChars: 20_000,
+  /** Settlement reads right after a paid call, before leaving the rest to the jobs tick. */
+  settlementInlineTries: 8,
+  /** Wait between those settlement reads. */
+  settlementInlineIntervalMs: 3_000,
+  /** Largest daily limit an owner may set on their allowance at onboarding: 5 USDC. */
+  onboardingDailyLimitMaxAtomic: 5_000_000,
+  /** Largest lifetime cap an owner may set on their allowance at onboarding: 50 USDC. */
+  onboardingLifetimeCapMaxAtomic: 50_000_000,
+  /** Longest an allowance may run before the owner renews it: 90 days. */
+  onboardingAllowanceMaxMs: 7_776_000_000,
 } as const;

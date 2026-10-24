@@ -5,24 +5,32 @@
 // submitSentences sending exactly once without waiting, and checkJobs mapping each relayer
 // state and refusing every malformed status answer. Against a stand-in chain: a gRPC refusal wrapped in a SimulationError keeping the failing
 // step's own code, and Tatum being paced at the anonymous rate only without an API key.
+// The unsigned builders: bytes that decode to exactly the expected Move call with the owner
+// as sender, nothing sent, refusals before building, and tampered resolutions refused by
+// assertSignable; findMemoryAccount's null, found and other-owner answers.
 // Does NOT cover: anything on the live relayer or on Sui. Account creation, delegate
 // registration, real job timing, rate limits and pacing against the live gateway are proven
-// only by `npm run prove:memory`, which runs against Mainnet.
+// only by `npm run prove:memory`, which runs against Mainnet. Whether a real wallet signs the
+// unsigned bytes as built is not covered anywhere yet.
 import { bcs } from '@mysten/sui/bcs';
 import { SimulationError } from '@mysten/sui/client';
 import { decodeSuiPrivateKey } from '@mysten/sui/cryptography';
 import { Ed25519Keypair } from '@mysten/sui/keypairs/ed25519';
-import { normalizeStructTag, normalizeSuiAddress, toHex } from '@mysten/sui/utils';
+import { Inputs, Transaction, type TransactionDataBuilder } from '@mysten/sui/transactions';
+import { deriveDynamicFieldID, normalizeStructTag, normalizeSuiAddress, toBase64, toHex } from '@mysten/sui/utils';
 import { type MemWal, MemWalMock } from '@mysten-incubation/memwal';
 import { RpcError } from '@protobuf-ts/runtime-rpc';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { Chain } from '../src/chain.js';
 import { LIMITS } from '../src/limits.js';
 import {
+  buildAddDelegateTx,
+  buildCreateAccountTx,
   checkJobs,
   createMemoryClient,
   DEFAULT_RELAYER_URL,
   ensureMemoryAccount,
+  findMemoryAccount,
   MemoryError,
   recallSentences,
   rememberSentences,
@@ -439,5 +447,219 @@ describe('ensureMemoryAccount against a stand-in chain', () => {
     } finally {
       vi.resetModules();
     }
+  });
+});
+
+describe('unsigned account builders and findMemoryAccount against a stand-in chain', () => {
+  const REGISTRY_ID = normalizeSuiAddress(WALRUS_MEMORY_REGISTRY_ID);
+  const TABLE_ID = `0x${'7e'.repeat(32)}`;
+  const CLOCK_ID = normalizeSuiAddress('0x6');
+  const OWNER = normalizeSuiAddress(`0x${'a1'.repeat(32)}`);
+  const OTHER = normalizeSuiAddress(`0x${'b2'.repeat(32)}`);
+  const ACCOUNT = normalizeSuiAddress(`0x${'c3'.repeat(32)}`);
+  const KEY = Uint8Array.from({ length: 32 }, (_, index) => index + 1);
+  const GAS_COIN = { objectId: normalizeSuiAddress(`0x${'9c'.repeat(32)}`), version: '7', digest: 'AQ2cfEAh3AiC1SBMkH64f4MP4QsvTettKfhLXErgNcFh' };
+  const FIELD_TYPE = normalizeStructTag('0x2::dynamic_field::Field<address, 0x2::object::ID>');
+  const ACCOUNT_TYPE = normalizeStructTag(`${WALRUS_MEMORY_PACKAGE_ID}::account::MemWalAccount`);
+  const notFound = () => Object.assign(new Error('stand-in not found'), { reason: 'notFound' });
+
+  const RegistryLayout = bcs.struct('AccountRegistry', {
+    id: bcs.Address,
+    accounts: bcs.struct('Table', { id: bcs.Address, size: bcs.u64() }),
+    migration_finalized: bcs.bool(),
+    pinned_allowlist_root: bcs.option(bcs.byteVector()),
+    expected_account_imports: bcs.u64(),
+    expected_delegate_imports: bcs.u64(),
+    imported_accounts: bcs.u64(),
+    imported_delegates: bcs.u64(),
+    version: bcs.u64(),
+  });
+  const FieldLayout = bcs.struct('Field', { id: bcs.Address, name: bcs.Address, value: bcs.Address });
+  const AccountLayout = bcs.struct('MemWalAccount', {
+    id: bcs.Address,
+    owner: bcs.Address,
+    delegate_keys: bcs.vector(
+      bcs.struct('DelegateKey', { public_key: bcs.byteVector(), sui_address: bcs.Address, label: bcs.string(), created_at: bcs.u64() }),
+    ),
+    created_at: bcs.u64(),
+    active: bcs.bool(),
+    admin_quarantined: bcs.bool(),
+    legacy_account_id: bcs.option(bcs.Address),
+    access_counter_version: bcs.u64(),
+  });
+
+  interface Setup {
+    /** The account the registry names for OWNER, if any. */
+    account?: { id: string; owner: string; keys: Uint8Array[] };
+    /** Changes the resolved transaction the way a hostile or broken gateway could. */
+    tamper?: (data: TransactionDataBuilder) => void;
+  }
+
+  function standIn(setup: Setup = {}) {
+    const objects = new Map<string, { objectId: string; type: string; content: Uint8Array }>();
+    const registry = RegistryLayout.serialize({
+      id: REGISTRY_ID,
+      accounts: { id: TABLE_ID, size: 1 },
+      migration_finalized: true,
+      pinned_allowlist_root: null,
+      expected_account_imports: 0,
+      expected_delegate_imports: 0,
+      imported_accounts: 0,
+      imported_delegates: 0,
+      version: 4,
+    });
+    objects.set(REGISTRY_ID, {
+      objectId: REGISTRY_ID,
+      type: normalizeStructTag(`${WALRUS_MEMORY_PACKAGE_ID}::account::AccountRegistry`),
+      content: registry.toBytes(),
+    });
+    if (setup.account) {
+      const { id, owner, keys } = setup.account;
+      const fieldId = deriveDynamicFieldID(TABLE_ID, 'address', bcs.Address.serialize(OWNER).toBytes());
+      objects.set(fieldId, { objectId: fieldId, type: FIELD_TYPE, content: FieldLayout.serialize({ id: fieldId, name: OWNER, value: id }).toBytes() });
+      const delegateKeys = keys.map((key) => ({ public_key: key, sui_address: OTHER, label: 'Ellai', created_at: 1 }));
+      const account = AccountLayout.serialize({
+        id,
+        owner,
+        delegate_keys: delegateKeys,
+        created_at: 1,
+        active: true,
+        admin_quarantined: false,
+        legacy_account_id: null,
+        access_counter_version: 0,
+      });
+      objects.set(id, { objectId: id, type: ACCOUNT_TYPE, content: account.toBytes() });
+    }
+    const getObjects = vi.fn(async ({ objectIds: [id] }: { objectIds: string[] }) => ({ objects: [objects.get(id ?? '') ?? notFound()] }));
+    const sent = vi.fn(() => Promise.reject(new Error('a transaction was sent')));
+    // Stands in for the gateway's resolution: shared objects get a version and the owner's gas is picked.
+    const resolve = vi.fn(async (data: TransactionDataBuilder, _options: unknown, next: () => Promise<void>) => {
+      data.inputs.forEach((input, index) => {
+        if (input.$kind !== 'UnresolvedObject') return;
+        const objectId = normalizeSuiAddress(input.UnresolvedObject.objectId);
+        data.inputs[index] = Inputs.SharedObjectRef({ objectId, initialSharedVersion: 1, mutable: objectId !== CLOCK_ID });
+      });
+      data.gasData.price = '1000';
+      data.gasData.budget = '4000000';
+      data.gasData.payment = [GAS_COIN];
+      setup.tamper?.(data);
+      await next();
+    });
+    const chain = {
+      usesApiKey: true,
+      executeTransaction: sent,
+      grpc: { getObjects, executeTransaction: sent, core: { resolveTransactionPlugin: () => resolve } },
+    } as unknown as Chain;
+    return { chain, getObjects, sent, resolve };
+  }
+
+  const untouchable = new Proxy({}, {
+    get() {
+      throw new Error('chain was touched');
+    },
+  }) as Chain;
+
+  type Data = ReturnType<Transaction['getData']>;
+  type Argument = NonNullable<Data['commands'][number]['MoveCall']>['arguments'][number];
+
+  function sharedId(data: Data, argument: Argument | undefined): string | undefined {
+    const input = argument?.$kind === 'Input' ? data.inputs[argument.Input] : undefined;
+    return input?.Object?.SharedObject?.objectId;
+  }
+
+  function pureBytes(data: Data, argument: Argument | undefined): string | undefined {
+    return argument?.$kind === 'Input' ? data.inputs[argument.Input]?.Pure?.bytes : undefined;
+  }
+
+  it('builds create_account for the owner as sender and gas payer, and sends nothing', async () => {
+    const { chain, sent, resolve } = standIn();
+    const bytes = await buildCreateAccountTx({ chain, owner: OWNER });
+    const data = Transaction.from(bytes).getData();
+    expect(data.sender).toBe(OWNER);
+    expect(data.gasData.owner ?? OWNER).toBe(OWNER);
+    expect(data.commands).toHaveLength(1);
+    const call = data.commands[0]?.MoveCall;
+    expect(call && normalizeSuiAddress(call.package)).toBe(WALRUS_MEMORY_PACKAGE_ID);
+    expect([call?.module, call?.function]).toEqual(['account', 'create_account']);
+    expect(call?.arguments.map((argument) => sharedId(data, argument))).toEqual([REGISTRY_ID, CLOCK_ID]);
+    expect(resolve).toHaveBeenCalledTimes(1);
+    expect(sent).not.toHaveBeenCalled();
+  });
+
+  it('refuses create_account for an owner who already has an account, before building', async () => {
+    const { chain, resolve } = standIn({ account: { id: ACCOUNT, owner: OWNER, keys: [] } });
+    const error = await caught(buildCreateAccountTx({ chain, owner: OWNER }));
+    expect(error.code).toBe('ACCOUNT');
+    expect(error.message).toBe('the owner already has a Walrus Memory account');
+    expect(resolve).not.toHaveBeenCalled();
+    expect((await caught(buildCreateAccountTx({ chain: untouchable, owner: 'not an address' }))).code).toBe('ACCOUNT');
+  });
+
+  it('builds add_delegate_key with exactly this account, key and label, and sends nothing', async () => {
+    const { chain, sent } = standIn({ account: { id: ACCOUNT, owner: OWNER, keys: [] } });
+    const bytes = await buildAddDelegateTx({ chain, owner: OWNER, accountId: ACCOUNT, delegatePublicKey: KEY, label: 'Ellai' });
+    const data = Transaction.from(bytes).getData();
+    expect(data.sender).toBe(OWNER);
+    expect(data.commands).toHaveLength(1);
+    const call = data.commands[0]?.MoveCall;
+    expect([call?.module, call?.function]).toEqual(['account', 'add_delegate_key']);
+    const [account, registry, key, label, clock] = call?.arguments ?? [];
+    expect([sharedId(data, account), sharedId(data, registry), sharedId(data, clock)]).toEqual([ACCOUNT, REGISTRY_ID, CLOCK_ID]);
+    expect(pureBytes(data, key)).toBe(toBase64(bcs.byteVector().serialize(KEY).toBytes()));
+    expect(pureBytes(data, label)).toBe(toBase64(bcs.string().serialize('Ellai').toBytes()));
+    expect(sent).not.toHaveBeenCalled();
+  });
+
+  it('refuses a bad key or label before touching the chain, and an account or key that does not fit', async () => {
+    const base = { chain: untouchable, owner: OWNER, accountId: ACCOUNT, label: 'Ellai' };
+    for (const key of [new Uint8Array(31), new Uint8Array(33)]) {
+      expect((await caught(buildAddDelegateTx({ ...base, delegatePublicKey: key }))).code).toBe('DELEGATE');
+    }
+    for (const label of ['', 'x'.repeat(65), 'Ellai<script>', 'Ellai\n']) {
+      expect((await caught(buildAddDelegateTx({ ...base, delegatePublicKey: KEY, label }))).code).toBe('DELEGATE');
+    }
+
+    const elsewhere = standIn({ account: { id: ACCOUNT, owner: OWNER, keys: [] } });
+    const notTheirs = await caught(
+      buildAddDelegateTx({ chain: elsewhere.chain, owner: OWNER, accountId: OTHER, delegatePublicKey: KEY, label: 'Ellai' }),
+    );
+    expect(notTheirs.message).toBe("the registry does not name this account as the owner's");
+
+    const already = standIn({ account: { id: ACCOUNT, owner: OWNER, keys: [KEY] } });
+    const present = await caught(buildAddDelegateTx({ chain: already.chain, owner: OWNER, accountId: ACCOUNT, delegatePublicKey: KEY, label: 'Ellai' }));
+    expect([present.code, present.message]).toEqual(['DELEGATE', 'the key is already on the account']);
+    expect(already.resolve).not.toHaveBeenCalled();
+  });
+
+  it('refuses bytes the gateway changed: another sender, a gas sponsor, an extra command, or gas over the cap', async () => {
+    const tampering: Array<(data: TransactionDataBuilder) => void> = [
+      (data) => {
+        data.sender = OTHER;
+      },
+      (data) => {
+        data.gasData.owner = OTHER;
+      },
+      (data) => {
+        data.commands.push({ $kind: 'MakeMoveVec', MakeMoveVec: { type: null, elements: [] } });
+      },
+      (data) => {
+        data.gasData.budget = String(LIMITS.memwalAccountTxMaxGasMist + 1);
+      },
+    ];
+    for (const tamper of tampering) {
+      const { chain, sent } = standIn({ tamper });
+      const error = await caught(buildCreateAccountTx({ chain, owner: OWNER }));
+      expect(error.code).toBe('ACCOUNT');
+      expect(error.message).toMatch(/^refused before signing: /);
+      expect(sent).not.toHaveBeenCalled();
+    }
+  });
+
+  it("findMemoryAccount returns null, the account with its delegate keys as hex, or refuses another owner's account", async () => {
+    expect(await findMemoryAccount(standIn().chain, OWNER)).toBeNull();
+    const found = await findMemoryAccount(standIn({ account: { id: ACCOUNT, owner: OWNER, keys: [KEY] } }).chain, OWNER);
+    expect(found).toEqual({ accountId: ACCOUNT, delegates: [toHex(KEY)] });
+    const stolen = await caught(findMemoryAccount(standIn({ account: { id: ACCOUNT, owner: OTHER, keys: [] } }).chain, OWNER));
+    expect([stolen.code, stolen.message]).toEqual(['ACCOUNT', 'the Walrus Memory account belongs to another owner']);
   });
 });

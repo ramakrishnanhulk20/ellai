@@ -1,0 +1,229 @@
+import { type AllowanceState, type Chain, ChainError, classifyChainError } from '@ellai/core/chain';
+import { canonicalSuiAddress } from '@ellai/core/keys';
+import { LIMITS } from '@ellai/core/limits';
+import { findMemoryAccount, MemoryError } from '@ellai/core/memory';
+import { USDC_TYPE_MAINNET } from '@ellai/core/usdc';
+import { GrpcTypes } from '@mysten/sui/grpc';
+import { isValidTransactionDigest, normalizeStructTag, normalizeSuiAddress, parseStructTag } from '@mysten/sui/utils';
+import { and, eq, isNull, or } from 'drizzle-orm';
+import type { Database } from '../db/client.js';
+import { owners } from '../db/schema.js';
+import { ownerDelegate } from '../memory/delegate.js';
+import { DAY_MS } from './build.js';
+import { checkNow, checkStep, loadOwner, OnboardingError, type OnboardingStep, type OwnerRow } from './state.js';
+
+const { ChangedObject_IdOperation: IdOperation } = GrpcTypes;
+const FRAMEWORK_ADDRESS = normalizeSuiAddress('0x2');
+// The Chain interface reads a transaction's status and balance changes but not its sender or
+// the objects it created, so those two come from one direct read of the same transaction.
+const FACT_PATHS = [
+  'digest',
+  'transaction.sender',
+  'effects.changed_objects.object_id',
+  'effects.changed_objects.object_type',
+  'effects.changed_objects.id_operation',
+];
+
+interface TransactionFacts {
+  sender: string;
+  created: Array<{ objectId: string; type: string }>;
+}
+
+function refuse(message: string): never {
+  throw new OnboardingError('REFUSED', message);
+}
+
+function badResponse(what: string): ChainError {
+  return new ChainError('BAD_RESPONSE', `unexpected response from Tatum: ${what}`);
+}
+
+function notLanded(error: unknown, message: string): never {
+  if (error instanceof ChainError && error.code === 'NOT_FOUND') throw new OnboardingError('NOT_LANDED', message);
+  throw error;
+}
+
+/** One read through Tatum, bounded by LIMITS.tatumTimeoutMs and the gRPC message cap, not retried. */
+async function readTransactionFacts(chain: Chain, digest: string): Promise<TransactionFacts> {
+  let transaction: GrpcTypes.ExecutedTransaction | undefined;
+  try {
+    const { response } = await chain.grpc.ledgerService.getTransaction(
+      { digest, readMask: { paths: FACT_PATHS } },
+      { timeout: LIMITS.tatumTimeoutMs },
+    );
+    transaction = response.transaction;
+  } catch (error) {
+    const failure = classifyChainError(error);
+    if (failure.code === 'NOT_FOUND') throw new OnboardingError('NOT_LANDED', `Sui does not show transaction ${digest} yet`);
+    throw new ChainError(failure.code, `Tatum getTransaction: ${failure.message}`, failure.retryable);
+  }
+  if (!transaction) throw new OnboardingError('NOT_LANDED', `Sui does not show transaction ${digest} yet`);
+  if (transaction.digest !== digest) throw badResponse('the transaction read names another digest');
+  let sender: string;
+  try {
+    sender = canonicalSuiAddress(transaction.transaction?.sender ?? '');
+  } catch {
+    throw badResponse('the transaction has no readable sender');
+  }
+  const created = (transaction.effects?.changedObjects ?? [])
+    .filter((change) => change.idOperation === IdOperation.CREATED)
+    .map((change) => {
+      try {
+        return { objectId: canonicalSuiAddress(change.objectId ?? ''), type: normalizeStructTag(change.objectType ?? '') };
+      } catch {
+        throw badResponse('a created object has no readable id or type');
+      }
+    });
+  return { sender, created };
+}
+
+/** Read by the SDK's own type parser, so any coin type counts and a second allowance cannot hide behind another one. */
+function isAllowance(type: string): boolean {
+  try {
+    const tag = parseStructTag(type);
+    return normalizeSuiAddress(tag.address) === FRAMEWORK_ADDRESS && tag.module === 'allowance' && tag.name === 'Allowance';
+  } catch {
+    return false;
+  }
+}
+
+/** findMemoryAccount, with its refusals of what Sui shows (another owner's account, a frozen one) turned into REFUSED. */
+async function accountOf(chain: Chain, ownerAddress: string): Promise<{ accountId: string; delegates: string[] } | null> {
+  try {
+    return await findMemoryAccount(chain, ownerAddress);
+  } catch (error) {
+    if (error instanceof MemoryError && (error.code === 'ACCOUNT' || error.code === 'DELEGATE')) refuse(error.message);
+    throw error;
+  }
+}
+
+async function confirmAccount(db: Database, owner: OwnerRow, chain: Chain, ownerAddress: string): Promise<string> {
+  const account = await accountOf(chain, ownerAddress);
+  if (account === null) refuse('Sui shows no Walrus Memory account for this owner');
+  const accountId = canonicalSuiAddress(account.accountId);
+  if (owner.memwalAccountId !== null && owner.memwalAccountId !== accountId) {
+    refuse('another Walrus Memory account is already recorded for this owner');
+  }
+  const unchangedOrEmpty = or(isNull(owners.memwalAccountId), eq(owners.memwalAccountId, accountId));
+  const updated = await db
+    .update(owners)
+    .set({ memwalAccountId: accountId })
+    .where(and(eq(owners.id, owner.id), unchangedOrEmpty))
+    .returning({ id: owners.id });
+  if (updated.length !== 1) refuse('another Walrus Memory account is already recorded for this owner');
+  return accountId;
+}
+
+async function confirmDelegate(
+  db: Database,
+  owner: OwnerRow,
+  chain: Chain,
+  ownerAddress: string,
+  masterSecretHex: string,
+  now: Date,
+): Promise<string> {
+  const recordedAccount = owner.memwalAccountId;
+  if (recordedAccount === null) throw new OnboardingError('NOT_READY', 'confirm the Walrus Memory account first');
+  const account = await accountOf(chain, ownerAddress);
+  if (account === null || canonicalSuiAddress(account.accountId) !== recordedAccount) {
+    refuse('Sui does not show the recorded Walrus Memory account for this owner');
+  }
+  // Both sides are lowercase hex from the same SDK encoder.
+  const { publicKeyHex } = ownerDelegate(masterSecretHex, ownerAddress);
+  if (!account.delegates.includes(publicKeyHex)) refuse("Ellai's key for this owner is not on the Walrus Memory account");
+  if (owner.delegateRegisteredAt === null) {
+    await db
+      .update(owners)
+      .set({ delegateRegisteredAt: now })
+      .where(and(eq(owners.id, owner.id), eq(owners.memwalAccountId, recordedAccount), isNull(owners.delegateRegisteredAt)));
+  }
+  return publicKeyHex;
+}
+
+/** Names the first way the allowance falls outside what onboarding lets an owner set up, or null. */
+function allowanceProblem(state: AllowanceState, ownerAddress: string, purseAddress: string, now: Date): string | null {
+  if (canonicalSuiAddress(state.funder) !== ownerAddress) return "the allowance does not draw from the owner's address";
+  if (canonicalSuiAddress(state.spender) !== purseAddress) return "the allowance's spender is not the owner's purse";
+  if (state.coinType !== USDC_TYPE_MAINNET) return 'the allowance is not over Sui Mainnet USDC';
+  const capMax = BigInt(LIMITS.onboardingLifetimeCapMaxAtomic);
+  if (state.lifetimeCap === null || state.lifetimeCap <= 0n || state.lifetimeCap > capMax) return 'the total cap is missing or over the onboarding maximum';
+  if (state.periodMs !== BigInt(DAY_MS)) return 'the rate-limit window is not one day';
+  const dailyMax = BigInt(LIMITS.onboardingDailyLimitMaxAtomic);
+  if (state.periodLimit === null || state.periodLimit <= 0n || state.periodLimit > dailyMax || state.periodLimit > state.lifetimeCap) {
+    return 'the daily limit is missing, over the onboarding maximum, or over the total cap';
+  }
+  const nowMs = BigInt(now.getTime());
+  if (state.expirationMs === null || state.expirationMs <= nowMs) return 'the allowance has no end date or has ended';
+  if (state.expirationMs > nowMs + BigInt(LIMITS.onboardingAllowanceMaxMs)) return 'the allowance runs longer than the onboarding maximum';
+  return null;
+}
+
+async function confirmAllowance(
+  db: Database,
+  owner: OwnerRow,
+  chain: Chain,
+  ownerAddress: string,
+  facts: TransactionFacts,
+  now: Date,
+): Promise<string> {
+  const allowances = facts.created.filter((object) => isAllowance(object.type));
+  const [created] = allowances;
+  if (allowances.length > 1) refuse('the transaction created more than one allowance');
+  if (created === undefined) refuse('the transaction created no allowance');
+  const state = await chain.getAllowance(created.objectId).catch((error: unknown) => notLanded(error, `Sui does not show allowance ${created.objectId} yet`));
+  const problem = allowanceProblem(state, ownerAddress, canonicalSuiAddress(owner.purseAddress), now);
+  if (problem !== null) refuse(problem);
+  await db.update(owners).set({ allowanceId: created.objectId, allowanceCheckedAt: now }).where(eq(owners.id, owner.id));
+  return created.objectId;
+}
+
+/**
+ * Records one onboarding step for the owner, but only what Ellai itself reads from Sui
+ * Mainnet through Tatum about the transaction `digest` (C7, C8). The transaction must have
+ * succeeded and been sent from the owner's own address. Then:
+ * - memory_account: the registry must name an account for the owner whose own owner field
+ *   is the owner (findMemoryAccount); its id is recorded as memwal_account_id. A different
+ *   account already recorded is refused.
+ * - add_delegate: needs the account recorded; Sui must show that same account holding
+ *   Ellai's derived delegate key for this owner; delegate_registered_at is recorded once.
+ * - allowance: exactly one allowance must have been created by the transaction, and getAllowance
+ *   must show it drawing USDC from the owner's address, spent only by the owner's purse,
+ *   with a total cap, a one-day window and limit, and an end date within the onboarding
+ *   maxima; allowance_id and allowance_checked_at are recorded. The allowance id comes
+ *   from the transaction's effects, never from the caller.
+ * Anything else refuses and records nothing. Idempotent: confirming the same step again
+ * records the same values.
+ * Returns what was recorded: the account id, the delegate public key as hex, or the allowance id.
+ * Throws OnboardingError: BAD_INPUT for a bad step, digest, date or owner id; NO_OWNER;
+ * NOT_READY for add_delegate before the account; NOT_LANDED while Sui does not show the
+ * transaction or the allowance; REFUSED for anything the chain shows that the step does not
+ * accept. Throws ChainError or MemoryError (fixed text) when Tatum cannot answer; nothing is
+ * recorded then and the call can be made again.
+ */
+export async function confirmOnboardingTx(args: {
+  db: Database;
+  ownerId: string;
+  step: OnboardingStep;
+  digest: string;
+  chain: Chain;
+  masterSecretHex: string;
+  now: Date;
+}): Promise<{ recorded: string }> {
+  const step = checkStep(args.step);
+  if (typeof args.digest !== 'string' || !isValidTransactionDigest(args.digest)) {
+    throw new OnboardingError('BAD_INPUT', 'the digest is not a Sui transaction digest');
+  }
+  const { digest, db, chain } = args;
+  const now = checkNow(args.now);
+  const owner = await loadOwner(db, args.ownerId);
+  const ownerAddress = canonicalSuiAddress(owner.suiAddress);
+  if (step === 'add_delegate' && owner.memwalAccountId === null) throw new OnboardingError('NOT_READY', 'confirm the Walrus Memory account first');
+
+  const result = await chain.getTransactionResult(digest).catch((error: unknown) => notLanded(error, `Sui does not show transaction ${digest} yet`));
+  if (result.status !== 'success') refuse('the transaction failed on chain');
+  const facts = await readTransactionFacts(chain, digest);
+  if (facts.sender !== ownerAddress) refuse("the transaction was not sent from the owner's address");
+
+  if (step === 'memory_account') return { recorded: await confirmAccount(db, owner, chain, ownerAddress) };
+  if (step === 'add_delegate') return { recorded: await confirmDelegate(db, owner, chain, ownerAddress, args.masterSecretHex, now) };
+  return { recorded: await confirmAllowance(db, owner, chain, ownerAddress, facts, now) };
+}
