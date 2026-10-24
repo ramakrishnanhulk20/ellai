@@ -4,6 +4,7 @@ import {
   bigint,
   boolean,
   check,
+  foreignKey,
   index,
   integer,
   pgTable,
@@ -11,6 +12,7 @@ import {
   real,
   text,
   timestamp,
+  unique,
   uniqueIndex,
   uuid,
 } from 'drizzle-orm/pg-core';
@@ -95,6 +97,14 @@ function positive(name: string, column: AnyPgColumn) {
   return check(name, sql`${column} > 0`);
 }
 
+// A child row carries its own owner_id, and this key makes (parent id, owner_id) name one
+// parent row of that same owner, so no row can tie one owner's records to another's,
+// whatever a later query gets wrong. Postgres's default MATCH SIMPLE skips the check when
+// the parent id is null, which is how an optional link stays optional.
+function sameOwner(name: string, columns: [AnyPgColumn, AnyPgColumn], foreignColumns: [AnyPgColumn, AnyPgColumn]) {
+  return foreignKey({ name, columns, foreignColumns }).onDelete('restrict');
+}
+
 export const owners = pgTable(
   'owners',
   {
@@ -158,6 +168,7 @@ export const agents = pgTable(
     revokedAt: at('revoked_at'),
   },
   (t) => [
+    unique('agents_id_owner_id_unique').on(t.id, t.ownerId),
     check('agents_label_length', sql`char_length(${t.label}) between 1 and ${sql.raw(String(TEXT_CAPS.agentLabel))}`),
     oneOf('agents_kind_known', t.kind, AGENT_KINDS),
     maxLength('agents_token_prefix_length', t.tokenPrefix, TEXT_CAPS.tokenPrefix),
@@ -171,9 +182,7 @@ export const decisions = pgTable(
     ownerId: uuid('owner_id')
       .notNull()
       .references(() => owners.id, RESTRICT),
-    agentId: uuid('agent_id')
-      .notNull()
-      .references(() => agents.id, RESTRICT),
+    agentId: uuid('agent_id').notNull(),
     requestKey: text('request_key').notNull(),
     sellerUrl: text('seller_url').notNull(),
     sellerMethod: text('seller_method', { enum: SELLER_METHODS }).notNull(),
@@ -196,6 +205,8 @@ export const decisions = pgTable(
     createdAt: createdAt(),
   },
   (t) => [
+    unique('decisions_id_owner_id_unique').on(t.id, t.ownerId),
+    sameOwner('decisions_agent_same_owner_fk', [t.agentId, t.ownerId], [agents.id, agents.ownerId]),
     // A retry of a request that is still open or asked must find the first decision,
     // never start a second one that could be paid as well (C5). Once the first has
     // reached any other status, the same request may be decided afresh.
@@ -228,7 +239,7 @@ export const memories = pgTable(
       .notNull()
       .references(() => owners.id, RESTRICT),
     kind: text('kind', { enum: MEMORY_KINDS }).notNull(),
-    decisionId: uuid('decision_id').references(() => decisions.id, RESTRICT),
+    decisionId: uuid('decision_id'),
     recipient: text('recipient'),
     amountAtomic: atomic('amount_atomic'),
     verdict: text('verdict', { enum: VERDICTS }),
@@ -243,6 +254,8 @@ export const memories = pgTable(
     confirmedAt: at('confirmed_at'),
   },
   (t) => [
+    unique('memories_id_owner_id_unique').on(t.id, t.ownerId),
+    sameOwner('memories_decision_same_owner_fk', [t.decisionId, t.ownerId], [decisions.id, decisions.ownerId]),
     // The refusal check (C11) and the learned approval (C10) read these structured
     // facts, never the sentence, so an owner decision without them could never be
     // matched and a refusal would silently stop counting.
@@ -266,22 +279,21 @@ export const memories = pgTable(
 export const decisionCitations = pgTable(
   'decision_citations',
   {
-    decisionId: uuid('decision_id')
-      .notNull()
-      .references(() => decisions.id, RESTRICT),
-    memoryId: uuid('memory_id')
-      .notNull()
-      .references(() => memories.id, RESTRICT),
+    decisionId: uuid('decision_id').notNull(),
+    memoryId: uuid('memory_id').notNull(),
+    ownerId: uuid('owner_id').notNull(),
   },
-  (t) => [primaryKey({ columns: [t.decisionId, t.memoryId] })],
+  (t) => [
+    primaryKey({ columns: [t.decisionId, t.memoryId] }),
+    sameOwner('decision_citations_decision_same_owner_fk', [t.decisionId, t.ownerId], [decisions.id, decisions.ownerId]),
+    sameOwner('decision_citations_memory_same_owner_fk', [t.memoryId, t.ownerId], [memories.id, memories.ownerId]),
+  ],
 );
 
 export const questions = pgTable(
   'questions',
   {
-    decisionId: uuid('decision_id')
-      .primaryKey()
-      .references(() => decisions.id, RESTRICT),
+    decisionId: uuid('decision_id').primaryKey(),
     ownerId: uuid('owner_id')
       .notNull()
       .references(() => owners.id, RESTRICT),
@@ -289,9 +301,11 @@ export const questions = pgTable(
     answeredAt: at('answered_at'),
     answer: text('answer', { enum: VERDICTS }),
     reason: text('reason'),
-    memoryId: uuid('memory_id').references(() => memories.id, RESTRICT),
+    memoryId: uuid('memory_id'),
   },
   (t) => [
+    sameOwner('questions_decision_same_owner_fk', [t.decisionId, t.ownerId], [decisions.id, decisions.ownerId]),
+    sameOwner('questions_memory_same_owner_fk', [t.memoryId, t.ownerId], [memories.id, memories.ownerId]),
     // An answer binds future decisions from the moment it is recorded (C12), so an
     // answer with no time, or a time with no answer, is a state nothing should read.
     check('questions_answer_has_time', sql`(${t.answer} is null) = (${t.answeredAt} is null)`),
@@ -307,29 +321,37 @@ export const grants = pgTable(
     ownerId: uuid('owner_id')
       .notNull()
       .references(() => owners.id, RESTRICT),
-    decisionId: uuid('decision_id')
-      .notNull()
-      .unique()
-      .references(() => decisions.id, RESTRICT),
+    decisionId: uuid('decision_id').notNull().unique(),
     recipient: text('recipient').notNull(),
     maxAmountAtomic: atomic('max_amount_atomic').notNull(),
     sellerUrl: text('seller_url').notNull(),
     sellerMethod: text('seller_method', { enum: SELLER_METHODS }).notNull(),
     bodyHash: text('body_hash').notNull(),
     expiresAt: at('expires_at').notNull(),
-    usedAt: at('used_at'),
-    usedByDecisionId: uuid('used_by_decision_id')
-      .unique()
-      .references(() => decisions.id, RESTRICT),
   },
   (t) => [
+    unique('grants_id_owner_id_unique').on(t.id, t.ownerId),
+    sameOwner('grants_decision_same_owner_fk', [t.decisionId, t.ownerId], [decisions.id, decisions.ownerId]),
     positive('grants_max_amount_positive', t.maxAmountAtomic),
-    // Code claims a grant with "where used_at is null"; keeping the two columns in step
-    // means that guard and the unique decision column can never disagree.
-    check('grants_used_together', sql`(${t.usedAt} is null) = (${t.usedByDecisionId} is null)`),
     oneOf('grants_seller_method_known', t.sellerMethod, SELLER_METHODS),
     maxLength('grants_recipient_length', t.recipient, TEXT_CAPS.suiId),
     maxLength('grants_seller_url_length', t.sellerUrl, TEXT_CAPS.sellerUrl),
+  ],
+);
+
+// A use is a row keyed by its grant, so a second use of one grant is a primary key
+// violation whatever the claiming query looks like, and a decision spends at most one grant.
+export const grantUses = pgTable(
+  'grant_uses',
+  {
+    grantId: uuid('grant_id').primaryKey(),
+    ownerId: uuid('owner_id').notNull(),
+    decisionId: uuid('decision_id').notNull().unique(),
+    usedAt: at('used_at').notNull().defaultNow(),
+  },
+  (t) => [
+    sameOwner('grant_uses_grant_same_owner_fk', [t.grantId, t.ownerId], [grants.id, grants.ownerId]),
+    sameOwner('grant_uses_decision_same_owner_fk', [t.decisionId, t.ownerId], [decisions.id, decisions.ownerId]),
   ],
 );
 
@@ -337,10 +359,7 @@ export const payments = pgTable(
   'payments',
   {
     id: uuid('id').primaryKey().defaultRandom(),
-    decisionId: uuid('decision_id')
-      .notNull()
-      .unique()
-      .references(() => decisions.id, RESTRICT),
+    decisionId: uuid('decision_id').notNull().unique(),
     ownerId: uuid('owner_id')
       .notNull()
       .references(() => owners.id, RESTRICT),
@@ -359,6 +378,7 @@ export const payments = pgTable(
     mismatchReason: text('mismatch_reason'),
   },
   (t) => [
+    sameOwner('payments_decision_same_owner_fk', [t.decisionId, t.ownerId], [decisions.id, decisions.ownerId]),
     index('payments_owner_signed_at_idx').on(t.ownerId, t.signedAt),
     positive('payments_amount_positive', t.amountAtomic),
     oneOf('payments_settlement_known', t.settlement, SETTLEMENTS),

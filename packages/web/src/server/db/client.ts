@@ -23,9 +23,15 @@ const MIGRATIONS_FOLDER = fileURLToPath(new URL('./migrations', import.meta.url)
  *   cannot take a row lock with SELECT ... FOR UPDATE. Node 22 and later supply the
  *   WebSocket the driver uses.
  * Throws for any other URL. The message never repeats the URL, which can hold a password.
+ * Throws for any 'pglite:' URL unless NODE_ENV is 'development' or 'test': a database inside one server
+ * process, in memory or on that machine's disk, would lose every payment record on a
+ * restart or a redeploy.
  */
 export async function createDb(url: string): Promise<{ db: Database; close(): Promise<void> }> {
   if (url.startsWith('pglite:')) {
+    if (process.env.NODE_ENV !== 'development' && process.env.NODE_ENV !== 'test') {
+      throw new Error('Unsupported database URL: pglite: is for development and tests, not production');
+    }
     const location = url.slice('pglite:'.length);
     if (location === '') throw new Error('Unsupported database URL: pglite: needs "memory" or a path');
     const client = location === 'memory' ? await PGlite.create() : await PGlite.create(location);

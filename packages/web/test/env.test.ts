@@ -10,7 +10,7 @@ type EnvModule = typeof import('../src/server/env.js');
 
 function validEnv(): Env {
   return {
-    NODE_ENV: 'production',
+    NODE_ENV: 'test',
     DATABASE_URL: 'pglite:memory',
     ELLAI_MASTER_SECRET: randomBytes(32).toString('hex'),
     GAS_PRIVATE_KEY: Ed25519Keypair.generate().getSecretKey(),
@@ -71,6 +71,14 @@ describe('loadServerEnv', () => {
     ];
     for (const url of urls) {
       expect(loadServerEnv({ ...validEnv(), DATABASE_URL: url }).DATABASE_URL).toBe(url);
+    }
+  });
+
+  it('refuses a pglite database outside development and test', () => {
+    for (const nodeEnv of ['production', undefined, 'staging']) {
+      for (const url of ['pglite:memory', 'pglite:./data/ellai']) {
+        expect(() => loadServerEnv({ ...validEnv(), NODE_ENV: nodeEnv, DATABASE_URL: url })).toThrow('DATABASE_URL (malformed)');
+      }
     }
   });
 

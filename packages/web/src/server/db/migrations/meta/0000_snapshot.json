@@ -1,5 +1,5 @@
 {
-  "id": "92b047fc-93a6-4f22-9d15-34f85c2b3fee",
+  "id": "4bc6ceff-277b-4532-93d9-ab9a9625d295",
   "prevId": "00000000-0000-0000-0000-000000000000",
   "version": "7",
   "dialect": "postgresql",
@@ -90,6 +90,14 @@
           "columns": [
             "token_hash"
           ]
+        },
+        "agents_id_owner_id_unique": {
+          "name": "agents_id_owner_id_unique",
+          "nullsNotDistinct": false,
+          "columns": [
+            "id",
+            "owner_id"
+          ]
         }
       },
       "policies": {},
@@ -124,32 +132,42 @@
           "type": "uuid",
           "primaryKey": false,
           "notNull": true
+        },
+        "owner_id": {
+          "name": "owner_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
         }
       },
       "indexes": {},
       "foreignKeys": {
-        "decision_citations_decision_id_decisions_id_fk": {
-          "name": "decision_citations_decision_id_decisions_id_fk",
+        "decision_citations_decision_same_owner_fk": {
+          "name": "decision_citations_decision_same_owner_fk",
           "tableFrom": "decision_citations",
           "tableTo": "decisions",
           "columnsFrom": [
-            "decision_id"
+            "decision_id",
+            "owner_id"
           ],
           "columnsTo": [
-            "id"
+            "id",
+            "owner_id"
           ],
           "onDelete": "restrict",
           "onUpdate": "no action"
         },
-        "decision_citations_memory_id_memories_id_fk": {
-          "name": "decision_citations_memory_id_memories_id_fk",
+        "decision_citations_memory_same_owner_fk": {
+          "name": "decision_citations_memory_same_owner_fk",
           "tableFrom": "decision_citations",
           "tableTo": "memories",
           "columnsFrom": [
-            "memory_id"
+            "memory_id",
+            "owner_id"
           ],
           "columnsTo": [
-            "id"
+            "id",
+            "owner_id"
           ],
           "onDelete": "restrict",
           "onUpdate": "no action"
@@ -352,22 +370,33 @@
           "onDelete": "restrict",
           "onUpdate": "no action"
         },
-        "decisions_agent_id_agents_id_fk": {
-          "name": "decisions_agent_id_agents_id_fk",
+        "decisions_agent_same_owner_fk": {
+          "name": "decisions_agent_same_owner_fk",
           "tableFrom": "decisions",
           "tableTo": "agents",
           "columnsFrom": [
-            "agent_id"
+            "agent_id",
+            "owner_id"
           ],
           "columnsTo": [
-            "id"
+            "id",
+            "owner_id"
           ],
           "onDelete": "restrict",
           "onUpdate": "no action"
         }
       },
       "compositePrimaryKeys": {},
-      "uniqueConstraints": {},
+      "uniqueConstraints": {
+        "decisions_id_owner_id_unique": {
+          "name": "decisions_id_owner_id_unique",
+          "nullsNotDistinct": false,
+          "columns": [
+            "id",
+            "owner_id"
+          ]
+        }
+      },
       "policies": {},
       "checkConstraints": {
         "decisions_amount_positive": {
@@ -433,6 +462,83 @@
       },
       "isRLSEnabled": false
     },
+    "public.grant_uses": {
+      "name": "grant_uses",
+      "schema": "",
+      "columns": {
+        "grant_id": {
+          "name": "grant_id",
+          "type": "uuid",
+          "primaryKey": true,
+          "notNull": true
+        },
+        "owner_id": {
+          "name": "owner_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "decision_id": {
+          "name": "decision_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "used_at": {
+          "name": "used_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {
+        "grant_uses_grant_same_owner_fk": {
+          "name": "grant_uses_grant_same_owner_fk",
+          "tableFrom": "grant_uses",
+          "tableTo": "grants",
+          "columnsFrom": [
+            "grant_id",
+            "owner_id"
+          ],
+          "columnsTo": [
+            "id",
+            "owner_id"
+          ],
+          "onDelete": "restrict",
+          "onUpdate": "no action"
+        },
+        "grant_uses_decision_same_owner_fk": {
+          "name": "grant_uses_decision_same_owner_fk",
+          "tableFrom": "grant_uses",
+          "tableTo": "decisions",
+          "columnsFrom": [
+            "decision_id",
+            "owner_id"
+          ],
+          "columnsTo": [
+            "id",
+            "owner_id"
+          ],
+          "onDelete": "restrict",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {
+        "grant_uses_decision_id_unique": {
+          "name": "grant_uses_decision_id_unique",
+          "nullsNotDistinct": false,
+          "columns": [
+            "decision_id"
+          ]
+        }
+      },
+      "policies": {},
+      "checkConstraints": {},
+      "isRLSEnabled": false
+    },
     "public.grants": {
       "name": "grants",
       "schema": "",
@@ -491,18 +597,6 @@
           "type": "timestamp with time zone",
           "primaryKey": false,
           "notNull": true
-        },
-        "used_at": {
-          "name": "used_at",
-          "type": "timestamp with time zone",
-          "primaryKey": false,
-          "notNull": false
-        },
-        "used_by_decision_id": {
-          "name": "used_by_decision_id",
-          "type": "uuid",
-          "primaryKey": false,
-          "notNull": false
         }
       },
       "indexes": {},
@@ -520,28 +614,17 @@
           "onDelete": "restrict",
           "onUpdate": "no action"
         },
-        "grants_decision_id_decisions_id_fk": {
-          "name": "grants_decision_id_decisions_id_fk",
+        "grants_decision_same_owner_fk": {
+          "name": "grants_decision_same_owner_fk",
           "tableFrom": "grants",
           "tableTo": "decisions",
           "columnsFrom": [
-            "decision_id"
+            "decision_id",
+            "owner_id"
           ],
           "columnsTo": [
-            "id"
-          ],
-          "onDelete": "restrict",
-          "onUpdate": "no action"
-        },
-        "grants_used_by_decision_id_decisions_id_fk": {
-          "name": "grants_used_by_decision_id_decisions_id_fk",
-          "tableFrom": "grants",
-          "tableTo": "decisions",
-          "columnsFrom": [
-            "used_by_decision_id"
-          ],
-          "columnsTo": [
-            "id"
+            "id",
+            "owner_id"
           ],
           "onDelete": "restrict",
           "onUpdate": "no action"
@@ -556,11 +639,12 @@
             "decision_id"
           ]
         },
-        "grants_used_by_decision_id_unique": {
-          "name": "grants_used_by_decision_id_unique",
+        "grants_id_owner_id_unique": {
+          "name": "grants_id_owner_id_unique",
           "nullsNotDistinct": false,
           "columns": [
-            "used_by_decision_id"
+            "id",
+            "owner_id"
           ]
         }
       },
@@ -569,10 +653,6 @@
         "grants_max_amount_positive": {
           "name": "grants_max_amount_positive",
           "value": "\"grants\".\"max_amount_atomic\" > 0"
-        },
-        "grants_used_together": {
-          "name": "grants_used_together",
-          "value": "(\"grants\".\"used_at\" is null) = (\"grants\".\"used_by_decision_id\" is null)"
         },
         "grants_seller_method_known": {
           "name": "grants_seller_method_known",
@@ -736,15 +816,17 @@
           "onDelete": "restrict",
           "onUpdate": "no action"
         },
-        "memories_decision_id_decisions_id_fk": {
-          "name": "memories_decision_id_decisions_id_fk",
+        "memories_decision_same_owner_fk": {
+          "name": "memories_decision_same_owner_fk",
           "tableFrom": "memories",
           "tableTo": "decisions",
           "columnsFrom": [
-            "decision_id"
+            "decision_id",
+            "owner_id"
           ],
           "columnsTo": [
-            "id"
+            "id",
+            "owner_id"
           ],
           "onDelete": "restrict",
           "onUpdate": "no action"
@@ -757,6 +839,14 @@
           "nullsNotDistinct": false,
           "columns": [
             "blob_id"
+          ]
+        },
+        "memories_id_owner_id_unique": {
+          "name": "memories_id_owner_id_unique",
+          "nullsNotDistinct": false,
+          "columns": [
+            "id",
+            "owner_id"
           ]
         }
       },
@@ -1090,19 +1180,6 @@
         }
       },
       "foreignKeys": {
-        "payments_decision_id_decisions_id_fk": {
-          "name": "payments_decision_id_decisions_id_fk",
-          "tableFrom": "payments",
-          "tableTo": "decisions",
-          "columnsFrom": [
-            "decision_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
-          "onDelete": "restrict",
-          "onUpdate": "no action"
-        },
         "payments_owner_id_owners_id_fk": {
           "name": "payments_owner_id_owners_id_fk",
           "tableFrom": "payments",
@@ -1112,6 +1189,21 @@
           ],
           "columnsTo": [
             "id"
+          ],
+          "onDelete": "restrict",
+          "onUpdate": "no action"
+        },
+        "payments_decision_same_owner_fk": {
+          "name": "payments_decision_same_owner_fk",
+          "tableFrom": "payments",
+          "tableTo": "decisions",
+          "columnsFrom": [
+            "decision_id",
+            "owner_id"
+          ],
+          "columnsTo": [
+            "id",
+            "owner_id"
           ],
           "onDelete": "restrict",
           "onUpdate": "no action"
@@ -1205,19 +1297,6 @@
       },
       "indexes": {},
       "foreignKeys": {
-        "questions_decision_id_decisions_id_fk": {
-          "name": "questions_decision_id_decisions_id_fk",
-          "tableFrom": "questions",
-          "tableTo": "decisions",
-          "columnsFrom": [
-            "decision_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
-          "onDelete": "restrict",
-          "onUpdate": "no action"
-        },
         "questions_owner_id_owners_id_fk": {
           "name": "questions_owner_id_owners_id_fk",
           "tableFrom": "questions",
@@ -1231,15 +1310,32 @@
           "onDelete": "restrict",
           "onUpdate": "no action"
         },
-        "questions_memory_id_memories_id_fk": {
-          "name": "questions_memory_id_memories_id_fk",
+        "questions_decision_same_owner_fk": {
+          "name": "questions_decision_same_owner_fk",
+          "tableFrom": "questions",
+          "tableTo": "decisions",
+          "columnsFrom": [
+            "decision_id",
+            "owner_id"
+          ],
+          "columnsTo": [
+            "id",
+            "owner_id"
+          ],
+          "onDelete": "restrict",
+          "onUpdate": "no action"
+        },
+        "questions_memory_same_owner_fk": {
+          "name": "questions_memory_same_owner_fk",
           "tableFrom": "questions",
           "tableTo": "memories",
           "columnsFrom": [
-            "memory_id"
+            "memory_id",
+            "owner_id"
           ],
           "columnsTo": [
-            "id"
+            "id",
+            "owner_id"
           ],
           "onDelete": "restrict",
           "onUpdate": "no action"

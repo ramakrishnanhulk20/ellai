@@ -1,22 +1,24 @@
 // Covers: the rules the database itself enforces, proven on PGlite in memory. One payment
-// per decision and per digest, one live decision per identical request, single-use grants,
-// unique refill digests and seller challenges, owners never deleted from under their
-// records, the answer and memory shape checks, the text caps, and a row lock inside a
-// transaction.
+// per decision and per digest, one live decision per identical request, one use per grant
+// and one grant per deciding decision, unique refill digests and seller challenges, owners
+// never deleted from under their records, no row linking one owner's records to another
+// owner's, the answer and memory shape checks, the text caps, a row lock inside a
+// transaction, and the refusal of an in-process database in production.
 // Does NOT cover: Neon (nothing here opens a network connection); two connections racing
 // for one row (PGlite serves a single connection, so no lock is ever waited on); the
-// queries later modules write. A grant's single use rests on the claiming query's
-// "where used_at is null" guard plus the unique used_by_decision_id column: a plain UPDATE
-// that skips the guard could still overwrite who used it. Nor does it cover rows that mix
-// owners, such as a payment whose owner differs from its decision's owner; no constraint
-// here ties those together.
+// queries later modules write. The owner keys prove a row agrees with the records it links
+// to, not that its owner is the signed-in one: a set of rows written wholly in the wrong
+// owner's name is consistent and is accepted. Nor do they check that a grant's use matches
+// the grant's recipient, amount or seller request.
 import { randomBytes } from 'node:crypto';
-import { type SQL, and, eq, isNull, sql } from 'drizzle-orm';
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { type SQL, eq, sql } from 'drizzle-orm';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { type Database, createDb, migrate } from '../src/server/db/client.js';
 import {
   agents,
+  decisionCitations,
   decisions,
+  grantUses,
   grants,
   memories,
   owners,
@@ -29,6 +31,7 @@ import {
 type Owner = typeof owners.$inferSelect;
 type Agent = typeof agents.$inferSelect;
 type Decision = typeof decisions.$inferSelect;
+type Grant = typeof grants.$inferSelect;
 
 const USDC = '0xdba34672e30cb065b1f93e3ab55318768fd6fef66c15942c9f7cb846e2f900e7::usdc::USDC';
 
@@ -159,12 +162,22 @@ function ownerDecisionMemory(owner: Owner, overrides: Partial<typeof memories.$i
   } satisfies typeof memories.$inferInsert;
 }
 
-function claimGrant(grantId: string, decisionId: string) {
-  return db
-    .update(grants)
-    .set({ usedAt: new Date(), usedByDecisionId: decisionId })
-    .where(and(eq(grants.id, grantId), isNull(grants.usedAt)))
-    .returning();
+function grantValues(decision: Decision, overrides: Partial<typeof grants.$inferInsert> = {}) {
+  return {
+    ownerId: decision.ownerId,
+    decisionId: decision.id,
+    recipient: decision.recipient,
+    maxAmountAtomic: decision.amountAtomic,
+    sellerUrl: decision.sellerUrl,
+    sellerMethod: decision.sellerMethod,
+    bodyHash: decision.bodyHash,
+    expiresAt: minutesFromNow(10),
+    ...overrides,
+  } satisfies typeof grants.$inferInsert;
+}
+
+function useGrant(grant: Grant, decision: Decision, ownerId: string = grant.ownerId) {
+  return db.insert(grantUses).values({ grantId: grant.id, decisionId: decision.id, ownerId }).returning();
 }
 
 describe('migrations', () => {
@@ -177,6 +190,7 @@ describe('migrations', () => {
       'agents',
       'decision_citations',
       'decisions',
+      'grant_uses',
       'grants',
       'memories',
       'owners',
@@ -195,7 +209,7 @@ describe('migrations', () => {
       sql`select conrelid::regclass::text as source, confrelid::regclass::text as target, confdeltype::text as on_delete
           from pg_constraint where contype = 'f'`,
     );
-    expect(keys.length).toBe(17);
+    expect(keys.length).toBe(18);
     expect(keys.filter((key) => key.on_delete !== 'r')).toEqual([]);
     const pointingAtOwners = keys.filter((key) => key.target === 'owners').map((key) => key.source).sort();
     expect(pointingAtOwners).toEqual(['agents', 'decisions', 'grants', 'memories', 'payments', 'questions', 'refills', 'sessions']);
@@ -424,32 +438,125 @@ describe('grants', () => {
   it('can be used by only one decision, and each decision uses at most one grant', async () => {
     const { owner, agent } = await ownerWithAgent();
     const asked = await newDecision(owner, agent, { status: 'answered', outcome: 'asked', rule: 'no_match' });
-    const grantValues = (decision: Decision) => ({
-      ownerId: owner.id,
-      decisionId: decision.id,
-      recipient: decision.recipient,
-      maxAmountAtomic: decision.amountAtomic,
-      sellerUrl: decision.sellerUrl,
-      sellerMethod: decision.sellerMethod,
-      bodyHash: decision.bodyHash,
-      expiresAt: minutesFromNow(10),
-    });
     const grant = one(await db.insert(grants).values(grantValues(asked)).returning());
     await expectRefusedBy(db.insert(grants).values(grantValues(asked)), 'grants_decision_id_unique');
 
     const firstUse = await newDecision(owner, agent, { rule: 'grant' });
     const secondUse = await newDecision(owner, agent, { rule: 'grant' });
-    expect(await claimGrant(grant.id, firstUse.id)).toHaveLength(1);
-    expect(await claimGrant(grant.id, secondUse.id)).toHaveLength(0);
-    expect(one(await db.select().from(grants).where(eq(grants.id, grant.id))).usedByDecisionId).toBe(firstUse.id);
+    expect(one(await useGrant(grant, firstUse)).usedAt).toBeInstanceOf(Date);
+    // 23505 is unique_violation: the second use collides with the first on the primary key.
+    expect(await refusal(useGrant(grant, secondUse))).toEqual({ code: '23505', constraint: 'grant_uses_pkey' });
+    const uses = await db.select().from(grantUses).where(eq(grantUses.grantId, grant.id));
+    expect(uses.map((use) => use.decisionId)).toEqual([firstUse.id]);
 
     const askedAgain = await newDecision(owner, agent, { status: 'answered', outcome: 'asked', rule: 'no_match' });
     const otherGrant = one(await db.insert(grants).values(grantValues(askedAgain)).returning());
-    await expectRefusedBy(claimGrant(otherGrant.id, firstUse.id), 'grants_used_by_decision_id_unique');
-    await expectRefusedBy(
-      db.update(grants).set({ usedAt: new Date() }).where(eq(grants.id, otherGrant.id)),
-      'grants_used_together',
+    await expectRefusedBy(useGrant(otherGrant, firstUse), 'grant_uses_decision_id_unique');
+  });
+});
+
+describe('rows that mix owners', () => {
+  // 23503 is foreign_key_violation. Each refused row is well formed and differs from an
+  // accepted one only in naming the other owner's record.
+  async function expectCrossOwnerRefusal(query: PromiseLike<unknown>, constraint: string): Promise<void> {
+    expect(await refusal(query)).toEqual({ code: '23503', constraint });
+  }
+
+  async function twoOwners() {
+    return { a: await ownerWithAgent(), b: await ownerWithAgent() };
+  }
+
+  it("refuse a decision for A that points at B's agent", async () => {
+    const { a, b } = await twoOwners();
+    await expectCrossOwnerRefusal(db.insert(decisions).values(decisionValues(a.owner, b.agent)), 'decisions_agent_same_owner_fk');
+  });
+
+  it("refuse a payment, a grant or a question in A's name on B's decision", async () => {
+    const { a, b } = await twoOwners();
+    const theirs = await newDecision(b.owner, b.agent, { status: 'asked', outcome: 'asked', rule: 'no_match' });
+    await expectCrossOwnerRefusal(
+      db.insert(payments).values(paymentValues(theirs, { ownerId: a.owner.id })),
+      'payments_decision_same_owner_fk',
     );
+    await expectCrossOwnerRefusal(
+      db.insert(grants).values(grantValues(theirs, { ownerId: a.owner.id })),
+      'grants_decision_same_owner_fk',
+    );
+    await expectCrossOwnerRefusal(
+      db.insert(questions).values({ decisionId: theirs.id, ownerId: a.owner.id }),
+      'questions_decision_same_owner_fk',
+    );
+  });
+
+  it("refuse a memory for A that names B's decision, and keep one that names A's own", async () => {
+    const { a, b } = await twoOwners();
+    const theirs = await newDecision(b.owner, b.agent);
+    await expectCrossOwnerRefusal(
+      db.insert(memories).values(ownerDecisionMemory(a.owner, { decisionId: theirs.id })),
+      'memories_decision_same_owner_fk',
+    );
+    const mine = await newDecision(a.owner, a.agent);
+    const kept = one(await db.insert(memories).values(ownerDecisionMemory(a.owner, { decisionId: mine.id })).returning());
+    expect(kept.decisionId).toBe(mine.id);
+  });
+
+  it("refuse a citation linking A's decision to B's memory under either owner, and keep A's own", async () => {
+    const { a, b } = await twoOwners();
+    const decision = await newDecision(a.owner, a.agent);
+    const theirMemory = one(await db.insert(memories).values(ownerDecisionMemory(b.owner)).returning());
+    const cite = (memoryId: string, ownerId: string) =>
+      db.insert(decisionCitations).values({ decisionId: decision.id, memoryId, ownerId });
+
+    await expectCrossOwnerRefusal(cite(theirMemory.id, a.owner.id), 'decision_citations_memory_same_owner_fk');
+    await expectCrossOwnerRefusal(cite(theirMemory.id, b.owner.id), 'decision_citations_decision_same_owner_fk');
+
+    const myMemory = one(await db.insert(memories).values(ownerDecisionMemory(a.owner)).returning());
+    expect(await cite(myMemory.id, a.owner.id).returning()).toHaveLength(1);
+  });
+
+  it("refuse a question for A that points at B's memory, and keep one that points at A's", async () => {
+    const { a, b } = await twoOwners();
+    const decision = await newDecision(a.owner, a.agent, { status: 'asked', outcome: 'asked', rule: 'no_match' });
+    const theirMemory = one(await db.insert(memories).values(ownerDecisionMemory(b.owner)).returning());
+    await expectCrossOwnerRefusal(
+      db.insert(questions).values({ decisionId: decision.id, ownerId: a.owner.id, memoryId: theirMemory.id }),
+      'questions_memory_same_owner_fk',
+    );
+
+    await db.insert(questions).values({ decisionId: decision.id, ownerId: a.owner.id });
+    const thisQuestion = eq(questions.decisionId, decision.id);
+    await expectCrossOwnerRefusal(
+      db.update(questions).set({ memoryId: theirMemory.id }).where(thisQuestion),
+      'questions_memory_same_owner_fk',
+    );
+    const myMemory = one(await db.insert(memories).values(ownerDecisionMemory(a.owner)).returning());
+    expect(one(await db.update(questions).set({ memoryId: myMemory.id }).where(thisQuestion).returning()).memoryId).toBe(
+      myMemory.id,
+    );
+  });
+
+  it("refuse a use that spends A's grant on B's decision under either owner", async () => {
+    const { a, b } = await twoOwners();
+    const asked = await newDecision(a.owner, a.agent, { status: 'answered', outcome: 'asked', rule: 'no_match' });
+    const grant = one(await db.insert(grants).values(grantValues(asked)).returning());
+    const theirs = await newDecision(b.owner, b.agent, { rule: 'grant' });
+
+    await expectCrossOwnerRefusal(useGrant(grant, theirs, a.owner.id), 'grant_uses_decision_same_owner_fk');
+    await expectCrossOwnerRefusal(useGrant(grant, theirs, b.owner.id), 'grant_uses_grant_same_owner_fk');
+    expect(await db.select().from(grantUses).where(eq(grantUses.grantId, grant.id))).toEqual([]);
+  });
+});
+
+describe('createDb', () => {
+  it('refuses a pglite database when NODE_ENV is production', async () => {
+    vi.stubEnv('NODE_ENV', 'production');
+    try {
+      await expect(createDb('pglite:memory')).rejects.toThrow(
+        'Unsupported database URL: pglite: is for development and tests, not production',
+      );
+    } finally {
+      vi.unstubAllEnvs();
+    }
   });
 });
 

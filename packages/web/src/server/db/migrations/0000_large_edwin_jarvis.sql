@@ -9,6 +9,7 @@ CREATE TABLE "agents" (
 	"created_at" timestamp with time zone DEFAULT now() NOT NULL,
 	"revoked_at" timestamp with time zone,
 	CONSTRAINT "agents_token_hash_unique" UNIQUE("token_hash"),
+	CONSTRAINT "agents_id_owner_id_unique" UNIQUE("id","owner_id"),
 	CONSTRAINT "agents_label_length" CHECK (char_length("agents"."label") between 1 and 60),
 	CONSTRAINT "agents_kind_known" CHECK ("agents"."kind" in ('external', 'builtin')),
 	CONSTRAINT "agents_token_prefix_length" CHECK (char_length("agents"."token_prefix") <= 12)
@@ -17,6 +18,7 @@ CREATE TABLE "agents" (
 CREATE TABLE "decision_citations" (
 	"decision_id" uuid NOT NULL,
 	"memory_id" uuid NOT NULL,
+	"owner_id" uuid NOT NULL,
 	CONSTRAINT "decision_citations_decision_id_memory_id_pk" PRIMARY KEY("decision_id","memory_id")
 );
 --> statement-breakpoint
@@ -44,6 +46,7 @@ CREATE TABLE "decisions" (
 	"reason" text NOT NULL,
 	"status" text NOT NULL,
 	"created_at" timestamp with time zone DEFAULT now() NOT NULL,
+	CONSTRAINT "decisions_id_owner_id_unique" UNIQUE("id","owner_id"),
 	CONSTRAINT "decisions_amount_positive" CHECK ("decisions"."amount_atomic" > 0),
 	CONSTRAINT "decisions_seller_method_known" CHECK ("decisions"."seller_method" in ('GET', 'POST')),
 	CONSTRAINT "decisions_outcome_known" CHECK ("decisions"."outcome" in ('approved', 'refused', 'asked')),
@@ -61,6 +64,14 @@ CREATE TABLE "decisions" (
 	CONSTRAINT "decisions_reason_length" CHECK (char_length("decisions"."reason") <= 400)
 );
 --> statement-breakpoint
+CREATE TABLE "grant_uses" (
+	"grant_id" uuid PRIMARY KEY NOT NULL,
+	"owner_id" uuid NOT NULL,
+	"decision_id" uuid NOT NULL,
+	"used_at" timestamp with time zone DEFAULT now() NOT NULL,
+	CONSTRAINT "grant_uses_decision_id_unique" UNIQUE("decision_id")
+);
+--> statement-breakpoint
 CREATE TABLE "grants" (
 	"id" uuid PRIMARY KEY DEFAULT gen_random_uuid() NOT NULL,
 	"owner_id" uuid NOT NULL,
@@ -71,12 +82,9 @@ CREATE TABLE "grants" (
 	"seller_method" text NOT NULL,
 	"body_hash" text NOT NULL,
 	"expires_at" timestamp with time zone NOT NULL,
-	"used_at" timestamp with time zone,
-	"used_by_decision_id" uuid,
 	CONSTRAINT "grants_decision_id_unique" UNIQUE("decision_id"),
-	CONSTRAINT "grants_used_by_decision_id_unique" UNIQUE("used_by_decision_id"),
+	CONSTRAINT "grants_id_owner_id_unique" UNIQUE("id","owner_id"),
 	CONSTRAINT "grants_max_amount_positive" CHECK ("grants"."max_amount_atomic" > 0),
-	CONSTRAINT "grants_used_together" CHECK (("grants"."used_at" is null) = ("grants"."used_by_decision_id" is null)),
 	CONSTRAINT "grants_seller_method_known" CHECK ("grants"."seller_method" in ('GET', 'POST')),
 	CONSTRAINT "grants_recipient_length" CHECK (char_length("grants"."recipient") <= 66),
 	CONSTRAINT "grants_seller_url_length" CHECK (char_length("grants"."seller_url") <= 2048)
@@ -100,6 +108,7 @@ CREATE TABLE "memories" (
 	"created_at" timestamp with time zone DEFAULT now() NOT NULL,
 	"confirmed_at" timestamp with time zone,
 	CONSTRAINT "memories_blob_id_unique" UNIQUE("blob_id"),
+	CONSTRAINT "memories_id_owner_id_unique" UNIQUE("id","owner_id"),
 	CONSTRAINT "memories_owner_decision_facts" CHECK ("memories"."kind" <> 'owner_decision' or ("memories"."verdict" is not null and "memories"."recipient" is not null and "memories"."amount_atomic" is not null)),
 	CONSTRAINT "memories_kind_known" CHECK ("memories"."kind" in ('owner_decision', 'outcome')),
 	CONSTRAINT "memories_verdict_known" CHECK ("memories"."verdict" in ('approve', 'refuse')),
@@ -236,20 +245,21 @@ CREATE TABLE "signin_nonces" (
 );
 --> statement-breakpoint
 ALTER TABLE "agents" ADD CONSTRAINT "agents_owner_id_owners_id_fk" FOREIGN KEY ("owner_id") REFERENCES "public"."owners"("id") ON DELETE restrict ON UPDATE no action;--> statement-breakpoint
-ALTER TABLE "decision_citations" ADD CONSTRAINT "decision_citations_decision_id_decisions_id_fk" FOREIGN KEY ("decision_id") REFERENCES "public"."decisions"("id") ON DELETE restrict ON UPDATE no action;--> statement-breakpoint
-ALTER TABLE "decision_citations" ADD CONSTRAINT "decision_citations_memory_id_memories_id_fk" FOREIGN KEY ("memory_id") REFERENCES "public"."memories"("id") ON DELETE restrict ON UPDATE no action;--> statement-breakpoint
+ALTER TABLE "decision_citations" ADD CONSTRAINT "decision_citations_decision_same_owner_fk" FOREIGN KEY ("decision_id","owner_id") REFERENCES "public"."decisions"("id","owner_id") ON DELETE restrict ON UPDATE no action;--> statement-breakpoint
+ALTER TABLE "decision_citations" ADD CONSTRAINT "decision_citations_memory_same_owner_fk" FOREIGN KEY ("memory_id","owner_id") REFERENCES "public"."memories"("id","owner_id") ON DELETE restrict ON UPDATE no action;--> statement-breakpoint
 ALTER TABLE "decisions" ADD CONSTRAINT "decisions_owner_id_owners_id_fk" FOREIGN KEY ("owner_id") REFERENCES "public"."owners"("id") ON DELETE restrict ON UPDATE no action;--> statement-breakpoint
-ALTER TABLE "decisions" ADD CONSTRAINT "decisions_agent_id_agents_id_fk" FOREIGN KEY ("agent_id") REFERENCES "public"."agents"("id") ON DELETE restrict ON UPDATE no action;--> statement-breakpoint
+ALTER TABLE "decisions" ADD CONSTRAINT "decisions_agent_same_owner_fk" FOREIGN KEY ("agent_id","owner_id") REFERENCES "public"."agents"("id","owner_id") ON DELETE restrict ON UPDATE no action;--> statement-breakpoint
+ALTER TABLE "grant_uses" ADD CONSTRAINT "grant_uses_grant_same_owner_fk" FOREIGN KEY ("grant_id","owner_id") REFERENCES "public"."grants"("id","owner_id") ON DELETE restrict ON UPDATE no action;--> statement-breakpoint
+ALTER TABLE "grant_uses" ADD CONSTRAINT "grant_uses_decision_same_owner_fk" FOREIGN KEY ("decision_id","owner_id") REFERENCES "public"."decisions"("id","owner_id") ON DELETE restrict ON UPDATE no action;--> statement-breakpoint
 ALTER TABLE "grants" ADD CONSTRAINT "grants_owner_id_owners_id_fk" FOREIGN KEY ("owner_id") REFERENCES "public"."owners"("id") ON DELETE restrict ON UPDATE no action;--> statement-breakpoint
-ALTER TABLE "grants" ADD CONSTRAINT "grants_decision_id_decisions_id_fk" FOREIGN KEY ("decision_id") REFERENCES "public"."decisions"("id") ON DELETE restrict ON UPDATE no action;--> statement-breakpoint
-ALTER TABLE "grants" ADD CONSTRAINT "grants_used_by_decision_id_decisions_id_fk" FOREIGN KEY ("used_by_decision_id") REFERENCES "public"."decisions"("id") ON DELETE restrict ON UPDATE no action;--> statement-breakpoint
+ALTER TABLE "grants" ADD CONSTRAINT "grants_decision_same_owner_fk" FOREIGN KEY ("decision_id","owner_id") REFERENCES "public"."decisions"("id","owner_id") ON DELETE restrict ON UPDATE no action;--> statement-breakpoint
 ALTER TABLE "memories" ADD CONSTRAINT "memories_owner_id_owners_id_fk" FOREIGN KEY ("owner_id") REFERENCES "public"."owners"("id") ON DELETE restrict ON UPDATE no action;--> statement-breakpoint
-ALTER TABLE "memories" ADD CONSTRAINT "memories_decision_id_decisions_id_fk" FOREIGN KEY ("decision_id") REFERENCES "public"."decisions"("id") ON DELETE restrict ON UPDATE no action;--> statement-breakpoint
-ALTER TABLE "payments" ADD CONSTRAINT "payments_decision_id_decisions_id_fk" FOREIGN KEY ("decision_id") REFERENCES "public"."decisions"("id") ON DELETE restrict ON UPDATE no action;--> statement-breakpoint
+ALTER TABLE "memories" ADD CONSTRAINT "memories_decision_same_owner_fk" FOREIGN KEY ("decision_id","owner_id") REFERENCES "public"."decisions"("id","owner_id") ON DELETE restrict ON UPDATE no action;--> statement-breakpoint
 ALTER TABLE "payments" ADD CONSTRAINT "payments_owner_id_owners_id_fk" FOREIGN KEY ("owner_id") REFERENCES "public"."owners"("id") ON DELETE restrict ON UPDATE no action;--> statement-breakpoint
-ALTER TABLE "questions" ADD CONSTRAINT "questions_decision_id_decisions_id_fk" FOREIGN KEY ("decision_id") REFERENCES "public"."decisions"("id") ON DELETE restrict ON UPDATE no action;--> statement-breakpoint
+ALTER TABLE "payments" ADD CONSTRAINT "payments_decision_same_owner_fk" FOREIGN KEY ("decision_id","owner_id") REFERENCES "public"."decisions"("id","owner_id") ON DELETE restrict ON UPDATE no action;--> statement-breakpoint
 ALTER TABLE "questions" ADD CONSTRAINT "questions_owner_id_owners_id_fk" FOREIGN KEY ("owner_id") REFERENCES "public"."owners"("id") ON DELETE restrict ON UPDATE no action;--> statement-breakpoint
-ALTER TABLE "questions" ADD CONSTRAINT "questions_memory_id_memories_id_fk" FOREIGN KEY ("memory_id") REFERENCES "public"."memories"("id") ON DELETE restrict ON UPDATE no action;--> statement-breakpoint
+ALTER TABLE "questions" ADD CONSTRAINT "questions_decision_same_owner_fk" FOREIGN KEY ("decision_id","owner_id") REFERENCES "public"."decisions"("id","owner_id") ON DELETE restrict ON UPDATE no action;--> statement-breakpoint
+ALTER TABLE "questions" ADD CONSTRAINT "questions_memory_same_owner_fk" FOREIGN KEY ("memory_id","owner_id") REFERENCES "public"."memories"("id","owner_id") ON DELETE restrict ON UPDATE no action;--> statement-breakpoint
 ALTER TABLE "refills" ADD CONSTRAINT "refills_owner_id_owners_id_fk" FOREIGN KEY ("owner_id") REFERENCES "public"."owners"("id") ON DELETE restrict ON UPDATE no action;--> statement-breakpoint
 ALTER TABLE "sessions" ADD CONSTRAINT "sessions_owner_id_owners_id_fk" FOREIGN KEY ("owner_id") REFERENCES "public"."owners"("id") ON DELETE restrict ON UPDATE no action;--> statement-breakpoint
 CREATE UNIQUE INDEX "decisions_live_request_unique" ON "decisions" USING btree ("owner_id","request_key") WHERE "decisions"."status" in ('open', 'asked');--> statement-breakpoint

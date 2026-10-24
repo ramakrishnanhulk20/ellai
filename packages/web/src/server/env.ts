@@ -17,8 +17,9 @@ function isEd25519SuiKey(value: string): boolean {
   }
 }
 
-function isDatabaseUrl(value: string): boolean {
+function isDatabaseUrl(value: string, allowLocalDatabase: boolean): boolean {
   if (value.startsWith('pglite:')) {
+    if (!allowLocalDatabase) return false;
     const location = value.slice('pglite:'.length);
     return location.length > 0 && location.trim() === location;
   }
@@ -57,9 +58,9 @@ function origin(allowLocalHttp: boolean) {
 
 const suiKey = z.string().startsWith('suiprivkey').refine(isEd25519SuiKey);
 
-function envSchema(allowLocalHttp: boolean) {
+function envSchema(isLocal: boolean) {
   return z.object({
-    DATABASE_URL: z.preprocess(blankIsMissing, z.string().refine(isDatabaseUrl)),
+    DATABASE_URL: z.preprocess(blankIsMissing, z.string().refine((value) => isDatabaseUrl(value, isLocal))),
     ELLAI_MASTER_SECRET: z.preprocess(blankIsMissing, z.string().regex(HEX_64)),
     GAS_PRIVATE_KEY: z.preprocess(blankIsMissing, suiKey),
     TATUM_API_KEY: z.preprocess(blankIsMissing, z.string().optional()),
@@ -67,7 +68,7 @@ function envSchema(allowLocalHttp: boolean) {
     ANTHROPIC_API_KEY: z.preprocess(blankIsMissing, z.string().optional()),
     SESSION_SECRET: z.preprocess(blankIsMissing, z.string().regex(AT_LEAST_32_BYTES_HEX)),
     JOBS_SECRET: z.preprocess(blankIsMissing, z.string().regex(AT_LEAST_32_BYTES_HEX)),
-    APP_ORIGIN: z.preprocess(blankIsMissing, origin(allowLocalHttp)),
+    APP_ORIGIN: z.preprocess(blankIsMissing, origin(isLocal)),
   });
 }
 
@@ -77,17 +78,18 @@ const VARIABLE_NAMES = Object.keys(envSchema(false).shape);
 
 /**
  * Validates the environment variables the server needs.
- * Plain http is accepted for APP_ORIGIN only as http://localhost:<port>, and only when
- * NODE_ENV is "development" or "test". An unset or unknown NODE_ENV counts as production,
- * so a deploy that forgets to set it still refuses an insecure origin.
+ * Plain http is accepted for APP_ORIGIN only as http://localhost:<port>, and a pglite:
+ * database only at all, and both only when NODE_ENV is "development" or "test". An unset
+ * or unknown NODE_ENV counts as production, so a deploy that forgets to set it still
+ * refuses an insecure origin and a database that would lose every payment record.
  * Throws an Error that names each bad variable and says whether it is missing or
  * malformed. The message never contains a value, and the zod error is not attached,
  * because its issues can carry the input.
  */
 export function loadServerEnv(env: Record<string, string | undefined>): ServerEnv {
-  const allowLocalHttp = env.NODE_ENV === 'development' || env.NODE_ENV === 'test';
+  const isLocal = env.NODE_ENV === 'development' || env.NODE_ENV === 'test';
   const picked = Object.fromEntries(VARIABLE_NAMES.map((name) => [name, env[name]]));
-  const result = envSchema(allowLocalHttp).safeParse(picked);
+  const result = envSchema(isLocal).safeParse(picked);
   if (result.success) return Object.freeze(result.data);
 
   const badNames = [...new Set(result.error.issues.map((issue) => String(issue.path[0])))];
