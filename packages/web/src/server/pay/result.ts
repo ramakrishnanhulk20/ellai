@@ -1,7 +1,6 @@
 import { LIMITS } from '@ellai/core/limits';
 import type { SafeResponse } from '@ellai/core/net';
 import type { SETTLEMENTS } from '../db/schema.js';
-import { formatUsdc } from '../decide/sentences.js';
 
 export type Settlement = (typeof SETTLEMENTS)[number];
 
@@ -70,11 +69,6 @@ export function sellerAnswer(response: SafeResponse): SellerAnswer {
     body: truncated ? characters.slice(0, LIMITS.sellerAnswerMaxChars).join('') : response.bodyText,
     truncated,
   };
-}
-
-/** Atomic USDC with trailing zeros dropped down to two places, for example 10000n as '0.01'. */
-export function shortUsdc(atomic: bigint): string {
-  return formatUsdc(atomic).replace(/(\.\d\d\d*?)0+$/, '$1');
 }
 
 /** A result that carries no decision, no seller answer and no payment. */

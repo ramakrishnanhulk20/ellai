@@ -1,14 +1,18 @@
 // Covers: paidFetch on PGlite with a stand-in seller and a stand-in chain: the free answer, an
 // unreadable price, asks and refusals that never sign, an approval signed once by the owner's
-// derived purse and sent as the same request plus the payment header, the daily budget checked
-// again at signing, a short purse, an expired price, a decision that no longer matches its
-// payment, a purse that moved, a request already in flight, a seller that fails after payment,
-// a settlement mismatch pausing the owner, the release of a payment that never landed, and
-// reasons that never carry agent or seller text.
+// derived purse and sent as the same request plus the payment header, the pause, the per-payment
+// maximum and the daily budget checked again at signing, a short purse, an expired price, a
+// decision that no longer matches its payment, a purse that moved, a request already in flight
+// (open, or signed and still able to land, up to the edge of that window), the same request
+// decided again once its payment was released, an x402 v2 price refused before decide, a seller
+// that fails after payment, a settlement mismatch pausing the owner, the release of a payment
+// that never landed, six-decimal amounts in reasons, and reasons that never carry agent or
+// seller text.
 // Does NOT cover: a real seller, the real Sui chain or Tatum (npm run prove:flow does those
 // live), safeFetch's own network checks (core's net tests), two connections racing on the owner
-// lock (PGlite serves one connection, so racing calls here run one transaction at a time), or
-// the jobs tick that settles payments the inline reads left pending.
+// lock (PGlite serves one connection, so racing calls here run one transaction at a time),
+// two identical requests whose in-flight check and decide interleave on separate connections,
+// or the jobs tick that settles payments the inline reads left pending.
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { ChainError, type Chain, type TransactionResult } from '@ellai/core/chain';
 import { type CanonicalPayment, parseChallenge } from '@ellai/core/challenge';
@@ -27,7 +31,7 @@ import { type Recall, decide } from '../src/server/decide/decide.js';
 import { ownerDelegate } from '../src/server/memory/delegate.js';
 import { MEMORY_NAMESPACE } from '../src/server/memory/namespace.js';
 import { type PaidFetchArgs, paidFetch } from '../src/server/pay/flow.js';
-import { settlePayment } from '../src/server/pay/settle.js';
+import { SETTLEMENT_MISMATCH, settlePayment } from '../src/server/pay/settle.js';
 import { PURSE_KEY_MISMATCH, signForDecision } from '../src/server/pay/sign.js';
 
 let handle: Awaited<ReturnType<typeof createDb>>;
@@ -182,6 +186,19 @@ function stubChain(w: World, overrides: Partial<{ epoch: bigint; balance: bigint
   return { chain, state, calls };
 }
 
+/** A chain that applies `change` to the owner when signing reads the epoch: after decide approved, before the signing lock. */
+function onSigning(w: World, change: Partial<typeof owners.$inferInsert>) {
+  const base = stubChain(w);
+  const chain = {
+    ...base.chain,
+    getCurrentEpoch: async () => {
+      await db.update(owners).set(change).where(eq(owners.id, w.ownerId));
+      return base.state.epoch;
+    },
+  } as Chain;
+  return { ...base, chain };
+}
+
 type RunOptions = Partial<Omit<PaidFetchArgs, 'db' | 'deps' | 'secrets'> & PaidFetchArgs['deps']>;
 
 function run(w: World, options: RunOptions = {}) {
@@ -302,7 +319,7 @@ describe('paidFetch', () => {
     const fetch = seller();
     const result = await run(w, { url: JMPR_URL, fetch, chain, recallFor });
 
-    expect(result).toMatchObject({ outcome: 'paid', rule: 'learned', reason: 'Paid 0.01 USDC to suimpp.jmpr.world.' });
+    expect(result).toMatchObject({ outcome: 'paid', rule: 'learned', reason: 'Paid 0.010000 USDC to suimpp.jmpr.world.' });
     expect(result.citedMemories.map((m) => m.blobId).sort()).toEqual(rows.map((row) => row.blobId).sort());
     expect(result.seller).toEqual({ status: 200, contentType: 'application/json', body: '{"hotels":[]}', truncated: false });
     const row = one(await paymentRows(w.ownerId));
@@ -338,6 +355,40 @@ describe('paidFetch', () => {
     expect(await sign(second)).toEqual({ refusal: 'over_daily_budget' });
     expect(await paymentRows(w.ownerId)).toHaveLength(1);
     expect(one(await db.select().from(decisions).where(eq(decisions.id, second.decisionId))).status).toBe('open');
+  });
+
+  it('refuses at signing, with decide\'s paused reason, an owner paused after decide approved, and signs nothing', async () => {
+    for (const pause of [{ paused: true }, { autoPausedReason: SETTLEMENT_MISMATCH }]) {
+      const w = await world();
+      const { recallFor } = await approvals(w);
+      const fetch = seller();
+      const result = await run(w, { fetch, chain: onSigning(w, pause).chain, recallFor });
+      expect(result).toMatchObject({ outcome: 'refused', rule: 'learned', reason: 'Automatic payments are paused for this account.', payment: null });
+      expect(one(await decisionRows(w.ownerId)).status).toBe('refused');
+      expect(await paymentRows(w.ownerId)).toHaveLength(0);
+      expect(paidCalls(fetch)).toHaveLength(0);
+      expect(await run(w, { fetch, recallFor, purpose: 'try again' })).toMatchObject({ outcome: 'refused', rule: 'paused', reason: result.reason });
+    }
+  });
+
+  it('refuses at signing a payment over a per-payment maximum lowered after decide approved', async () => {
+    const w = await world();
+    const { recall, recallFor } = await approvals(w);
+    const lowered = { perPaymentMaxAtomic: PRICE - 1n };
+    const fetch = seller();
+    const result = await run(w, { fetch, chain: onSigning(w, lowered).chain, recallFor });
+    expect(result).toMatchObject({ outcome: 'refused', reason: 'This payment of 0.010000 USDC is over your limit of 0.009999 USDC per payment.', payment: null });
+    expect(one(await decisionRows(w.ownerId)).status).toBe('refused');
+    expect(await run(w, { fetch, recallFor, purpose: 'another search' })).toMatchObject({ outcome: 'refused', rule: 'over_payment_max', reason: result.reason });
+
+    await db.update(owners).set({ perPaymentMaxAtomic: PRICE }).where(eq(owners.id, w.ownerId));
+    const direct = await approvedDecision(w, recall, 'signed directly');
+    await db.update(owners).set(lowered).where(eq(owners.id, w.ownerId));
+    const signed = await signForDecision({ db, ownerId: w.ownerId, ...direct, masterSecretHex: MASTER, chain: stubChain(w).chain, now: NOW });
+    expect(signed).toEqual({ refusal: 'over_payment_max', perPaymentMaxAtomic: PRICE - 1n });
+    expect(one(await db.select().from(decisions).where(eq(decisions.id, direct.decisionId))).status).toBe('refused');
+    expect(await paymentRows(w.ownerId)).toHaveLength(0);
+    expect(paidCalls(fetch)).toHaveLength(0);
   });
 
   it('fails without signing when the purse holds less than the payment', async () => {
@@ -430,13 +481,79 @@ describe('paidFetch', () => {
     expect(await paymentRows(w.ownerId)).toHaveLength(1);
   });
 
+  it('fails the same request without deciding or signing while its signed payment may still land', async () => {
+    const w = await world();
+    const { recallFor } = await approvals(w);
+    const { chain, calls } = stubChain(w, { landed: () => null });
+    const fetch = seller();
+    const first = await run(w, { fetch, chain, recallFor });
+    expect(first).toMatchObject({ outcome: 'paid', payment: { settlement: 'pending' } });
+    expect(one(await decisionRows(w.ownerId)).status).toBe('paid');
+
+    const windowMs = LIMITS.paymentValidityMs + LIMITS.netPaidTimeoutDefaultMs + LIMITS.settlementInlineTries * LIMITS.settlementInlineIntervalMs;
+    const again = await run(w, { fetch, chain, recallFor, now: () => new Date(NOW.getTime() + windowMs - 1) });
+    expect(again).toEqual({ outcome: 'failed', decisionId: null, rule: null, reason: 'A payment for this same request is already in progress.', citedMemories: [], seller: null, payment: null });
+    // Only signing reads the purse balance, so one read is one signature.
+    expect(calls.balances).toEqual([w.purse]);
+    expect(paidCalls(fetch)).toHaveLength(1);
+    expect(await paymentRows(w.ownerId)).toHaveLength(1);
+    expect(await decisionRows(w.ownerId)).toHaveLength(1);
+
+    const later = await run(w, { fetch, chain, recallFor, now: () => new Date(NOW.getTime() + windowMs) });
+    expect(later.outcome).toBe('paid');
+    expect(await paymentRows(w.ownerId)).toHaveLength(2);
+  });
+
+  it('decides and pays the same request again once its first payment was released as never landed', async () => {
+    const w = await world();
+    const { recallFor } = await approvals(w);
+    const { chain, state } = stubChain(w, { landed: () => null });
+    const first = await run(w, { chain, recallFor });
+    expect(first.payment?.settlement).toBe('pending');
+    const row = one(await paymentRows(w.ownerId));
+    state.epoch = 102n;
+    expect(await settlePayment({ db, ownerId: w.ownerId, paymentId: row.id, chain, tries: 1, intervalMs: 5, sleep: noSleep })).toBe('not_landed');
+
+    state.landed = () => settled(w.purse, RECIPIENT, PRICE);
+    const fetch = seller(ok, (url) => challenge(url, { minEpoch: 102n }));
+    const again = await run(w, { fetch, chain, recallFor });
+    expect(again).toMatchObject({ outcome: 'paid', rule: 'learned', payment: { settlement: 'verified' } });
+    expect(again.decisionId).not.toBe(first.decisionId);
+    expect(paidCalls(fetch)).toHaveLength(1);
+    expect(await paymentRows(w.ownerId)).toHaveLength(2);
+  });
+
+  it('refuses an x402 v2 price before decide, so the owner is never asked about it', async () => {
+    const w = await world();
+    const { chain, calls } = stubChain(w);
+    const recall = vi.fn(async () => []);
+    const v2 = (url: string) =>
+      response(
+        url,
+        402,
+        JSON.stringify({
+          x402Version: 2,
+          accepts: [{ scheme: 'exact', network: 'sui:mainnet', amount: String(PRICE), asset: USDC_TYPE_MAINNET, payTo: RECIPIENT, maxTimeoutSeconds: 60, extra: {} }],
+        }),
+        { 'content-type': JSON_TYPE },
+      );
+    expect(parseChallenge(v2(SELLER_URL), NOW.getTime()).dialect).toBe('x402-v2');
+    const fetch = seller(ok, v2);
+    const result = await run(w, { fetch, chain, recallFor: () => recall });
+    expect(result).toEqual({ outcome: 'refused', decisionId: null, rule: null, reason: "Ellai cannot pay this seller's payment format yet.", citedMemories: [], seller: null, payment: null });
+    expect(await decisionRows(w.ownerId)).toHaveLength(0);
+    expect(recall).not.toHaveBeenCalled();
+    expect(calls).toEqual({ epochs: 0, balances: [], reads: [] });
+    expect(paidCalls(fetch)).toHaveLength(0);
+  });
+
   it('reports paid when the seller fails after payment, records the outcome once verified, and then asks', async () => {
     const w = await world();
     const { recallFor } = await approvals(w);
     const fetch = seller((url) => response(url, 500, 'internal error'));
     const result = await run(w, { fetch, recallFor });
 
-    expect(result).toMatchObject({ outcome: 'paid', reason: 'Paid 0.01 USDC to hotels.example; the seller returned no answer.' });
+    expect(result).toMatchObject({ outcome: 'paid', reason: 'Paid 0.010000 USDC to hotels.example; the seller returned no answer.' });
     expect(result.seller).toMatchObject({ status: 500, body: 'internal error' });
     expect(result.payment?.settlement).toBe('verified');
     expect(paidCalls(fetch)[0]?.[1]).toMatchObject({ timeoutMs: LIMITS.netPaidTimeoutDefaultMs });

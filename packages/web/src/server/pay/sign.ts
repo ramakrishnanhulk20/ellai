@@ -7,7 +7,13 @@ import { and, eq, gte, isNull, sql } from 'drizzle-orm';
 import type { Database } from '../db/client.js';
 import { decisions, owners, payments } from '../db/schema.js';
 
-export type SignRefusal = 'expired' | 'wrong_epoch' | 'over_daily_budget' | 'purse_short' | 'not_open';
+export type SignRefusal = 'expired' | 'wrong_epoch' | 'paused' | 'over_payment_max' | 'over_daily_budget' | 'purse_short' | 'not_open';
+
+/** A refusal over the per-payment maximum carries the maximum it was checked against, so the reason can name it. */
+export type SignResult =
+  | { signed: SignedPayment }
+  | { refusal: Exclude<SignRefusal, 'over_payment_max'> }
+  | { refusal: 'over_payment_max'; perPaymentMaxAtomic: bigint };
 
 export interface SignArgs {
   db: Database;
@@ -58,18 +64,21 @@ function decidedThis(decision: typeof decisions.$inferSelect, payment: Canonical
 
 /**
  * Turns one open, approved decision into a signed payment from the owner's own purse, with
- * the daily budget checked and debited in the same step (C4, C6, C7).
+ * the pause, the per-payment maximum and the daily budget checked, and the budget debited,
+ * in the same step (C4, C6, C7, C8).
  *
  * Before any lock: reads the chain's current epoch and the recorded purse's USDC address
  * balance; a balance below the amount is 'purse_short'. Then in one transaction: locks the
  * owner row FOR UPDATE and the decision row after it, in the order every other writer takes
  * them. The decision must be this owner's, 'open', and name the canonical payment's
- * recipient, amount, asset and network ('not_open' otherwise). Everything this owner signed
- * in the 24 hours before `now` and has not released counts, settled or not; going past
- * daily_budget_atomic is 'over_daily_budget'. The purse key is derived from the master secret
- * and the owner's address, and must give the recorded purse address: if it does not, the
- * owner's auto_paused_reason is set to PURSE_KEY_MISMATCH, that is committed, and the answer
- * is 'not_open'. Then core's signPayment builds, checks and signs the plain USDC send (its
+ * recipient, amount, asset and network ('not_open' otherwise). An owner that is paused or has
+ * an auto_paused_reason is 'paused', and an amount over per_payment_max_atomic is
+ * 'over_payment_max'; either way the decision becomes 'refused' in the same transaction.
+ * Everything this owner signed in the 24 hours before `now` and has not released counts,
+ * settled or not; going past daily_budget_atomic is 'over_daily_budget'. The purse key is
+ * derived from the master secret and the owner's address, and must give the recorded purse
+ * address: if it does not, the owner's auto_paused_reason is set to PURSE_KEY_MISMATCH, that
+ * is committed, and the answer is 'not_open'. Then core's signPayment builds, checks and signs the plain USDC send (its
  * EXPIRED and WRONG_EPOCH become 'expired' and 'wrong_epoch'), the payments row is written
  * with the digest of the signed bytes and the challenge's maxEpoch as valid_until_epoch, and
  * the decision becomes 'paid'. Nothing is sent anywhere.
@@ -77,7 +86,7 @@ function decidedThis(decision: typeof decisions.$inferSelect, payment: Canonical
  * Throws ChainError from the two reads, and PaymentError for a payment core cannot build
  * (UNSUPPORTED_DIALECT, BUILD_FAILED, MISMATCH); either way nothing is written.
  */
-export async function signForDecision(args: SignArgs): Promise<{ signed: SignedPayment } | { refusal: SignRefusal }> {
+export async function signForDecision(args: SignArgs): Promise<SignResult> {
   const { db, payment, now, chain } = args;
   if (typeof args.ownerId !== 'string' || !UUID.test(args.ownerId) || typeof args.decisionId !== 'string' || !UUID.test(args.decisionId)) {
     return { refusal: 'not_open' };
@@ -96,9 +105,16 @@ export async function signForDecision(args: SignArgs): Promise<{ signed: SignedP
   // A gasless send redeems from the address balance only, so coins at the purse do not count.
   if (usdcAddressBalance < payment.amount) return { refusal: 'purse_short' };
 
-  return db.transaction(async (tx): Promise<{ signed: SignedPayment } | { refusal: SignRefusal }> => {
+  return db.transaction(async (tx): Promise<SignResult> => {
     const [owner] = await tx
-      .select({ suiAddress: owners.suiAddress, purseAddress: owners.purseAddress, dailyBudgetAtomic: owners.dailyBudgetAtomic })
+      .select({
+        suiAddress: owners.suiAddress,
+        purseAddress: owners.purseAddress,
+        paused: owners.paused,
+        autoPausedReason: owners.autoPausedReason,
+        perPaymentMaxAtomic: owners.perPaymentMaxAtomic,
+        dailyBudgetAtomic: owners.dailyBudgetAtomic,
+      })
       .from(owners)
       .where(eq(owners.id, ownerId))
       .for('update');
@@ -106,6 +122,18 @@ export async function signForDecision(args: SignArgs): Promise<{ signed: SignedP
     const thisDecision = and(eq(decisions.id, decisionId), eq(decisions.ownerId, ownerId));
     const [decision] = await tx.select().from(decisions).where(thisDecision).for('update');
     if (decision === undefined || decision.status !== 'open' || !decidedThis(decision, payment)) return { refusal: 'not_open' };
+
+    // decide read these settings before its recall, so a pause (a settlement mismatch, or the
+    // owner's own) or a lower maximum set since then is caught only here, under the lock (C4, C8).
+    const refuse = () => tx.update(decisions).set({ status: 'refused' }).where(and(thisDecision, eq(decisions.status, 'open')));
+    if (owner.paused || owner.autoPausedReason !== null) {
+      await refuse();
+      return { refusal: 'paused' };
+    }
+    if (payment.amount > owner.perPaymentMaxAtomic) {
+      await refuse();
+      return { refusal: 'over_payment_max', perPaymentMaxAtomic: owner.perPaymentMaxAtomic };
+    }
 
     // Read under the owner lock, so a payment signed by a racing call is already counted here.
     const [spent] = await tx

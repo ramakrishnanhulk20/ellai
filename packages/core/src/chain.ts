@@ -824,10 +824,12 @@ export function createChain(opts: { apiKey?: string }): Chain {
    *
    * Identical signed bytes always have the same digest and Sui runs a digest at most once,
    * so retrying is safe; even so, after a timeout or a transient error the digest is
-   * looked up first and the bytes are sent again only when the chain does not have it.
-   * A refusal is believed only after the same lookup, because bytes that landed through an
-   * earlier send can be refused when sent again. At most LIMITS.tatumRetries further
-   * rounds, each bounded by LIMITS.tatumTimeoutMs per request.
+   * looked up first, at least LIMITS.tatumRetryDelayMs later, and the bytes are sent again
+   * only when the chain does not have it. A refusal is believed only after the same lookup,
+   * also LIMITS.tatumRetryDelayMs later, because bytes that landed through an earlier send
+   * can be refused when sent again; a failed lookup there, RATE_LIMITED included, is an
+   * unknown outcome and nothing is sent again. At most LIMITS.tatumRetries further rounds,
+   * each bounded by LIMITS.tatumTimeoutMs per request.
    *
    * Returns status "failure" with a fixed code for a transaction that ran and failed, or
    * that the network refused before running it. Throws ChainError INVALID_INPUT for empty
@@ -875,6 +877,9 @@ export function createChain(opts: { apiKey?: string }): Chain {
         const failure = classifyChainError(error);
         if (failure.code === 'INVALID_INPUT') {
           const refusal = simulationRefusal(error) ?? 'REFUSED';
+          // Tatum's free plan answers about 3 requests a second, so a read sent the moment the
+          // send is refused is often rate limited and the outcome would read as unknown.
+          await sleep(LIMITS.tatumRetryDelayMs);
           let landed: ExecutionResult | null;
           try {
             landed = await landedResult(digest);

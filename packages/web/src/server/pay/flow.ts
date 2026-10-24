@@ -1,21 +1,21 @@
 import { createHash } from 'node:crypto';
 import { type Chain, ChainError } from '@ellai/core/chain';
-import { type CanonicalPayment, ChallengeError, parseChallenge } from '@ellai/core/challenge';
+import { type CanonicalPayment, ChallengeError, type Dialect, parseChallenge } from '@ellai/core/challenge';
 import { LIMITS } from '@ellai/core/limits';
 import { NetError, type SafeRequest, type SafeResponse, type safeFetch } from '@ellai/core/net';
 import { PaymentError, paymentHeader } from '@ellai/core/payment';
 import { KNOWN_SELLERS } from '@ellai/core/sellers';
-import { and, eq, inArray, isNull } from 'drizzle-orm';
+import { and, eq, gt, inArray, isNull, ne } from 'drizzle-orm';
 import type { Database } from '../db/client.js';
 import { SELLER_METHODS, TEXT_CAPS, agents, decisions, memories, owners, payments } from '../db/schema.js';
 import { DecideError, type DecideErrorCode, type DecideResult, type Recall, decide } from '../decide/decide.js';
-import { hostLabel } from '../decide/sentences.js';
+import { formatUsdc, hostLabel, requestKey } from '../decide/sentences.js';
 import { ownerDelegate } from '../memory/delegate.js';
 import { MEMORY_NAMESPACE } from '../memory/namespace.js';
 import { recordOutcome } from '../memory/outcome.js';
-import { type PaidFetchResult, bare, isPlainContentType, sellerAnswer, shortUsdc } from './result.js';
+import { type PaidFetchResult, bare, isPlainContentType, sellerAnswer } from './result.js';
 import { settlePayment } from './settle.js';
-import { type SignRefusal, signForDecision } from './sign.js';
+import { type SignRefusal, type SignResult, signForDecision } from './sign.js';
 
 export type RecallFn = Recall;
 
@@ -46,6 +46,9 @@ export interface PaidFetchArgs {
 
 const HTTP_PAYMENT_REQUIRED = 402;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+// The one dialect core's signPayment and paymentHeader accept. Any other is refused before
+// decide, so the owner is never asked about a payment Ellai would then refuse to make.
+const PAYABLE_DIALECT: Dialect = 'x402-v1-t2000';
 
 const REASONS = {
   notAllowed: 'This agent is not allowed to pay for this account.',
@@ -56,18 +59,34 @@ const REASONS = {
   contentType: 'Ellai forwards only a plain content type, such as application/json.',
   purpose: `The purpose must be 1 to ${LIMITS.purposeMaxChars} characters.`,
   free: 'This seller answered without asking for payment.',
+  dialect: "Ellai cannot pay this seller's payment format yet.",
   inProgress: 'A payment for this same request is already in progress.',
   requestMismatch: 'An earlier decision under this request key is for a different request, so Ellai did not pay.',
   chain: 'Ellai could not read Sui just now, so it did not pay.',
 } as const;
 
-const SIGN_REFUSALS: Record<SignRefusal, { outcome: 'refused' | 'failed'; status: 'refused' | 'failed'; reason: string }> = {
+interface SignRefusalAnswer {
+  outcome: 'refused' | 'failed';
+  status: 'refused' | 'failed';
+  reason: string;
+}
+
+const SIGN_REFUSALS: Record<Exclude<SignRefusal, 'over_payment_max'>, SignRefusalAnswer> = {
+  // decide's own sentence for its paused rule, so the agent reads one reason whichever check caught it.
+  paused: { outcome: 'refused', status: 'refused', reason: 'Automatic payments are paused for this account.' },
   over_daily_budget: { outcome: 'refused', status: 'refused', reason: 'This payment would take the last 24 hours past your daily budget.' },
   purse_short: { outcome: 'failed', status: 'failed', reason: "This account's purse does not hold enough USDC for this payment right now." },
   expired: { outcome: 'failed', status: 'failed', reason: "The seller's price expired before Ellai could pay it." },
   wrong_epoch: { outcome: 'failed', status: 'failed', reason: "The seller's price is not valid on Sui right now, so Ellai did not pay it." },
   not_open: { outcome: 'failed', status: 'failed', reason: 'This decision can no longer be paid.' },
 };
+
+function signRefusal(refused: Exclude<SignResult, { signed: unknown }>, amount: bigint): SignRefusalAnswer {
+  if (refused.refusal !== 'over_payment_max') return SIGN_REFUSALS[refused.refusal];
+  // decide's own sentence for its per-payment maximum rule, naming the maximum checked at signing.
+  const reason = `This payment of ${formatUsdc(amount)} USDC is over your limit of ${formatUsdc(refused.perPaymentMaxAtomic)} USDC per payment.`;
+  return { outcome: 'refused', status: 'refused', reason };
+}
 
 const DECIDE_REFUSALS: Partial<Record<DecideErrorCode, string>> = {
   OWNER: REASONS.notAllowed,
@@ -144,6 +163,32 @@ function paidTimeoutMs(sellerUrl: string): number {
   return known?.paidTimeoutMs ?? LIMITS.netPaidTimeoutDefaultMs;
 }
 
+/**
+ * True when this owner already signed a payment for this request key that may still be under
+ * way: its decision is 'paid', it has not been released as 'not_landed', and it was signed
+ * less than the price's validity, plus the seller's paid patience, plus the inline settlement
+ * reads ago (C5). A 'paid' decision has left decide's live statuses, so decide alone would
+ * decide and sign the same request again.
+ */
+async function paymentInFlight(db: Database, ownerId: string, key: string, sellerUrl: string, now: Date): Promise<boolean> {
+  const windowMs = LIMITS.paymentValidityMs + paidTimeoutMs(sellerUrl) + LIMITS.settlementInlineTries * LIMITS.settlementInlineIntervalMs;
+  const [row] = await db
+    .select({ id: decisions.id })
+    .from(decisions)
+    .innerJoin(payments, and(eq(payments.decisionId, decisions.id), eq(payments.ownerId, decisions.ownerId)))
+    .where(
+      and(
+        eq(decisions.ownerId, ownerId),
+        eq(decisions.requestKey, key),
+        eq(decisions.status, 'paid'),
+        ne(payments.settlement, 'not_landed'),
+        gt(payments.signedAt, new Date(now.getTime() - windowMs)),
+      ),
+    )
+    .limit(1);
+  return row !== undefined;
+}
+
 /** The cited memories with their Walrus blob ids, in the order decide cited them, owner-scoped. */
 async function citations(db: Database, ownerId: string, ids: string[]): Promise<PaidFetchResult['citedMemories']> {
   if (ids.length === 0) return [];
@@ -173,14 +218,20 @@ async function closeDecision(db: Database, ownerId: string, decisionId: string, 
  * 2. The unpaid request goes through deps.fetch (safeFetch, C20). A NetError is 'failed'.
  * 3. Any answer but 402 is 'free': the answer goes back and no decision is recorded.
  * 4. parseChallenge reads the 402 into one canonical payment; a ChallengeError is 'refused'
- *    with no decision recorded (C1, C3).
- * 5, 6. decide runs on the payment, the method, the SHA-256 of the body and the purpose, with
+ *    with no decision recorded (C1, C3). So is a payment in any dialect but x402-v1-t2000,
+ *    the only one Ellai can sign.
+ * 5. When this owner already signed the same request (same request key) and that payment may
+ *    still be under way (see paymentInFlight), the result is 'failed' and neither decide nor
+ *    signing runs (C5).
+ * 6. decide runs on the payment, the method, the SHA-256 of the body and the purpose, with
  *    the owner's derived delegate key and recall. Refused and asked come back as decided. A
  *    live decision reused for the same request never pays: an asked one comes back as asked,
  *    an approved one is 'failed' because its payment is already under way (C5).
- * 7. signForDecision checks the budget and signs at that moment (C4, C6, C7). A refusal there,
- *    or a chain or build failure, is 'refused' (over the daily budget) or 'failed', and the
- *    decision is closed as 'refused' or 'failed' so the request can be decided again.
+ * 7. signForDecision checks the pause, the per-payment maximum and the budget again under the
+ *    owner lock and signs at that moment (C4, C6, C7, C8). A refusal there, or a chain or build
+ *    failure, is 'refused' (paused or over the maximum, with decide's own reasons for those
+ *    rules, or over the daily budget) or 'failed', and the decision is closed as 'refused' or
+ *    'failed' so the request can be decided again.
  * 8. The paid request is the same request plus the payment header, with the seller's own
  *    patience. Its status, or null when it never answered, is stored with the payment.
  * 9. settlePayment reads the chain by Ellai's digest, LIMITS.settlementInlineTries times (C8).
@@ -214,9 +265,14 @@ export async function paidFetch(args: PaidFetchArgs): Promise<PaidFetchResult> {
     if (error instanceof ChallengeError) return bare('refused', `Ellai could not read this seller's price safely (${error.code}).`);
     throw error;
   }
+  if (payment.dialect !== PAYABLE_DIALECT) return bare('refused', REASONS.dialect);
   const bodyHash = createHash('sha256')
     .update(request.body ?? '', 'utf8')
     .digest('hex');
+  // Built from the same normalised parts decide builds it from (the lowercased agent id, the
+  // trimmed purpose), so this finds exactly the decisions decide would match.
+  const key = requestKey({ agentId: party.agentId, payment, method: request.method, bodyHash, purpose: args.purpose.trim() });
+  if (await paymentInFlight(db, ownerId, key, payment.sellerUrl, deps.now())) return bare('failed', REASONS.inProgress);
 
   const delegate = ownerDelegate(args.secrets.masterSecretHex, party.suiAddress);
   let decided: DecideResult;
@@ -244,7 +300,7 @@ export async function paidFetch(args: PaidFetchArgs): Promise<PaidFetchResult> {
   if (decided.reused && decided.outcome === 'approved') return { ...bare('failed', REASONS.inProgress), ...recorded };
   if (decided.outcome !== 'approved') return { ...bare(decided.outcome, decided.reason), ...recorded };
 
-  let signing: Awaited<ReturnType<typeof signForDecision>>;
+  let signing: SignResult;
   try {
     signing = await signForDecision({ db, ownerId, decisionId, payment, masterSecretHex: args.secrets.masterSecretHex, chain: deps.chain, now: deps.now() });
   } catch (error) {
@@ -256,7 +312,7 @@ export async function paidFetch(args: PaidFetchArgs): Promise<PaidFetchResult> {
     throw error;
   }
   if ('refusal' in signing) {
-    const refusal = SIGN_REFUSALS[signing.refusal];
+    const refusal = signRefusal(signing, payment.amount);
     await closeDecision(db, ownerId, decisionId, refusal.status);
     return { ...bare(refusal.outcome, refusal.reason), ...recorded };
   }
@@ -296,7 +352,7 @@ export async function paidFetch(args: PaidFetchArgs): Promise<PaidFetchResult> {
     await recordOutcome({ db, ownerId, decisionId, delivered: false, delegatePublicKeyHex: delegate.publicKeyHex, now: deps.now() });
   }
 
-  const paidText = `Paid ${shortUsdc(payment.amount)} USDC to ${hostLabel(payment.sellerHost)}`;
+  const paidText = `Paid ${formatUsdc(payment.amount)} USDC to ${hostLabel(payment.sellerHost)}`;
   return {
     outcome: 'paid',
     ...recorded,
