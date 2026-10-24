@@ -1,6 +1,7 @@
 // Covers: safeFetch's URL rules, the public-address check on every resolved address,
 // pinning the connection to the checked address, refusal of redirects, the size cap,
-// the timeout (on the lookup and on a silent server), the headers sent and returned,
+// the timeout (on the lookup and on a silent server), the per-call timeout's range and
+// that it replaces the default, the headers sent and returned,
 // and two live requests: a real seller through the real resolver, and the same seller
 // pinned to the wrong address, which TLS must refuse.
 // Does NOT cover: DNS answers that change between two lookups (safeFetch looks up
@@ -97,6 +98,20 @@ describe('safeFetch URL rules', () => {
       const error = await failureOf(safeFetch('https://seller.example/', { method: 'GET', headers }, { resolve: resolveToPublic }));
       expect(error.code).toBe('BAD_URL');
     }
+  });
+
+  it.each([
+    ['0', 0],
+    ['999', 999],
+    ['one above the paid maximum', LIMITS.netPaidTimeoutMaxMs + 1],
+    ['NaN', Number.NaN],
+  ])('refuses a timeout of %s before any lookup', async (_label, timeoutMs) => {
+    let lookups = 0;
+    const error = await failureOf(
+      safeFetch('https://seller.example/', { method: 'GET', timeoutMs }, { resolve: async () => [String(++lookups)] }),
+    );
+    expect(error.code).toBe('BAD_URL');
+    expect(lookups).toBe(0);
   });
 });
 
@@ -248,6 +263,17 @@ describe('safeFetch against a local server', () => {
     } finally {
       hooks.timeoutOverrideMs = undefined;
     }
+  });
+
+  it('uses the per-call timeout instead of the default when one is given', async () => {
+    const started = Date.now();
+    const error = await failureOf(
+      safeFetch('https://seller.example/silent', { method: 'GET', timeoutMs: LIMITS.netTimeoutMinMs }, { resolve: resolveToPublic }),
+    );
+    const elapsed = Date.now() - started;
+    expect(error.code).toBe('TIMEOUT');
+    expect(elapsed).toBeGreaterThanOrEqual(LIMITS.netTimeoutMinMs - 50);
+    expect(elapsed).toBeLessThan(LIMITS.netTimeoutMs);
   });
 });
 

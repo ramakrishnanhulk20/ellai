@@ -26,6 +26,8 @@ export interface SafeRequest {
   method: 'GET' | 'POST';
   headers?: Record<string, string>;
   body?: string;
+  /** Whole-call ceiling, within [LIMITS.netTimeoutMinMs, LIMITS.netPaidTimeoutMaxMs]. Defaults to LIMITS.netTimeoutMs. */
+  timeoutMs?: number;
 }
 
 export interface SafeResponse {
@@ -82,6 +84,15 @@ function parseSellerUrl(raw: string): SellerTarget {
   }
   url.hash = '';
   return { href: url.href, hostname };
+}
+
+function requestTimeoutMs(timeoutMs: number | undefined): number {
+  if (timeoutMs === undefined) return LIMITS.netTimeoutMs;
+  // Written so NaN and anything that is not a number fail both comparisons and are refused.
+  if (typeof timeoutMs === 'number' && timeoutMs >= LIMITS.netTimeoutMinMs && timeoutMs <= LIMITS.netPaidTimeoutMaxMs) {
+    return timeoutMs;
+  }
+  throw new NetError('BAD_URL', 'Request timeout is outside the allowed range');
 }
 
 function checkRequestHeaders(headers: Record<string, string> | undefined): void {
@@ -164,19 +175,22 @@ async function readCapped(body: AsyncIterable<Buffer>): Promise<string> {
  * no user name or password). The host is resolved once; every address must be public
  * unicast, and the connection is pinned to the first of them while TLS still checks the
  * certificate against the host name. Redirects are refused, not followed. The whole
- * call, lookup included, is bounded by LIMITS.netTimeoutMs, and the body by
- * LIMITS.netMaxResponseBytes. Only the headers passed in are sent: no cookies, no
- * credentials, and never a Host or Cookie header.
+ * call, lookup included, is bounded by init.timeoutMs, which must lie within
+ * [LIMITS.netTimeoutMinMs, LIMITS.netPaidTimeoutMaxMs] and defaults to LIMITS.netTimeoutMs,
+ * and the body by LIMITS.netMaxResponseBytes. Only the headers passed in are sent: no
+ * cookies, no credentials, and never a Host or Cookie header.
  *
- * Throws NetError: BAD_URL, NOT_PUBLIC, REDIRECT, TIMEOUT, TOO_LARGE or NETWORK.
+ * Throws NetError: BAD_URL (also for a timeout outside its range), NOT_PUBLIC, REDIRECT,
+ * TIMEOUT, TOO_LARGE or NETWORK.
  */
 export async function safeFetch(url: string, init: SafeRequest, deps: SafeFetchDeps = {}): Promise<SafeResponse> {
   const target = parseSellerUrl(url);
   checkRequestHeaders(init.headers);
+  const timeoutMs = requestTimeoutMs(init.timeoutMs);
   const resolve = deps.resolve ?? systemResolve;
 
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), LIMITS.netTimeoutMs);
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
   let agent: Agent | undefined;
   try {
     let addresses: string[];

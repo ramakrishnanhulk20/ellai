@@ -4,17 +4,25 @@
 //      30 days), read back from chain and checked: funder is the owner, spender the purse, coin USDC
 //   3. if refillDecision says so, the purse pulls one 0.10 USDC refill through the allowance,
 //      the gas wallet sponsoring the gas, after assertRefill passes
-//   4. the purse pays one live third-party seller 0.01 USDC with a gasless send, and the payment
-//      is verified on chain from the digest Ellai computed itself (C8)
+//   4. every payment an earlier run signed and did not see settle is read again by its digest:
+//      one that landed is verified, one that has not keeps counting until its epoch window
+//      has closed and the chain shows it never landed, and only then is released (C4). Then
+//      the purse pays at most one live third-party seller 0.01 USDC with a gasless send,
+//      skipping hosts that answered a paid call with an error while it can still land: the
+//      seller's documented request goes unpaid and must answer a 0.01 USDC 402, the same
+//      request goes again with the payment header and that seller's paid wait, and the
+//      payment is verified on chain by verifySettlement from the digest Ellai computed (C8)
 //   5. the final balances
 // Every stage is idempotent through scratchpad/slice-state-pay.json, written before anything
-// is sent and updated after, so a re-run never issues, refills or pays twice. At most 0.20 USDC
-// may leave the owner and at most 0.02 USDC may go to sellers; any stage that would pass
-// either stops the run. Every transaction is dry-run first and must move exactly the money
-// expected; a real transaction that moves anything else stops the run on the spot.
+// is sent and updated after, so a re-run never issues, refills or pays twice. Ceilings: at most
+// 0.20 USDC may leave the owner; in this order at most 0.02 USDC newly signed to sellers and at
+// most one new payment settled; across both orders at most 0.04 USDC signed to sellers and not
+// released. Anything that would pass one stops the run. Every transaction is dry-run first
+// and must move exactly the money expected; a real transaction that moves anything else
+// stops the run on the spot.
 // Prints digests, addresses, amounts and links. Never prints a key, a signature, signed
 // bytes or the X-PAYMENT value, and seller text is printed as inert, length-capped text.
-// Flags: --until=N stops after stage N; --again allows one more seller payment.
+// Flag: --until=N stops after stage N.
 import { randomInt } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { Ed25519Keypair } from '@mysten/sui/keypairs/ed25519';
@@ -39,14 +47,15 @@ import {
   ChainError,
   createChain,
   type ExecutionResult,
+  type TransactionResult,
 } from '../src/chain.js';
 import { type CanonicalPayment, ChallengeError, parseChallenge } from '../src/challenge.js';
 import { config } from '../src/config.js';
 import { canonicalSuiAddress, derivePurseKeypair } from '../src/keys.js';
 import { LIMITS } from '../src/limits.js';
-import { NetError, safeFetch } from '../src/net.js';
-import { PaymentError, paymentHeader, signPayment } from '../src/payment.js';
-import { KNOWN_SELLERS } from '../src/sellers.js';
+import { NetError, type SafeRequest, safeFetch } from '../src/net.js';
+import { PaymentError, paymentHeader, signPayment, verifySettlement } from '../src/payment.js';
+import { KNOWN_SELLERS, type Seller } from '../src/sellers.js';
 import { USDC_DECIMALS, USDC_TYPE_MAINNET } from '../src/usdc.js';
 
 const STATE_FILE = new URL('../../../scratchpad/slice-state-pay.json', import.meta.url);
@@ -61,9 +70,17 @@ const SLICE_PERIOD_MS = BigInt(DAY_MS);
 const SLICE_PERIOD_LIMIT_ATOMIC = 500_000n;
 const SLICE_EXPIRY_MS = 30 * DAY_MS;
 const SELLER_PRICE_ATOMIC = 10_000n;
-// Ceilings for this order alone, on top of the allowance's own caps.
+// The order the payments signed by this run belong to. The ceilings below are its own.
+const THIS_ORDER = 'WO-3c';
+// Ceilings on top of the allowance's own caps.
 const MAX_OWNER_OUTFLOW_ATOMIC = 200_000n;
-const MAX_SELLER_PAID_ATOMIC = 20_000n;
+/** Signed to sellers in this order, released or not, so a release never buys another attempt. */
+const MAX_NEW_SIGNED_ATOMIC = 20_000n;
+/**
+ * Signed to sellers and not released, settled or not, across both orders (C4): the earlier
+ * order's 0.02 USDC ceiling plus this order's.
+ */
+const MAX_SELLER_COUNTED_ATOMIC = 40_000n;
 const BODY_EXCERPT_CHARS = 300;
 // Facts older than this are read again before a build, so a build never leans on a stale epoch.
 const FACTS_MAX_AGE_MS = 5 * 60_000;
@@ -104,7 +121,7 @@ const factsSchema = z.strictObject({
 
 // Holds digests, addresses, amounts and build facts only: nothing here can move money.
 const stateSchema = z.strictObject({
-  version: z.literal(1),
+  version: z.literal(2),
   owner: addressText,
   purse: addressText,
   gasWallet: addressText,
@@ -136,11 +153,16 @@ const stateSchema = z.strictObject({
   payments: z
     .array(
       z.strictObject({
-        status: z.enum(['signed', 'sent', 'verified', 'mismatch', 'unsettled']),
+        // signed, sent and unsettled are open: the bytes may still land. released means the
+        // window closed and the chain showed they never did.
+        status: z.enum(['signed', 'sent', 'verified', 'mismatch', 'unsettled', 'released']),
+        order: z.enum(['WO-3b', THIS_ORDER]),
         digest: digestText,
         sellerUrl: z.string().max(LIMITS.resourceMaxLength),
         recipient: addressText,
         amountAtomic: uintText,
+        /** The last epoch the signed bytes can land in. */
+        maxEpoch: uintText,
         sellerStatus: z.number().int().nullable(),
         verdict: z.string().max(300).nullable(),
         signedAtMs: z.number().int().nonnegative(),
@@ -149,10 +171,11 @@ const stateSchema = z.strictObject({
     .max(50),
 });
 type State = z.infer<typeof stateSchema>;
+type PaymentRecord = State['payments'][number];
 type FactsRecord = z.infer<typeof factsSchema>;
 
 function loadState(owner: string, purse: string, gasWallet: string): State {
-  if (!existsSync(STATE_FILE)) return { version: 1, owner, purse, gasWallet, issue: null, refills: [], payments: [] };
+  if (!existsSync(STATE_FILE)) return { version: 2, owner, purse, gasWallet, issue: null, refills: [], payments: [] };
   let parsed: unknown;
   try {
     parsed = JSON.parse(readFileSync(STATE_FILE, 'utf8'));
@@ -233,7 +256,6 @@ interface Run {
   tatum: Tatum;
   wallets: Wallets;
   state: State;
-  again: boolean;
   facts: { value: ChainFacts; readAtMs: number } | null;
   purseUsdc: bigint | null;
 }
@@ -581,90 +603,155 @@ function inertExcerpt(body: string, secrets: string[]): string {
     .join('');
 }
 
-/**
- * C8: verified only from the digest Ellai computed from the bytes it signed, a success, and
- * exactly two USDC changes: minus the canonical amount at the purse, plus it at the canonical
- * recipient. Addresses and coin types on both sides come out of the SDK normalisers.
- */
-function settlementMismatch(
-  changes: BalanceChange[],
-  status: 'success' | 'failure',
-  purse: string,
-  expected: { recipient: string; amount: bigint },
-): string | null {
-  if (status !== 'success') return 'the transaction failed on chain';
-  const usdcChanges = changes.filter((change) => change.coinType === USDC_TYPE_MAINNET);
-  const debits = usdcChanges.filter((change) => change.address === purse);
-  const credits = usdcChanges.filter((change) => change.address === expected.recipient);
-  if (debits.length !== 1 || debits[0]?.amount !== -expected.amount) return `the purse's USDC change is not -${usdc(expected.amount)}`;
-  if (credits.length !== 1 || credits[0]?.amount !== expected.amount) return `the recipient's USDC change is not +${usdc(expected.amount)}`;
-  if (usdcChanges.length !== 2) return 'another address had a USDC change';
-  return null;
-}
+const isOpen = (record: PaymentRecord) => record.status === 'signed' || record.status === 'sent' || record.status === 'unsettled';
+const sumAtomic = (records: PaymentRecord[]) => records.reduce((sum, record) => sum + BigInt(record.amountAtomic), 0n);
 
 /**
- * Reads the settlement of a recorded payment, at most `tries` times, and records the verdict.
- * The record holds the canonical recipient and amount. A mismatch always stops the run. A
- * payment still not on chain is recorded as unsettled; it stops the run only when stopIfUnsettled.
+ * The canonical payment a stored record was signed from, rebuilt from what the record keeps.
+ * verifySettlement reads only the recipient, amount, asset and network, and signPayment signs
+ * nothing but Sui Mainnet USDC in the t2000 dialect, so those hold for every record. The
+ * signing time stands in for the expiry and the challenge id is left empty, so the rebuilt
+ * payment could never be signed again.
  */
-async function verifyPayment(run: Run, record: State['payments'][number], tries: number, stopIfUnsettled: boolean): Promise<void> {
-  const { chain, tatum, wallets, state } = run;
-  const expected = { recipient: record.recipient, amount: BigInt(record.amountAtomic) };
-  for (let attempt = 0; attempt < tries; attempt++) {
-    await sleep(LIMITS.settlementPollIntervalMs);
-    let result;
-    try {
-      result = await tatum.read(() => chain.getTransactionResult(record.digest));
-    } catch (error) {
-      if (error instanceof ChainError && error.code === 'NOT_FOUND') continue;
-      throw error;
-    }
-    const mismatch = settlementMismatch(result.balanceChanges, result.status, wallets.purseAddress, expected);
-    record.status = mismatch === null ? 'verified' : 'mismatch';
-    record.verdict = mismatch;
-    saveState(state);
-    if (mismatch !== null) throw new Stop(`NOT VERIFIED: ${mismatch}. Digest ${record.digest}  ${txLink(record.digest)}`);
-    console.log(`  VERIFIED on chain through Tatum, digest computed by Ellai: ${record.digest}`);
-    console.log(`    purse     ${wallets.purseAddress}  -${usdc(expected.amount)}`);
-    console.log(`    recipient ${record.recipient}  +${usdc(expected.amount)}`);
-    console.log(`    no other USDC change; ${txLink(record.digest)}`);
-    return;
+function storedPayment(record: PaymentRecord): CanonicalPayment {
+  return {
+    dialect: 'x402-v1-t2000',
+    sellerUrl: record.sellerUrl,
+    sellerHost: new URL(record.sellerUrl).hostname,
+    recipient: record.recipient,
+    amount: BigInt(record.amountAtomic),
+    asset: USDC_TYPE_MAINNET,
+    network: 'sui:mainnet',
+    expiresAtMs: record.signedAtMs,
+    challengeId: null,
+    nonce: null,
+    minEpoch: null,
+    maxEpoch: BigInt(record.maxEpoch),
+    resource: null,
+  };
+}
+
+/** The settled transaction by the digest Ellai computed, or null while the chain does not have it. */
+async function readSettlement(run: Run, digest: string): Promise<TransactionResult | null> {
+  try {
+    return await run.tatum.read(() => run.chain.getTransactionResult(digest));
+  } catch (error) {
+    if (error instanceof ChainError && error.code === 'NOT_FOUND') return null;
+    throw error;
   }
-  record.status = 'unsettled';
-  record.verdict = `seller answered ${record.sellerStatus ?? 'nothing'}; not on chain when last read`;
-  saveState(state);
-  const message = `Payment ${record.digest} is not on chain after ${tries} read(s). It is never sent again, and it still counts against the seller ceiling.`;
-  if (stopIfUnsettled) throw new Stop(message);
-  console.log(`  ${message}`);
 }
 
-async function findSeller(
-  run: Run,
-  skipHosts: ReadonlySet<string>,
-): Promise<{ seller: (typeof KNOWN_SELLERS)[number]; payment: CanonicalPayment } | null> {
+/** C8 through verifySettlement. A payment that landed and is not exactly the approved one stops the run. */
+function recordVerdict(run: Run, record: PaymentRecord, result: TransactionResult, payment: CanonicalPayment): void {
+  const { wallets, state } = run;
+  const verdict = verifySettlement(result, payment, wallets.purseAddress);
+  record.status = verdict.verified ? 'verified' : 'mismatch';
+  record.verdict = verdict.verified ? null : verdict.reason;
+  saveState(state);
+  if (!verdict.verified) throw new Stop(`NOT VERIFIED: ${verdict.reason}. Digest ${record.digest}  ${txLink(record.digest)}`);
+  // After the check passed, these are the one debit and the one credit it found.
+  const change = (address: string) =>
+    result.balanceChanges.find((entry) => entry.address === address && entry.coinType === USDC_TYPE_MAINNET)?.amount ?? 0n;
+  const credit = change(record.recipient);
+  console.log(`  VERIFIED by verifySettlement, read through Tatum by the digest Ellai computed: ${record.digest}`);
+  console.log(`    purse     ${wallets.purseAddress}  ${usdc(change(wallets.purseAddress))}`);
+  console.log(`    recipient ${record.recipient}  ${credit > 0n ? '+' : ''}${usdc(credit)}`);
+  console.log(`    no other USDC change; ${txLink(record.digest)}`);
+}
+
+/**
+ * C4: every payment still open is read again by its digest. One that landed is verified.
+ * One that has not keeps counting while the chain's epoch is at or before its maxEpoch. Past
+ * it, the payment is released only if LIMITS.paymentReleaseReads further reads, all taken
+ * after the epoch read, still do not find it.
+ */
+async function recheckOpenPayments(run: Run): Promise<void> {
+  let epoch: bigint | null = null;
+  for (const record of run.state.payments.filter(isOpen)) {
+    const label = `${record.digest} (${record.order}, ${usdc(BigInt(record.amountAtomic))} to ${new URL(record.sellerUrl).hostname})`;
+    const landed = await readSettlement(run, record.digest);
+    if (landed !== null) {
+      console.log(`  ${label}: landed since it was last read`);
+      recordVerdict(run, record, landed, storedPayment(record));
+      continue;
+    }
+    epoch ??= await run.tatum.read(() => run.chain.getCurrentEpoch());
+    const maxEpoch = BigInt(record.maxEpoch);
+    if (epoch <= maxEpoch) {
+      record.status = 'unsettled';
+      saveState(run.state);
+      console.log(`  ${label}: not on chain. It can still land until epoch ${maxEpoch} ends and the chain is in epoch ${epoch}, so it still counts.`);
+      continue;
+    }
+    let late: TransactionResult | null = null;
+    for (let read = 0; read < LIMITS.paymentReleaseReads && late === null; read++) {
+      await sleep(LIMITS.settlementPollIntervalMs);
+      late = await readSettlement(run, record.digest);
+    }
+    if (late !== null) {
+      console.log(`  ${label}: landed at the end of its window`);
+      recordVerdict(run, record, late, storedPayment(record));
+      continue;
+    }
+    record.status = 'released';
+    record.verdict = `never landed; window closed after epoch ${maxEpoch}, released in epoch ${epoch}`;
+    saveState(run.state);
+    console.log(`  ${label}: released. Its window closed after epoch ${maxEpoch} and the chain shows it never landed.`);
+  }
+}
+
+/** The seller's documented request: its method, its content type and body when it has one, then any extra headers. */
+function sellerRequest(seller: Seller, extraHeaders: Record<string, string>, timeoutMs?: number): SafeRequest {
+  return {
+    method: seller.method,
+    headers: { ...(seller.contentType === undefined ? {} : { 'content-type': seller.contentType }), ...extraHeaders },
+    ...(seller.body === undefined ? {} : { body: seller.body }),
+    ...(timeoutMs === undefined ? {} : { timeoutMs }),
+  };
+}
+
+const sellerLabel = (seller: Seller) => {
+  const { hostname, pathname } = new URL(seller.url);
+  return `${seller.method} ${hostname}${pathname}`;
+};
+
+/**
+ * Hosts whose paid route answered one of Ellai's payments with anything but success while that
+ * payment can still land. Their route failed after taking a valid header, so they are not paid
+ * again until those payments are released. A request Ellai itself cut short puts no host here.
+ * Hosts on both sides come from the same URL parser.
+ */
+function hostsThatFailedPaidCalls(state: State): Set<string> {
+  const failed = state.payments.filter(
+    (record) => isOpen(record) && record.sellerStatus !== null && (record.sellerStatus < 200 || record.sellerStatus >= 300),
+  );
+  return new Set(failed.map((record) => new URL(record.sellerUrl).hostname));
+}
+
+/** The first seller, in KNOWN_SELLERS order, whose unpaid documented request answers a 402 that parses to 0.01 USDC. */
+async function findSeller(run: Run): Promise<{ seller: Seller; payment: CanonicalPayment } | null> {
+  const failedHosts = hostsThatFailedPaidCalls(run.state);
   for (const seller of KNOWN_SELLERS) {
-    const { hostname, pathname } = new URL(seller.url);
-    if (skipHosts.has(hostname)) {
-      console.log(`  ${seller.method} ${hostname}${pathname}: skipped, this host took a payment header in this order without a verified settlement`);
+    if (failedHosts.has(new URL(seller.url).hostname)) {
+      console.log(`  ${sellerLabel(seller)}: skipped, this host answered a paid call from Ellai with an error and that payment can still land`);
       continue;
     }
     // Reserved before the challenge is fetched, so a pacing wait never eats its validity window.
     await run.tatum.reserve(2);
     try {
-      const response = await safeFetch(seller.url, {
-        method: seller.method,
-        ...(seller.body === undefined ? {} : { headers: { 'content-type': 'application/json' }, body: seller.body }),
-      });
+      // Unpaid, so the default timeout: a 402 comes back before the seller does any work.
+      const response = await safeFetch(seller.url, sellerRequest(seller, {}));
       const payment = parseChallenge(response, Date.now());
       if (payment.amount !== SELLER_PRICE_ATOMIC) {
-        console.log(`  ${seller.method} ${hostname}${pathname}: asks ${usdc(payment.amount)}, not ${usdc(SELLER_PRICE_ATOMIC)}; next seller`);
+        console.log(`  unpaid ${sellerLabel(seller)}: asks ${usdc(payment.amount)}, not ${usdc(SELLER_PRICE_ATOMIC)}; next seller`);
         continue;
       }
-      console.log(`  ${seller.method} ${hostname}${pathname}: 402 for ${usdc(payment.amount)} to ${payment.recipient}`);
+      console.log(`  unpaid ${sellerLabel(seller)}, ${seller.contentType ?? 'no'} body: HTTP ${response.status}, ${usdc(payment.amount)} to ${payment.recipient}`);
+      console.log(`    ${seller.note}`);
       return { seller, payment };
     } catch (error) {
       const label = error instanceof NetError || error instanceof ChallengeError ? error.code : 'UNEXPECTED';
-      console.log(`  ${seller.method} ${hostname}${pathname}: refused (${label}); next seller`);
+      console.log(`  unpaid ${sellerLabel(seller)}: refused (${label}); next seller`);
     }
   }
   return null;
@@ -672,46 +759,44 @@ async function findSeller(
 
 async function stagePayment(run: Run): Promise<void> {
   const { state, wallets, chain } = run;
-  for (const record of state.payments.filter((entry) => entry.status === 'signed' || entry.status === 'sent' || entry.status === 'unsettled')) {
-    console.log(`  Checking the payment an earlier run signed: ${record.digest} (it is never sent again)`);
-    // One read for a payment already polled to its limit; the full poll for one a run never finished.
-    await verifyPayment(run, record, record.status === 'unsettled' ? 1 : LIMITS.settlementPollTries, false);
-  }
+  await recheckOpenPayments(run);
   const mismatched = state.payments.find((entry) => entry.status === 'mismatch');
   if (mismatched) {
-    throw new Stop(`Payment ${mismatched.digest} settled but did not verify (${mismatched.verdict}). No more payments until a person reviews it.`);
+    throw new Stop(`Payment ${mismatched.digest} landed but did not verify (${mismatched.verdict}). No more payments until a person reviews it.`);
   }
-  const verified = state.payments.find((entry) => entry.status === 'verified');
-  const unverified = state.payments.find((entry) => entry.status === 'unsettled');
-  if (verified && !run.again) {
-    console.log(`  Already paid and verified, nothing sent: ${verified.digest}  ${txLink(verified.digest)}`);
-    console.log('  (pass --again to pay one more 0.01 USDC)');
+  const ours = state.payments.filter((entry) => entry.order === THIS_ORDER);
+  const settled = ours.find((entry) => entry.status === 'verified');
+  if (settled) {
+    console.log(`  This order's one new payment is settled and verified, nothing sent: ${settled.digest}  ${txLink(settled.digest)}`);
     return;
   }
-  // C8: a payment whose check could not finish pauses paying until a person has looked and passes --again.
-  if (unverified && !run.again) {
-    console.log(`  Payments paused: ${unverified.digest} could not be verified (${unverified.verdict}).`);
-    console.log('  Nothing sent. After reviewing it, pass --again to pay one more 0.01 USDC.');
-    return;
-  }
+
   // Everything signed counts, settled or not, because signed bytes can still land.
-  const signedTotal = state.payments.reduce((sum, entry) => sum + BigInt(entry.amountAtomic), 0n) + SELLER_PRICE_ATOMIC;
-  if (signedTotal > MAX_SELLER_PAID_ATOMIC) {
-    throw new Stop(`Another payment would bring sellers to ${usdc(signedTotal)}, over the ${usdc(MAX_SELLER_PAID_ATOMIC)} ceiling. Stopping.`);
+  const newSigned = sumAtomic(ours) + SELLER_PRICE_ATOMIC;
+  if (newSigned > MAX_NEW_SIGNED_ATOMIC) {
+    throw new Stop(`Another payment would bring this order's signed total to ${usdc(newSigned)}, over the ${usdc(MAX_NEW_SIGNED_ATOMIC)} ceiling. Stopping.`);
   }
+  const counted = sumAtomic(state.payments.filter((entry) => entry.status !== 'released')) + SELLER_PRICE_ATOMIC;
+  if (counted > MAX_SELLER_COUNTED_ATOMIC) {
+    throw new Stop(`Another payment would bring sellers' unreleased total to ${usdc(counted)}, over the ${usdc(MAX_SELLER_COUNTED_ATOMIC)} ceiling. Stopping.`);
+  }
+  console.log(
+    `  Ceilings hold with one more payment: ${usdc(newSigned)} of ${usdc(MAX_NEW_SIGNED_ATOMIC)} newly signed in this order, ` +
+      `${usdc(counted)} of ${usdc(MAX_SELLER_COUNTED_ATOMIC)} signed and not released`,
+  );
   if (run.purseUsdc === null || run.purseUsdc < SELLER_PRICE_ATOMIC) {
     throw new Stop(`The purse holds ${run.purseUsdc === null ? 'an unknown amount' : usdc(run.purseUsdc)}, less than one payment. Nothing was paid.`);
   }
 
-  const failedHosts = new Set(state.payments.filter((entry) => entry.status !== 'verified').map((entry) => new URL(entry.sellerUrl).hostname));
-  const found = await findSeller(run, failedHosts);
-  if (found === null) throw new Stop('No known seller answered a 0.01 USDC challenge. Nothing was paid.');
+  const found = await findSeller(run);
+  if (found === null) throw new Stop('No known seller answered its documented request with a 0.01 USDC challenge. Nothing was paid.');
   const { seller, payment } = found;
+  if (payment.maxEpoch === null) throw new Stop('The challenge carries no epoch window. Nothing was signed.');
 
   // Both requests below use the two slots findSeller reserved before fetching the challenge.
   const epoch = await chain.getCurrentEpoch();
   const signed = await signPayment(payment, wallets.purse, Date.now(), epoch);
-  console.log(`  signed from the purse; digest ${signed.digest} (computed from the signed bytes)`);
+  console.log(`  signed from the purse; digest ${signed.digest} (computed from the signed bytes), valid until epoch ${payment.maxEpoch} ends`);
   await dryRun(
     run,
     'payment',
@@ -722,12 +807,14 @@ async function stagePayment(run: Run): Promise<void> {
     ],
     true,
   );
-  const record: State['payments'][number] = {
+  const record: PaymentRecord = {
     status: 'signed',
+    order: THIS_ORDER,
     digest: signed.digest,
     sellerUrl: payment.sellerUrl,
     recipient: payment.recipient,
     amountAtomic: String(payment.amount),
+    maxEpoch: String(payment.maxEpoch),
     sellerStatus: null,
     verdict: null,
     signedAtMs: Date.now(),
@@ -737,40 +824,69 @@ async function stagePayment(run: Run): Promise<void> {
 
   const header = paymentHeader(payment, signed);
   let bodyText = '';
+  let failure = '';
+  console.log(`  paid ${sellerLabel(seller)}, same body and content type plus the payment header, waiting up to ${seller.paidTimeoutMs / 1_000} s`);
   try {
-    const response = await safeFetch(seller.url, {
-      method: seller.method,
-      headers: { ...(seller.body === undefined ? {} : { 'content-type': 'application/json' }), [header.name]: header.value },
-      ...(seller.body === undefined ? {} : { body: seller.body }),
-    });
+    const response = await safeFetch(seller.url, sellerRequest(seller, { [header.name]: header.value }, seller.paidTimeoutMs));
     record.sellerStatus = response.status;
     bodyText = response.bodyText;
   } catch (error) {
-    console.log(`  the paid request failed (${error instanceof NetError ? error.code : 'UNEXPECTED'}); checking the chain anyway`);
+    failure = error instanceof NetError ? error.code : 'UNEXPECTED';
   }
   record.status = 'sent';
   saveState(state);
-  if (record.sellerStatus !== null) {
+  if (record.sellerStatus === null) {
+    console.log(`  the paid request failed (${failure}); checking the chain anyway`);
+  } else {
     console.log(`  seller answered HTTP ${record.sellerStatus}`);
-    console.log(`  body, first ${BODY_EXCERPT_CHARS} characters as plain text: ${inertExcerpt(bodyText, [header.value, signed.signature, signed.txBytesBase64])}`);
+    console.log(`  answer, first ${BODY_EXCERPT_CHARS} characters as plain text: ${inertExcerpt(bodyText, [header.value, signed.signature, signed.txBytesBase64])}`);
   }
-  await verifyPayment(run, record, LIMITS.settlementPollTries, true);
+  const answeredOk = record.sellerStatus !== null && record.sellerStatus >= 200 && record.sellerStatus < 300;
+
+  // recordVerdict stops the run on a mismatch, so landing here means verified.
+  let verified = false;
+  for (let attempt = 0; attempt < LIMITS.settlementPollTries && !verified; attempt++) {
+    await sleep(LIMITS.settlementPollIntervalMs);
+    const result = await readSettlement(run, record.digest);
+    if (result !== null) {
+      recordVerdict(run, record, result, payment);
+      verified = true;
+    }
+  }
+  if (!verified) {
+    record.status = 'unsettled';
+    record.verdict = `seller answered ${record.sellerStatus ?? 'nothing'}; not on chain when last read`;
+    saveState(state);
+  }
+  if (!answeredOk && verified) {
+    throw new Stop(`Payment ${record.digest} settled and verified, but the seller answered ${record.sellerStatus ?? failure}, not success. Stopping.`);
+  }
+  if (!answeredOk) {
+    throw new Stop(
+      `The seller did not answer with success (${record.sellerStatus ?? failure}) and payment ${record.digest} is not on chain. ` +
+        `No other seller is tried until the chain shows it never landed after epoch ${record.maxEpoch}.`,
+    );
+  }
+  if (!verified) {
+    throw new Stop(
+      `Payment ${record.digest} is not on chain after ${LIMITS.settlementPollTries} reads. It is never sent again and keeps counting ` +
+        `until its window closes after epoch ${record.maxEpoch} and the chain shows it never landed.`,
+    );
+  }
 }
 
-function parseFlags(argv: string[]): { until: number; again: boolean } {
+function parseFlags(argv: string[]): { until: number } {
   let until = 5;
-  let again = false;
   for (const flag of argv) {
     const match = /^--until=([1-5])$/.exec(flag);
     if (match?.[1]) until = Number(match[1]);
-    else if (flag === '--again') again = true;
-    else throw new Stop('Unknown flag. Use --until=N (1 to 5) and --again.');
+    else throw new Stop('Unknown flag. Use --until=N (1 to 5).');
   }
-  return { until, again };
+  return { until };
 }
 
 async function main(): Promise<void> {
-  const { until, again } = parseFlags(process.argv.slice(2));
+  const { until } = parseFlags(process.argv.slice(2));
   const owner = Ed25519Keypair.fromSecretKey(config.OWNER_TEST_PRIVATE_KEY);
   const gas = Ed25519Keypair.fromSecretKey(config.GAS_PRIVATE_KEY);
   const ownerAddress = canonicalSuiAddress(owner.toSuiAddress());
@@ -786,7 +902,7 @@ async function main(): Promise<void> {
   const state = loadState(wallets.ownerAddress, wallets.purseAddress, wallets.gasAddress);
   const anonymous = !config.TATUM_API_KEY;
   const chain = createChain({ apiKey: config.TATUM_API_KEY });
-  const run: Run = { chain, tatum: new Tatum(anonymous), wallets, state, again, facts: null, purseUsdc: null };
+  const run: Run = { chain, tatum: new Tatum(anonymous), wallets, state, facts: null, purseUsdc: null };
 
   console.log('Ellai money path on Sui Mainnet, real USDC, small and capped.');
   console.log(`Tatum API key used: ${anonymous ? `no (anonymous, paced to ${LIMITS.tatumAnonymousRequestsPerMinute} a minute)` : 'yes'}`);
@@ -809,10 +925,16 @@ async function main(): Promise<void> {
   } finally {
     chain.close();
     const outflow = state.refills.filter((entry) => entry.status === 'landed').reduce((sum, entry) => sum + BigInt(entry.amountAtomic), 0n);
-    const paid = state.payments.filter((entry) => entry.status === 'verified').reduce((sum, entry) => sum + BigInt(entry.amountAtomic), 0n);
+    const paid = sumAtomic(state.payments.filter((entry) => entry.status === 'verified'));
+    const newSigned = sumAtomic(state.payments.filter((entry) => entry.order === THIS_ORDER));
+    const counted = sumAtomic(state.payments.filter((entry) => entry.status !== 'released'));
     const ownerGas = BigInt(state.issue?.gasMist ?? '0');
     const sponsorGas = state.refills.reduce((sum, entry) => sum + BigInt(entry.gasMist ?? '0'), 0n);
-    console.log(`\nIn this order so far: ${usdc(outflow)} left the owner (ceiling ${usdc(MAX_OWNER_OUTFLOW_ATOMIC)}), ${usdc(paid)} paid to sellers and verified (ceiling ${usdc(MAX_SELLER_PAID_ATOMIC)}).`);
+    console.log(`\nSo far: ${usdc(outflow)} left the owner (ceiling ${usdc(MAX_OWNER_OUTFLOW_ATOMIC)}); ${usdc(paid)} paid to sellers and verified.`);
+    console.log(
+      `Sellers: ${usdc(newSigned)} newly signed in ${THIS_ORDER} (ceiling ${usdc(MAX_NEW_SIGNED_ATOMIC)}), ` +
+        `${usdc(counted)} signed and not released across both orders (ceiling ${usdc(MAX_SELLER_COUNTED_ATOMIC)}).`,
+    );
     console.log(`Gas so far: owner ${sui(ownerGas)}, gas wallet ${sui(sponsorGas)}.`);
   }
 }

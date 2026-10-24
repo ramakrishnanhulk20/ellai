@@ -31,6 +31,17 @@ export const LIMITS = {
   tatumAnonymousRequestsPerMinute: 5,
   /** Ceiling on one request to a seller, from DNS lookup to the last body byte. */
   netTimeoutMs: 10_000,
+  /** Shortest wait a caller may ask safeFetch for. Anything shorter cannot finish a TLS handshake reliably. */
+  netTimeoutMinMs: 1_000,
+  /**
+   * Longest wait a caller may ask safeFetch for. A t2000 seller runs its handler before it
+   * settles, so cutting a paid request short means the seller never takes the payment.
+   */
+  netPaidTimeoutMaxMs: 60_000,
+  /** Wait on a paid request to a seller whose answer is a lookup. */
+  sellerLookupPaidTimeoutMs: 15_000,
+  /** Wait on a paid request to a seller that plans its answer with a language model, or does not say how it answers. */
+  sellerSlowPaidTimeoutMs: 60_000,
   /** Bytes read from a seller's response before the request is abandoned. */
   netMaxResponseBytes: 262_144,
   /** Largest challenge body or header that is parsed. Live 402 bodies are under 1 KB. */
@@ -76,6 +87,12 @@ export const LIMITS = {
   settlementPollTries: 20,
   /** Wait between settlement reads. */
   settlementPollIntervalMs: 3_000,
+  /**
+   * Reads, settlementPollIntervalMs apart, that must all miss a signed payment after its
+   * epoch window has closed before it is released, so one lagging node cannot release a
+   * payment that landed at the very end of its window.
+   */
+  paymentReleaseReads: 3,
   /** Reads of an object or a balance after a transaction lands, while Tatum's nodes catch up, before it counts as missing. */
   chainReadAfterWriteTries: 6,
   /** Wait between those reads. */

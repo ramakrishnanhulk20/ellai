@@ -1,10 +1,12 @@
 // Covers: building the t2000 gasless USDC send from a canonical payment parsed out of a
 // saved live 402, offline and deterministically; assertPlainUsdcSend refusing every
 // hand-built variant the work order names; signPayment's expiry and epoch refusals and
-// what it signs; and t2000's own seller verifier, run offline, accepting Ellai's header
-// (byte for byte the header t2000's payer makes) and rejecting tampered bytes.
+// what it signs; t2000's own seller verifier, run offline, accepting Ellai's header
+// (byte for byte the header t2000's payer makes) and rejecting tampered bytes; and
+// verifySettlement's rule on hand-made balance changes.
 // Does NOT cover: the live epoch or a dry run through Tatum (probe:pay does both),
-// settlement, whether the seller is honest, multisig payers, or x402 v2 payments.
+// reading a real settlement from chain (prove:pay does that), whether the seller is
+// honest, multisig payers, or x402 v2 payments.
 import { readFileSync } from 'node:fs';
 import { Ed25519Keypair } from '@mysten/sui/keypairs/ed25519';
 import { Transaction, TransactionDataBuilder } from '@mysten/sui/transactions';
@@ -19,6 +21,7 @@ import {
   type X402Requirements,
 } from '@t2000/sui-x402';
 import { describe, expect, it } from 'vitest';
+import type { BalanceChange } from '../src/chain.js';
 import { type CanonicalPayment, parseChallenge } from '../src/challenge.js';
 import type { SafeResponse } from '../src/net.js';
 import {
@@ -27,6 +30,7 @@ import {
   PaymentError,
   paymentHeader,
   signPayment,
+  verifySettlement,
 } from '../src/payment.js';
 import { USDC_TYPE_MAINNET } from '../src/usdc.js';
 
@@ -237,5 +241,46 @@ describe('paymentHeader', () => {
     const other = await signPayment(paymentFrom('live', 'jp-task-policy-classify'), payer, NOW, EPOCH_AT_CAPTURE);
     const mixed = { ...signed, digest: other.digest };
     expect((await refusalOf(Promise.resolve().then(() => paymentHeader(payment, mixed)))).code).toBe('MISMATCH');
+  });
+});
+
+describe('verifySettlement', () => {
+  const PAYER = payer.toSuiAddress();
+  const debit: BalanceChange = { address: PAYER, coinType: USDC_TYPE_MAINNET, amount: -payment.amount };
+  const credit: BalanceChange = { address: payment.recipient, coinType: USDC_TYPE_MAINNET, amount: payment.amount };
+  type Settled = Parameters<typeof verifySettlement>[0];
+  const success = (balanceChanges: BalanceChange[]): Settled => ({ status: 'success', balanceChanges });
+
+  it('verifies exactly one debit at the payer and one credit at the recipient, in USDC', () => {
+    expect(verifySettlement(success([debit, credit]), payment, PAYER)).toEqual({ verified: true });
+  });
+
+  it.each<[string, Settled, string]>([
+    ['a failed status', { status: 'failure', balanceChanges: [debit, credit] }, 'the transaction did not succeed on chain'],
+    ['a missing payer debit', success([credit]), "the payer's USDC change is not minus the approved amount"],
+    ['one unit too little taken from the payer', success([{ ...debit, amount: debit.amount + 1n }, credit]), "the payer's USDC change is not minus the approved amount"],
+    ['one unit too much taken from the payer', success([{ ...debit, amount: debit.amount - 1n }, credit]), "the payer's USDC change is not minus the approved amount"],
+    ['one unit too little credited to the recipient', success([debit, { ...credit, amount: credit.amount - 1n }]), "the recipient's USDC change is not plus the approved amount"],
+    ['one unit too much credited to the recipient', success([debit, { ...credit, amount: credit.amount + 1n }]), "the recipient's USDC change is not plus the approved amount"],
+    ['a third USDC change', success([debit, credit, { address: ATTACKER, coinType: USDC_TYPE_MAINNET, amount: 1n }]), 'another address has a USDC change'],
+    ['the same amounts in a different coin', success([{ ...debit, coinType: SUI }, { ...credit, coinType: SUI }]), "the payer's USDC change is not minus the approved amount"],
+  ])('refuses %s', (_name, result, reason) => {
+    expect(verifySettlement(result, payment, PAYER)).toEqual({ verified: false, reason });
+  });
+
+  it('accepts the short and the long form of the same address, on either side', () => {
+    const longPayer = `0x${'0'.repeat(58)}12abcd`;
+    const longRecipient = `0x${'0'.repeat(60)}beef`;
+    const usdcUpperCase = USDC_TYPE_MAINNET.replace(/^0x[0-9a-f]+/, (address) => `0x${address.slice(2).toUpperCase()}`);
+    const longChanges = success([
+      { address: longPayer, coinType: USDC_TYPE_MAINNET, amount: -payment.amount },
+      { address: longRecipient, coinType: USDC_TYPE_MAINNET, amount: payment.amount },
+    ]);
+    const shortChanges = success([
+      { address: '0x12ABCD', coinType: usdcUpperCase, amount: -payment.amount },
+      { address: '0xbeef', coinType: usdcUpperCase, amount: payment.amount },
+    ]);
+    expect(verifySettlement(shortChanges, { ...payment, recipient: longRecipient }, longPayer)).toEqual({ verified: true });
+    expect(verifySettlement(longChanges, { ...payment, recipient: '0xBEEF', asset: usdcUpperCase }, '0x12abcd')).toEqual({ verified: true });
   });
 });

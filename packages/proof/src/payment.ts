@@ -3,6 +3,7 @@ import { bcs } from '@mysten/sui/bcs';
 import type { Ed25519Keypair } from '@mysten/sui/keypairs/ed25519';
 import { Transaction, TransactionDataBuilder } from '@mysten/sui/transactions';
 import { SUI_ADDRESS_LENGTH, fromBase64, normalizeStructTag, normalizeSuiAddress, toBase64 } from '@mysten/sui/utils';
+import type { BalanceChange } from './chain.js';
 import type { CanonicalPayment } from './challenge.js';
 import { canonicalSuiAddress } from './keys.js';
 import { LIMITS } from './limits.js';
@@ -344,4 +345,71 @@ export function paymentHeader(payment: CanonicalPayment, signed: SignedPayment):
     },
   };
   return { name: X402_PAYMENT_HEADER, value: toBase64(new TextEncoder().encode(JSON.stringify(body))) };
+}
+
+/** canonicalSuiAddress, the address normaliser C3 uses everywhere, as null instead of a throw. */
+function settlementAddress(value: unknown): string | null {
+  try {
+    return typeof value === 'string' ? canonicalSuiAddress(value) : null;
+  } catch {
+    return null;
+  }
+}
+
+function settlementCoinType(value: unknown): string | null {
+  try {
+    return typeof value === 'string' ? normalizeStructTag(value) : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * C8: whether a transaction read from chain is exactly the approved payment. Verified only
+ * when the status is success, the payer's USDC change is exactly minus payment.amount, the
+ * recipient's is exactly plus payment.amount, and no other address has a USDC change.
+ * The payment must itself be Sui Mainnet USDC with a positive amount. Every address and
+ * coin type, on both sides, goes through the same SDK normalisers as C3, so the short and
+ * long spellings of one address compare equal. Changes in other coins are not judged.
+ * Pure and offline: the caller reads the result by the digest Ellai computed from the
+ * bytes it signed, never a digest a seller or an agent reported.
+ * Never throws. Each reason is fixed text with no value from the chain or the seller, so
+ * it is safe to log and to store.
+ */
+export function verifySettlement(
+  result: { status: 'success' | 'failure'; balanceChanges: BalanceChange[] },
+  payment: CanonicalPayment,
+  payer: string,
+): { verified: true } | { verified: false; reason: string } {
+  const refuse = (reason: string) => ({ verified: false as const, reason });
+  if (result?.status !== 'success') return refuse('the transaction did not succeed on chain');
+  if (!Array.isArray(result.balanceChanges)) return refuse('the balance changes are missing');
+  const payerAddress = settlementAddress(payer);
+  if (payerAddress === null) return refuse('the payer is not a Sui address');
+  const recipient = settlementAddress(payment?.recipient);
+  if (recipient === null) return refuse('the approved recipient is not a Sui address');
+  const asset = settlementCoinType(payment.asset);
+  if (asset !== USDC_TYPE_MAINNET) return refuse('the approved asset is not Sui Mainnet USDC');
+  if (payment.network !== 'sui:mainnet') return refuse('the approved payment is not on Sui Mainnet');
+  const amount = payment.amount;
+  if (typeof amount !== 'bigint' || amount <= 0n) return refuse('the approved amount is not a positive integer');
+
+  const moved: { address: string; amount: bigint }[] = [];
+  for (const change of result.balanceChanges) {
+    const coinType = settlementCoinType(change?.coinType);
+    // An unreadable coin type could be the asset spelled some way the parser rejects, so it fails closed.
+    if (coinType === null) return refuse('a balance change has an unreadable coin type');
+    if (coinType !== asset) continue;
+    const address = settlementAddress(change.address);
+    if (address === null || typeof change.amount !== 'bigint') return refuse('a USDC balance change is unreadable');
+    moved.push({ address, amount: change.amount });
+  }
+  const debits = moved.filter((change) => change.address === payerAddress);
+  if (debits.length !== 1 || debits[0]?.amount !== -amount) return refuse("the payer's USDC change is not minus the approved amount");
+  const credits = moved.filter((change) => change.address === recipient);
+  if (credits.length !== 1 || credits[0]?.amount !== amount) {
+    return refuse("the recipient's USDC change is not plus the approved amount");
+  }
+  if (moved.length !== 2) return refuse('another address has a USDC change');
+  return { verified: true };
 }
