@@ -8,7 +8,8 @@
     "db:generate": "drizzle-kit generate",
     "prove:loop": "tsx --env-file-if-exists=../../.env scripts/prove-memory-loop.ts",
     "prove:onboarding": "tsx --env-file-if-exists=../../.env scripts/prove-onboarding.ts",
-    "prove:flow": "tsx --env-file-if-exists=../../.env scripts/prove-pay-flow.ts"
+    "prove:flow": "tsx --env-file-if-exists=../../.env scripts/prove-pay-flow.ts",
+    "prove:seller": "tsx --env-file-if-exists=../../.env scripts/prove-seller.ts"
   },
   "dependencies": {
     "@electric-sql/pglite": "0.5.11",

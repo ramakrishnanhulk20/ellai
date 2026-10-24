@@ -20,6 +20,7 @@ function validEnv(): Env {
     SESSION_SECRET: randomBytes(32).toString('hex'),
     JOBS_SECRET: randomBytes(32).toString('hex'),
     APP_ORIGIN: 'https://ellai.example',
+    ELLAI_SELLER_PAYTO: '',
   };
 }
 
@@ -60,7 +61,18 @@ describe('loadServerEnv', () => {
     expect(parsed.TATUM_API_KEY).toBeUndefined();
     expect(parsed.ANTHROPIC_API_KEY).toBeUndefined();
     expect(parsed.APP_ORIGIN).toBe('https://ellai.example');
+    expect(parsed.ELLAI_SELLER_PAYTO).toBeUndefined();
     expect(Object.isFrozen(parsed)).toBe(true);
+  });
+
+  it('keeps ELLAI_SELLER_PAYTO as the normalised Sui address and refuses anything that cannot be paid', () => {
+    const long = `0x${'ab'.repeat(32)}`;
+    expect(loadServerEnv({ ...validEnv(), ELLAI_SELLER_PAYTO: long.toUpperCase().replace('0X', '0x') }).ELLAI_SELLER_PAYTO).toBe(long);
+    expect(loadServerEnv({ ...validEnv(), ELLAI_SELLER_PAYTO: '0x2' }).ELLAI_SELLER_PAYTO).toBe(`0x${'0'.repeat(63)}2`);
+    for (const bad of ['0x0', `0x${'0'.repeat(64)}`, '0x', `0x${'ab'.repeat(33)}`, '0xnot-hex', 'seller']) {
+      const error = errorFrom(() => loadServerEnv({ ...validEnv(), ELLAI_SELLER_PAYTO: bad }));
+      expect(error.message).toBe('Invalid environment variable: ELLAI_SELLER_PAYTO (malformed)');
+    }
   });
 
   it('accepts postgres URLs and a local file database', () => {
@@ -102,6 +114,7 @@ describe('loadServerEnv', () => {
       JOBS_SECRET: `${randomBytes(32).toString('hex')}a`,
       APP_ORIGIN: 'https://ellai.example/app?token=origin-secret',
       TATUM_API_KEY: 'tatum-key-that-must-stay-hidden',
+      ELLAI_SELLER_PAYTO: '0xseller-address-that-must-stay-hidden',
     };
     const error = errorFrom(() => loadServerEnv({ ...validEnv(), ...malformed }));
 

@@ -1,3 +1,4 @@
+import { canonicalSuiAddress } from '@ellai/core/keys';
 import { decodeSuiPrivateKey } from '@mysten/sui/cryptography';
 import { z } from 'zod';
 
@@ -58,6 +59,23 @@ function origin(allowLocalHttp: boolean) {
 
 const suiKey = z.string().startsWith('suiprivkey').refine(isEd25519SuiKey);
 
+// Money sent to the zero address is gone for good, and buyers refuse a challenge that names it.
+const ZERO_ADDRESS = canonicalSuiAddress('0x0');
+
+const payToAddress = z.string().transform((value, ctx) => {
+  let address: string;
+  try {
+    address = canonicalSuiAddress(value);
+  } catch {
+    address = ZERO_ADDRESS;
+  }
+  if (address === ZERO_ADDRESS) {
+    ctx.addIssue({ code: 'custom', message: 'not a Sui address that can be paid' });
+    return z.NEVER;
+  }
+  return address;
+});
+
 function envSchema(isLocal: boolean) {
   return z.object({
     DATABASE_URL: z.preprocess(blankIsMissing, z.string().refine((value) => isDatabaseUrl(value, isLocal))),
@@ -69,6 +87,7 @@ function envSchema(isLocal: boolean) {
     SESSION_SECRET: z.preprocess(blankIsMissing, z.string().regex(AT_LEAST_32_BYTES_HEX)),
     JOBS_SECRET: z.preprocess(blankIsMissing, z.string().regex(AT_LEAST_32_BYTES_HEX)),
     APP_ORIGIN: z.preprocess(blankIsMissing, origin(isLocal)),
+    ELLAI_SELLER_PAYTO: z.preprocess(blankIsMissing, payToAddress.optional()),
   });
 }
 
@@ -82,6 +101,8 @@ const VARIABLE_NAMES = Object.keys(envSchema(false).shape);
  * database only at all, and both only when NODE_ENV is "development" or "test". An unset
  * or unknown NODE_ENV counts as production, so a deploy that forgets to set it still
  * refuses an insecure origin and a database that would lose every payment record.
+ * ELLAI_SELLER_PAYTO is optional and comes back in the one Sui address form used everywhere;
+ * the zero address is refused. When it is unset the seller is paid to the gas wallet.
  * Throws an Error that names each bad variable and says whether it is missing or
  * malformed. The message never contains a value, and the zod error is not attached,
  * because its issues can carry the input.
