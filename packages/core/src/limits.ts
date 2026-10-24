@@ -181,4 +181,14 @@ export const LIMITS = {
   reasonMaxChars: 300,
   /** Longest stretch of purpose text copied into a memory sentence, in characters. */
   sentencePurposeMaxChars: 200,
+  /** How long a sign-in message may be signed and sent back: five minutes (C14). */
+  signinNonceTtlMs: 300_000,
+  /** How long an owner session lasts before signing in again: seven days. */
+  sessionTtlMs: 604_800_000,
+  /** Random bytes in a session token and an agent token. */
+  bearerTokenBytes: 32,
+  /** Pending memories submitted to Walrus Memory in one bulk write, the relayer's per-call maximum. */
+  pendingMemoryWriteBatch: 20,
+  /** Memory write jobs checked per owner in one confirmation pass. */
+  memoryJobConfirmBatch: 50,
 } as const;
