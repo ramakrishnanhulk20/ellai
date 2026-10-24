@@ -1,0 +1,101 @@
+import { decodeSuiPrivateKey } from '@mysten/sui/cryptography';
+import { z } from 'zod';
+
+// A line copied from .env.example arrives as an empty string. Treat it as unset so
+// it is reported as missing instead of slipping through as a real value.
+const blankIsMissing = (value: unknown): unknown => (value === '' ? undefined : value);
+
+const HEX_64 = /^[0-9a-f]{64}$/i;
+const AT_LEAST_32_BYTES_HEX = /^(?:[0-9a-f]{2}){32,}$/i;
+
+function isEd25519SuiKey(value: string): boolean {
+  try {
+    const { scheme, secretKey } = decodeSuiPrivateKey(value);
+    return scheme === 'ED25519' && secretKey.length === 32;
+  } catch {
+    return false;
+  }
+}
+
+function isDatabaseUrl(value: string): boolean {
+  if (value.startsWith('pglite:')) {
+    const location = value.slice('pglite:'.length);
+    return location.length > 0 && location.trim() === location;
+  }
+  if (!URL.canParse(value)) return false;
+  const url = new URL(value);
+  return (url.protocol === 'postgres:' || url.protocol === 'postgresql:') && url.hostname !== '';
+}
+
+/**
+ * Returns the URL's origin when the value is nothing but an origin, else null. A path,
+ * query or credentials are refused rather than dropped, so the origin Ellai compares
+ * requests against is exactly the one the operator wrote.
+ */
+function originOf(value: string, allowLocalHttp: boolean): string | null {
+  if (!URL.canParse(value)) return null;
+  const url = new URL(value);
+  if (url.username !== '' || url.password !== '') return null;
+  if (url.pathname !== '/' || url.search !== '' || url.hash !== '') return null;
+  if (url.protocol === 'https:') return url.origin;
+  if (url.protocol === 'http:' && allowLocalHttp && url.hostname === 'localhost' && url.port !== '') {
+    return url.origin;
+  }
+  return null;
+}
+
+function origin(allowLocalHttp: boolean) {
+  return z.string().transform((value, ctx) => {
+    const parsed = originOf(value, allowLocalHttp);
+    if (parsed === null) {
+      ctx.addIssue({ code: 'custom', message: 'not an allowed origin' });
+      return z.NEVER;
+    }
+    return parsed;
+  });
+}
+
+const suiKey = z.string().startsWith('suiprivkey').refine(isEd25519SuiKey);
+
+function envSchema(allowLocalHttp: boolean) {
+  return z.object({
+    DATABASE_URL: z.preprocess(blankIsMissing, z.string().refine(isDatabaseUrl)),
+    ELLAI_MASTER_SECRET: z.preprocess(blankIsMissing, z.string().regex(HEX_64)),
+    GAS_PRIVATE_KEY: z.preprocess(blankIsMissing, suiKey),
+    TATUM_API_KEY: z.preprocess(blankIsMissing, z.string().optional()),
+    MEMWAL_RELAYER_URL: z.preprocess(blankIsMissing, origin(false).optional()),
+    ANTHROPIC_API_KEY: z.preprocess(blankIsMissing, z.string().optional()),
+    SESSION_SECRET: z.preprocess(blankIsMissing, z.string().regex(AT_LEAST_32_BYTES_HEX)),
+    JOBS_SECRET: z.preprocess(blankIsMissing, z.string().regex(AT_LEAST_32_BYTES_HEX)),
+    APP_ORIGIN: z.preprocess(blankIsMissing, origin(allowLocalHttp)),
+  });
+}
+
+export type ServerEnv = Readonly<z.infer<ReturnType<typeof envSchema>>>;
+
+const VARIABLE_NAMES = Object.keys(envSchema(false).shape);
+
+/**
+ * Validates the environment variables the server needs.
+ * Plain http is accepted for APP_ORIGIN only as http://localhost:<port>, and only when
+ * NODE_ENV is "development" or "test". An unset or unknown NODE_ENV counts as production,
+ * so a deploy that forgets to set it still refuses an insecure origin.
+ * Throws an Error that names each bad variable and says whether it is missing or
+ * malformed. The message never contains a value, and the zod error is not attached,
+ * because its issues can carry the input.
+ */
+export function loadServerEnv(env: Record<string, string | undefined>): ServerEnv {
+  const allowLocalHttp = env.NODE_ENV === 'development' || env.NODE_ENV === 'test';
+  const picked = Object.fromEntries(VARIABLE_NAMES.map((name) => [name, env[name]]));
+  const result = envSchema(allowLocalHttp).safeParse(picked);
+  if (result.success) return Object.freeze(result.data);
+
+  const badNames = [...new Set(result.error.issues.map((issue) => String(issue.path[0])))];
+  const described = badNames.map((name) => {
+    const value = env[name];
+    return `${name} (${value === undefined || value === '' ? 'missing' : 'malformed'})`;
+  });
+  throw new Error(`Invalid environment variable: ${described.join(', ')}`);
+}
+
+export const serverEnv: ServerEnv = loadServerEnv(process.env);

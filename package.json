@@ -6,8 +6,8 @@
   ],
   "scripts": {
     "build": "npm run build -w packages/core",
-    "test": "npm run build -w packages/core && npm test -w packages/core && npm test -w packages/proof",
-    "typecheck": "npm run build -w packages/core && npm run typecheck -w packages/core && npm run typecheck -w packages/proof"
+    "test": "npm run build -w packages/core && npm test -w packages/core && npm test -w packages/proof && npm test -w packages/web",
+    "typecheck": "npm run build -w packages/core && npm run typecheck -w packages/core && npm run typecheck -w packages/proof && npm run typecheck -w packages/web"
   },
   "engines": {
     "node": ">=22.19"
