@@ -4,8 +4,7 @@ import { type CanonicalPayment, ChallengeError, type Dialect, parseChallenge } f
 import { LIMITS } from '@ellai/core/limits';
 import { NetError, type SafeRequest, type SafeResponse, type safeFetch } from '@ellai/core/net';
 import { PaymentError, paymentHeader } from '@ellai/core/payment';
-import { KNOWN_SELLERS } from '@ellai/core/sellers';
-import { and, eq, gt, inArray, isNull, ne } from 'drizzle-orm';
+import { and, eq, inArray, isNull } from 'drizzle-orm';
 import type { Database } from '../db/client.js';
 import { SELLER_METHODS, TEXT_CAPS, agents, decisions, memories, owners, payments } from '../db/schema.js';
 import { DecideError, type DecideErrorCode, type DecideResult, type Recall, decide } from '../decide/decide.js';
@@ -15,7 +14,7 @@ import { MEMORY_NAMESPACE } from '../memory/namespace.js';
 import { recordOutcome } from '../memory/outcome.js';
 import { type PaidFetchResult, bare, isPlainContentType, sellerAnswer } from './result.js';
 import { settlePayment } from './settle.js';
-import { type SignRefusal, type SignResult, signForDecision } from './sign.js';
+import { type SignRefusal, type SignResult, paidTimeoutMs, paymentInFlight, signForDecision } from './sign.js';
 
 export type RecallFn = Recall;
 
@@ -79,6 +78,7 @@ const SIGN_REFUSALS: Record<Exclude<SignRefusal, 'over_payment_max'>, SignRefusa
   expired: { outcome: 'failed', status: 'failed', reason: "The seller's price expired before Ellai could pay it." },
   wrong_epoch: { outcome: 'failed', status: 'failed', reason: "The seller's price is not valid on Sui right now, so Ellai did not pay it." },
   not_open: { outcome: 'failed', status: 'failed', reason: 'This decision can no longer be paid.' },
+  in_flight: { outcome: 'failed', status: 'failed', reason: REASONS.inProgress },
 };
 
 function signRefusal(refused: Exclude<SignResult, { signed: unknown }>, amount: bigint): SignRefusalAnswer {
@@ -146,49 +146,6 @@ function sellerRequest(request: Checked, extraHeaders: Record<string, string>, t
   };
 }
 
-function normalizedUrl(raw: string): string | null {
-  try {
-    const url = new URL(raw);
-    url.hash = '';
-    return url.href;
-  } catch {
-    return null;
-  }
-}
-
-/** How long a paid request may run: the recorded patience of a known seller, else the default (C21). */
-function paidTimeoutMs(sellerUrl: string): number {
-  const target = normalizedUrl(sellerUrl);
-  const known = KNOWN_SELLERS.find((seller) => target !== null && normalizedUrl(seller.url) === target);
-  return known?.paidTimeoutMs ?? LIMITS.netPaidTimeoutDefaultMs;
-}
-
-/**
- * True when this owner already signed a payment for this request key that may still be under
- * way: its decision is 'paid', it has not been released as 'not_landed', and it was signed
- * less than the price's validity, plus the seller's paid patience, plus the inline settlement
- * reads ago (C5). A 'paid' decision has left decide's live statuses, so decide alone would
- * decide and sign the same request again.
- */
-async function paymentInFlight(db: Database, ownerId: string, key: string, sellerUrl: string, now: Date): Promise<boolean> {
-  const windowMs = LIMITS.paymentValidityMs + paidTimeoutMs(sellerUrl) + LIMITS.settlementInlineTries * LIMITS.settlementInlineIntervalMs;
-  const [row] = await db
-    .select({ id: decisions.id })
-    .from(decisions)
-    .innerJoin(payments, and(eq(payments.decisionId, decisions.id), eq(payments.ownerId, decisions.ownerId)))
-    .where(
-      and(
-        eq(decisions.ownerId, ownerId),
-        eq(decisions.requestKey, key),
-        eq(decisions.status, 'paid'),
-        ne(payments.settlement, 'not_landed'),
-        gt(payments.signedAt, new Date(now.getTime() - windowMs)),
-      ),
-    )
-    .limit(1);
-  return row !== undefined;
-}
-
 /** The cited memories with their Walrus blob ids, in the order decide cited them, owner-scoped. */
 async function citations(db: Database, ownerId: string, ids: string[]): Promise<PaidFetchResult['citedMemories']> {
   if (ids.length === 0) return [];
@@ -227,11 +184,12 @@ async function closeDecision(db: Database, ownerId: string, decisionId: string, 
  *    the owner's derived delegate key and recall. Refused and asked come back as decided. A
  *    live decision reused for the same request never pays: an asked one comes back as asked,
  *    an approved one is 'failed' because its payment is already under way (C5).
- * 7. signForDecision checks the pause, the per-payment maximum and the budget again under the
- *    owner lock and signs at that moment (C4, C6, C7, C8). A refusal there, or a chain or build
- *    failure, is 'refused' (paused or over the maximum, with decide's own reasons for those
- *    rules, or over the daily budget) or 'failed', and the decision is closed as 'refused' or
- *    'failed' so the request can be decided again.
+ * 7. signForDecision checks the pause, the per-payment maximum, a payment already under way for
+ *    the same request (step 5's check again) and the budget under the owner lock and signs at
+ *    that moment (C4, C5, C6, C7, C8). A refusal there, or a chain or build failure, is
+ *    'refused' (paused or over the maximum, with decide's own reasons for those rules, or over
+ *    the daily budget) or 'failed' (a payment already in progress gets step 5's reason), and the
+ *    decision is closed as 'refused' or 'failed' so the request can be decided again.
  * 8. The paid request is the same request plus the payment header, with the seller's own
  *    patience. Its status, or null when it never answered, is stored with the payment.
  * 9. settlePayment reads the chain by Ellai's digest, LIMITS.settlementInlineTries times (C8).

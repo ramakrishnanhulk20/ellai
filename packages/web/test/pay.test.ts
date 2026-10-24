@@ -3,7 +3,8 @@
 // derived purse and sent as the same request plus the payment header, the pause, the per-payment
 // maximum and the daily budget checked again at signing, a short purse, an expired price, a
 // decision that no longer matches its payment, a purse that moved, a request already in flight
-// (open, or signed and still able to land, up to the edge of that window), the same request
+// (open, or signed and still able to land, up to the edge of that window), a twin decision
+// opened once the first was paid and refused under the signing lock, the same request
 // decided again once its payment was released, an x402 v2 price refused before decide, a seller
 // that fails after payment, a settlement mismatch pausing the owner, the release of a payment
 // that never landed, six-decimal amounts in reasons, and reasons that never carry agent or
@@ -479,6 +480,29 @@ describe('paidFetch', () => {
     expect(done.outcome).toBe('paid');
     expect(paidCalls(fetch)).toHaveLength(1);
     expect(await paymentRows(w.ownerId)).toHaveLength(1);
+  });
+
+  it('refuses under the signing lock a twin decision opened once the first was paid, and fails it', async () => {
+    const w = await world();
+    const { recall } = await approvals(w);
+    const { chain } = stubChain(w);
+    const sign = (d: { decisionId: string; payment: CanonicalPayment }) =>
+      signForDecision({ db, ownerId: w.ownerId, ...d, masterSecretHex: MASTER, chain, now: NOW });
+    const decisionRow = async (id: string) => one(await db.select().from(decisions).where(eq(decisions.id, id)));
+
+    const first = await approvedDecision(w, recall, PURPOSE);
+    expect(await sign(first)).toHaveProperty('signed');
+    // The live-request index allows one open decision per request key, so the twin opens only
+    // after the first has signed: the state a twin whose early check ran while the first was
+    // still open reaches.
+    const twin = await approvedDecision(w, recall, PURPOSE);
+    expect(twin.decisionId).not.toBe(first.decisionId);
+    expect(await decisionRow(twin.decisionId)).toMatchObject({ status: 'open', requestKey: (await decisionRow(first.decisionId)).requestKey });
+
+    expect(await sign(twin)).toEqual({ refusal: 'in_flight' });
+    expect((await decisionRow(twin.decisionId)).status).toBe('failed');
+    expect((await decisionRow(first.decisionId)).status).toBe('paid');
+    expect(one(await paymentRows(w.ownerId)).decisionId).toBe(first.decisionId);
   });
 
   it('fails the same request without deciding or signing while its signed payment may still land', async () => {
