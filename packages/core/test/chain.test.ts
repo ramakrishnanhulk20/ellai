@@ -2,11 +2,11 @@
 // that does not exist, the balance split for the test owner, refusal of bad input,
 // and that a rejected key never shows up in an error. Then, after waiting for a fresh
 // Tatum minute: the current epoch, a real settled USDC payment read with its status,
-// a dry run of garbage bytes, and both response size caps. Offline, against stand-in
-// gateway answers: executeTransaction's retry and refusal rules and getAllowance's
-// shape checks. Then, after a third fresh minute: a real third-party USDC allowance
-// read with its terms, an app-bound one refused, and a wrongly signed transaction
-// refused by the network.
+// a dry run of garbage bytes, and both response size caps. Offline: whether a chain says
+// it sends an API key and, against stand-in gateway answers, executeTransaction's retry
+// and refusal rules and getAllowance's shape checks. Then, after a third fresh minute: a
+// real third-party USDC allowance read with its terms, an app-bound one refused, and a
+// wrongly signed transaction refused by the network.
 // Does NOT cover: a paid key's rate limits, the Walrus blob listing (the probe script
 // and the scratch cross-check exercise it), paging past one page, an owner that
 // actually holds USDC, a failed transaction's status read from chain (none is pinned
@@ -238,6 +238,17 @@ function standIn(sends: Answer[], lookups: Answer[]) {
   for (const answer of lookups) lookup.mockImplementationOnce(answer as never);
   return { local, send, lookup };
 }
+
+describe('createChain options', () => {
+  it('says whether it sends an API key, treating a blank key as none', () => {
+    const chains = [createChain({}), createChain({ apiKey: '' }), createChain({ apiKey: 'stand-in-key' })];
+    try {
+      expect(chains.map((each) => each.usesApiKey)).toEqual([false, false, true]);
+    } finally {
+      for (const each of chains) each.close();
+    }
+  });
+});
 
 describe('executeTransaction retry and refusal rules, against stand-in gateway answers', () => {
   it('refuses empty bytes and bad signatures without sending anything, and never echoes a signature', async () => {

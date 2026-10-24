@@ -3,10 +3,10 @@
 // which fits the anonymous allowance of 5 requests a minute.
 import { Ed25519Keypair } from '@mysten/sui/keypairs/ed25519';
 import { SUI_DECIMALS } from '@mysten/sui/utils';
-import { type Balances, createChain } from '../src/chain.js';
+import { type Balances, createChain } from '@ellai/core/chain';
+import { derivePurseKeypair } from '@ellai/core/keys';
+import { USDC_DECIMALS } from '@ellai/core/usdc';
 import { config } from '../src/config.js';
-import { derivePurseKeypair } from '../src/keys.js';
-import { USDC_DECIMALS } from '../src/usdc.js';
 
 function inUnits(amount: bigint, decimals: number): string {
   const base = 10n ** BigInt(decimals);

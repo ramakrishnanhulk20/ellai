@@ -2,6 +2,7 @@ import { normalizeStructTag } from '@mysten/sui/utils';
 import { canonicalSuiAddress } from './keys.js';
 import { LIMITS } from './limits.js';
 import type { SafeResponse } from './net.js';
+import { DEPLOYMENT_NETWORK, SUI_MAINNET_CHAIN_ID } from './network.js';
 import { USDC_DECIMALS, USDC_TYPE_MAINNET } from './usdc.js';
 
 export type Dialect = 'x402-v1-t2000' | 'x402-v2';
@@ -60,11 +61,6 @@ export class ChallengeError extends Error {
     this.code = code;
   }
 }
-
-const DEPLOYMENT_NETWORK = 'sui:mainnet';
-// Base58 digest of the Sui Mainnet genesis checkpoint, which Sui calls the chain
-// identifier. t2000 challenges carry it as extra.suimpp.chain, a second copy of the network.
-const SUI_MAINNET_CHAIN_ID = '4btiuiMPvEENsttpZC7CZ53DruC3MAgfznDbASZ7DR6S';
 
 const HTTP_PAYMENT_REQUIRED = 402;
 const MS_PER_SECOND = 1_000;

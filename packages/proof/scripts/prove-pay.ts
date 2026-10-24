@@ -38,7 +38,7 @@ import {
   type RefillArgs,
   type RefillFacts,
   refillDecision,
-} from '../src/allowance.js';
+} from '@ellai/core/allowance';
 import {
   type AllowanceState,
   type BalanceChange,
@@ -48,15 +48,15 @@ import {
   createChain,
   type ExecutionResult,
   type TransactionResult,
-} from '../src/chain.js';
-import { type CanonicalPayment, ChallengeError, parseChallenge } from '../src/challenge.js';
+} from '@ellai/core/chain';
+import { type CanonicalPayment, ChallengeError, parseChallenge } from '@ellai/core/challenge';
+import { canonicalSuiAddress, derivePurseKeypair } from '@ellai/core/keys';
+import { LIMITS } from '@ellai/core/limits';
+import { NetError, type SafeRequest, safeFetch } from '@ellai/core/net';
+import { PaymentError, paymentHeader, signPayment, verifySettlement } from '@ellai/core/payment';
+import { KNOWN_SELLERS, type Seller } from '@ellai/core/sellers';
+import { USDC_DECIMALS, USDC_TYPE_MAINNET } from '@ellai/core/usdc';
 import { config } from '../src/config.js';
-import { canonicalSuiAddress, derivePurseKeypair } from '../src/keys.js';
-import { LIMITS } from '../src/limits.js';
-import { NetError, type SafeRequest, safeFetch } from '../src/net.js';
-import { PaymentError, paymentHeader, signPayment, verifySettlement } from '../src/payment.js';
-import { KNOWN_SELLERS, type Seller } from '../src/sellers.js';
-import { USDC_DECIMALS, USDC_TYPE_MAINNET } from '../src/usdc.js';
 
 const STATE_FILE = new URL('../../../scratchpad/slice-state-pay.json', import.meta.url);
 const SUISCAN = 'https://suiscan.xyz/mainnet';

@@ -1,5 +1,5 @@
 /**
- * Every numeric bound used by the proof package lives here, so a reviewer can see
+ * Every numeric bound Ellai uses lives here, so a reviewer can see
  * all of them in one place and no call can quietly run without one.
  */
 export const LIMITS = {

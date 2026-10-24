@@ -12,11 +12,11 @@ import { Ed25519Keypair } from '@mysten/sui/keypairs/ed25519';
 import { toHex } from '@mysten/sui/utils';
 import type { MemWal } from '@mysten-incubation/memwal';
 import { z } from 'zod';
-import { type Chain, ChainError, createChain, type WalrusBlob } from '../src/chain.js';
+import { type Chain, ChainError, createChain, type WalrusBlob } from '@ellai/core/chain';
+import { deriveMemwalDelegateKeypair, derivePurseKeypair } from '@ellai/core/keys';
+import { LIMITS } from '@ellai/core/limits';
+import { createMemoryClient, ensureMemoryAccount, MemoryError, recallSentences, rememberSentences } from '@ellai/core/memory';
 import { config } from '../src/config.js';
-import { deriveMemwalDelegateKeypair, derivePurseKeypair } from '../src/keys.js';
-import { LIMITS } from '../src/limits.js';
-import { createMemoryClient, ensureMemoryAccount, MemoryError, recallSentences, rememberSentences } from '../src/memory.js';
 
 const NAMESPACE = 'ellai-test-v1';
 const SENTENCE_COUNT = 10;

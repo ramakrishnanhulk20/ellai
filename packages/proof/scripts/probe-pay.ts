@@ -8,15 +8,15 @@
 import { Ed25519Keypair } from '@mysten/sui/keypairs/ed25519';
 import { fromBase64 } from '@mysten/sui/utils';
 import { parseX402Header, USDC, verifyX402Payment } from '@t2000/sui-x402';
-import { ChainError, createChain } from '../src/chain.js';
-import { type CanonicalPayment, ChallengeError, parseChallenge } from '../src/challenge.js';
+import { ChainError, createChain } from '@ellai/core/chain';
+import { type CanonicalPayment, ChallengeError, parseChallenge } from '@ellai/core/challenge';
+import { derivePurseKeypair } from '@ellai/core/keys';
+import { LIMITS } from '@ellai/core/limits';
+import { NetError, safeFetch } from '@ellai/core/net';
+import { assertPlainUsdcSend, PaymentError, paymentHeader, signPayment } from '@ellai/core/payment';
+import { KNOWN_SELLERS } from '@ellai/core/sellers';
+import { USDC_DECIMALS } from '@ellai/core/usdc';
 import { config } from '../src/config.js';
-import { derivePurseKeypair } from '../src/keys.js';
-import { LIMITS } from '../src/limits.js';
-import { NetError, safeFetch } from '../src/net.js';
-import { assertPlainUsdcSend, PaymentError, paymentHeader, signPayment } from '../src/payment.js';
-import { KNOWN_SELLERS } from '../src/sellers.js';
-import { USDC_DECIMALS } from '../src/usdc.js';
 
 // Two seconds of slack over Tatum's minute.
 const PACING_WINDOW_MS = 62_000;

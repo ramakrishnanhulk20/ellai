@@ -4,6 +4,7 @@ import { Transaction } from '@mysten/sui/transactions';
 import { fromBase64, normalizeStructTag, normalizeSuiAddress, SUI_ADDRESS_LENGTH } from '@mysten/sui/utils';
 import { canonicalSuiAddress } from './keys.js';
 import { LIMITS } from './limits.js';
+import { SUI_MAINNET_CHAIN_ID } from './network.js';
 import { USDC_TYPE_MAINNET } from './usdc.js';
 
 /** What the owner lets the purse pull, all four required. Amounts are atomic USDC. */
@@ -64,10 +65,6 @@ export class AllowanceError extends Error {
     this.code = code;
   }
 }
-
-// The base58 digest of the Sui Mainnet genesis checkpoint. payment.ts and challenge.ts
-// hold the same value; a test pins this copy to the one payment.ts builds with.
-const SUI_MAINNET_CHAIN_ID = '4btiuiMPvEENsttpZC7CZ53DruC3MAgfznDbASZ7DR6S';
 
 const ALLOWANCE_NEW = '0x2::allowance::new';
 const PERIODIC_RATE_LIMIT = '0x2::allowance::periodic_rate_limit';

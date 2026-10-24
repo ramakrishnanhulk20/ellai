@@ -2,13 +2,18 @@
 // wait against the SDK's own MemWalMock, failed jobs, recall's numeric-distance rule (C12)
 // and cutoff, that errors never carry the delegate secret or upstream text (C19), the
 // relayer URL rule, the relayer response size cap (C21) and the delegate key length check.
+// Against a stand-in chain: a gRPC refusal wrapped in a SimulationError keeping the failing
+// step's own code, and Tatum being paced at the anonymous rate only without an API key.
 // Does NOT cover: anything on the live relayer or on Sui. Account creation, delegate
-// registration, real job timing, rate limits and Tatum pacing are proven only by
-// `npm run prove:memory`, which runs against Mainnet.
+// registration, real job timing, rate limits and pacing against the live gateway are proven
+// only by `npm run prove:memory`, which runs against Mainnet.
+import { bcs } from '@mysten/sui/bcs';
+import { SimulationError } from '@mysten/sui/client';
 import { decodeSuiPrivateKey } from '@mysten/sui/cryptography';
 import { Ed25519Keypair } from '@mysten/sui/keypairs/ed25519';
-import { toHex } from '@mysten/sui/utils';
+import { normalizeStructTag, normalizeSuiAddress, toHex } from '@mysten/sui/utils';
 import { type MemWal, MemWalMock } from '@mysten-incubation/memwal';
+import { RpcError } from '@protobuf-ts/runtime-rpc';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { Chain } from '../src/chain.js';
 import { LIMITS } from '../src/limits.js';
@@ -19,6 +24,8 @@ import {
   MemoryError,
   recallSentences,
   rememberSentences,
+  WALRUS_MEMORY_PACKAGE_ID,
+  WALRUS_MEMORY_REGISTRY_ID,
 } from '../src/memory.js';
 
 const NAMESPACE = 'ellai-test-v1';
@@ -247,6 +254,95 @@ describe('ensureMemoryAccount', () => {
     for (const key of [new Uint8Array(31), new Uint8Array(33), new Uint8Array(0)]) {
       const error = await caught(ensureMemoryAccount({ chain: untouchable, owner: Ed25519Keypair.generate(), delegatePublicKey: key }));
       expect(error.code).toBe('DELEGATE');
+    }
+  });
+});
+
+describe('ensureMemoryAccount against a stand-in chain', () => {
+  const REGISTRY_ID = normalizeSuiAddress(WALRUS_MEMORY_REGISTRY_ID);
+  const notFound = () => Object.assign(new Error('stand-in not found'), { reason: 'notFound' });
+
+  /** The registry as create_account needs it, in the on-chain layout memory.ts decodes. */
+  function openRegistry(): { objectId: string; type: string; content: Uint8Array } {
+    const layout = bcs.struct('AccountRegistry', {
+      id: bcs.Address,
+      accounts: bcs.struct('Table', { id: bcs.Address, size: bcs.u64() }),
+      migration_finalized: bcs.bool(),
+      pinned_allowlist_root: bcs.option(bcs.byteVector()),
+      expected_account_imports: bcs.u64(),
+      expected_delegate_imports: bcs.u64(),
+      imported_accounts: bcs.u64(),
+      imported_delegates: bcs.u64(),
+      version: bcs.u64(),
+    });
+    const content = layout
+      .serialize({
+        id: REGISTRY_ID,
+        accounts: { id: `0x${'7e'.repeat(32)}`, size: 0 },
+        migration_finalized: true,
+        pinned_allowlist_root: null,
+        expected_account_imports: 0,
+        expected_delegate_imports: 0,
+        imported_accounts: 0,
+        imported_delegates: 0,
+        version: 4,
+      })
+      .toBytes();
+    return { objectId: REGISTRY_ID, type: normalizeStructTag(`${WALRUS_MEMORY_PACKAGE_ID}::account::AccountRegistry`), content };
+  }
+
+  it("reports a gRPC refusal wrapped in a SimulationError with the failing step's own code", async () => {
+    const refusal = new RpcError('stand-in refusal', 'FAILED_PRECONDITION');
+    const wrapped = new SimulationError(refusal.message, { cause: refusal });
+    const getObjects = vi.fn(async ({ objectIds: [id] }: { objectIds: string[] }) => ({
+      objects: [id === REGISTRY_ID ? openRegistry() : notFound()],
+    }));
+    const chain = {
+      // A key, so the module's shared pacing ledger can never make this test wait.
+      usesApiKey: true,
+      grpc: {
+        getObjects,
+        // Transaction.build hands resolution to the client's plugin. The gRPC client's own
+        // plugin rethrows a gateway refusal exactly like this: the SDK's SimulationError,
+        // whose name stays "Error", with the RpcError as its cause.
+        core: {
+          resolveTransactionPlugin: () => async () => {
+            throw wrapped;
+          },
+        },
+      },
+    } as unknown as Chain;
+    const error = await caught(ensureMemoryAccount({ chain, owner: Ed25519Keypair.generate(), delegatePublicKey: new Uint8Array(32) }));
+    expect(error.code).toBe('ACCOUNT');
+    expect(error.message).toBe('Sui refused a Walrus Memory account step (gRPC FAILED_PRECONDITION)');
+    expect(getObjects).toHaveBeenCalledTimes(2);
+  });
+
+  it('paces Tatum at the anonymous rate only when the chain has no API key', async () => {
+    const requests = LIMITS.tatumAnonymousRequestsPerMinute + 1;
+    const fakeMsFor = async (usesApiKey: boolean): Promise<number> => {
+      // A fresh module, so each run starts from an empty pacing ledger.
+      vi.resetModules();
+      const fresh = await import('../src/memory.js');
+      const getObjects = vi.fn(async () => ({ objects: [notFound()] }));
+      const chain = { usesApiKey, grpc: { getObjects } } as unknown as Chain;
+      const elapsed = await withFakeTimers(async () => {
+        const started = Date.now();
+        for (let i = 0; i < requests; i++) {
+          // A registry that is not found ends the call after exactly one Tatum request.
+          const run = fresh.ensureMemoryAccount({ chain, owner: Ed25519Keypair.generate(), delegatePublicKey: new Uint8Array(32) });
+          await expect(run).rejects.toMatchObject({ name: 'MemoryError', code: 'ACCOUNT' });
+        }
+        return Date.now() - started;
+      });
+      expect(getObjects).toHaveBeenCalledTimes(requests);
+      return elapsed;
+    };
+    try {
+      expect(await fakeMsFor(true)).toBe(0);
+      expect(await fakeMsFor(false)).toBeGreaterThanOrEqual(LIMITS.tatumPacingWindowMs);
+    } finally {
+      vi.resetModules();
     }
   });
 });

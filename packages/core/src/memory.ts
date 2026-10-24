@@ -5,7 +5,7 @@ import { Transaction } from '@mysten/sui/transactions';
 import { deriveDynamicFieldID, normalizeStructTag, normalizeSuiAddress, toBase64 } from '@mysten/sui/utils';
 import { MemWal } from '@mysten-incubation/memwal';
 import { addDelegateKey, type CreateAccountOpts, createAccount } from '@mysten-incubation/memwal/account';
-import { type Chain, ChainError } from './chain.js';
+import { type Chain, ChainError, classifyChainError } from './chain.js';
 import { canonicalSuiAddress } from './keys.js';
 import { LIMITS } from './limits.js';
 
@@ -28,7 +28,6 @@ const REGISTRY_VERSION = '4';
 const ED25519_PUBLIC_KEY_BYTES = 32;
 // Stored on chain in the clear next to the key, so it names the app and nothing else.
 const DELEGATE_LABEL = 'Ellai';
-const GRPC_SIZE_CAP_PHRASE = 'Received message larger than max';
 const HTTP_TOO_MANY_REQUESTS = 429;
 const HTTP_GATEWAY_TIMEOUT = 504;
 
@@ -111,10 +110,12 @@ function sameBytes(a: Uint8Array, b: Uint8Array): boolean {
 
 // Calls made through chain.grpc directly get the transport timeout but no retries and no
 // pacing, and anonymous Tatum allows 5 requests a minute. Every account step goes through
-// here so a first run, about a dozen requests, never bursts past that.
+// here so a first run, about a dozen requests, never bursts past that. A chain with an API
+// key is not held to the anonymous rate; a rate limit there is still retried by tatumStep.
 const tatumRequestTimes: number[] = [];
 
-async function reserveTatum(requests: number): Promise<void> {
+async function reserveTatum(chain: Chain, requests: number): Promise<void> {
+  if (chain.usesApiKey) return;
   for (;;) {
     const now = Date.now();
     while (tatumRequestTimes.length > 0 && (tatumRequestTimes[0] ?? 0) <= now - LIMITS.tatumPacingWindowMs) {
@@ -129,12 +130,12 @@ async function reserveTatum(requests: number): Promise<void> {
 }
 
 /** The gateway's RpcError, found by shape: the SDK wraps it in a SimulationError as `cause`. */
-function rpcErrorIn(error: unknown): { code: string; message: string } | null {
+function rpcErrorIn(error: unknown): { rpcError: object; code: string } | null {
   let current: unknown = error;
   for (let depth = 0; depth < 3 && typeof current === 'object' && current !== null; depth++) {
-    const { name, code, message, cause } = current as { name?: unknown; code?: unknown; message?: unknown; cause?: unknown };
+    const { name, code, cause } = current as { name?: unknown; code?: unknown; cause?: unknown };
     if (name === 'RpcError' && typeof code === 'string') {
-      return { code: /^[A-Z_]+$/.test(code) ? code : 'UNKNOWN', message: typeof message === 'string' ? message : '' };
+      return { rpcError: current, code: /^[A-Z_]+$/.test(code) ? code : 'UNKNOWN' };
     }
     current = cause;
   }
@@ -150,15 +151,16 @@ function tatumFailure(error: unknown, fallback: MemoryErrorCode): MemoryError {
   }
   const rpc = rpcErrorIn(error);
   if (rpc) {
-    // grpc-js reports an HTTP 429 from the gateway as UNAVAILABLE, and a message over the
-    // size cap as RESOURCE_EXHAUSTED, the same code as a rate limit. Only fixed phrases are read.
-    if ((rpc.code === 'RESOURCE_EXHAUSTED' && !rpc.message.startsWith(GRPC_SIZE_CAP_PHRASE)) || rpc.message.includes(`HTTP status code ${HTTP_TOO_MANY_REQUESTS}`)) {
+    // chain.ts owns the reading of a gRPC status, including the fixed phrases that tell a
+    // rate limit from an oversized message. The codes and wording here stay this module's.
+    const status = classifyChainError(rpc.rpcError).code;
+    if (status === 'RATE_LIMITED') {
       return new MemoryError('RATE_LIMITED', `Tatum rate limited a Walrus Memory account step (gRPC ${rpc.code})`);
     }
-    if (rpc.code === 'DEADLINE_EXCEEDED' || rpc.code === 'CANCELLED') {
+    if (status === 'TIMEOUT') {
       return new MemoryError('TIMEOUT', `Tatum did not answer a Walrus Memory account step in time (gRPC ${rpc.code})`);
     }
-    if (rpc.code === 'INVALID_ARGUMENT' || rpc.code === 'FAILED_PRECONDITION' || rpc.code === 'OUT_OF_RANGE') {
+    if (status === 'INVALID_INPUT') {
       return new MemoryError(fallback, `Sui refused a Walrus Memory account step (gRPC ${rpc.code})`);
     }
     return new MemoryError('UPSTREAM', `Tatum gateway error on a Walrus Memory account step (gRPC ${rpc.code})`);
@@ -171,10 +173,10 @@ function tatumFailure(error: unknown, fallback: MemoryErrorCode): MemoryError {
   return new MemoryError(fallback, 'a Walrus Memory account step failed');
 }
 
-/** One Tatum step: paced, and tried again after a rate limit up to LIMITS.tatumRateLimitRetries times. */
-async function tatumStep<T>(fallback: MemoryErrorCode, requests: number, run: () => PromiseLike<T>): Promise<T> {
+/** One Tatum step: paced when the chain is anonymous, and tried again after a rate limit up to LIMITS.tatumRateLimitRetries times. */
+async function tatumStep<T>(chain: Chain, fallback: MemoryErrorCode, requests: number, run: () => PromiseLike<T>): Promise<T> {
   for (let retry = 0; ; retry++) {
-    await reserveTatum(requests);
+    await reserveTatum(chain, requests);
     try {
       return await run();
     } catch (error) {
@@ -186,7 +188,7 @@ async function tatumStep<T>(fallback: MemoryErrorCode, requests: number, run: ()
 }
 
 async function readObjectContents(chain: Chain, objectId: string, expectedType: string, what: string): Promise<Uint8Array | null> {
-  const { objects } = await tatumStep('UPSTREAM', 1, () => chain.grpc.getObjects({ objectIds: [objectId], include: { content: true } }));
+  const { objects } = await tatumStep(chain, 'UPSTREAM', 1, () => chain.grpc.getObjects({ objectIds: [objectId], include: { content: true } }));
   const [object] = objects;
   if (objects.length !== 1 || object === undefined) throw new MemoryError('UPSTREAM', `Tatum returned no answer for the ${what}`);
   if (object instanceof Error) {
@@ -318,20 +320,20 @@ function ownerWallet(
       if (!(transaction instanceof Transaction)) throw new MemoryError(code, 'the account helper did not hand over a transaction');
       transaction.setSender(ownerAddress);
       // One simulate call: the gateway resolves the objects, picks the gas and sets the expiry.
-      const bytes = await tatumStep(code, 1, () => transaction.build({ client: chain.grpc }));
+      const bytes = await tatumStep(chain, code, 1, () => transaction.build({ client: chain.grpc }));
       assertSignable(bytes, ownerAddress, fn, expected, code);
       const { signature } = await owner.signTransaction(bytes);
       // Sending the same signed bytes again after a rate limit is safe: Sui runs a digest once.
-      const result = await tatumStep(code, 1, () =>
+      const result = await tatumStep(chain, code, 1, () =>
         chain.grpc.executeTransaction({ transaction: bytes, signatures: [signature], include: { effects: true } }),
       );
       if (result.$kind !== 'Transaction') throw new MemoryError(code, `transaction ${result.FailedTransaction.digest} failed on chain`);
       const { digest } = result.Transaction;
       // The helper polls Tatum for this digest next, every 2 seconds for up to a minute and
       // outside any pacing. Waiting here until Tatum shows it lets that first poll succeed.
-      const visible = await readAfterWrite(() => tatumStep(code, 1, () => landedSuccessfully(chain, digest, code)), (seen) => seen);
+      const visible = await readAfterWrite(() => tatumStep(chain, code, 1, () => landedSuccessfully(chain, digest, code)), (seen) => seen);
       if (!visible) throw new MemoryError('TIMEOUT', `transaction ${digest} was sent but Tatum does not show it yet; run again to pick it up`);
-      await reserveTatum(LIMITS.memwalHelperWaitRequests);
+      await reserveTatum(chain, LIMITS.memwalHelperWaitRequests);
       return { digest };
     },
     async signPersonalMessage() {

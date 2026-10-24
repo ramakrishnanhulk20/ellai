@@ -7,6 +7,7 @@ import type { BalanceChange } from './chain.js';
 import type { CanonicalPayment } from './challenge.js';
 import { canonicalSuiAddress } from './keys.js';
 import { LIMITS } from './limits.js';
+import { DEPLOYMENT_NETWORK, SUI_MAINNET_CHAIN_ID } from './network.js';
 import { USDC_TYPE_MAINNET } from './usdc.js';
 
 export interface SignedPayment {
@@ -34,9 +35,8 @@ export class PaymentError extends Error {
   }
 }
 
-// parseChallenge refuses any t2000 challenge whose extra.suimpp.chain is not this
-// digest, so it is the challenge's own chain id.
-const SUI_MAINNET_CHAIN_ID = '4btiuiMPvEENsttpZC7CZ53DruC3MAgfznDbASZ7DR6S';
+// parseChallenge refuses any t2000 challenge whose extra.suimpp.chain is not
+// SUI_MAINNET_CHAIN_ID, so building with it uses the challenge's own chain id.
 const SUPPORTED_DIALECT = 'x402-v1-t2000';
 const X402_VERSION = 1;
 const X402_SCHEME = 'exact';
@@ -78,7 +78,7 @@ function addressOrFail(value: unknown, what: string): string {
  */
 function sendTerms(payment: CanonicalPayment, payer: string): SendTerms {
   if (payment?.dialect !== SUPPORTED_DIALECT) fail('UNSUPPORTED_DIALECT', 'only the t2000 x402 v1 dialect can be paid');
-  if (payment.network !== 'sui:mainnet') fail('BUILD_FAILED', 'the payment is not on Sui Mainnet');
+  if (payment.network !== DEPLOYMENT_NETWORK) fail('BUILD_FAILED', 'the payment is not on Sui Mainnet');
   let asset: string | null;
   try {
     asset = typeof payment.asset === 'string' ? normalizeStructTag(payment.asset) : null;
@@ -390,7 +390,7 @@ export function verifySettlement(
   if (recipient === null) return refuse('the approved recipient is not a Sui address');
   const asset = settlementCoinType(payment.asset);
   if (asset !== USDC_TYPE_MAINNET) return refuse('the approved asset is not Sui Mainnet USDC');
-  if (payment.network !== 'sui:mainnet') return refuse('the approved payment is not on Sui Mainnet');
+  if (payment.network !== DEPLOYMENT_NETWORK) return refuse('the approved payment is not on Sui Mainnet');
   const amount = payment.amount;
   if (typeof amount !== 'bigint' || amount <= 0n) return refuse('the approved amount is not a positive integer');
 

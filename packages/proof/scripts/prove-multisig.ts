@@ -22,10 +22,9 @@ import { Ed25519Keypair } from '@mysten/sui/keypairs/ed25519';
 import type { MultiSigPublicKey } from '@mysten/sui/multisig';
 import { TransactionDataBuilder } from '@mysten/sui/transactions';
 import { z } from 'zod';
-import { type BalanceChange, type Balances, type Chain, ChainError, createChain, type TransactionResult } from '../src/chain.js';
-import { config } from '../src/config.js';
-import { canonicalSuiAddress, derivePurseKeypair } from '../src/keys.js';
-import { LIMITS } from '../src/limits.js';
+import { type BalanceChange, type Balances, type Chain, ChainError, createChain, type TransactionResult } from '@ellai/core/chain';
+import { canonicalSuiAddress, derivePurseKeypair } from '@ellai/core/keys';
+import { LIMITS } from '@ellai/core/limits';
 import {
   assertInternalSend,
   buildInternalSend,
@@ -33,8 +32,9 @@ import {
   MultisigError,
   recoveryPurse,
   signAsMultisigMember,
-} from '../src/multisig.js';
-import { USDC_DECIMALS, USDC_TYPE_MAINNET } from '../src/usdc.js';
+} from '@ellai/core/multisig';
+import { USDC_DECIMALS, USDC_TYPE_MAINNET } from '@ellai/core/usdc';
+import { config } from '../src/config.js';
 
 const STATE_FILE = new URL('../../../scratchpad/slice-state-multisig.json', import.meta.url);
 const SUISCAN = 'https://suiscan.xyz/mainnet';

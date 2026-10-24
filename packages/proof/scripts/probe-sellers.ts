@@ -3,10 +3,10 @@
 // parseChallenge, and prints one line per seller. It never pays, signs or sends a
 // transaction, and it needs no keys. Everything printed comes from the canonical payment
 // or a refusal code, never from raw seller text.
-import { ChallengeError, type CanonicalPayment, parseChallenge } from '../src/challenge.js';
-import { NetError, safeFetch } from '../src/net.js';
-import { KNOWN_SELLERS } from '../src/sellers.js';
-import { USDC_DECIMALS } from '../src/usdc.js';
+import { ChallengeError, type CanonicalPayment, parseChallenge } from '@ellai/core/challenge';
+import { NetError, safeFetch } from '@ellai/core/net';
+import { KNOWN_SELLERS } from '@ellai/core/sellers';
+import { USDC_DECIMALS } from '@ellai/core/usdc';
 
 function inUsdc(atomic: bigint): string {
   const base = 10n ** BigInt(USDC_DECIMALS);

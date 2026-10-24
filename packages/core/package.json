@@ -1,0 +1,42 @@
+{
+  "name": "@ellai/core",
+  "private": true,
+  "type": "module",
+  "exports": {
+    "./chain": { "types": "./dist/chain.d.ts", "default": "./dist/chain.js" },
+    "./keys": { "types": "./dist/keys.d.ts", "default": "./dist/keys.js" },
+    "./net": { "types": "./dist/net.d.ts", "default": "./dist/net.js" },
+    "./challenge": { "types": "./dist/challenge.d.ts", "default": "./dist/challenge.js" },
+    "./payment": { "types": "./dist/payment.d.ts", "default": "./dist/payment.js" },
+    "./allowance": { "types": "./dist/allowance.d.ts", "default": "./dist/allowance.js" },
+    "./memory": { "types": "./dist/memory.d.ts", "default": "./dist/memory.js" },
+    "./multisig": { "types": "./dist/multisig.d.ts", "default": "./dist/multisig.js" },
+    "./usdc": { "types": "./dist/usdc.d.ts", "default": "./dist/usdc.js" },
+    "./limits": { "types": "./dist/limits.d.ts", "default": "./dist/limits.js" },
+    "./sellers": { "types": "./dist/sellers.d.ts", "default": "./dist/sellers.js" },
+    "./network": { "types": "./dist/network.d.ts", "default": "./dist/network.js" }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@grpc/grpc-js": "1.14.6",
+    "@mysten-incubation/memwal": "0.1.8",
+    "@mysten/seal": "1.5.1",
+    "@mysten/sui": "2.37.0",
+    "@protobuf-ts/grpc-transport": "2.11.1",
+    "@protobuf-ts/runtime-rpc": "2.11.1",
+    "ipaddr.js": "2.5.0",
+    "undici": "8.12.3",
+    "zod": "4.6.7"
+  },
+  "devDependencies": {
+    "@t2000/sui-x402": "11.7.0",
+    "@types/node": "26.6.5",
+    "tsx": "4.23.15",
+    "typescript": "7.0.2",
+    "vitest": "5.0.5"
+  }
+}

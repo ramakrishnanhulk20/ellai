@@ -182,6 +182,8 @@ export interface WalrusBlob {
 }
 
 export interface Chain {
+  /** True when an API key is sent with every request; false for the anonymous gateway. */
+  readonly usesApiKey: boolean;
   /** Raw gRPC client. Calls made on it directly get the transport timeout but no retries. */
   readonly grpc: SuiGrpcClient;
   /** Raw GraphQL client. Calls made on it directly get the fetch timeout but no retries. */
@@ -239,7 +241,13 @@ function httpFailure(status: number): ChainError {
   return new ChainError('UPSTREAM', `request refused (HTTP ${status})`);
 }
 
-function classify(error: unknown): ChainError {
+/**
+ * Maps any failure from the gateway or the transport to a ChainError, reading only the
+ * top-level error: a ChainError passes through, an RpcError (matched by shape) is sorted
+ * by its gRPC status, an abort or timeout is TIMEOUT, and anything else is a retryable
+ * UPSTREAM. Never copies upstream text into the result and never throws.
+ */
+export function classifyChainError(error: unknown): ChainError {
   if (error instanceof ChainError) return error;
   if (typeof error === 'object' && error !== null) {
     const { name, code, message } = error as { name?: unknown; code?: unknown; message?: unknown };
@@ -319,13 +327,13 @@ function executionErrorCode(kind: number | undefined): string {
 }
 
 /**
- * A gRPC refusal that is about the transaction itself (the same codes classify reads as
- * INVALID_INPUT) becomes a short code: the gRPC code name, or INSUFFICIENT_ADDRESS_BALANCE
- * when the node says the sender's address balance cannot cover it. Anything else, such
- * as a timeout or a rate limit, returns null and stays an error.
+ * A gRPC refusal that is about the transaction itself (the same codes classifyChainError
+ * reads as INVALID_INPUT) becomes a short code: the gRPC code name, or
+ * INSUFFICIENT_ADDRESS_BALANCE when the node says the sender's address balance cannot
+ * cover it. Anything else, such as a timeout or a rate limit, returns null and stays an error.
  */
 function simulationRefusal(error: unknown): string | null {
-  if (classify(error).code !== 'INVALID_INPUT') return null;
+  if (classifyChainError(error).code !== 'INVALID_INPUT') return null;
   const { code, message } = error as { code: string; message?: unknown };
   if (typeof message === 'string' && message.includes(INSUFFICIENT_BALANCE_PHRASE)) return 'INSUFFICIENT_ADDRESS_BALANCE';
   return code;
@@ -593,7 +601,7 @@ export function createChain(opts: { apiKey?: string }): Chain {
       try {
         return await attempt(run);
       } catch (error) {
-        const failure = classify(error);
+        const failure = classifyChainError(error);
         if (!failure.retryable || retry >= LIMITS.tatumRetries) {
           throw scrub(new ChainError(failure.code, `Tatum ${operation}: ${failure.message}`, failure.retryable));
         }
@@ -803,7 +811,7 @@ export function createChain(opts: { apiKey?: string }): Chain {
       );
       return response.transaction ? executedResult(response.transaction, digest) : null;
     } catch (error) {
-      const failure = classify(error);
+      const failure = classifyChainError(error);
       if (failure.code === 'NOT_FOUND') return null;
       throw failure;
     }
@@ -849,7 +857,7 @@ export function createChain(opts: { apiKey?: string }): Chain {
         try {
           landed = await landedResult(digest);
         } catch (error) {
-          lastFailure = classify(error);
+          lastFailure = classifyChainError(error);
           if (!lastFailure.retryable) throw outcomeUnknown(lastFailure);
           continue;
         }
@@ -864,14 +872,14 @@ export function createChain(opts: { apiKey?: string }): Chain {
         );
         return executedResult(response.transaction, digest);
       } catch (error) {
-        const failure = classify(error);
+        const failure = classifyChainError(error);
         if (failure.code === 'INVALID_INPUT') {
           const refusal = simulationRefusal(error) ?? 'REFUSED';
           let landed: ExecutionResult | null;
           try {
             landed = await landedResult(digest);
           } catch (lookupError) {
-            throw outcomeUnknown(classify(lookupError));
+            throw outcomeUnknown(classifyChainError(lookupError));
           }
           return landed ?? { digest, status: 'failure', errorCode: refusal, balanceChanges: [], createdObjects: [] };
         }
@@ -936,6 +944,7 @@ export function createChain(opts: { apiKey?: string }): Chain {
   }
 
   return {
+    usesApiKey: apiKey !== undefined,
     grpc,
     graphql,
     getReferenceGasPrice,

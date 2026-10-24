@@ -4,6 +4,11 @@
   "workspaces": [
     "packages/*"
   ],
+  "scripts": {
+    "build": "npm run build -w packages/core",
+    "test": "npm run build -w packages/core && npm test -w packages/core && npm test -w packages/proof",
+    "typecheck": "npm run build -w packages/core && npm run typecheck -w packages/core && npm run typecheck -w packages/proof"
+  },
   "engines": {
     "node": ">=22.19"
   }

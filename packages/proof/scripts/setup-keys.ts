@@ -9,7 +9,7 @@ import { fileURLToPath } from 'node:url';
 import { parseEnv } from 'node:util';
 import { Ed25519Keypair } from '@mysten/sui/keypairs/ed25519';
 import { toHex } from '@mysten/sui/utils';
-import { deriveMemwalDelegateKeypair, derivePurseKeypair } from '../src/keys.js';
+import { deriveMemwalDelegateKeypair, derivePurseKeypair } from '@ellai/core/keys';
 
 const ENV_PATH = fileURLToPath(new URL('../../../.env', import.meta.url));
 const MASTER_SECRET_BYTES = 32;

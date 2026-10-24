@@ -8,6 +8,7 @@ import { fromBase64, normalizeStructTag, normalizeSuiAddress, SUI_ADDRESS_LENGTH
 import { isValidTransactionSignature } from '@mysten/sui/verify';
 import { canonicalSuiAddress } from './keys.js';
 import { LIMITS } from './limits.js';
+import { SUI_MAINNET_CHAIN_ID } from './network.js';
 import { USDC_TYPE_MAINNET } from './usdc.js';
 
 /** A gasless USDC send between Ellai's purses and the owner. Every field is checked before a build. */
@@ -38,9 +39,7 @@ export class MultisigError extends Error {
   }
 }
 
-// The base58 digest of the Sui Mainnet genesis checkpoint. payment.ts builds with the same
-// value; a test pins this send to the bytes payment.ts makes for the same terms.
-const SUI_MAINNET_CHAIN_ID = '4btiuiMPvEENsttpZC7CZ53DruC3MAgfznDbASZ7DR6S';
+// A test pins this send to the bytes payment.ts makes for the same terms.
 const REDEEM_FUNDS = '0x2::balance::redeem_funds';
 const SEND_FUNDS = '0x2::balance::send_funds';
 
