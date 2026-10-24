@@ -30,6 +30,7 @@ export const DECISION_RULES = [
   'learned',
   'recall_unavailable',
   'no_match',
+  'too_many_pending',
 ] as const;
 export const DECISION_STATUSES = ['open', 'paid', 'asked', 'answered', 'refused', 'expired', 'failed'] as const;
 /** Statuses in which a decision can still lead to a payment, so only one may exist per request. */

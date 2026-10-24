@@ -50,7 +50,7 @@ CREATE TABLE "decisions" (
 	CONSTRAINT "decisions_amount_positive" CHECK ("decisions"."amount_atomic" > 0),
 	CONSTRAINT "decisions_seller_method_known" CHECK ("decisions"."seller_method" in ('GET', 'POST')),
 	CONSTRAINT "decisions_outcome_known" CHECK ("decisions"."outcome" in ('approved', 'refused', 'asked')),
-	CONSTRAINT "decisions_rule_known" CHECK ("decisions"."rule" in ('paused', 'over_payment_max', 'over_daily_budget', 'refused_recipient', 'bad_outcome', 'grant', 'learned', 'recall_unavailable', 'no_match')),
+	CONSTRAINT "decisions_rule_known" CHECK ("decisions"."rule" in ('paused', 'over_payment_max', 'over_daily_budget', 'refused_recipient', 'bad_outcome', 'grant', 'learned', 'recall_unavailable', 'no_match', 'too_many_pending')),
 	CONSTRAINT "decisions_status_known" CHECK ("decisions"."status" in ('open', 'paid', 'asked', 'answered', 'refused', 'expired', 'failed')),
 	CONSTRAINT "decisions_request_key_length" CHECK (char_length("decisions"."request_key") <= 128),
 	CONSTRAINT "decisions_seller_url_length" CHECK (char_length("decisions"."seller_url") <= 2048),

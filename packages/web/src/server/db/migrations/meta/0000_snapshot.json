@@ -1,5 +1,5 @@
 {
-  "id": "4bc6ceff-277b-4532-93d9-ab9a9625d295",
+  "id": "eb1d63f2-49cf-425b-b4cc-207d92ca2a50",
   "prevId": "00000000-0000-0000-0000-000000000000",
   "version": "7",
   "dialect": "postgresql",
@@ -413,7 +413,7 @@
         },
         "decisions_rule_known": {
           "name": "decisions_rule_known",
-          "value": "\"decisions\".\"rule\" in ('paused', 'over_payment_max', 'over_daily_budget', 'refused_recipient', 'bad_outcome', 'grant', 'learned', 'recall_unavailable', 'no_match')"
+          "value": "\"decisions\".\"rule\" in ('paused', 'over_payment_max', 'over_daily_budget', 'refused_recipient', 'bad_outcome', 'grant', 'learned', 'recall_unavailable', 'no_match', 'too_many_pending')"
         },
         "decisions_status_known": {
           "name": "decisions_status_known",

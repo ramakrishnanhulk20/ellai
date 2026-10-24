@@ -164,4 +164,21 @@ export const LIMITS = {
   memwalProofRecallAttempts: 5,
   /** Wait between those recalls. */
   memwalProofRecallDelayMs: 15_000,
+  /**
+   * Hits one decision asks recall for. A result this long may have cut off a closer
+   * refusal or approval, so it counts as unclear and Ellai asks (C12).
+   */
+  decideRecallLimit: 20,
+  /** Longest wait for recall during a decision. Past it, the recall counts as failed and Ellai asks. */
+  decideRecallTimeoutMs: 15_000,
+  /** Memories one decision cites. Bounds the rows written per decision whatever the history holds. */
+  decideMaxCitedMemories: 20,
+  /** How long an owner's yes stays usable as a one-time grant: 10 minutes. */
+  grantTtlMs: 600_000,
+  /** Longest purpose an agent may give, in characters. Equal to the database cap. */
+  purposeMaxChars: 500,
+  /** Longest reason an owner may give with an answer, in characters. Equal to the database cap. */
+  reasonMaxChars: 300,
+  /** Longest stretch of purpose text copied into a memory sentence, in characters. */
+  sentencePurposeMaxChars: 200,
 } as const;
