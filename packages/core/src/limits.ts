@@ -205,4 +205,18 @@ export const LIMITS = {
   onboardingLifetimeCapMaxAtomic: 50_000_000,
   /** Longest an allowance may run before the owner renews it: 90 days. */
   onboardingAllowanceMaxMs: 7_776_000_000,
+  /** Price of Ellai's own wallet check, in atomic USDC: 0.01 USDC, the gasless minimum. */
+  sellerPriceAtomic: 10_000,
+  /** How long a wallet check challenge may be paid after Ellai issues it. */
+  sellerChallengeTtlMs: 60_000,
+  /** Challenges Ellai's seller issues per caller address per minute (C22). */
+  sellerChallengesPerMinute: 10,
+  /** Owners whose background work one jobs tick handles. */
+  jobsOwnersPerTick: 25,
+  /** An approved decision with no payment after this long was abandoned by a crash: five minutes. */
+  staleOpenDecisionMs: 300_000,
+  /** A question the owner has not answered after a day is closed. */
+  questionTtlMs: 86_400_000,
+  /** Gas wallet SUI below which the jobs tick warns: 0.1 SUI in MIST. */
+  gasWalletLowMist: 100_000_000,
 } as const;
