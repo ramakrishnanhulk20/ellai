@@ -627,16 +627,17 @@ export function createChain(opts: { apiKey?: string }): Chain {
         const coinType = chainStructTag(entry.coinType, 'balance coin type');
         if (coinType !== USDC_TYPE_MAINNET && coinType !== SUI_TYPE) continue;
 
-        // Tatum omits a part that is zero (a wallet holding only an address balance comes
-        // back with no coin_balance). One missing part is read as zero, checked by the sum
-        // below. Both missing would hide a gateway that cannot tell the pools apart, so
-        // that is refused, unlike the SDK wrapper, which turns any missing field into "0".
-        if (entry.addressBalance === undefined && entry.coinBalance === undefined) {
+        // Tatum omits a part that is zero: a wallet holding only an address balance comes
+        // back with no coin_balance, and an emptied wallet comes back as total "0" with
+        // neither part. A missing part reads as zero, checked by the sum below. Both parts
+        // missing with a non-zero total would hide a gateway that cannot tell the pools
+        // apart, so that is refused, unlike the SDK wrapper, which turns any gap into "0".
+        const total = parseUnsigned(entry.balance, `${coinType} total balance`);
+        if (entry.addressBalance === undefined && entry.coinBalance === undefined && total !== 0n) {
           throw badResponse(`${coinType} balance has neither an address part nor a coin part`);
         }
         const inAddress = entry.addressBalance === undefined ? 0n : parseUnsigned(entry.addressBalance, `${coinType} address balance`);
         const inCoins = entry.coinBalance === undefined ? 0n : parseUnsigned(entry.coinBalance, `${coinType} coin balance`);
-        const total = parseUnsigned(entry.balance, `${coinType} total balance`);
         if (inAddress + inCoins !== total) throw badResponse(`${coinType} parts do not add up to the total`);
 
         if (coinType === USDC_TYPE_MAINNET) {

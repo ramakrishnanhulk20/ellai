@@ -10,7 +10,8 @@
     "probe:sellers": "tsx scripts/probe-sellers.ts",
     "probe:pay": "tsx --env-file-if-exists=../../.env scripts/probe-pay.ts",
     "prove:memory": "tsx --env-file-if-exists=../../.env scripts/prove-memory.ts",
-    "prove:pay": "tsx --env-file-if-exists=../../.env scripts/prove-pay.ts"
+    "prove:pay": "tsx --env-file-if-exists=../../.env scripts/prove-pay.ts",
+    "prove:multisig": "tsx --env-file-if-exists=../../.env scripts/prove-multisig.ts"
   },
   "dependencies": {
     "@grpc/grpc-js": "1.14.6",

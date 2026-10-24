@@ -56,6 +56,11 @@ export const LIMITS = {
   minPaymentAtomic: 10_000,
   /** Largest single payment in atomic USDC: 1 USDC. */
   maxPaymentAtomic: 1_000_000,
+  /**
+   * Largest send between Ellai's own purses and the owner, in atomic USDC: 0.05 USDC. Kept
+   * well under the purse float, so a bug in a funding or recovery send can only move pennies.
+   */
+  internalSendMaxAtomic: 50_000,
   /** How long a parsed payment stays usable, whatever expiry the seller asks for. */
   paymentValidityMs: 60_000,
   /**
