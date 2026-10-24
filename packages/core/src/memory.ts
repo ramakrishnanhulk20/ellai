@@ -712,6 +712,91 @@ export async function rememberSentences(
 }
 
 /**
+ * Stores each sentence as its own memory in `namespace` with one bulk write and returns the
+ * relayer's job ids in sentence order, without waiting for the jobs: read them later with
+ * checkJobs. Same checks and the same per-client pace as rememberSentences. The write is
+ * sent once and never resent, because SDK 0.1.8 sends no idempotency key on bulk writes and
+ * a resend would store every sentence twice.
+ *
+ * Throws MemoryError: WRITE for no sentences, more than LIMITS.memwalBulkMaxItems, an
+ * empty, oversized or repeated sentence, a bad namespace, a relayer refusal, or an accepted
+ * write that did not return one distinct job id per sentence; TIMEOUT, DELEGATE,
+ * RATE_LIMITED or UPSTREAM from the relayer.
+ */
+export async function submitSentences(client: MemWal, namespace: string, sentences: string[]): Promise<string[]> {
+  const label = checkNamespace(namespace, 'WRITE');
+  const texts = checkSentences(sentences);
+  await spendRelayerPoints(client, LIMITS.memwalBulkPoints);
+  let accepted: unknown;
+  try {
+    accepted = await client.rememberBulk(texts.map((text) => ({ text, namespace: label })));
+  } catch (error) {
+    throw relayerFailure(error, 'WRITE');
+  }
+  return checkJobIds(accepted, texts.length);
+}
+
+/**
+ * Reads the state of up to LIMITS.memwalBulkMaxItems bulk write jobs with one status call,
+ * spending relayer points through the same per-client pace as every other call here, and
+ * returns one entry per job id in the order given. 'done' carries the blob id. 'failed'
+ * covers a failed job and one the relayer does not know. 'pending' covers every state in
+ * which the job is still working. The call is not retried here: the caller decides when to
+ * look again.
+ *
+ * Throws MemoryError: WRITE for no job ids, more than LIMITS.memwalBulkMaxItems (the
+ * relayer refuses more per call), a malformed or repeated job id, or an answer that is not
+ * exactly one entry per job asked about, has a finished job without a usable blob id, or
+ * names a state this code does not know; TIMEOUT, DELEGATE, RATE_LIMITED or UPSTREAM from
+ * the relayer.
+ */
+export async function checkJobs(
+  client: MemWal,
+  jobIds: string[],
+): Promise<Array<{ jobId: string; state: 'done' | 'pending' | 'failed'; blobId: string | null }>> {
+  if (!Array.isArray(jobIds) || jobIds.length === 0) throw new MemoryError('WRITE', 'give at least one job id');
+  if (jobIds.length > LIMITS.memwalBulkMaxItems) {
+    throw new MemoryError('WRITE', `at most ${LIMITS.memwalBulkMaxItems} job ids per status check, got ${jobIds.length}`);
+  }
+  if (!jobIds.every((id: unknown) => typeof id === 'string' && RELAYER_ID_PATTERN.test(id))) {
+    throw new MemoryError('WRITE', 'every job id must be 1 to 128 characters of A-Z, a-z, 0-9, dash or underscore');
+  }
+  const asked = [...jobIds];
+  if (new Set(asked).size !== asked.length) throw new MemoryError('WRITE', 'a job id is repeated');
+
+  await spendRelayerPoints(client, LIMITS.memwalRequestPoints);
+  let status: unknown;
+  try {
+    status = await client.getRememberBulkStatus(asked, { timeoutMs: LIMITS.memwalRequestTimeoutMs });
+  } catch (error) {
+    throw relayerFailure(error, 'WRITE');
+  }
+
+  const results = typeof status === 'object' && status !== null ? (status as { results?: unknown }).results : undefined;
+  // The relayer answers every job id it is asked about, "not_found" included, so a short or
+  // long answer is malformed rather than a job that is still working.
+  if (!Array.isArray(results) || results.length !== asked.length) throw new MemoryError('WRITE', 'the relayer status answer has the wrong shape');
+  const pending = new Set(asked);
+  const states = new Map<string, { state: 'done' | 'pending' | 'failed'; blobId: string | null }>();
+  for (const item of results as unknown[]) {
+    const { job_id: jobId, status: state, blob_id: blobId } = (typeof item === 'object' && item !== null ? item : {}) as Record<string, unknown>;
+    if (typeof jobId !== 'string' || !pending.has(jobId)) throw new MemoryError('WRITE', 'the relayer reported on a job that was not asked about, or on one job twice');
+    pending.delete(jobId);
+    if (state === 'done') {
+      if (typeof blobId !== 'string' || !RELAYER_ID_PATTERN.test(blobId)) throw new MemoryError('WRITE', `job ${jobId} finished without a usable blob id`);
+      states.set(jobId, { state: 'done', blobId });
+    } else if (state === 'failed' || state === 'not_found') {
+      states.set(jobId, { state: 'failed', blobId: null });
+    } else if (state === 'pending' || state === 'running' || state === 'uploaded') {
+      states.set(jobId, { state: 'pending', blobId: null });
+    } else {
+      throw new MemoryError('WRITE', `job ${jobId} is in a state this code does not know`);
+    }
+  }
+  return asked.map((jobId) => ({ jobId, ...(states.get(jobId) ?? { state: 'pending' as const, blobId: null }) }));
+}
+
+/**
  * Searches `namespace` by meaning and returns the hits closer than `opts.maxDistance`,
  * closest first as the relayer ranks them, or [] when none are. Every hit must carry a
  * numeric distance, or the whole call fails, so a malformed answer can never pass as a

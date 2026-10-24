@@ -2,7 +2,8 @@
 // wait against the SDK's own MemWalMock, failed jobs, recall's numeric-distance rule (C12)
 // and cutoff, that errors never carry the delegate secret or upstream text (C19), the
 // relayer URL rule, the relayer response size cap (C21) and the delegate key length check.
-// Against a stand-in chain: a gRPC refusal wrapped in a SimulationError keeping the failing
+// submitSentences sending exactly once without waiting, and checkJobs mapping each relayer
+// state and refusing every malformed status answer. Against a stand-in chain: a gRPC refusal wrapped in a SimulationError keeping the failing
 // step's own code, and Tatum being paced at the anonymous rate only without an API key.
 // Does NOT cover: anything on the live relayer or on Sui. Account creation, delegate
 // registration, real job timing, rate limits and pacing against the live gateway are proven
@@ -18,12 +19,14 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { Chain } from '../src/chain.js';
 import { LIMITS } from '../src/limits.js';
 import {
+  checkJobs,
   createMemoryClient,
   DEFAULT_RELAYER_URL,
   ensureMemoryAccount,
   MemoryError,
   recallSentences,
   rememberSentences,
+  submitSentences,
   WALRUS_MEMORY_PACKAGE_ID,
   WALRUS_MEMORY_REGISTRY_ID,
 } from '../src/memory.js';
@@ -132,6 +135,98 @@ describe('rememberSentences', () => {
     expect(error.code).toBe('WRITE');
     expect(error.message).toContain('job-b failed');
     expect(error.message).not.toContain('encryption backend');
+  });
+});
+
+describe('submitSentences', () => {
+  it('sends one bulk write and returns the job ids in sentence order without polling', async () => {
+    const mock = MemWalMock.create({ namespace: 'default' });
+    const bulk = vi.spyOn(mock, 'rememberBulk');
+    const status = vi.spyOn(mock, 'getRememberBulkStatus');
+    const sentences = distinctSentences(3);
+    const jobIds = await submitSentences(mock as unknown as MemWal, NAMESPACE, sentences);
+    expect(bulk).toHaveBeenCalledTimes(1);
+    expect(bulk.mock.calls[0]?.[0]).toEqual(sentences.map((text) => ({ text, namespace: NAMESPACE })));
+    expect(jobIds).toHaveLength(3);
+    expect(new Set(jobIds).size).toBe(3);
+    for (const jobId of jobIds) expect(jobId).toMatch(/^mock-job-/);
+    expect(status).not.toHaveBeenCalled();
+  });
+
+  it('refuses bad input before sending, and never sends again after a failed send', async () => {
+    const { client, asMemWal } = stubClient({});
+    expect((await caught(submitSentences(asMemWal, NAMESPACE, distinctSentences(LIMITS.memwalBulkMaxItems + 1)))).code).toBe('WRITE');
+    expect((await caught(submitSentences(asMemWal, NAMESPACE, ['Same fact.', 'same fact.']))).code).toBe('WRITE');
+    expect((await caught(submitSentences(asMemWal, 'Has Spaces', ['A fact.']))).code).toBe('WRITE');
+    expect(client.rememberBulk).not.toHaveBeenCalled();
+
+    const timeout = Object.assign(new Error('deadline'), { name: 'MemWalRequestTimeout' });
+    const timedOut = stubClient({ rememberBulk: () => Promise.reject(timeout) });
+    expect((await caught(submitSentences(timedOut.asMemWal, NAMESPACE, ['A fact.']))).code).toBe('TIMEOUT');
+    expect(timedOut.client.rememberBulk).toHaveBeenCalledTimes(1);
+
+    const short = stubClient({ rememberBulk: async () => ({ job_ids: ['job-a'], total: 1, status: 'running' }) });
+    const error = await caught(submitSentences(short.asMemWal, NAMESPACE, ['A fact.', 'Another fact.']));
+    expect(error.message).toContain('did not return 2 distinct job ids');
+    expect(short.client.rememberBulk).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('checkJobs', () => {
+  const answer = (results: unknown) => stubClient({ getRememberBulkStatus: async () => ({ results }) });
+
+  it('maps every relayer state onto done, pending or failed, in the order asked, with one status read', async () => {
+    const asked = ['job-a', 'job-b', 'job-c', 'job-d', 'job-e', 'job-f'];
+    const { client, asMemWal } = answer([
+      { job_id: 'job-f', status: 'not_found' },
+      { job_id: 'job-a', status: 'done', blob_id: 'blob-a' },
+      { job_id: 'job-b', status: 'pending' },
+      { job_id: 'job-c', status: 'running' },
+      { job_id: 'job-d', status: 'uploaded' },
+      { job_id: 'job-e', status: 'failed', error: 'encryption backend unavailable' },
+    ]);
+    expect(await checkJobs(asMemWal, asked)).toEqual([
+      { jobId: 'job-a', state: 'done', blobId: 'blob-a' },
+      { jobId: 'job-b', state: 'pending', blobId: null },
+      { jobId: 'job-c', state: 'pending', blobId: null },
+      { jobId: 'job-d', state: 'pending', blobId: null },
+      { jobId: 'job-e', state: 'failed', blobId: null },
+      { jobId: 'job-f', state: 'failed', blobId: null },
+    ]);
+    expect(client.getRememberBulkStatus).toHaveBeenCalledTimes(1);
+    expect(client.getRememberBulkStatus.mock.calls[0]?.[0]).toEqual(asked);
+  });
+
+  it('refuses every malformed answer', async () => {
+    const malformed: Array<[unknown, RegExp]> = [
+      [undefined, /wrong shape/],
+      [[], /wrong shape/],
+      [[{ job_id: 'job-a', status: 'done', blob_id: 'blob-a' }, { job_id: 'job-b', status: 'pending' }], /wrong shape/],
+      [[{ job_id: 'job-z', status: 'done', blob_id: 'blob-z' }], /not asked about/],
+      [[{ job_id: 'job-a', status: 'done' }], /without a usable blob id/],
+      [[{ job_id: 'job-a', status: 'done', blob_id: 'has spaces' }], /without a usable blob id/],
+      [[{ job_id: 'job-a', status: 'queued' }], /state this code does not know/],
+      [[{ status: 'done', blob_id: 'blob-a' }], /not asked about/],
+    ];
+    for (const [results, message] of malformed) {
+      const error = await caught(checkJobs(answer(results).asMemWal, ['job-a']));
+      expect(error.code).toBe('WRITE');
+      expect(error.message).toMatch(message);
+    }
+    const twice = answer([
+      { job_id: 'job-a', status: 'pending' },
+      { job_id: 'job-a', status: 'done', blob_id: 'blob-a' },
+    ]);
+    expect((await caught(checkJobs(twice.asMemWal, ['job-a', 'job-b']))).message).toMatch(/one job twice/);
+  });
+
+  it('refuses bad job ids and more than the relayer allows per call without calling it', async () => {
+    const { client, asMemWal } = stubClient({});
+    const tooMany = Array.from({ length: LIMITS.memwalBulkMaxItems + 1 }, (_, index) => `job-${index}`);
+    for (const jobIds of [[], tooMany, ['job a'], ['job-a', 'job-a'], [`job-${'x'.repeat(128)}`]]) {
+      expect((await caught(checkJobs(asMemWal, jobIds))).code).toBe('WRITE');
+    }
+    expect(client.getRememberBulkStatus).not.toHaveBeenCalled();
   });
 });
 

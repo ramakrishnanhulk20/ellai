@@ -1,4 +1,4 @@
-// Covers: Tatum's live Sui Mainnet gateway with no API key: the gas price, a digest
+// Covers: Tatum's live Sui Mainnet gateway (the .env key if set, else anonymous): the gas price, a digest
 // that does not exist, the balance split for the test owner, refusal of bad input,
 // and that a rejected key never shows up in an error. Then, after waiting for a fresh
 // Tatum minute: the current epoch, a real settled USDC payment read with its status,
@@ -52,12 +52,15 @@ async function failureOf(call: Promise<unknown>): Promise<ChainError> {
   throw new Error('expected the call to fail');
 }
 
-const chain = createChain({});
+// Uses the operator's Tatum key when .env has one, so two suites running at once cannot
+// exhaust the shared anonymous limit; without a key the waits below keep it under 5 a minute.
+const ROOT_TATUM_KEY = existsSync(ROOT_ENV) ? parseEnv(readFileSync(ROOT_ENV, 'utf8')).TATUM_API_KEY || undefined : undefined;
+const chain = createChain({ apiKey: ROOT_TATUM_KEY });
 const owner = testOwner();
 
 afterAll(() => chain.close());
 
-describe('createChain against Tatum Sui Mainnet, anonymous', () => {
+describe('createChain against Tatum Sui Mainnet', () => {
   it('reads a reference gas price above zero', { timeout: TEST_TIMEOUT_MS }, async () => {
     const price = await chain.getReferenceGasPrice();
     expect(typeof price).toBe('bigint');
@@ -116,7 +119,7 @@ const FRESH_MINUTE_MS = 65_000;
 
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
-describe('createChain payment reads against Tatum Sui Mainnet, anonymous', () => {
+describe('createChain payment reads against Tatum Sui Mainnet', () => {
   beforeAll(async () => {
     await sleep(Math.max(0, FILE_STARTED_AT + FRESH_MINUTE_MS - Date.now()));
   }, FRESH_MINUTE_MS + 5_000);
@@ -445,7 +448,7 @@ const REAL_ALLOWANCE = {
 // An app-bound mainnet allowance (blink::SwapFunding), from the same search.
 const APP_BOUND_ALLOWANCE = '0x2be7c47e7eec4ef6476b732ec19aa506ca6cd5e634e02b640fec8af057a92e40';
 
-describe('allowance and execution against Tatum Sui Mainnet, anonymous', () => {
+describe('allowance and execution against Tatum Sui Mainnet', () => {
   beforeAll(async () => {
     await sleep(Math.max(0, FILE_STARTED_AT + 2 * FRESH_MINUTE_MS - Date.now()));
   }, 2 * FRESH_MINUTE_MS + 5_000);

@@ -5,7 +5,8 @@
   "scripts": {
     "test": "vitest run",
     "typecheck": "tsc --noEmit",
-    "db:generate": "drizzle-kit generate"
+    "db:generate": "drizzle-kit generate",
+    "prove:loop": "tsx --env-file-if-exists=../../.env scripts/prove-memory-loop.ts"
   },
   "dependencies": {
     "@electric-sql/pglite": "0.5.11",
