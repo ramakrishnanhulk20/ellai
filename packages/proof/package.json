@@ -12,6 +12,8 @@
   },
   "dependencies": {
     "@grpc/grpc-js": "1.14.6",
+    "@mysten-incubation/memwal": "0.1.8",
+    "@mysten/seal": "1.5.1",
     "@mysten/sui": "2.37.0",
     "@protobuf-ts/grpc-transport": "2.11.1",
     "@protobuf-ts/runtime-rpc": "2.11.1",
