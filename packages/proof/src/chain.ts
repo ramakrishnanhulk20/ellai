@@ -2,12 +2,15 @@ import { ChannelCredentials } from '@grpc/grpc-js';
 import { bcs } from '@mysten/sui/bcs';
 import { SuiGraphQLClient } from '@mysten/sui/graphql';
 import { GrpcTypes, SuiGrpcClient } from '@mysten/sui/grpc';
+import { TransactionDataBuilder } from '@mysten/sui/transactions';
 import {
+  fromBase64,
   isValidStructTag,
   isValidSuiAddress,
   isValidTransactionDigest,
   normalizeStructTag,
   normalizeSuiAddress,
+  parseStructTag,
   SUI_TYPE_ARG,
 } from '@mysten/sui/utils';
 import { GrpcTransport } from '@protobuf-ts/grpc-transport';
@@ -29,6 +32,32 @@ export const WALRUS_BLOB_TYPE = normalizeStructTag(
 
 const { ExecutionError_ExecutionErrorKind: ExecutionErrorKind, SimulateTransactionRequest_TransactionChecks: SimulationChecks } =
   GrpcTypes;
+const { ChangedObject_IdOperation: IdOperation } = GrpcTypes;
+
+const FRAMEWORK_ADDRESS = normalizeSuiAddress('0x2');
+
+// The same fields are read when a transaction is sent and when its digest is looked up
+// afterwards, so a landed transaction reads the same either way.
+const EXECUTED_PATHS = [
+  'digest',
+  'effects.status',
+  'balance_changes',
+  'effects.changed_objects.object_id',
+  'effects.changed_objects.object_type',
+  'effects.changed_objects.id_operation',
+];
+// A sender and, when someone else pays the gas, that sponsor. Sui takes no others.
+const MAX_SIGNATURES = 2;
+// A ten-member multisig with zkLogin members stays well under this.
+const MAX_SIGNATURE_CHARS = 16_384;
+const STRICT_BASE64 = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
+
+const U64_MAX = 2n ** 64n - 1n;
+const U256_MAX = 2n ** 256n - 1n;
+// The longest decimal u256. Longer text is refused before BigInt ever sees it.
+const U256_MAX_DIGITS = 78;
+// The allowance module refuses a longer name, so a longer one means the shape is not the module's.
+const ALLOWANCE_NAME_MAX_CHARS = 128;
 
 // grpc-js reports a message over grpc.max_receive_message_length as RESOURCE_EXHAUSTED,
 // the same code a rate limit uses, so its own fixed wording is what tells the two apart.
@@ -102,6 +131,47 @@ export interface SimulationResult {
   balanceChanges: BalanceChange[];
 }
 
+export interface CreatedObject {
+  objectId: string;
+  /** normalizeStructTag form. */
+  type: string;
+}
+
+export interface ExecutionResult {
+  /** Computed from the signed bytes before they are sent, never taken from the gateway. */
+  digest: string;
+  status: ExecutionOutcome;
+  /**
+   * Null on success. Otherwise a fixed upper-case code: the chain's execution error kind,
+   * or for bytes the network refused before running them, the gRPC refusal code or
+   * INSUFFICIENT_ADDRESS_BALANCE. A refused transaction has no balance changes and cost nothing.
+   */
+  errorCode: string | null;
+  balanceChanges: BalanceChange[];
+  createdObjects: CreatedObject[];
+}
+
+export interface AllowanceState {
+  /** The address whose address balance every spend debits. */
+  funder: string;
+  /** The only address that may send a spend. */
+  spender: string;
+  /** T in Allowance<Balance<T>>, normalizeStructTag form. */
+  coinType: string;
+  /** The most that may ever be spent, in atomic units. Null when only the rate limit bounds it. */
+  lifetimeCap: bigint | null;
+  /** Everything spent through the allowance so far. */
+  spentTotal: bigint;
+  /** Length of one fixed rate-limit window. Null when there is no rate limit. */
+  periodMs: bigint | null;
+  /** The most that may be spent inside one window. Null when there is no rate limit. */
+  periodLimit: bigint | null;
+  /** Spends at or after this time abort. Null when only the rate limit bounds time. */
+  expirationMs: bigint | null;
+  /** Names the allowance as a shared input in a spend. Read in the same request as the rest. */
+  initialSharedVersion: bigint;
+}
+
 export interface WalrusBlob {
   objectId: string;
   /** Walrus's own text form (URL-safe base64 of the little-endian u256), the form Walrus Memory reports. */
@@ -123,6 +193,8 @@ export interface Chain {
   getCurrentEpoch(): Promise<bigint>;
   simulate(txBytes: Uint8Array): Promise<SimulationResult>;
   listOwnedWalrusBlobs(owner: string): Promise<WalrusBlob[]>;
+  executeTransaction(txBytes: Uint8Array, signatures: string[]): Promise<ExecutionResult>;
+  getAllowance(objectId: string): Promise<AllowanceState>;
   /** Closes the gRPC channel so a script can exit. */
   close(): void;
 }
@@ -329,6 +401,130 @@ const BLOBS_QUERY = `
     }
   }
 `;
+
+type UserSignatureInput = { bcs: { value: Uint8Array }; signature: { oneofKind: undefined } };
+
+/** The message never repeats a signature, because a signature over unsent bytes is a bearer value. */
+function signatureInputs(signatures: unknown): UserSignatureInput[] {
+  if (!Array.isArray(signatures) || signatures.length === 0 || signatures.length > MAX_SIGNATURES) {
+    throw new ChainError('INVALID_INPUT', `a transaction needs between 1 and ${MAX_SIGNATURES} signatures`);
+  }
+  return signatures.map((signature: unknown) => {
+    if (
+      typeof signature !== 'string' ||
+      signature.length === 0 ||
+      signature.length > MAX_SIGNATURE_CHARS ||
+      !STRICT_BASE64.test(signature)
+    ) {
+      throw new ChainError('INVALID_INPUT', 'a signature is not base64');
+    }
+    return { bcs: { value: fromBase64(signature) }, signature: { oneofKind: undefined } };
+  });
+}
+
+function executedResult(transaction: GrpcTypes.ExecutedTransaction | undefined, digest: string): ExecutionResult {
+  if (!transaction) throw badResponse('execution returned no transaction');
+  if (transaction.digest !== digest) throw badResponse('the executed digest is not the digest of the signed bytes');
+  const status = executionOutcome(transaction.effects?.status);
+  const createdObjects = (transaction.effects?.changedObjects ?? [])
+    .filter((change) => change.idOperation === IdOperation.CREATED)
+    .map((change) => ({
+      objectId: chainAddress(change.objectId, 'created object id'),
+      type: chainStructTag(change.objectType, 'created object type'),
+    }));
+  return {
+    digest,
+    status,
+    errorCode: status === 'success' ? null : executionErrorCode(transaction.effects?.status?.error?.kind),
+    balanceChanges: parseBalanceChanges(transaction.balanceChanges),
+    createdObjects,
+  };
+}
+
+const uintText = z.string().max(U256_MAX_DIGITS).regex(/^(0|[1-9]\d*)$/);
+
+// Strict objects: a field the allowance module does not have today, or a window kind
+// other than fixed milliseconds, is an unknown shape and is refused rather than skipped.
+const allowanceObjectSchema = z.strictObject({
+  object: z
+    .strictObject({
+      address: z.string(),
+      owner: z.strictObject({ __typename: z.string(), initialSharedVersion: z.number().int().positive().optional() }),
+      asMoveObject: z
+        .strictObject({
+          contents: z.strictObject({
+            type: z.strictObject({ repr: z.string() }),
+            json: z.strictObject({
+              id: z.string(),
+              settings: z.strictObject({
+                funder: z.string(),
+                spender: z.string().nullable(),
+                app: z.string().nullable(),
+                lifetime_cap: uintText.nullable(),
+                start_timestamp_ms: uintText.nullable(),
+                expiration_timestamp_ms: uintText.nullable(),
+                rate_limit: z
+                  .strictObject({
+                    '@variant': z.literal('Windowed'),
+                    limit: uintText,
+                    spent: uintText,
+                    anchor_ms: uintText.nullable(),
+                    index: uintText,
+                    window: z.strictObject({ '@variant': z.literal('PeriodicMs'), pos0: uintText }),
+                  })
+                  .nullable(),
+                name: z.string().max(ALLOWANCE_NAME_MAX_CHARS),
+              }),
+              current_spend: uintText,
+            }),
+          }),
+        })
+        .nullable(),
+    })
+    .nullable(),
+});
+
+const ALLOWANCE_QUERY = `
+  query EllaiAllowance($id: SuiAddress!) {
+    object(address: $id) {
+      address
+      owner { __typename ... on Shared { initialSharedVersion } }
+      asMoveObject { contents { type { repr } json } }
+    }
+  }
+`;
+
+function unsignedAtMost(text: string, max: bigint, what: string): bigint {
+  const value = BigInt(text);
+  if (value > max) throw badResponse(`${what} is out of range`);
+  return value;
+}
+
+/** T from 0x2::allowance::Allowance<0x2::balance::Balance<T>>, read by the SDK's own type parser. */
+function allowanceCoinType(repr: string): string {
+  const outer = parseStructTag(chainStructTag(repr, 'allowance type'));
+  const [balance] = outer.typeParams;
+  if (
+    outer.address !== FRAMEWORK_ADDRESS ||
+    outer.module !== 'allowance' ||
+    outer.name !== 'Allowance' ||
+    outer.typeParams.length !== 1 ||
+    typeof balance !== 'object'
+  ) {
+    throw badResponse('the object is not a Sui allowance');
+  }
+  const [coin] = balance.typeParams;
+  if (
+    balance.address !== FRAMEWORK_ADDRESS ||
+    balance.module !== 'balance' ||
+    balance.name !== 'Balance' ||
+    balance.typeParams.length !== 1 ||
+    typeof coin !== 'object'
+  ) {
+    throw badResponse('the allowance is not over the Balance of a coin');
+  }
+  return chainStructTag(normalizeStructTag(coin), 'allowance coin type');
+}
 
 /**
  * Connects to Tatum's Sui Mainnet gateway: gRPC over the native HTTP/2 transport
@@ -598,6 +794,146 @@ export function createChain(opts: { apiKey?: string }): Chain {
     );
   }
 
+  /** One read of a digest's outcome, no retries. Null while the chain has no such transaction. */
+  async function landedResult(digest: string): Promise<ExecutionResult | null> {
+    try {
+      const { response } = await attempt((abort) =>
+        grpc.ledgerService.getTransaction({ digest, readMask: { paths: EXECUTED_PATHS } }, { abort }),
+      );
+      return response.transaction ? executedResult(response.transaction, digest) : null;
+    } catch (error) {
+      const failure = classify(error);
+      if (failure.code === 'NOT_FOUND') return null;
+      throw failure;
+    }
+  }
+
+  /**
+   * Sends signed bytes to Sui Mainnet through Tatum and returns what the chain did with
+   * them. The digest is computed here from the bytes, so the result always names the
+   * transaction that was signed.
+   *
+   * Identical signed bytes always have the same digest and Sui runs a digest at most once,
+   * so retrying is safe; even so, after a timeout or a transient error the digest is
+   * looked up first and the bytes are sent again only when the chain does not have it.
+   * A refusal is believed only after the same lookup, because bytes that landed through an
+   * earlier send can be refused when sent again. At most LIMITS.tatumRetries further
+   * rounds, each bounded by LIMITS.tatumTimeoutMs per request.
+   *
+   * Returns status "failure" with a fixed code for a transaction that ran and failed, or
+   * that the network refused before running it. Throws ChainError INVALID_INPUT for empty
+   * bytes or bad signatures without sending anything. Any other ChainError means the
+   * outcome is unknown, and its message says so and names the digest to read later.
+   */
+  async function executeTransaction(txBytes: Uint8Array, signatures: string[]): Promise<ExecutionResult> {
+    if (!(txBytes instanceof Uint8Array) || txBytes.length === 0) {
+      throw new ChainError('INVALID_INPUT', 'transaction bytes are empty');
+    }
+    const userSignatures = signatureInputs(signatures);
+    const digest = TransactionDataBuilder.getDigestFromBytes(txBytes);
+    const outcomeUnknown = (failure: ChainError) =>
+      scrub(
+        new ChainError(
+          failure.code,
+          `Tatum executeTransaction: ${failure.message}; transaction ${digest} may have landed, read it before building another`,
+          failure.retryable,
+        ),
+      );
+
+    let lastFailure: ChainError | null = null;
+    for (let round = 0; round <= LIMITS.tatumRetries; round++) {
+      if (lastFailure !== null) {
+        await sleep(LIMITS.tatumRetryDelayMs * 2 ** (round - 1));
+        let landed: ExecutionResult | null;
+        try {
+          landed = await landedResult(digest);
+        } catch (error) {
+          lastFailure = classify(error);
+          if (!lastFailure.retryable) throw outcomeUnknown(lastFailure);
+          continue;
+        }
+        if (landed !== null) return landed;
+      }
+      try {
+        const { response } = await attempt((abort) =>
+          grpc.transactionExecutionService.executeTransaction(
+            { transaction: { bcs: { value: txBytes } }, signatures: userSignatures, readMask: { paths: EXECUTED_PATHS } },
+            { abort },
+          ),
+        );
+        return executedResult(response.transaction, digest);
+      } catch (error) {
+        const failure = classify(error);
+        if (failure.code === 'INVALID_INPUT') {
+          const refusal = simulationRefusal(error) ?? 'REFUSED';
+          let landed: ExecutionResult | null;
+          try {
+            landed = await landedResult(digest);
+          } catch (lookupError) {
+            throw outcomeUnknown(classify(lookupError));
+          }
+          return landed ?? { digest, status: 'failure', errorCode: refusal, balanceChanges: [], createdObjects: [] };
+        }
+        if (!failure.retryable) throw outcomeUnknown(failure);
+        lastFailure = failure;
+      }
+    }
+    throw outcomeUnknown(lastFailure ?? new ChainError('UPSTREAM', 'no attempt was made', true));
+  }
+
+  /**
+   * Reads a direct (not app-bound) allowance from Sui Mainnet through Tatum GraphQL, in
+   * one request. Every address and the coin type come out of the SDK normalisers.
+   * Refuses, as BAD_RESPONSE, anything that is not exactly the allowance module's shape
+   * today: another object type, an app-bound allowance, one with no spender or with a
+   * start time (Ellai never sets one, and the result has nowhere to report it), a
+   * calendar-month window, an unknown field, or a number out of range.
+   * Throws ChainError: INVALID_INPUT for a malformed id, NOT_FOUND when no object has the
+   * id (never issued, revoked, or not yet indexed), or any transport code.
+   */
+  async function getAllowance(objectId: string): Promise<AllowanceState> {
+    const id = inputAddress(objectId);
+    const result = await bounded('getAllowance', (signal) =>
+      graphql.query({ query: ALLOWANCE_QUERY, variables: { id }, signal }),
+    );
+    if (result.errors?.length) {
+      throw new ChainError('UPSTREAM', `Tatum getAllowance: GraphQL returned ${result.errors.length} error(s)`);
+    }
+    const parsed = allowanceObjectSchema.safeParse(result.data);
+    if (!parsed.success) throw badResponse('the allowance object has an unknown shape');
+    const object = parsed.data.object;
+    if (object === null) throw new ChainError('NOT_FOUND', `Allowance ${id} was not found on Sui mainnet`);
+    if (chainAddress(object.address, 'allowance object id') !== id) throw badResponse('the object returned is not the one asked for');
+    if (object.asMoveObject === null) throw badResponse('the object is not a Move object');
+    const { type, json } = object.asMoveObject.contents;
+    const coinType = allowanceCoinType(type.repr);
+    if (chainAddress(json.id, 'allowance id field') !== id) throw badResponse('the allowance contents name another object');
+    const { initialSharedVersion } = object.owner;
+    if (object.owner.__typename !== 'Shared' || initialSharedVersion === undefined) {
+      throw badResponse('the allowance is not a shared object');
+    }
+
+    const { settings } = json;
+    if (settings.app !== null) throw badResponse('the allowance is bound to an app, which Ellai does not spend from');
+    if (settings.spender === null) throw badResponse('the allowance has no spender');
+    if (settings.start_timestamp_ms !== null) throw badResponse('the allowance has a start time, which Ellai never sets');
+    const rate = settings.rate_limit;
+    return {
+      funder: chainAddress(settings.funder, 'allowance funder'),
+      spender: chainAddress(settings.spender, 'allowance spender'),
+      coinType,
+      lifetimeCap: settings.lifetime_cap === null ? null : unsignedAtMost(settings.lifetime_cap, U256_MAX, 'the lifetime cap'),
+      spentTotal: unsignedAtMost(json.current_spend, U256_MAX, 'the amount spent'),
+      periodMs: rate === null ? null : unsignedAtMost(rate.window.pos0, U64_MAX, 'the rate-limit period'),
+      periodLimit: rate === null ? null : unsignedAtMost(rate.limit, U256_MAX, 'the rate-limit amount'),
+      expirationMs:
+        settings.expiration_timestamp_ms === null
+          ? null
+          : unsignedAtMost(settings.expiration_timestamp_ms, U64_MAX, 'the expiration'),
+      initialSharedVersion: BigInt(initialSharedVersion),
+    };
+  }
+
   return {
     grpc,
     graphql,
@@ -608,6 +944,8 @@ export function createChain(opts: { apiKey?: string }): Chain {
     getCurrentEpoch,
     simulate,
     listOwnedWalrusBlobs,
+    executeTransaction,
+    getAllowance,
     close: () => transport.close(),
   };
 }

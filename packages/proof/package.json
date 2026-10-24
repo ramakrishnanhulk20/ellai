@@ -8,7 +8,9 @@
     "setup": "tsx scripts/setup-keys.ts",
     "probe": "tsx --env-file-if-exists=../../.env scripts/probe-chain.ts",
     "probe:sellers": "tsx scripts/probe-sellers.ts",
-    "probe:pay": "tsx --env-file-if-exists=../../.env scripts/probe-pay.ts"
+    "probe:pay": "tsx --env-file-if-exists=../../.env scripts/probe-pay.ts",
+    "prove:memory": "tsx --env-file-if-exists=../../.env scripts/prove-memory.ts",
+    "prove:pay": "tsx --env-file-if-exists=../../.env scripts/prove-pay.ts"
   },
   "dependencies": {
     "@grpc/grpc-js": "1.14.6",
