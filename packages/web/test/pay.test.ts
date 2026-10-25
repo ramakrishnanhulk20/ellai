@@ -6,10 +6,12 @@
 // (open, or signed and still able to land, up to the edge of that window), a twin decision
 // opened once the first was paid and refused under the signing lock, the same request
 // decided again once its payment was released, an x402 v2 price refused before decide, a seller
-// that fails after payment, a status write, settlement read or outcome memory that fails after
+// that fails after payment or never answers (delivered false), a status write that fails and
+// leaves delivered null with no outcome, a status write, settlement read or outcome memory that fails after
 // payment and still leaves 'paid', a settlement mismatch pausing the owner, the release of a payment
-// that never landed, six-decimal amounts in reasons, and reasons that never carry agent or
-// seller text.
+// that never landed, the call's deadline (the paid request's wait cut to it, nothing signed when
+// too little time is left, settlement reads stopped at it), six-decimal amounts in reasons, and
+// reasons that never carry agent or seller text.
 // Does NOT cover: a real seller, the real Sui chain or Tatum (npm run prove:flow does those
 // live), safeFetch's own network checks (core's net tests), two connections racing on the owner
 // lock (PGlite serves one connection, so racing calls here run one transaction at a time),
@@ -224,6 +226,7 @@ function run(w: World, options: RunOptions = {}) {
     body: options.body === undefined ? BODY : options.body,
     contentType: options.contentType === undefined ? JSON_TYPE : options.contentType,
     purpose: options.purpose ?? PURPOSE,
+    ...(options.deadlineAt === undefined ? {} : { deadlineAt: options.deadlineAt }),
     secrets: { masterSecretHex: MASTER },
     deps: {
       fetch: options.fetch ?? seller(),
@@ -235,7 +238,28 @@ function run(w: World, options: RunOptions = {}) {
   });
 }
 
+/** The database, except that the first write to payments outside the signing transaction, the seller's status, throws. */
+function statusWriteFails(failure: () => Error): Database {
+  let failed = false;
+  return new Proxy(db, {
+    get(target, property) {
+      if (property === 'update') {
+        return (table: typeof payments) => {
+          if (table === payments && !failed) {
+            failed = true;
+            throw failure();
+          }
+          return target.update(table);
+        };
+      }
+      const value = Reflect.get(target, property);
+      return typeof value === 'function' ? value.bind(target) : value;
+    },
+  });
+}
+
 const paymentRows = (ownerId: string) => db.select().from(payments).where(eq(payments.ownerId, ownerId));
+const outcomeRows = (ownerId: string) => db.select().from(memories).where(and(eq(memories.ownerId, ownerId), eq(memories.kind, 'outcome')));
 const decisionRows = (ownerId: string) => db.select().from(decisions).where(eq(decisions.ownerId, ownerId));
 const ownerRow = async (ownerId: string) => one(await db.select().from(owners).where(eq(owners.id, ownerId)));
 const paidCalls = (fetch: ReturnType<typeof seller>) => fetch.mock.calls.filter(([, init]) => init.headers?.['X-PAYMENT'] !== undefined);
@@ -606,27 +630,10 @@ describe('paidFetch', () => {
     const error = vi.spyOn(console, 'error').mockImplementation(() => undefined);
     const failure = () => new Error(`the database went away ${hex(4)}`);
 
-    // The first write to payments outside the signing transaction is the seller's status.
-    const statusWriteFails = await world();
-    let failed = false;
-    const flaky = new Proxy(db, {
-      get(target, property) {
-        if (property === 'update') {
-          return (table: typeof payments) => {
-            if (table === payments && !failed) {
-              failed = true;
-              throw failure();
-            }
-            return target.update(table);
-          };
-        }
-        const value = Reflect.get(target, property);
-        return typeof value === 'function' ? value.bind(target) : value;
-      },
-    });
-    const statusResult = await run(statusWriteFails, { db: flaky, recallFor: (await approvals(statusWriteFails)).recallFor });
+    const statusFails = await world();
+    const statusResult = await run(statusFails, { db: statusWriteFails(failure), recallFor: (await approvals(statusFails)).recallFor });
     expect(statusResult).toMatchObject({ outcome: 'paid', reason: 'Paid 0.010000 USDC to hotels.example.', seller: { status: 200 }, payment: { settlement: 'verified' } });
-    expect(one(await paymentRows(statusWriteFails.ownerId))).toMatchObject({ sellerStatus: null, settlement: 'verified' });
+    expect(one(await paymentRows(statusFails.ownerId))).toMatchObject({ sellerStatus: null, delivered: null, settlement: 'verified' });
 
     const settleFails = await world();
     vi.mocked(settlePayment).mockRejectedValueOnce(failure());
@@ -649,6 +656,28 @@ describe('paidFetch', () => {
       '[ellai pay] after_payment_failed settlement',
       '[ellai pay] after_payment_failed outcome',
     ]);
+    error.mockRestore();
+  });
+
+  it('stores delivered false for a seller that never answered after the header left, and leaves it null, with no outcome, when that write fails', async () => {
+    const w = await world();
+    const { recallFor } = await approvals(w);
+    const timedOut = seller(() => {
+      throw new NetError('TIMEOUT', 'Seller request timed out');
+    });
+    const silent = await run(w, { fetch: timedOut, recallFor });
+    expect(silent).toMatchObject({ outcome: 'paid', seller: null, reason: 'Paid 0.010000 USDC to hotels.example; the seller returned no answer.', payment: { settlement: 'verified' } });
+    expect(one(await paymentRows(w.ownerId))).toMatchObject({ sellerStatus: null, delivered: false, settlement: 'verified' });
+    expect(one(await outcomeRows(w.ownerId)).decisionId).toBe(silent.decisionId);
+
+    const error = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    const unknown = await world();
+    const failing = seller((url) => response(url, 500, 'internal error'));
+    const result = await run(unknown, { db: statusWriteFails(() => new Error('the database went away')), fetch: failing, recallFor: (await approvals(unknown)).recallFor });
+    expect(result).toMatchObject({ outcome: 'paid', seller: { status: 500 }, payment: { settlement: 'verified' } });
+    expect(one(await paymentRows(unknown.ownerId))).toMatchObject({ sellerStatus: null, delivered: null, settlement: 'verified' });
+    expect(await outcomeRows(unknown.ownerId)).toHaveLength(0);
+    expect(error.mock.calls.map((call) => call.join(' '))).toEqual(['[ellai pay] after_payment_failed seller_status']);
     error.mockRestore();
   });
 
@@ -706,6 +735,111 @@ describe('paidFetch', () => {
     // One read inside the tries, then every release read but the last one misses.
     misses = LIMITS.paymentReleaseReads;
     expect(await settlePayment({ db, ownerId: w.ownerId, paymentId: row.id, chain: late, tries: 1, intervalMs: 5, sleep: noSleep })).toBe('verified');
+  });
+
+  it('cuts the paid request to end 10 s before the deadline, measured again after signing', async () => {
+    const w = await world();
+    const { recallFor } = await approvals(w);
+    let clock = NOW.getTime();
+    const base = stubChain(w);
+    // The unpaid request takes 200 s and signing's epoch read 5 s, so 25 s are left once the margin is kept.
+    const chain = {
+      ...base.chain,
+      getCurrentEpoch: async () => {
+        clock += 5_000;
+        return base.state.epoch;
+      },
+    } as Chain;
+    const fetch = seller(ok, (url) => {
+      clock += 200_000;
+      return challenge(url);
+    });
+    const result = await run(w, { url: JMPR_URL, fetch, chain, recallFor, now: () => new Date(clock) });
+    expect(result).toMatchObject({ outcome: 'paid', payment: { settlement: 'verified' } });
+    expect(LIMITS.sellerSlowPaidTimeoutMs).toBeGreaterThan(25_000);
+    expect(paidCalls(fetch)[0]?.[1]).toMatchObject({ timeoutMs: LIMITS.paidFetchDeadlineMs - 205_000 - 10_000 });
+  });
+
+  it('fails before signing anything when less than the shortest safeFetch wait would be left, and sends at exactly that wait', async () => {
+    const leaving = (left: number, clock: { at: number }) => (url: string) => {
+      clock.at = NOW.getTime() + LIMITS.paidFetchDeadlineMs - 10_000 - left;
+      return challenge(url);
+    };
+
+    const short = await world();
+    const shortClock = { at: NOW.getTime() };
+    const { chain, calls } = stubChain(short);
+    const tooLate = seller(ok, leaving(LIMITS.netTimeoutMinMs - 1, shortClock));
+    const refused = await run(short, { fetch: tooLate, chain, recallFor: (await approvals(short)).recallFor, now: () => new Date(shortClock.at) });
+    expect(refused).toMatchObject({
+      outcome: 'failed',
+      rule: 'learned',
+      reason: 'Too little time was left to pay this seller and still answer in time, so Ellai did not pay.',
+      seller: null,
+      payment: null,
+    });
+    expect(paidCalls(tooLate)).toHaveLength(0);
+    expect(calls).toEqual({ epochs: 0, balances: [], reads: [] });
+    expect(await paymentRows(short.ownerId)).toHaveLength(0);
+    expect(one(await decisionRows(short.ownerId)).status).toBe('failed');
+
+    const edge = await world();
+    const edgeClock = { at: NOW.getTime() };
+    const justInTime = seller(ok, leaving(LIMITS.netTimeoutMinMs, edgeClock));
+    const paid = await run(edge, { fetch: justInTime, recallFor: (await approvals(edge)).recallFor, now: () => new Date(edgeClock.at) });
+    expect(paid.outcome).toBe('paid');
+    expect(paidCalls(justInTime)[0]?.[1]).toMatchObject({ timeoutMs: LIMITS.netTimeoutMinMs });
+  });
+
+  it("keeps to a caller's deadlineAt when it is earlier than its own, and signs nothing when that leaves too little time", async () => {
+    const w = await world();
+    const { recallFor } = await approvals(w);
+    const fetch = seller();
+    expect((await run(w, { url: JMPR_URL, fetch, recallFor, deadlineAt: NOW.getTime() + 30_000 })).outcome).toBe('paid');
+    expect(paidCalls(fetch)[0]?.[1]).toMatchObject({ timeoutMs: 20_000 });
+
+    const tooSoon = seller();
+    const { chain, calls } = stubChain(w);
+    for (const deadlineAt of [NOW.getTime() + 10_000 + LIMITS.netTimeoutMinMs - 1, Number.NaN]) {
+      const refused = await run(w, { fetch: tooSoon, chain, recallFor, purpose: `a search with deadline ${deadlineAt}`, deadlineAt });
+      expect(refused).toMatchObject({ outcome: 'failed', reason: 'Too little time was left to pay this seller and still answer in time, so Ellai did not pay.', payment: null });
+    }
+    expect(paidCalls(tooSoon)).toHaveLength(0);
+    expect(calls).toEqual({ epochs: 0, balances: [], reads: [] });
+    expect(await paymentRows(w.ownerId)).toHaveLength(1);
+  });
+
+  it('stops the settlement reads at the deadline and answers paid and pending, with no read after it', async () => {
+    const w = await world();
+    const { recallFor } = await approvals(w);
+    let clock = NOW.getTime();
+    const { chain, calls } = stubChain(w, { landed: () => null });
+    // The seller answers 5 s before the deadline and reads are 3 s apart, so two reads start in time.
+    const fetch = seller((url, init) => {
+      clock = NOW.getTime() + LIMITS.paidFetchDeadlineMs - 5_000;
+      return ok(url, init);
+    });
+    const sleep = vi.fn(async (ms: number) => {
+      clock += ms;
+    });
+    const result = await run(w, { fetch, chain, recallFor, now: () => new Date(clock), sleep });
+    expect(result).toMatchObject({ outcome: 'paid', reason: 'Paid 0.010000 USDC to hotels.example.', payment: { settlement: 'pending' } });
+    expect(calls.reads).toHaveLength(2);
+    expect(calls.epochs).toBe(1);
+    expect(sleep.mock.calls).toEqual([[LIMITS.settlementInlineIntervalMs]]);
+    expect(one(await paymentRows(w.ownerId))).toMatchObject({ settlement: 'pending', delivered: true });
+
+    // Answered at the deadline itself: the payment would verify, but no read is made.
+    const late = await world();
+    let lateClock = NOW.getTime();
+    const lateChain = stubChain(late);
+    const atDeadline = seller((url, init) => {
+      lateClock = NOW.getTime() + LIMITS.paidFetchDeadlineMs;
+      return ok(url, init);
+    });
+    const lateResult = await run(late, { fetch: atDeadline, chain: lateChain.chain, recallFor: (await approvals(late)).recallFor, now: () => new Date(lateClock) });
+    expect(lateResult).toMatchObject({ outcome: 'paid', payment: { settlement: 'pending' } });
+    expect(lateChain.calls).toMatchObject({ epochs: 1, reads: [] });
   });
 
   it('never puts the purpose or anything a seller wrote into a reason', async () => {

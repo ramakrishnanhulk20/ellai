@@ -3,7 +3,7 @@ import { type Chain, ChainError } from '@ellai/core/chain';
 import { LIMITS } from '@ellai/core/limits';
 import { MemoryError } from '@ellai/core/memory';
 import type { Ed25519Keypair } from '@mysten/sui/keypairs/ed25519';
-import { and, asc, eq, inArray, isNotNull, sql } from 'drizzle-orm';
+import { and, asc, eq, inArray, isNotNull, notExists, sql } from 'drizzle-orm';
 import { unionAll } from 'drizzle-orm/pg-core';
 import type { Database } from '../db/client.js';
 import { LIVE_DECISION_STATUSES, decisions, memories, owners, payments } from '../db/schema.js';
@@ -49,11 +49,22 @@ export interface JobsTickSummary {
 }
 
 // The most payments one owner can sign in a day at the largest budget onboarding allows, so a
-// full day's backlog fits in one pass and an owner's pending payments are still a bounded loop.
+// full day's backlog fits in one pass and an owner's pending payments, or its payments still
+// owed an outcome, are still a bounded loop.
 const PAYMENTS_PER_OWNER = Math.ceil(LIMITS.onboardingDailyLimitMaxAtomic / LIMITS.minPaymentAtomic);
 const CODE = /^[A-Z][A-Z0-9_]{0,63}$/;
-const HTTP_FIRST_SUCCESS = 200;
-const HTTP_FIRST_AFTER_SUCCESS = 300;
+
+/**
+ * A verified payment stored as delivering nothing whose decision has no outcome memory yet. A
+ * null delivered, which means the seller's answer could not be stored, never matches.
+ */
+function owedOutcome(db: Database) {
+  const outcome = db
+    .select({ id: memories.id })
+    .from(memories)
+    .where(and(eq(memories.ownerId, payments.ownerId), eq(memories.decisionId, payments.decisionId), eq(memories.kind, 'outcome')));
+  return and(eq(payments.settlement, 'verified'), eq(payments.delivered, false), notExists(outcome));
+}
 
 /**
  * The fixed code for a failure: the kind of error and its own code, both from closed sets in
@@ -73,8 +84,9 @@ export function errorCode(error: unknown): string {
 
 /**
  * Owners with work, oldest work first: pending memories (only for an owner with a Walrus Memory
- * account, the only kind the memory step can send), pending payments, open or asked decisions,
- * and an allowance, dated by when it was checked or, before that, when the owner joined.
+ * account, the only kind the memory step can send), pending payments, payments owed an outcome
+ * memory, open or asked decisions, and an allowance, dated by when it was checked or, before
+ * that, when the owner joined.
  */
 async function ownersWithWork(db: Database): Promise<string[]> {
   const memoryWork = db
@@ -88,6 +100,11 @@ async function ownersWithWork(db: Database): Promise<string[]> {
     .from(payments)
     .where(eq(payments.settlement, 'pending'))
     .groupBy(payments.ownerId);
+  const outcomeWork = db
+    .select({ ownerId: payments.ownerId, at: sql<Date>`min(${payments.signedAt})`.as('at') })
+    .from(payments)
+    .where(owedOutcome(db))
+    .groupBy(payments.ownerId);
   const decisionWork = db
     .select({ ownerId: decisions.ownerId, at: sql<Date>`min(${decisions.createdAt})`.as('at') })
     .from(decisions)
@@ -97,7 +114,7 @@ async function ownersWithWork(db: Database): Promise<string[]> {
     .select({ ownerId: owners.id, at: sql<Date>`coalesce(${owners.allowanceCheckedAt}, ${owners.createdAt})`.as('at') })
     .from(owners)
     .where(isNotNull(owners.allowanceId));
-  const work = unionAll(memoryWork, paymentWork, decisionWork, allowanceWork).as('work');
+  const work = unionAll(memoryWork, paymentWork, outcomeWork, decisionWork, allowanceWork).as('work');
   const rows = await db
     .select({ ownerId: work.ownerId })
     .from(work)
@@ -112,11 +129,14 @@ async function ownersWithWork(db: Database): Promise<string[]> {
  * LIMITS.jobsOwnersPerTick owners with work, oldest work first. For each owner, in order:
  * 1. memory (only with a Walrus Memory account): submitPendingMemories, then confirmMemoryJobs;
  * 2. payments: every payment still 'pending', oldest first, is read once by settlePayment
- *    (tries 1; later ticks are the patience), which checks it against Ellai's own digest (C8).
- *    One that becomes 'verified' while the seller's status is missing or not 2xx becomes a
- *    delivered=false outcome memory through recordOutcome, idempotent per decision;
- * 3. expireDecisions: stale open decisions and unanswered questions past their time;
- * 4. refillIfNeeded (only with an allowance): C7 and C23 at refill time.
+ *    (tries 1; later ticks are the patience), which checks it against Ellai's own digest (C8);
+ * 3. outcomes: every 'verified' payment stored as delivered false (never null) whose decision has
+ *    no outcome memory yet, oldest first, becomes a delivered=false outcome memory through
+ *    recordOutcome, idempotent per decision. That takes in a payment step 2 has just verified
+ *    and one whose outcome the paid call itself failed to record;
+ * 4. expireDecisions: stale open decisions and unanswered questions past their time;
+ * 5. refillIfNeeded (only with an allowance), waiting with this tick's `sleep`: C7 and C23 at
+ *    refill time.
  * Then the gas wallet's SUI is read once; below LIMITS.gasWalletLowMist, or unreadable, sets
  * gasWalletLow.
  * Every owner and every step is wrapped: a failure is recorded with the owner, the step and a
@@ -170,7 +190,7 @@ export async function runJobsTick(args: JobsTickArgs): Promise<JobsTickSummary> 
 
       await step(ownerId, 'payments', async () => {
         const pending = await db
-          .select({ id: payments.id, decisionId: payments.decisionId, sellerStatus: payments.sellerStatus })
+          .select({ id: payments.id })
           .from(payments)
           .where(and(eq(payments.ownerId, ownerId), eq(payments.settlement, 'pending')))
           .orderBy(asc(payments.signedAt), asc(payments.id))
@@ -181,13 +201,23 @@ export async function runJobsTick(args: JobsTickArgs): Promise<JobsTickSummary> 
             if (settled === 'verified') summary.paymentsVerified += 1;
             else if (settled === 'not_landed') summary.paymentsNotLanded += 1;
             else if (settled === 'mismatch') summary.paymentsMismatched += 1;
-            const delivered = payment.sellerStatus !== null && payment.sellerStatus >= HTTP_FIRST_SUCCESS && payment.sellerStatus < HTTP_FIRST_AFTER_SUCCESS;
-            if (settled !== 'verified' || delivered) return;
-            await step(ownerId, 'outcome', async () => {
-              const { publicKeyHex } = ownerDelegate(masterSecretHex, owner.suiAddress);
-              await recordOutcome({ db, ownerId, decisionId: payment.decisionId, delivered: false, delegatePublicKeyHex: publicKeyHex, now: now() });
-              summary.outcomesRecorded += 1;
-            });
+          });
+        }
+      });
+
+      await step(ownerId, 'outcomes', async () => {
+        const owed = await db
+          .select({ decisionId: payments.decisionId })
+          .from(payments)
+          .where(and(eq(payments.ownerId, ownerId), owedOutcome(db)))
+          .orderBy(asc(payments.signedAt), asc(payments.id))
+          .limit(PAYMENTS_PER_OWNER);
+        if (owed.length === 0) return;
+        const { publicKeyHex } = ownerDelegate(masterSecretHex, owner.suiAddress);
+        for (const payment of owed) {
+          await step(ownerId, 'outcome', async () => {
+            await recordOutcome({ db, ownerId, decisionId: payment.decisionId, delivered: false, delegatePublicKeyHex: publicKeyHex, now: now() });
+            summary.outcomesRecorded += 1;
           });
         }
       });
@@ -200,7 +230,7 @@ export async function runJobsTick(args: JobsTickArgs): Promise<JobsTickSummary> 
 
       if (owner.allowanceId !== null) {
         await step(ownerId, 'refill', async () => {
-          if ((await refillIfNeeded({ db, chain, ownerId, masterSecretHex, gasKeypair, now: now() })) === 'refilled') summary.refills += 1;
+          if ((await refillIfNeeded({ db, chain, ownerId, masterSecretHex, gasKeypair, now: now(), sleep })) === 'refilled') summary.refills += 1;
         });
       }
     });

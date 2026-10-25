@@ -5,7 +5,8 @@
 // PaidFetchResult with the seller's answer marked untrusted and nothing of Ellai's sent to the
 // seller; a question, the owner's yes, retryAllowed, one paid retry, and the grant spent or
 // expired; the per-agent and per-owner pay limits and the per-agent decision read limit, each
-// shared by HTTP and MCP; the routes' time ceilings; bodies the route does not take; one agent never reading
+// shared by HTTP and MCP, and the one too_many_requests body every limit answers with; a caller's
+// deadline handed through agentPaidFetch; the routes' time ceilings; bodies the route does not take; one agent never reading
 // another's decision; an unexpected failure as a bare 500; and the MCP handshake, tool list,
 // both tools running the same flow as the HTTP routes, tool failures as fixed JSON, and 405 on
 // GET and DELETE.
@@ -34,6 +35,10 @@ import { decisions, payments } from '../src/server/db/schema.js';
 import { answerQuestion } from '../src/server/decide/answer.js';
 import type { ServerEnv } from '../src/server/env.js';
 import { setServerContextFactory } from '../src/server/http/context.js';
+import { AgentLimitError, agentLimitResponse } from '../src/server/http/agent-auth.js';
+import { HttpError, toErrorResponse, tooManyRequestsResponse } from '../src/server/http/errors.js';
+import { limitOwnerChainReads } from '../src/server/http/owner-limits.js';
+import { type PaidFetchInput, agentPaidFetch } from '../src/server/mcp/server.js';
 import { ownerDelegate } from '../src/server/memory/delegate.js';
 import { MEMORY_NAMESPACE } from '../src/server/memory/namespace.js';
 
@@ -249,9 +254,27 @@ describe('route files', () => {
     expect(route.dynamic).toBe('force-dynamic');
   });
 
-  it('gives the routes that can wait on a paid call or a tick a 60 second ceiling of their own', () => {
-    expect([fetchRoute.maxDuration, mcpRoute.maxDuration, jobsRoute.maxDuration]).toEqual([60, 60, 60]);
-    expect(LIMITS.netPaidTimeoutMaxMs).toBeLessThanOrEqual(60_000);
+  it('gives the routes that can wait on a paid call or a tick the ceiling in LIMITS.slowRouteMaxDurationS, past the paid call deadline', () => {
+    const ceiling = LIMITS.slowRouteMaxDurationS;
+    expect([fetchRoute.maxDuration, mcpRoute.maxDuration, jobsRoute.maxDuration]).toEqual([ceiling, ceiling, ceiling]);
+    expect(LIMITS.paidFetchDeadlineMs).toBeLessThan(ceiling * 1_000);
+  });
+});
+
+describe('the per-minute limits', () => {
+  it('answer with the one too_many_requests body from the error table, for agents and owners alike', async () => {
+    quiet();
+    const w = await world();
+    const ctx = { db, chain, env: ENV, now: () => clock };
+    let ownerAnswer: Response | null = null;
+    for (let read = 0; read <= LIMITS.ownerChainReadsPerMinute && ownerAnswer === null; read += 1) ownerAnswer = await limitOwnerChainReads(ctx, w.ownerId);
+    const answers = [agentLimitResponse(), tooManyRequestsResponse(), toErrorResponse(new HttpError(429, 'too_many_requests')), ownerAnswer ?? new Response()];
+    for (const response of answers) {
+      expect(response.status).toBe(429);
+      expect(response.headers.get('cache-control')).toBe('no-store');
+      expect(await response.json()).toEqual(TOO_MANY);
+    }
+    expect(new AgentLimitError().message).toBe(TOO_MANY.message);
   });
 });
 
@@ -408,6 +431,28 @@ describe('POST /api/agent/fetch', () => {
     expect((await agentFetch(fetchInput(), bearer(stranger.token))).status).toBe(200);
     clock = new Date(clock.getTime() + 60_000);
     expect((await agentFetch(fetchInput(), bearer(third.token))).status).toBe(200);
+  });
+
+  it("hands a caller's deadline to paidFetch, which signs nothing when too little of it is left", async () => {
+    const w = await world();
+    chain = stubChain(w);
+    payingSeller();
+    const ctx = { db, chain, env: ENV, now: () => clock };
+    const agent = { ownerId: w.ownerId, agentId: w.agentId };
+    const input = fetchInput() as PaidFetchInput;
+    const asked = await agentPaidFetch(ctx, agent, input);
+    await approve(w, asked.decisionId ?? '');
+
+    const late = await agentPaidFetch(ctx, agent, input, { deadlineAt: clock.getTime() + 10_000 });
+    expect(late).toMatchObject({
+      outcome: 'failed',
+      rule: 'grant',
+      reason: 'Too little time was left to pay this seller and still answer in time, so Ellai did not pay.',
+      payment: null,
+      sellerBodyIsUntrusted: true,
+    });
+    expect(seller.mock.calls.filter(([, init]) => init.headers?.['X-PAYMENT'] !== undefined)).toHaveLength(0);
+    expect(await db.select().from(payments).where(eq(payments.ownerId, w.ownerId))).toHaveLength(0);
   });
 
   it('refuses a body it does not take with 400, before any seller is called', async () => {

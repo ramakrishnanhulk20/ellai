@@ -5,9 +5,11 @@ import { AGENT_BODY_CAP, agentPaidFetch, paidFetchInput } from '../../../../serv
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
-// Seconds this route may run, set here so the ceiling is Ellai's choice and not the platform's
-// default. A paid call can wait up to LIMITS.netPaidTimeoutMaxMs on the seller, then read the chain.
-export const maxDuration = 60;
+// Seconds this route may run, so the ceiling is Ellai's choice and not the platform's default.
+// Next.js reads this export without running the module, so it is written as the literal value of
+// LIMITS.slowRouteMaxDurationS, and a test holds the two equal. A paid call answers by
+// LIMITS.paidFetchDeadlineMs, inside this ceiling.
+export const maxDuration = 300;
 
 /**
  * An agent asks Ellai to fetch a URL and, if the seller asks for payment, to decide with the

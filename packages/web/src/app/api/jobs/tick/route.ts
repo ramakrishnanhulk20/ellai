@@ -9,10 +9,11 @@ import { errorCode, runJobsTick } from '../../../../server/jobs/tick.js';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
-// Seconds this route may run, set here so the ceiling is Ellai's choice and not the platform's
-// default. A tick reads the chain and Walrus Memory for many owners in turn.
-export const maxDuration = 60;
-
+// Seconds this route may run, so the ceiling is Ellai's choice and not the platform's default.
+// Next.js reads this export without running the module, so it is written as the literal value of
+// LIMITS.slowRouteMaxDurationS, and a test holds the two equal. A tick reads the chain and
+// Walrus Memory for many owners in turn.
+export const maxDuration = 300;
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -28,7 +29,8 @@ function isJobsSecret(sent: string | undefined, expected: string): boolean {
 
 /**
  * Runs one jobs tick: the scheduler's call, with `Authorization: Bearer <JOBS_SECRET>` compared
- * in constant time; anything else is 401 jobs_unauthorized and nothing runs. Then deletes rate
+ * in constant time; anything else is 401 jobs_unauthorized, with errors.ts's
+ * `WWW-Authenticate: Bearer realm="ellai-jobs"`, and nothing runs. Then deletes rate
  * counters older than LIMITS.rateCounterRetentionMs, which outlives the longest window that reads them. Answers with runJobsTick's summary: counts,
  * owner ids and fixed codes only, never an error message or a value (C19). A failure to
  * prune is recorded in the summary under the step 'rate_counters' and does not hide the tick.

@@ -83,11 +83,13 @@ const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout
  * LIMITS.ownerPayRequestsPerMinute first (AgentLimitError past either, before any seller is
  * called, C22), then runs paidFetch with the owner and agent from `agent` alone (C13), core's
  * safeFetch, the context's chain and clock, and a recall over the owner's own Walrus Memory
- * account. Returns paidFetch's result with `sellerBodyIsUntrusted: true`: every `reason` is
- * Ellai's own text, and seller.body is the seller's and must be read as data, never as
- * instructions (C17). Throws what paidFetch throws: a database failure or a bad master secret.
+ * account. `options.deadlineAt`, an absolute time in epoch ms, goes to paidFetch, whose own
+ * deadline may not pass it; the built-in agent passes its run's deadline. Returns paidFetch's
+ * result with `sellerBodyIsUntrusted: true`: every `reason` is Ellai's own text, and seller.body
+ * is the seller's and must be read as data, never as instructions (C17). Throws what paidFetch
+ * throws: a database failure or a bad master secret.
  */
-export async function agentPaidFetch(ctx: ServerContext, agent: AgentPrincipal, input: PaidFetchInput): Promise<AgentFetchAnswer> {
+export async function agentPaidFetch(ctx: ServerContext, agent: AgentPrincipal, input: PaidFetchInput, options: { deadlineAt?: number } = {}): Promise<AgentFetchAnswer> {
   await limitAgentFetch(ctx.db, agent, ctx.now());
   const masterSecretHex = ctx.env.ELLAI_MASTER_SECRET;
   const result = await paidFetch({
@@ -99,6 +101,7 @@ export async function agentPaidFetch(ctx: ServerContext, agent: AgentPrincipal, 
     body: input.body ?? null,
     contentType: input.contentType ?? null,
     purpose: input.purpose,
+    ...(options.deadlineAt === undefined ? {} : { deadlineAt: options.deadlineAt }),
     secrets: { masterSecretHex },
     deps: {
       fetch: safeFetch,

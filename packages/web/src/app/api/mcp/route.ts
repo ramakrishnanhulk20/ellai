@@ -5,9 +5,11 @@ import { handleMcpRequest } from '../../../server/mcp/server.js';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
-// Seconds this route may run, set here so the ceiling is Ellai's choice and not the platform's
-// default. paid_fetch can wait up to LIMITS.netPaidTimeoutMaxMs on the seller, then read the chain.
-export const maxDuration = 60;
+// Seconds this route may run, so the ceiling is Ellai's choice and not the platform's default.
+// Next.js reads this export without running the module, so it is written as the literal value of
+// LIMITS.slowRouteMaxDurationS, and a test holds the two equal. paid_fetch answers by
+// LIMITS.paidFetchDeadlineMs, inside this ceiling.
+export const maxDuration = 300;
 
 /**
  * Ellai as an MCP server over Streamable HTTP, stateless: each POST carries one JSON-RPC

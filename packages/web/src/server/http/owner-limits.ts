@@ -3,7 +3,7 @@ import { LIMITS } from '@ellai/core/limits';
 import { MemoryError } from '@ellai/core/memory';
 import { z } from 'zod';
 import type { ServerContext } from './context.js';
-import { HttpError, httpErrorResponse } from './errors.js';
+import { HttpError, httpErrorResponse, tooManyRequestsResponse } from './errors.js';
 import { consume, consumeWindow } from './ratelimit.js';
 
 /**
@@ -37,13 +37,13 @@ const HOUR_MS = 3_600_000;
  * LIMITS.ownerChainReadsPerMinute (C22). The key is the owner the session named, never
  * anything the caller sends, and every route that calls this shares it, so spreading calls
  * across routes buys nothing. A request over the limit still counts.
- * Returns null within the limit, and beyond it errors.ts's 429 too_many_requests response,
+ * Returns null within the limit, and beyond it errors.ts's one 429 too_many_requests response,
  * which the route must return as it is.
  */
 export async function limitOwnerChainReads(ctx: ServerContext, ownerId: string): Promise<Response | null> {
   if (await consume(ctx.db, `${OWNER_CHAIN_KEY_PREFIX}${ownerId}`, LIMITS.ownerChainReadsPerMinute, ctx.now())) return null;
   console.warn('[ellai http] owner_chain too_many_requests');
-  return httpErrorResponse(new HttpError(429, 'too_many_requests'));
+  return tooManyRequestsResponse();
 }
 
 /**

@@ -5,12 +5,14 @@
 // unknown seller or a url field reaches no fetch and the URL is always the catalog's; 'asked',
 // 'refused' and a pay limit ending the run; the tool cap; a refusal stop; SDK errors kept out
 // of the answer and the log; the hourly and daily run limits; the one built-in agent row per
-// owner; and the exact shape of every request sent. Then POST /api/owner/agent/run as Next
-// calls it: the session and same-origin checks, the needs-key answer without
-// ANTHROPIC_API_KEY, body and task refusals, and, with a key and a stubbed fetch under the
-// real SDK, that the key goes only to Anthropic and neither it nor the API's error text
-// reaches the response or the log, each try's timeout and the one retry, and the owner's
-// per-minute pay limit shared with outside agents.
+// owner, made even for an owner at the external agent cap; the run's one deadline (each model
+// request's timeout, retry and abort signal, each paid call's deadlineAt, and the stop with
+// under 20 s left); and the exact shape of every request sent. Then POST /api/owner/agent/run
+// as Next calls it: the session and same-origin checks, the needs-key answer without
+// ANTHROPIC_API_KEY, body and task refusals (bad_task from the error table), and, with a key and
+// a stubbed fetch under the real SDK, that the key goes only to Anthropic and neither it nor the
+// API's error text reaches the response or the log, each try's timeout and the one retry, and
+// the owner's per-minute pay limit shared with outside agents, with the run's deadline handed on.
 // Does NOT cover: a live model call (no key in tests; the head chef runs that proof), what
 // paidFetch itself decides or pays (pay.test.ts does), how well Haiku picks a seller, or two
 // database connections starting a first run at once (PGlite serves one connection).
@@ -33,17 +35,26 @@ import {
   BUILTIN_AGENT_LABEL,
   PAY_LIMIT_REASON,
   type PaidFetchInput,
+  RUN_MIN_LEFT_MS,
   TOOL_ERRORS,
   runAgentTask,
 } from '../src/server/agent/run.js';
-import { revokeAgent } from '../src/server/auth/agents.js';
+import { createAgentToken, revokeAgent } from '../src/server/auth/agents.js';
 import { completeSignIn, issueSignIn } from '../src/server/auth/signin.js';
 import { type Database, createDb, migrate } from '../src/server/db/client.js';
 import { agents, owners, rateCounters } from '../src/server/db/schema.js';
 import type { ServerEnv } from '../src/server/env.js';
 import { AgentLimitError, limitAgentFetch } from '../src/server/http/agent-auth.js';
 import { setServerContextFactory } from '../src/server/http/context.js';
+import { HttpError, toErrorResponse } from '../src/server/http/errors.js';
+import { agentPaidFetch } from '../src/server/mcp/server.js';
 import { type PaidFetchResult, bare } from '../src/server/pay/result.js';
+
+// Runs as written; wrapped only so the route test can see what the route hands it.
+vi.mock('../src/server/mcp/server.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../src/server/mcp/server.js')>();
+  return { ...actual, agentPaidFetch: vi.fn(actual.agentPaidFetch) };
+});
 
 let handle: Awaited<ReturnType<typeof createDb>>;
 let db: Database;
@@ -122,23 +133,31 @@ const checkWallet = (id: string, extra: Record<string, unknown> = {}) => use(id,
 // Every request any stub saw in this file, so the request-shape test also checks the others.
 const everyRequest: Array<Record<string, unknown>> = [];
 
-function stubClient(script: Array<Anthropic.Message | Error>) {
+interface SentOptions {
+  timeout: number;
+  maxRetries: number;
+  signal: AbortSignal;
+}
+
+function stubClient(script: Array<Anthropic.Message | Error | (() => Anthropic.Message)>) {
   const requests: Array<Record<string, unknown>> = [];
-  const create = vi.fn(async (params: unknown) => {
+  const options: SentOptions[] = [];
+  const create = vi.fn(async (params: unknown, sent: SentOptions) => {
     // A copy, because the run keeps appending to the same messages array.
     const copy = structuredClone(params) as Record<string, unknown>;
     requests.push(copy);
     everyRequest.push(copy);
+    options.push(sent);
     const next = script.shift();
     if (next === undefined) throw new Error('the script ran out');
     if (next instanceof Error) throw next;
-    return next;
+    return typeof next === 'function' ? next() : next;
   });
-  return { client: { messages: { create } } as unknown as Anthropic, requests, create };
+  return { client: { messages: { create } } as unknown as Anthropic, requests, create, options };
 }
 
 function stubGate(results: PaidFetchResult[] = []) {
-  return vi.fn(async (_agentId: string, _input: PaidFetchInput): Promise<PaidFetchResult> => {
+  return vi.fn(async (_agentId: string, _input: PaidFetchInput, _deadlineAt: number): Promise<PaidFetchResult> => {
     const next = results.shift();
     if (next === undefined) throw new Error('no scripted gate result');
     return next;
@@ -158,9 +177,9 @@ const paid = (sellerBody: string): PaidFetchResult => ({
 const asked = (): PaidFetchResult => ({ ...bare('asked', 'Ellai has no decision of yours like this one.'), decisionId: DECISION_ID, rule: 'no_match' });
 const refused = (): PaidFetchResult => ({ ...bare('refused', 'Automatic payments are paused for this account.'), decisionId: DECISION_ID, rule: 'paused' });
 
-function run(ownerId: string, client: Anthropic | null, paidFetchFor = stubGate(), options: { task?: string; now?: Date } = {}) {
+function run(ownerId: string, client: Anthropic | null, paidFetchFor = stubGate(), options: { task?: string; now?: Date; clock?: () => Date } = {}) {
   const now = options.now ?? clock;
-  return runAgentTask({ db, ownerId, task: options.task ?? 'Check the Sui wallet 0x2', appOrigin: APP_ORIGIN, anthropic: client, paidFetchFor, now: () => now });
+  return runAgentTask({ db, ownerId, task: options.task ?? 'Check the Sui wallet 0x2', appOrigin: APP_ORIGIN, anthropic: client, paidFetchFor, now: options.clock ?? (() => now) });
 }
 
 type Block = { type: string; tool_use_id?: string; is_error?: boolean; content?: string };
@@ -263,7 +282,11 @@ describe('runAgentTask', () => {
     });
     const [builtin] = await builtinAgents(ownerId);
     expect(gate).toHaveBeenCalledTimes(1);
-    expect(gate).toHaveBeenCalledWith(builtin?.id, { url: WALLET_CHECK_URL, method: 'POST', body: WALLET_BODY, contentType: 'application/json', purpose: PURPOSE });
+    expect(gate).toHaveBeenCalledWith(
+      builtin?.id,
+      { url: WALLET_CHECK_URL, method: 'POST', body: WALLET_BODY, contentType: 'application/json', purpose: PURPOSE },
+      clock.getTime() + LIMITS.paidFetchDeadlineMs,
+    );
 
     const [listed] = toolResultsIn(requests, 1);
     expect(listed).toMatchObject({ type: 'tool_result', tool_use_id: 't1' });
@@ -448,6 +471,86 @@ describe('runAgentTask', () => {
     expect(active[0]?.id).not.toBe(rows[0]?.id);
   });
 
+  it(`runs the built-in agent for an owner who already holds ${LIMITS.agentsPerOwnerMax} external agents`, async () => {
+    const ownerId = await newOwner();
+    for (let i = 1; i <= LIMITS.agentsPerOwnerMax; i += 1) {
+      await createAgentToken({ db, ownerId, label: `Agent ${i}`, kind: 'external', sessionSecretHex: SECRET, now: clock });
+    }
+    const gate = stubGate([paid('{}')]);
+    const { client } = stubClient([calling(checkWallet('w')), final('Done.')]);
+    expect(await run(ownerId, client, gate)).toMatchObject({ status: 'done', answer: 'Done.' });
+    const [builtin] = await builtinAgents(ownerId);
+    expect(gate.mock.calls.map(([agentId]) => agentId)).toEqual([builtin?.id]);
+  });
+
+  it('holds each model request to the run deadline: the full limit and one retry early on, then no retry, then a shorter wait', async () => {
+    const ownerId = await newOwner();
+    let now = clock.getTime();
+    const deadline = now + LIMITS.paidFetchDeadlineMs;
+    const { client, options } = stubClient([
+      () => {
+        now = deadline - 100_000;
+        return calling(use('t1', 'list_sellers', {}));
+      },
+      () => {
+        now = deadline - 40_000;
+        return calling(use('t2', 'list_sellers', {}));
+      },
+      final('ok'),
+    ]);
+    expect((await run(ownerId, client, stubGate(), { clock: () => new Date(now) })).status).toBe('done');
+    // 230 s fit two tries of 60 s; 90 s do not; 30 s cut the wait itself. Each keeps 10 s spare.
+    expect(options.map(({ timeout, maxRetries }) => ({ timeout, maxRetries }))).toEqual([
+      { timeout: LIMITS.agentModelTimeoutMs, maxRetries: AGENT_MODEL_RETRIES },
+      { timeout: LIMITS.agentModelTimeoutMs, maxRetries: 0 },
+      { timeout: 30_000, maxRetries: 0 },
+    ]);
+    for (const sent of options) expect(sent.signal).toBeInstanceOf(AbortSignal);
+  });
+
+  it('ends a run whose paid call was slow before its deadline, with no model request after it', async () => {
+    const ownerId = await newOwner();
+    let now = clock.getTime();
+    const deadline = now + LIMITS.paidFetchDeadlineMs;
+    const { client, create } = stubClient([calling(checkWallet('p1')), final('never asked for')]);
+    const gate = vi.fn(async (_agentId: string, _input: PaidFetchInput, _deadlineAt: number): Promise<PaidFetchResult> => {
+      now = deadline - RUN_MIN_LEFT_MS + 1;
+      return paid('{}');
+    });
+    expect(await run(ownerId, client, gate, { clock: () => new Date(now) })).toEqual({
+      status: 'stopped',
+      answer: AGENT_ANSWERS.outOfTime,
+      steps: [{ sellerId: 'ellai-wallet-check', outcome: 'paid', reason: 'Paid 0.01 USDC to ellai.example.', digest: 'Fq3sD1gestFromEllai' }],
+    });
+    expect(gate.mock.calls.map(([, , deadlineAt]) => deadlineAt)).toEqual([deadline]);
+    expect(create).toHaveBeenCalledTimes(1);
+    expect(now).toBeLessThan(deadline);
+  });
+
+  it(`stops with less than ${RUN_MIN_LEFT_MS / 1_000} s of the run left, before calling the model or a seller`, async () => {
+    const start = clock.getTime();
+    const deadline = start + LIMITS.paidFetchDeadlineMs;
+    const gate = stubGate();
+    // The first read of the clock starts the run; every later one finds it just inside its last 20 s.
+    let reads = 0;
+    const late = () => new Date(reads++ === 0 ? start : deadline - RUN_MIN_LEFT_MS + 1);
+    const idle = stubClient([final('never asked for')]);
+    expect(await run(await newOwner(), idle.client, gate, { clock: late })).toEqual({ status: 'stopped', answer: AGENT_ANSWERS.outOfTime, steps: [] });
+    expect(idle.create).not.toHaveBeenCalled();
+
+    // The model's reply came back that late, so the paid call it asks for is never made.
+    let now = start;
+    const slowModel = stubClient([
+      () => {
+        now = deadline - RUN_MIN_LEFT_MS + 1;
+        return calling(checkWallet('p1'));
+      },
+    ]);
+    expect(await run(await newOwner(), slowModel.client, gate, { clock: () => new Date(now) })).toEqual({ status: 'stopped', answer: AGENT_ANSWERS.outOfTime, steps: [] });
+    expect(slowModel.create).toHaveBeenCalledTimes(1);
+    expect(gate).not.toHaveBeenCalled();
+  });
+
   it('refuses a task that is empty or too long before any model call, counting in code points', async () => {
     const ownerId = await newOwner();
     const { client, create } = stubClient([final('ok'), final('ok')]);
@@ -506,10 +609,10 @@ describe('POST /api/owner/agent/run', () => {
 
   beforeEach(() => useEnv(ENV));
 
-  it('runs on Node, is never cached or prerendered, and has a 60 second ceiling of its own', () => {
+  it('runs on Node, is never cached or prerendered, and has the ceiling in LIMITS.slowRouteMaxDurationS', () => {
     expect(agentRunRoute.runtime).toBe('nodejs');
     expect(agentRunRoute.dynamic).toBe('force-dynamic');
-    expect(agentRunRoute.maxDuration).toBe(60);
+    expect(agentRunRoute.maxDuration).toBe(LIMITS.slowRouteMaxDurationS);
   });
 
   it('is 401 signed_out without a session, whatever the body names', async () => {
@@ -566,6 +669,9 @@ describe('POST /api/owner/agent/run', () => {
       const refused = await post(payload, { cookie });
       expect([refused.status, ((await refused.json()) as { error: string }).error]).toEqual([400, code]);
     }
+    const badTask = await post({ task: 'a'.repeat(LIMITS.agentTaskMaxChars + 1) }, { cookie });
+    expect(await badTask.text()).toBe(await toErrorResponse(new HttpError(400, 'bad_task')).text());
+    expect(JSON.parse(await toErrorResponse(new HttpError(400, 'bad_task')).text())).toEqual({ error: 'bad_task', message: new AgentTaskError().message });
     expect(seen).toEqual([]);
 
     const response = await post({ task: 'Check the Sui wallet 0x2' }, { cookie });
@@ -636,5 +742,12 @@ describe('POST /api/owner/agent/run', () => {
     });
     expect(anthropic).toHaveBeenCalledTimes(1);
     expect(warn?.mock.calls.map((call) => call.join(' '))).toEqual(['[ellai http] owner_pay too_many_requests']);
+    // The route hands the gate the run's deadline, which started with this request.
+    expect(vi.mocked(agentPaidFetch)).toHaveBeenLastCalledWith(
+      expect.anything(),
+      { ownerId, agentId: expect.any(String) },
+      expect.objectContaining({ url: WALLET_CHECK_URL, purpose: PURPOSE }),
+      { deadlineAt: clock.getTime() + LIMITS.paidFetchDeadlineMs },
+    );
   });
 });

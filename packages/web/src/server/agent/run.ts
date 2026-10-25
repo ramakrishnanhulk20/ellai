@@ -15,9 +15,17 @@ import { AGENT_SYSTEM_PROMPT } from './prompt.js';
 export const AGENT_MODEL = 'claude-haiku-5-5';
 /**
  * Retries the model client makes after a failed request. One, not the SDK's two: the owner is
- * waiting on the page, and a second failure in a row is reported rather than waited out.
+ * waiting on the page, and a second failure in a row is reported rather than waited out. The
+ * SDK's timeout applies to each try, so with this retry one request can take twice its timeout
+ * plus the SDK's wait between tries; runAgentTask asks for no retry when two tries would not
+ * fit before the run's deadline.
  */
 export const AGENT_MODEL_RETRIES = 1;
+/** Less of the run than this left, and no model request or paid call is started. */
+export const RUN_MIN_LEFT_MS = 20_000;
+// Every model request ends at least this long before the run's deadline, so the answer still
+// reaches the owner inside the route's time.
+const RUN_MARGIN_MS = 10_000;
 export const BUILTIN_AGENT_LABEL = 'Built-in agent';
 
 export type AgentRunStatus = 'done' | 'needs_key' | 'stopped' | 'limit' | 'refused';
@@ -59,6 +67,7 @@ export const AGENT_ANSWERS = {
   asked: 'Ellai asked you before paying, so the built-in agent stopped. Answer the question in Ellai, then run the task again.',
   refusedPayment: 'Ellai refused this payment, so the built-in agent stopped.',
   payLimit: "Your agents reached Ellai's limit on paid calls for this minute, so the built-in agent stopped. Try again in a minute.",
+  outOfTime: 'The built-in agent ran out of time for this task, so it stopped before asking Claude or a seller again.',
 } as const;
 
 /** The reason on a step Ellai did not run because a per-minute pay limit was reached (C22). */
@@ -194,6 +203,25 @@ function toolsFor(catalog: ReadonlyArray<CatalogEntry>): Anthropic.Tool[] {
   ];
 }
 
+/** True while at least RUN_MIN_LEFT_MS of the run is left. Written so an unreadable clock (NaN) is false. */
+function timeLeft(deadlineAt: number, now: Date): boolean {
+  return deadlineAt - now.getTime() >= RUN_MIN_LEFT_MS;
+}
+
+/**
+ * How the next model request is held to the run's deadline: each try waits the smaller of
+ * LIMITS.agentModelTimeoutMs and the time left less RUN_MARGIN_MS, the retry is dropped when two
+ * tries would not fit in that, and the signal ends the request, the SDK's wait between tries
+ * included, at that point whatever the API's retry-after asks for. Null when too little is left.
+ */
+function modelRequestOptions(deadlineAt: number, now: Date): { timeout: number; maxRetries: number; signal: AbortSignal } | null {
+  if (!timeLeft(deadlineAt, now)) return null;
+  // The SDK takes only whole milliseconds.
+  const budget = Math.floor(deadlineAt - now.getTime() - RUN_MARGIN_MS);
+  const timeout = Math.min(LIMITS.agentModelTimeoutMs, budget);
+  return { timeout, maxRetries: 2 * timeout <= budget ? AGENT_MODEL_RETRIES : 0, signal: AbortSignal.timeout(budget) };
+}
+
 function textOf(message: Anthropic.Message): string {
   return message.content
     .flatMap((block) => (block.type === 'text' ? [block.text] : []))
@@ -290,6 +318,13 @@ async function runTool(
  * A 'refusal' stop ends it 'refused'; any other stop but end_turn and tool_use, and any SDK
  * error, end it 'stopped' with fixed text (C19).
  *
+ * The run has one deadline, LIMITS.paidFetchDeadlineMs after it starts (C21). Every paid call
+ * gets it as `deadlineAt`, so paidFetch answers by then. Every model request waits at most the
+ * smaller of LIMITS.agentModelTimeoutMs and the time left less 10 s, with no retry when two such
+ * tries would not fit, and is aborted, retry wait included, at that point. With less than
+ * RUN_MIN_LEFT_MS left, no model request or paid call is started: the run ends 'stopped' with
+ * AGENT_ANSWERS.outOfTime, or with the halted answer when a payment was already asked or refused.
+ *
  * `steps` lists every call that reached the gate, with Ellai's outcome, reason and digest.
  * Throws for failures that are not about the run: a database error, a bad owner id or clock,
  * an app origin that is not an origin, or an error that is not from the SDK.
@@ -300,9 +335,10 @@ export async function runAgentTask(args: {
   task: string;
   appOrigin: string;
   anthropic: Anthropic | null;
-  paidFetchFor: (agentId: string, input: PaidFetchInput) => Promise<PaidFetchResult>;
+  paidFetchFor: (agentId: string, input: PaidFetchInput, deadlineAt: number) => Promise<PaidFetchResult>;
   now: () => Date;
 }): Promise<AgentRunResult> {
+  const deadlineAt = args.now().getTime() + LIMITS.paidFetchDeadlineMs;
   const steps: AgentStep[] = [];
   const finish = (status: AgentRunStatus, answer: string): AgentRunResult => ({ status, answer, steps });
   const { db, anthropic } = args;
@@ -317,23 +353,28 @@ export async function runAgentTask(args: {
 
   const byId = new Map(catalog.map((entry) => [entry.id, entry]));
   const tools = toolsFor(catalog);
-  const pay = (input: PaidFetchInput) => args.paidFetchFor(agentId, input);
+  const pay = (input: PaidFetchInput) => args.paidFetchFor(agentId, input, deadlineAt);
   const messages: Anthropic.MessageParam[] = [{ role: 'user', content: task }];
   let toolCalls = 0;
   let halted: PaidFetchResult | null = null;
 
   // Bounded: every pass either returns or runs at least one tool call, and tool calls are capped.
   for (;;) {
+    const requestOptions = modelRequestOptions(deadlineAt, args.now());
+    if (requestOptions === null) return finish('stopped', halted === null ? AGENT_ANSWERS.outOfTime : haltedAnswer(halted));
     let response: Anthropic.Message;
     try {
-      response = await anthropic.messages.create({
-        model: AGENT_MODEL,
-        max_tokens: LIMITS.agentMaxTokens,
-        system: AGENT_SYSTEM_PROMPT,
-        tools,
-        messages,
-        output_config: { effort: 'low' },
-      });
+      response = await anthropic.messages.create(
+        {
+          model: AGENT_MODEL,
+          max_tokens: LIMITS.agentMaxTokens,
+          system: AGENT_SYSTEM_PROMPT,
+          tools,
+          messages,
+          output_config: { effort: 'low' },
+        },
+        requestOptions,
+      );
     } catch (error) {
       if (error instanceof Anthropic.AnthropicError) return finish('stopped', modelFailure(error));
       throw error;
@@ -361,6 +402,7 @@ export async function runAgentTask(args: {
         results.push(errorResult(call.id, TOOL_ERRORS.notRun));
         continue;
       }
+      if (call.name === 'paid_fetch' && !timeLeft(deadlineAt, args.now())) return finish('stopped', AGENT_ANSWERS.outOfTime);
       const outcome = await runTool(call, catalog, byId, pay);
       // Every later call this minute would be turned away too, so the run ends here, with no
       // further model request spent on it.

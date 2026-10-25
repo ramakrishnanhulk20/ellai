@@ -2,21 +2,13 @@ import { LIMITS } from '@ellai/core/limits';
 import { authenticateAgent } from '../auth/agents.js';
 import type { Database } from '../db/client.js';
 import type { ServerContext } from './context.js';
-import { HttpError, toErrorResponse } from './errors.js';
-import { jsonResponse } from './json.js';
+import { HttpError, TOO_MANY_REQUESTS, toErrorResponse, tooManyRequestsResponse } from './errors.js';
 import { consume } from './ratelimit.js';
 
 // RFC 6750's credentials: the scheme, which RFC 9110 makes case-insensitive, one or more
 // spaces, then one token with no spaces in it. Two Authorization headers arrive joined by a
 // comma and a space, so they never match and the request is refused.
 const BEARER = /^bearer +(\S+)$/i;
-
-// RFC 6750 section 3: a 401 from a resource behind a bearer token names the scheme it wants.
-const BEARER_CHALLENGE = 'Bearer realm="ellai"';
-
-// errors.ts names no code for this, so the body is fixed here, in the words owner-limits.ts
-// gives its own 429. Nothing in it comes from the caller (C19).
-const TOO_MANY_REQUESTS = { error: 'too_many_requests', message: 'Too many requests. Try again in a minute.' } as const;
 
 /**
  * An agent, or the owner it acts for, is past one of its per-minute limits (C22). The message
@@ -30,9 +22,9 @@ export class AgentLimitError extends Error {
   }
 }
 
-/** The 429 { error: 'too_many_requests', message } answer to an AgentLimitError. */
+/** The answer to an AgentLimitError: errors.ts's 429 with its one too_many_requests body. */
 export function agentLimitResponse(): Response {
-  return jsonResponse(TOO_MANY_REQUESTS, { status: 429 });
+  return tooManyRequestsResponse();
 }
 
 /**
@@ -87,17 +79,14 @@ export async function limitDecisionRead(db: Database, agentId: string, now: Date
 
 /**
  * respond, for the routes an agent calls with its token: an AgentLimitError is the fixed 429
- * too_many_requests, and the 401 agent_unauthorized also carries
- * `WWW-Authenticate: Bearer realm="ellai"`. Anything else is toErrorResponse's answer.
- * Never throws.
+ * too_many_requests. Anything else is toErrorResponse's answer, whose 401 agent_unauthorized
+ * carries `WWW-Authenticate: Bearer realm="ellai"`. Never throws.
  */
 export async function respondToAgent(run: () => Promise<Response>): Promise<Response> {
   try {
     return await run();
   } catch (error) {
     if (error instanceof AgentLimitError) return agentLimitResponse();
-    const response = toErrorResponse(error);
-    if (error instanceof HttpError && error.code === 'agent_unauthorized') response.headers.set('www-authenticate', BEARER_CHALLENGE);
-    return response;
+    return toErrorResponse(error);
   }
 }

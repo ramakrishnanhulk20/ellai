@@ -1,7 +1,7 @@
 // Covers: the public routes called as Next would call them, with Request objects, on PGlite
 // with a stub chain: Ellai's wallet check seller bound to APP_ORIGIN whatever Host says, its
 // 402 and its paid 200 with a stubbed settlement, and its body cap; the jobs tick refused
-// without the exact secret and run with it, its summary in fixed codes only, and old rate
+// without the exact secret, with its own Bearer challenge, and run with it, its summary in fixed codes only, and old rate
 // counters pruned; the public proof listing only verified payments and confirmed memories,
 // with no sentence, purpose, label or owner address, at most 20 of each, read from the
 // database at most once per cache window however many requests come, and its last good copy
@@ -217,6 +217,7 @@ describe('POST /api/jobs/tick', () => {
     for (const headers of refused) {
       const response = await tick(headers);
       expect(response.status).toBe(401);
+      expect(response.headers.get('www-authenticate')).toBe('Bearer realm="ellai-jobs"');
       expect(await response.json()).toEqual({ error: 'jobs_unauthorized', message: 'This endpoint needs the jobs secret.' });
     }
     expect(getBalances).not.toHaveBeenCalled();

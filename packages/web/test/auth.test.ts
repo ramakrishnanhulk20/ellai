@@ -1,27 +1,31 @@
 // Covers: wallet sign-in end to end on PGlite with real Ed25519, Secp256k1, Secp256r1 and
-// multisig keys; the message shape and every refusal of a message, a signature or a nonce;
+// multisig keys; the message shape and every refusal of a message, a signature or a nonce, the
+// site and nonce checked before any chain read; zkLogin through a stub client, including a chain
+// that cannot be read answering CHAIN_UNAVAILABLE (503) with the nonce left unused;
 // the owner row and its derived purse; sessions, their cookie and their end; agent tokens,
-// their display prefixes, the cap on live agents per owner, and their revocation; that one
+// their display prefixes, the cap on live external agents per owner (never counting the one
+// built-in agent), and their revocation; that one
 // kind of token never works as the other or as a record id;
 // that malformed tokens never reach the database; and that no refusal repeats a token, a
 // signature or the message.
-// Does NOT cover: zkLogin with a chain client (there is no network here, so only the
-// refusal without one is proven; routes-auth runs one through a stub client), passkey or
+// Does NOT cover: zkLogin against a real chain (there is no network here, and no real proof is
+// made; routes-auth also runs one through the route), passkey or
 // ML-DSA signatures, real wallet software, two database connections racing for one nonce or
 // for an owner's last agent place (PGlite serves one connection, so each race is run with
 // Promise.all on that one connection), or the routes that will call these functions with
 // their same-origin check and rate limits.
 import { createHmac, randomBytes } from 'node:crypto';
-import { derivePurseKeypair } from '@ellai/core/keys';
+import { canonicalSuiAddress, derivePurseKeypair } from '@ellai/core/keys';
 import { LIMITS } from '@ellai/core/limits';
 import { bcs } from '@mysten/sui/bcs';
+import type { ClientWithCoreApi } from '@mysten/sui/client';
 import { SIGNATURE_SCHEME_TO_FLAG, type Signer } from '@mysten/sui/cryptography';
 import { Ed25519Keypair } from '@mysten/sui/keypairs/ed25519';
 import { Secp256k1Keypair } from '@mysten/sui/keypairs/secp256k1';
 import { Secp256r1Keypair } from '@mysten/sui/keypairs/secp256r1';
 import { MultiSigPublicKey, MultiSigSigner } from '@mysten/sui/multisig';
 import { fromBase64, toBase64 } from '@mysten/sui/utils';
-import { getZkLoginSignature } from '@mysten/sui/zklogin';
+import { computeZkLoginAddressFromSeed, getZkLoginSignature } from '@mysten/sui/zklogin';
 import { eq } from 'drizzle-orm';
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import { AgentError, authenticateAgent, createAgentToken, listAgents, revokeAgent } from '../src/server/auth/agents.js';
@@ -30,6 +34,7 @@ import { SignInError, type SignInErrorCode, completeSignIn, issueSignIn } from '
 import { AGENT_TOKEN_PREFIX, type BearerTokenPrefix, SESSION_TOKEN_PREFIX, hashBearerToken, isBearerToken, newBearerToken } from '../src/server/auth/tokens.js';
 import { type Database, createDb, migrate } from '../src/server/db/client.js';
 import { TEXT_CAPS, agents, owners, sessions, signinNonces } from '../src/server/db/schema.js';
+import { toErrorResponse } from '../src/server/http/errors.js';
 
 let handle: Awaited<ReturnType<typeof createDb>>;
 let db: Database;
@@ -107,6 +112,30 @@ async function refused(promise: Promise<unknown>, code: SignInErrorCode): Promis
   expect(error).toBeInstanceOf(SignInError);
   expect(error).toMatchObject({ code, message: new SignInError(code).message });
   return error;
+}
+
+// A well-formed zkLogin signature for a Google account. Its proof is not real: what Sui would say
+// about it is the stub client's answer.
+const ZKLOGIN_ADDRESS_SEED = '13322897930163218532266430409510394316985274769125667290600321564259466511711';
+const ZKLOGIN_ADDRESS = canonicalSuiAddress(computeZkLoginAddressFromSeed(BigInt(ZKLOGIN_ADDRESS_SEED), 'https://accounts.google.com', false));
+
+async function zkLoginSignature(message: string): Promise<string> {
+  return getZkLoginSignature({
+    inputs: {
+      proofPoints: { a: ['1', '2', '1'], b: [['1', '0'], ['3', '4'], ['1', '0']], c: ['5', '6', '1'] },
+      issBase64Details: { value: 'yJpc3MiOiJodHRwczovL2FjY291bnRzLmdvb2dsZS5jb20iLC', indexMod4: 1 },
+      headerBase64: 'eyJhbGciOiJSUzI1NiIsImtpZCI6IjEifQ',
+      addressSeed: ZKLOGIN_ADDRESS_SEED,
+    },
+    maxEpoch: '10',
+    userSignature: await sign(Ed25519Keypair.generate(), message),
+  });
+}
+
+/** A stand-in chain client whose only call is Sui's zkLogin check, answered by `answer`. */
+function zkLoginClient(answer: () => Promise<{ success: boolean; errors: string[] }>) {
+  const verifyZkLoginSignature = vi.fn(answer);
+  return { client: { core: { verifyZkLoginSignature } } as unknown as ClientWithCoreApi, verifyZkLoginSignature };
 }
 
 function createAgent(ownerId: string, label = 'Travel agent') {
@@ -333,16 +362,7 @@ describe('completeSignIn', () => {
   it('refuses a zkLogin signature without a chain client, alone or inside a multisig', async () => {
     const member = Ed25519Keypair.generate();
     const { message } = await issue(member.toSuiAddress());
-    const zkLogin = getZkLoginSignature({
-      inputs: {
-        proofPoints: { a: ['1', '2', '1'], b: [['1', '0'], ['3', '4'], ['1', '0']], c: ['5', '6', '1'] },
-        issBase64Details: { value: 'yJpc3MiOiJodHRwczovL2FjY291bnRzLmdvb2dsZS5jb20iLC', indexMod4: 1 },
-        headerBase64: 'eyJhbGciOiJSUzI1NiIsImtpZCI6IjEifQ',
-        addressSeed: '13322897930163218532266430409510394316985274769125667290600321564259466511711',
-      },
-      maxEpoch: '10',
-      userSignature: await sign(Ed25519Keypair.generate(), message),
-    });
+    const zkLogin = await zkLoginSignature(message);
     await refused(complete(message, zkLogin), 'ZKLOGIN_UNAVAILABLE');
 
     const multisig = bcs.MultiSig.serialize(
@@ -355,6 +375,43 @@ describe('completeSignIn', () => {
     ).toBytes();
     const zkLoginInsideMultisig = toBase64(new Uint8Array([SIGNATURE_SCHEME_TO_FLAG.MultiSig, ...multisig]));
     await refused(complete(message, zkLoginInsideMultisig), 'ZKLOGIN_UNAVAILABLE');
+  });
+
+  it('checks the site and the nonce before the signature, so a zkLogin signature on a bad one makes no chain call', async () => {
+    const { client, verifyZkLoginSignature } = zkLoginClient(async () => ({ success: true, errors: [] }));
+    const { message } = await issue(ZKLOGIN_ADDRESS);
+    const otherSite = withLine(message, 0, 'ellax.example wants you to sign in to Ellai with your Sui account:');
+    await refused(complete(otherSite, await zkLoginSignature(otherSite), { zkLoginClient: client }), 'WRONG_SITE');
+    const madeUpNonce = withLine(message, 4, `Nonce: ${hex(16)}`);
+    await refused(complete(madeUpNonce, await zkLoginSignature(madeUpNonce), { zkLoginClient: client }), 'NONCE_UNKNOWN');
+    const signature = await zkLoginSignature(message);
+    await refused(complete(message, signature, { zkLoginClient: client, now: later(LIMITS.signinNonceTtlMs) }), 'NONCE_EXPIRED');
+    expect(verifyZkLoginSignature).not.toHaveBeenCalled();
+
+    await expect(complete(message, signature, { zkLoginClient: client })).resolves.toMatchObject({ ownerId: expect.any(String) });
+    await refused(complete(message, signature, { zkLoginClient: client }), 'NONCE_USED');
+    expect(verifyZkLoginSignature).toHaveBeenCalledTimes(1);
+  });
+
+  it('refuses a zkLogin signature Sui could not be read for as CHAIN_UNAVAILABLE, a 503 chain_unavailable, and leaves the nonce for a retry', async () => {
+    const error = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    const { client, verifyZkLoginSignature } = zkLoginClient(async () => {
+      throw new Error('UNAVAILABLE: the gateway did not answer');
+    });
+    const { nonce, message } = await issue(ZKLOGIN_ADDRESS);
+    const signature = await zkLoginSignature(message);
+    const unavailable = await refused(complete(message, signature, { zkLoginClient: client }), 'CHAIN_UNAVAILABLE');
+    const response = toErrorResponse(unavailable);
+    expect(response.status).toBe(503);
+    expect(await response.json()).toEqual({ error: 'chain_unavailable', message: 'Ellai could not read Sui just now. Try again in a minute.' });
+    expect(one(await db.select().from(signinNonces).where(eq(signinNonces.nonce, nonce))).usedAt).toBeNull();
+
+    verifyZkLoginSignature.mockResolvedValueOnce({ success: false, errors: ['the proof does not verify'] });
+    await refused(complete(message, signature, { zkLoginClient: client }), 'BAD_SIGNATURE');
+    verifyZkLoginSignature.mockResolvedValueOnce({ success: true, errors: [] });
+    await expect(complete(message, signature, { zkLoginClient: client })).resolves.toMatchObject({ ownerId: expect.any(String) });
+    expect(verifyZkLoginSignature).toHaveBeenCalledTimes(3);
+    error.mockRestore();
   });
 });
 
@@ -481,23 +538,31 @@ describe('agents', () => {
     expect(await listAgents({ db, ownerId })).toEqual([]);
   });
 
-  it('refuses the 21st live agent of either kind, even in a race, and makes room when one is revoked', async () => {
+  it('refuses the 21st live external agent, even in a race, never counts the built-in agent, and makes room when one is revoked', async () => {
     const { ownerId } = await signIn();
     expect(LIMITS.agentsPerOwnerMax).toBe(20);
     const tooMany = new AgentError('TOO_MANY_AGENTS', 'an owner may hold at most 20 agents at once; revoke one first');
-    const made = [await createAgentToken({ db, ownerId, label: 'Demo agent', kind: 'builtin', sessionSecretHex: SECRET, now: NOW })];
-    for (let i = 2; i <= 19; i += 1) made.push(await createAgent(ownerId, `Agent ${i}`));
+    const builtin = (label: string) => createAgentToken({ db, ownerId, label, kind: 'builtin', sessionSecretHex: SECRET, now: NOW });
+    await builtin('Demo agent');
+    const made = [];
+    for (let i = 1; i <= 19; i += 1) made.push(await createAgent(ownerId, `Agent ${i}`));
 
     const raced = await Promise.allSettled([createAgent(ownerId, 'Racer 1'), createAgent(ownerId, 'Racer 2'), createAgent(ownerId, 'Racer 3')]);
     expect(raced.filter((outcome) => outcome.status === 'fulfilled')).toHaveLength(1);
     for (const lost of raced.filter((outcome) => outcome.status === 'rejected')) expect(lost.reason).toEqual(tooMany);
     await expect(createAgent(ownerId, 'Agent 21')).rejects.toThrow(tooMany);
-    expect(await listAgents({ db, ownerId })).toHaveLength(20);
+    expect(await listAgents({ db, ownerId })).toHaveLength(21);
+
+    // At the cap, a revoked built-in agent is replaced, and the index still allows only one live one.
+    const [demo] = (await listAgents({ db, ownerId })).filter((agent) => agent.kind === 'builtin');
+    await revokeAgent({ db, ownerId, agentId: demo?.agentId ?? '', now: later(500) });
+    await expect(builtin('Built-in agent')).resolves.toMatchObject({ agentId: expect.any(String) });
+    await expect(builtin('A second built-in agent')).rejects.toThrow();
 
     await revokeAgent({ db, ownerId, agentId: made[1]?.agentId ?? '', now: later(1_000) });
     await expect(createAgent(ownerId, 'Agent 21')).resolves.toMatchObject({ agentId: expect.any(String) });
     await expect(createAgent(ownerId, 'Agent 22')).rejects.toMatchObject({ name: 'AgentError', code: 'TOO_MANY_AGENTS' });
-    expect(await listAgents({ db, ownerId })).toHaveLength(21);
+    expect(await listAgents({ db, ownerId })).toHaveLength(23);
     await expect(createAgent((await signIn()).ownerId, 'Someone else')).resolves.toBeDefined();
   });
 });

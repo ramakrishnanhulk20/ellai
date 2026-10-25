@@ -1,6 +1,7 @@
 // Covers: the sign-in routes called as Next would call them, with Request objects, on PGlite:
 // nonce, verify and logout end to end with a real Ed25519 key; a zkLogin sign-in whose proof
-// verify sends, once, to the chain client it was given, and nothing read for any other key;
+// verify sends, once, to the chain client it was given (a 503 when that chain cannot answer),
+// and nothing read for any other key;
 // the session cookie and its flags; the same-origin check on all three; the per-client and
 // overall rate limits, keyed on the platform's client address; and the fixed 400s for a bad
 // body.
@@ -272,16 +273,27 @@ describe('zkLogin sign-in', () => {
     expect(owner?.suiAddress).toBe(zkLoginAddress);
   });
 
-  it('refuses with 401 and no session a zkLogin proof the chain rejects, or cannot check at all', async () => {
+  it('refuses with 401 and no session a zkLogin proof the chain rejects', async () => {
     verifyZkLoginSignature.mockResolvedValueOnce({ success: false, errors: ['the proof does not verify'] });
+    const { message, signature } = await zkLoginSigned();
+    const response = await verify({ message, signature });
+    expect(response.status).toBe(401);
+    expect(await response.json()).toEqual({ error: 'bad_signature', message: 'the signature does not prove the address in the message signed it' });
+    expect(response.headers.get('set-cookie')).toBeNull();
+    expect(verifyZkLoginSignature).toHaveBeenCalledTimes(1);
+  });
+
+  it('answers 503 chain_unavailable and no session when the chain cannot check a zkLogin proof, and the same sign-in works once it can', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => undefined);
     verifyZkLoginSignature.mockRejectedValueOnce(new Error('UNAVAILABLE: the gateway did not answer'));
-    for (let attempt = 0; attempt < 2; attempt += 1) {
-      const { message, signature } = await zkLoginSigned();
-      const response = await verify({ message, signature });
-      expect(response.status).toBe(401);
-      expect(await response.json()).toEqual({ error: 'bad_signature', message: 'the signature does not prove the address in the message signed it' });
-      expect(response.headers.get('set-cookie')).toBeNull();
-    }
+    const { message, signature } = await zkLoginSigned();
+    const response = await verify({ message, signature });
+    expect(response.status).toBe(503);
+    expect(await response.json()).toEqual({ error: 'chain_unavailable', message: 'Ellai could not read Sui just now. Try again in a minute.' });
+    expect(response.headers.get('set-cookie')).toBeNull();
+
+    verifyZkLoginSignature.mockResolvedValueOnce({ success: true, errors: [] });
+    expect((await verify({ message, signature })).status).toBe(200);
     expect(verifyZkLoginSignature).toHaveBeenCalledTimes(2);
   });
 });

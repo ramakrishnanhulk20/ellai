@@ -57,11 +57,13 @@ function checkLabel(label: unknown): string {
  * Creates an agent for an owner and its bearer token (C13). Only the token's hash and its
  * display prefix are stored; the token itself is returned here once and can never be read
  * back. The label is trimmed and must be 1 to TEXT_CAPS.agentLabel characters with no
- * control characters. An owner holds at most LIMITS.agentsPerOwnerMax agents that are not
- * revoked, of either kind: the count and the insert run in one transaction holding the owner
- * row FOR UPDATE, so two creates at once can never both take the last place.
+ * control characters. An owner holds at most LIMITS.agentsPerOwnerMax external agents that are
+ * not revoked: the count and the insert run in one transaction holding the owner row FOR
+ * UPDATE, so two creates at once can never both take the last place. The built-in agent is not
+ * counted, so an owner at the cap can still run it; the agents_one_live_builtin_per_owner index
+ * holds each owner to one live built-in agent.
  * Throws AgentError: BAD_INPUT, NOT_FOUND (no such owner), TOO_MANY_AGENTS (the owner already
- * holds the most). Throws Error if `now` is not a date or the secret is malformed.
+ * holds the most external agents). Throws Error if `now` is not a date or the secret is malformed.
  */
 export async function createAgentToken(args: {
   db: Database;
@@ -80,12 +82,14 @@ export async function createAgentToken(args: {
   return args.db.transaction(async (tx) => {
     const [owner] = await tx.select({ id: owners.id }).from(owners).where(eq(owners.id, ownerId)).for('update');
     if (owner === undefined) throw new AgentError('NOT_FOUND', 'there is no such owner');
-    const [held] = await tx
-      .select({ n: count() })
-      .from(agents)
-      .where(and(eq(agents.ownerId, ownerId), isNull(agents.revokedAt)));
-    if ((held?.n ?? 0) >= LIMITS.agentsPerOwnerMax) {
-      throw new AgentError('TOO_MANY_AGENTS', `an owner may hold at most ${LIMITS.agentsPerOwnerMax} agents at once; revoke one first`);
+    if (args.kind === 'external') {
+      const [held] = await tx
+        .select({ n: count() })
+        .from(agents)
+        .where(and(eq(agents.ownerId, ownerId), eq(agents.kind, 'external'), isNull(agents.revokedAt)));
+      if ((held?.n ?? 0) >= LIMITS.agentsPerOwnerMax) {
+        throw new AgentError('TOO_MANY_AGENTS', `an owner may hold at most ${LIMITS.agentsPerOwnerMax} agents at once; revoke one first`);
+      }
     }
     const [agent] = await tx
       .insert(agents)

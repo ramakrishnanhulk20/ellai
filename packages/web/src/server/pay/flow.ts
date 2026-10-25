@@ -33,6 +33,8 @@ export interface PaidFetchArgs {
   body: string | null;
   contentType: string | null;
   purpose: string;
+  /** An absolute time in epoch ms the call's own deadline may not pass, for a caller with a deadline of its own. */
+  deadlineAt?: number;
   secrets: { masterSecretHex: string };
   deps: {
     fetch: typeof safeFetch;
@@ -48,6 +50,9 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 // The one dialect core's signPayment and paymentHeader accept. Any other is refused before
 // decide, so the owner is never asked about a payment Ellai would then refuse to make.
 const PAYABLE_DIALECT: Dialect = 'x402-v1-t2000';
+// The paid request ends at least this long before the deadline, so storing what the seller did
+// and answering the agent still fit before it.
+const PAID_REQUEST_MARGIN_MS = 10_000;
 
 const REASONS = {
   notAllowed: 'This agent is not allowed to pay for this account.',
@@ -62,6 +67,7 @@ const REASONS = {
   inProgress: 'A payment for this same request is already in progress.',
   requestMismatch: 'An earlier decision under this request key is for a different request, so Ellai did not pay.',
   chain: 'Ellai could not read Sui just now, so it did not pay.',
+  deadline: 'Too little time was left to pay this seller and still answer in time, so Ellai did not pay.',
 } as const;
 
 interface SignRefusalAnswer {
@@ -169,6 +175,51 @@ async function afterPayment<T>(step: 'seller_status' | 'settlement' | 'outcome',
   }
 }
 
+/**
+ * How long the paid request may wait: the seller's patience, cut so the request ends
+ * PAID_REQUEST_MARGIN_MS before the deadline. Null when that leaves less than safeFetch's
+ * shortest wait, or the clock cannot be read, because then the payment must not be signed.
+ */
+function paidWaitMs(sellerUrl: string, deadlineMs: number, now: Date): number | null {
+  const wait = Math.min(paidTimeoutMs(sellerUrl), deadlineMs - now.getTime() - PAID_REQUEST_MARGIN_MS);
+  // Written so NaN fails the comparison.
+  return wait >= LIMITS.netTimeoutMinMs ? wait : null;
+}
+
+/**
+ * The wait the paid request is sent with, measured again once signing, which reads Sui, is done.
+ * It never drops below safeFetch's shortest wait: the payment is signed by then, and one never
+ * sent would hold the daily budget until its epoch window closed.
+ */
+function sendWaitMs(plannedMs: number, deadlineMs: number, now: Date): number {
+  const left = deadlineMs - now.getTime() - PAID_REQUEST_MARGIN_MS;
+  if (!(left >= LIMITS.netTimeoutMinMs)) return LIMITS.netTimeoutMinMs;
+  return Math.min(plannedMs, left);
+}
+
+/**
+ * The chain and the wait settlePayment gets inside a paid call, which reads the chain through
+ * these two calls only. No read starts once the deadline has passed, and a wait that would end
+ * at or past it is not taken, which stops every read after it. settlePayment counts a read that
+ * was not made as one that failed and answers 'pending', which the jobs tick reads again.
+ */
+function untilDeadline(chain: Chain, now: () => Date, sleep: (ms: number) => Promise<void>, deadlineMs: number): { chain: Chain; sleep: (ms: number) => Promise<void> } {
+  let stopped = false;
+  const open = () => !stopped && now().getTime() < deadlineMs;
+  const closed = () => Promise.reject(new ChainError('TIMEOUT', 'the paid call deadline has passed'));
+  return {
+    chain: {
+      ...chain,
+      getTransactionResult: (digest: string) => (open() ? chain.getTransactionResult(digest) : closed()),
+      getCurrentEpoch: () => (open() ? chain.getCurrentEpoch() : closed()),
+    },
+    sleep: async (ms: number) => {
+      if (now().getTime() + ms >= deadlineMs) stopped = true;
+      else await sleep(ms);
+    },
+  };
+}
+
 async function closeDecision(db: Database, ownerId: string, decisionId: string, status: 'failed' | 'refused'): Promise<void> {
   await db
     .update(decisions)
@@ -178,7 +229,9 @@ async function closeDecision(db: Database, ownerId: string, decisionId: string, 
 
 /**
  * Fetches a seller URL for an agent and, when the seller asks for payment and Ellai's rules
- * allow it, pays from the owner's purse and hands back the seller's answer.
+ * allow it, pays from the owner's purse and hands back the seller's answer. Every call has a
+ * deadline LIMITS.paidFetchDeadlineMs after it starts, or `deadlineAt` when that is earlier, so
+ * it answers inside the route's time and inside a caller's own deadline.
  *
  * 1. The agent must be an active agent of this owner, else 'refused'. The method must be GET
  *    or POST, the URL at most TEXT_CAPS.sellerUrl characters, the body at most
@@ -196,16 +249,25 @@ async function closeDecision(db: Database, ownerId: string, decisionId: string, 
  *    the owner's derived delegate key and recall. Refused and asked come back as decided. A
  *    live decision reused for the same request never pays: an asked one comes back as asked,
  *    an approved one is 'failed' because its payment is already under way (C5).
- * 7. signForDecision checks the pause, the per-payment maximum, a payment already under way for
+ * 7. The paid request may wait the seller's own patience (paidTimeoutMs), cut so it ends
+ *    PAID_REQUEST_MARGIN_MS (10 s) before the deadline. When that leaves less than
+ *    LIMITS.netTimeoutMinMs, the result is 'failed' with a fixed reason and the decision is
+ *    closed as 'failed' before anything is signed or sent (C21).
+ * 8. signForDecision checks the pause, the per-payment maximum, a payment already under way for
  *    the same request (step 5's check again) and the budget under the owner lock and signs at
  *    that moment (C4, C5, C6, C7, C8). A refusal there, or a chain or build failure, is
  *    'refused' (paused or over the maximum, with decide's own reasons for those rules, or over
  *    the daily budget) or 'failed' (a payment already in progress gets step 5's reason), and the
  *    decision is closed as 'refused' or 'failed' so the request can be decided again.
- * 8. The paid request is the same request plus the payment header, with the seller's own
- *    patience. Its status, or null when it never answered, is stored with the payment.
- * 9. settlePayment reads the chain by Ellai's digest, LIMITS.settlementInlineTries times (C8).
- * 10. A verified payment the seller answered with anything but 2xx becomes an outcome memory.
+ * 9. The paid request is the same request plus the payment header, with step 7's wait measured
+ *    again after signing and never below LIMITS.netTimeoutMinMs. Its status, or null when it
+ *    never answered, is stored with the payment, and so is delivered: true for a 2xx answer,
+ *    false for any other answer or none. delivered stays null only when that write fails.
+ * 10. settlePayment reads the chain by Ellai's digest, up to LIMITS.settlementInlineTries times
+ *    (C8). No read starts once the deadline has passed, and no wait runs past it; the payment
+ *    is then reported 'pending', and the jobs tick reads it again.
+ * 11. A verified payment stored as delivered false becomes an outcome memory. One whose delivered
+ *    could not be stored does not; the jobs tick redoes an outcome that failed here.
  *    Once signed material has left, the result is 'paid' with its payment block whatever the
  *    seller did, and whatever fails after it: a failed status write, settlement read or outcome
  *    memory is logged by step name and left undone, and a settlement that was not read is
@@ -217,6 +279,9 @@ async function closeDecision(db: Database, ownerId: string, decisionId: string, 
  */
 export async function paidFetch(args: PaidFetchArgs): Promise<PaidFetchResult> {
   const { db, deps } = args;
+  const ownDeadlineMs = deps.now().getTime() + LIMITS.paidFetchDeadlineMs;
+  // Math.min passes NaN on, so a deadlineAt that is not a number leaves too little time and nothing is signed.
+  const deadlineMs = args.deadlineAt === undefined ? ownDeadlineMs : Math.min(ownDeadlineMs, args.deadlineAt);
   const party = await loadParty(db, args.ownerId, args.agentId);
   if (party === null) return bare('refused', REASONS.notAllowed);
   const request = checkRequest(args);
@@ -274,6 +339,12 @@ export async function paidFetch(args: PaidFetchArgs): Promise<PaidFetchResult> {
   if (decided.reused && decided.outcome === 'approved') return { ...bare('failed', REASONS.inProgress), ...recorded };
   if (decided.outcome !== 'approved') return { ...bare(decided.outcome, decided.reason), ...recorded };
 
+  const plannedWaitMs = paidWaitMs(payment.sellerUrl, deadlineMs, deps.now());
+  if (plannedWaitMs === null) {
+    await closeDecision(db, ownerId, decisionId, 'failed');
+    return { ...bare('failed', REASONS.deadline), ...recorded };
+  }
+
   let signing: SignResult;
   try {
     signing = await signForDecision({ db, ownerId, decisionId, payment, masterSecretHex: args.secrets.masterSecretHex, chain: deps.chain, now: deps.now() });
@@ -300,35 +371,41 @@ export async function paidFetch(args: PaidFetchArgs): Promise<PaidFetchResult> {
   const header = paymentHeader(payment, signed);
   let answer: SafeResponse | null = null;
   try {
-    answer = await deps.fetch(payment.sellerUrl, sellerRequest(request, { [header.name]: header.value }, paidTimeoutMs(payment.sellerUrl)));
+    answer = await deps.fetch(payment.sellerUrl, sellerRequest(request, { [header.name]: header.value }, sendWaitMs(plannedWaitMs, deadlineMs, deps.now())));
   } catch {
     // Once the header has left, the seller may settle whatever this request did, so every
     // failure here is "no answer" and the flow still goes on to read the chain.
   }
   const delivered = answer !== null && answer.status >= 200 && answer.status < 300;
-  await afterPayment('seller_status', () =>
-    db
+  // undefined when the write failed, which leaves the column null: then Ellai does not know
+  // what the seller did, and no outcome is made from it here or by the jobs tick.
+  const storedDelivered = await afterPayment('seller_status', async () => {
+    const written = await db
       .update(payments)
       .set({ sellerStatus: answer?.status ?? null, delivered })
-      .where(and(eq(payments.id, paymentRow.id), eq(payments.ownerId, ownerId))),
-  );
+      .where(and(eq(payments.id, paymentRow.id), eq(payments.ownerId, ownerId)))
+      .returning({ id: payments.id });
+    return written.length === 1 ? delivered : undefined;
+  });
 
   // A settlement that could not be read stays 'pending' in payments, which the jobs tick reads again.
+  const bounded = untilDeadline(deps.chain, deps.now, deps.sleep, deadlineMs);
   const settlement =
     (await afterPayment('settlement', () =>
       settlePayment({
         db,
         ownerId,
         paymentId: paymentRow.id,
-        chain: deps.chain,
+        chain: bounded.chain,
         tries: LIMITS.settlementInlineTries,
         intervalMs: LIMITS.settlementInlineIntervalMs,
-        sleep: deps.sleep,
+        sleep: bounded.sleep,
       }),
     )) ?? 'pending';
   // A normal paid call is already on chain and in payments; only a bad one becomes a memory,
-  // so outcomes never crowd the owner's own answers out of recall.
-  if (settlement === 'verified' && !delivered) {
+  // so outcomes never crowd the owner's own answers out of recall. Only a stored false counts,
+  // so the memory always agrees with payments.delivered, which decide's bad-outcome rule reads.
+  if (settlement === 'verified' && storedDelivered === false) {
     await afterPayment('outcome', () =>
       recordOutcome({ db, ownerId, decisionId, delivered: false, delegatePublicKeyHex: delegate.publicKeyHex, now: deps.now() }),
     );

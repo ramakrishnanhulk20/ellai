@@ -16,6 +16,7 @@ export type SignInErrorCode =
   | 'WRONG_SITE'
   | 'BAD_SIGNATURE'
   | 'ZKLOGIN_UNAVAILABLE'
+  | 'CHAIN_UNAVAILABLE'
   | 'NONCE_UNKNOWN'
   | 'NONCE_USED'
   | 'NONCE_EXPIRED';
@@ -26,6 +27,7 @@ const SIGN_IN_ERROR_MESSAGES: Readonly<Record<SignInErrorCode, string>> = {
   WRONG_SITE: 'the sign-in message is for a different site',
   BAD_SIGNATURE: 'the signature does not prove the address in the message signed it',
   ZKLOGIN_UNAVAILABLE: 'zkLogin sign-in is not available on this server',
+  CHAIN_UNAVAILABLE: 'Sui could not be read to check this zkLogin signature',
   NONCE_UNKNOWN: 'the sign-in request was not issued by this server',
   NONCE_USED: 'the sign-in request has already been used',
   NONCE_EXPIRED: 'the sign-in request has expired',
@@ -147,6 +149,28 @@ function signatureNeedsChain(signature: string): boolean {
   return parsed.signatureScheme === 'MultiSig' && parsed.multisig.sigs.some((sig) => 'ZkLogin' in sig);
 }
 
+/**
+ * The client with its one call the SDK makes for zkLogin, Sui's own check of the proof, watched.
+ * The SDK answers a proof that does not hold with success false, so a throw from that call means
+ * Sui could not be read, while every other throw during verification is about the signature.
+ * The SDK calls nothing else on the client.
+ */
+function watchedClient(client: ClientWithCoreApi): { client: ClientWithCoreApi; chainFailed: () => boolean } {
+  let failed = false;
+  const { core } = client;
+  const verifyZkLoginSignature: typeof core.verifyZkLoginSignature = async (options) => {
+    try {
+      return await core.verifyZkLoginSignature(options);
+    } catch (error) {
+      failed = true;
+      throw error;
+    }
+  };
+  const watchedCore = new Proxy(core, { get: (target, property) => (property === 'verifyZkLoginSignature' ? verifyZkLoginSignature : Reflect.get(target, property)) });
+  const watched = new Proxy(client, { get: (target, property) => (property === 'core' ? watchedCore : Reflect.get(target, property)) });
+  return { client: watched, chainFailed: () => failed };
+}
+
 async function recoveredAddress(message: string, signature: unknown, claimed: string, client: ClientWithCoreApi | undefined): Promise<string> {
   if (typeof signature !== 'string' || signature === '') refuse('BAD_SIGNATURE');
   let needsChain: boolean;
@@ -156,14 +180,27 @@ async function recoveredAddress(message: string, signature: unknown, claimed: st
     refuse('BAD_SIGNATURE');
   }
   if (needsChain && client === undefined) refuse('ZKLOGIN_UNAVAILABLE');
+  const watched = client === undefined ? undefined : watchedClient(client);
   try {
     // The claimed address is passed so the SDK picks the matching zkLogin address form;
     // the comparison that decides is the one below, through the shared address parser.
-    const publicKey = await verifyPersonalMessageSignature(new TextEncoder().encode(message), signature, { address: claimed, client });
+    const publicKey = await verifyPersonalMessageSignature(new TextEncoder().encode(message), signature, { address: claimed, client: watched?.client });
     return canonicalSuiAddress(publicKey.toSuiAddress());
   } catch {
-    refuse('BAD_SIGNATURE');
+    refuse(watched?.chainFailed() === true ? 'CHAIN_UNAVAILABLE' : 'BAD_SIGNATURE');
   }
+}
+
+/**
+ * Why a stored nonce cannot sign this message in, or null when it can: it must be one this
+ * server issued with exactly the message's times (NONCE_UNKNOWN), unused (NONCE_USED) and
+ * unexpired at `now` (NONCE_EXPIRED), the same conditions the claim in completeSignIn sets.
+ */
+function nonceRefusal(row: typeof signinNonces.$inferSelect | undefined, fields: SignInFields, now: Date): SignInErrorCode | null {
+  const sameIssue = row !== undefined && row.createdAt.getTime() === fields.issuedAt.getTime() && row.expiresAt.getTime() === fields.expiresAt.getTime();
+  if (!sameIssue) return 'NONCE_UNKNOWN';
+  if (row.usedAt !== null) return 'NONCE_USED';
+  return row.expiresAt.getTime() > now.getTime() ? null : 'NONCE_EXPIRED';
 }
 
 /**
@@ -190,11 +227,14 @@ export async function issueSignIn(args: { db: Database; address: string; appOrig
 }
 
 /**
- * Finishes a wallet sign-in (C14). Accepts the message only when it is exactly one that
- * issueSignIn writes for this app's host and origin, and the signature, checked as a Sui
- * personal message, recovers to the address the message names. Ed25519, Secp256k1,
+ * Finishes a wallet sign-in (C14), cheapest check first. The message must be exactly one that
+ * issueSignIn writes for this app's host and origin. Its nonce must be one this server issued
+ * with the message's times, unused and unexpired; that is read before any signature is
+ * checked, so a bad nonce never costs a chain read. Then the signature, checked as a Sui
+ * personal message, must recover to the address the message names. Ed25519, Secp256k1,
  * Secp256r1 and multisig signatures are checked offline; a zkLogin signature is checked
- * only through `zkLoginClient` and is refused when none is given.
+ * only through `zkLoginClient` and is refused when none is given. When Sui cannot be read for
+ * that check, the refusal is CHAIN_UNAVAILABLE, not BAD_SIGNATURE, and the nonce is left for a retry.
  * Then, in one transaction: the nonce is marked used by a conditional update that only an
  * unused, unexpired nonce issued with these exact times can pass, so a second use fails
  * even under a race; the owner row is created on first sign-in with its derived purse
@@ -203,8 +243,8 @@ export async function issueSignIn(args: { db: Database; address: string; appOrig
  * Returns the owner id, the session token (to be set as the cookie, never stored), and its
  * expiry.
  * Throws SignInError: BAD_MESSAGE, WRONG_SITE, BAD_SIGNATURE, ZKLOGIN_UNAVAILABLE,
- * NONCE_UNKNOWN, NONCE_USED, NONCE_EXPIRED. A refused signature or message never uses up
- * the nonce. Throws Error for server faults: a bad time, origin, master secret or session
+ * CHAIN_UNAVAILABLE, NONCE_UNKNOWN, NONCE_USED, NONCE_EXPIRED. A refused signature or message
+ * never uses up the nonce. Throws Error for server faults: a bad time, origin, master secret or session
  * secret.
  */
 export async function completeSignIn(args: {
@@ -225,6 +265,12 @@ export async function completeSignIn(args: {
   const issuedLength = formatSignInMessage({ ...site, address: canonicalSuiAddress('0x1'), nonce: '0'.repeat(NONCE_BYTES * 2), issuedAt: now, expiresAt: now }).length;
   if (args.message.length > issuedLength) refuse('BAD_MESSAGE');
   const fields = parseSignInMessage(args.message, site);
+  const thisNonce = eq(signinNonces.nonce, fields.nonce);
+  // Read before any signature is checked, so a junk signature on a nonce that cannot sign in
+  // costs one indexed read and never a chain read. The claim below decides; this only refuses early.
+  const [issued] = await args.db.select().from(signinNonces).where(thisNonce);
+  const early = nonceRefusal(issued, fields, now);
+  if (early !== null) refuse(early);
 
   const recovered = await recoveredAddress(args.message, args.signature, fields.address, args.zkLoginClient);
   if (recovered !== fields.address) refuse('BAD_SIGNATURE');
@@ -234,7 +280,6 @@ export async function completeSignIn(args: {
   const sessionExpiresAt = new Date(now.getTime() + LIMITS.sessionTtlMs);
 
   return args.db.transaction(async (tx) => {
-    const thisNonce = eq(signinNonces.nonce, fields.nonce);
     const claimed = await tx
       .update(signinNonces)
       .set({ usedAt: now })
@@ -249,10 +294,9 @@ export async function completeSignIn(args: {
       )
       .returning({ nonce: signinNonces.nonce });
     if (claimed.length !== 1) {
+      // A racing sign-in can use the nonce between the early read and this claim.
       const [row] = await tx.select().from(signinNonces).where(thisNonce);
-      const sameIssue = row !== undefined && row.createdAt.getTime() === fields.issuedAt.getTime() && row.expiresAt.getTime() === fields.expiresAt.getTime();
-      if (!sameIssue) refuse('NONCE_UNKNOWN');
-      refuse(row.usedAt !== null ? 'NONCE_USED' : 'NONCE_EXPIRED');
+      refuse(nonceRefusal(row, fields, now) ?? 'NONCE_EXPIRED');
     }
 
     await tx.insert(owners).values({ suiAddress: address, purseAddress, createdAt: now }).onConflictDoNothing({ target: owners.suiAddress });

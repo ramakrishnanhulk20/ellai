@@ -1,5 +1,6 @@
 import { ChainError, type ChainErrorCode } from '@ellai/core/chain';
 import { ChallengeError, type ChallengeErrorCode } from '@ellai/core/challenge';
+import { LIMITS } from '@ellai/core/limits';
 import { MemoryError, type MemoryErrorCode } from '@ellai/core/memory';
 import { NetError, type NetErrorCode } from '@ellai/core/net';
 import { PaymentError, type PaymentErrorCode } from '@ellai/core/payment';
@@ -37,6 +38,7 @@ export type HttpErrorCode =
   | 'bad_query'
   | 'out_of_bounds'
   | 'too_many_requests'
+  | 'bad_task'
   | 'chain_refused'
   | 'chain_unavailable';
 
@@ -58,9 +60,23 @@ const HTTP_ERROR_MESSAGES: Readonly<Record<HttpErrorCode, string>> = {
   bad_query: 'The query string does not have the values this endpoint takes.',
   out_of_bounds: 'A value in the request is outside the bounds this endpoint allows.',
   too_many_requests: 'Too many requests. Try again in a minute.',
+  bad_task: `The task must be 1 to ${LIMITS.agentTaskMaxChars} characters.`,
   chain_refused: 'Sui does not allow this step for your Walrus Memory account right now.',
   chain_unavailable: 'Ellai could not read Sui just now. Try again in a minute.',
 };
+
+// RFC 6750 section 3: a 401 from a resource behind a bearer token names the scheme it wants. Each
+// credential has a realm of its own, so a caller can tell which one was refused.
+const BEARER_CHALLENGES: Readonly<Partial<Record<HttpErrorCode, string>>> = {
+  agent_unauthorized: 'Bearer realm="ellai"',
+  jobs_unauthorized: 'Bearer realm="ellai-jobs"',
+};
+
+/**
+ * The one body for a per-minute limit (C22), the same from every route and every MCP tool.
+ * Nothing in it comes from the caller (C19).
+ */
+export const TOO_MANY_REQUESTS = { error: 'too_many_requests', message: HTTP_ERROR_MESSAGES.too_many_requests } as const;
 
 // The known classes promise fixed text plus values Ellai checked itself. This holds them to
 // it on the way out, since the next reader may be a page or an agent (C17).
@@ -91,10 +107,16 @@ export class HttpError extends Error {
 
 /**
  * The JSON answer for one HttpError, exactly as toErrorResponse gives it, for a helper that
- * returns its refusal rather than throwing it. Logs nothing: the caller logs its own line.
+ * returns its refusal rather than throwing it. A 401 for a bearer credential carries its
+ * WWW-Authenticate challenge. Logs nothing: the caller logs its own line.
  */
 export function httpErrorResponse(error: HttpError): Response {
-  return errorJson(error.status, { error: error.code, message: error.message });
+  return errorJson(error.status, { error: error.code, message: error.message }, BEARER_CHALLENGES[error.code]);
+}
+
+/** The 429 answer with TOO_MANY_REQUESTS as its body. Logs nothing: the caller logs its own line. */
+export function tooManyRequestsResponse(): Response {
+  return errorJson(429, TOO_MANY_REQUESTS);
 }
 
 // Typed as complete records, so a code added to one of these classes without a status here
@@ -105,9 +127,16 @@ const SIGN_IN_STATUS: Readonly<Record<SignInErrorCode, number>> = {
   WRONG_SITE: 400,
   BAD_SIGNATURE: 401,
   ZKLOGIN_UNAVAILABLE: 400,
+  CHAIN_UNAVAILABLE: 503,
   NONCE_UNKNOWN: 401,
   NONCE_USED: 401,
   NONCE_EXPIRED: 401,
+};
+
+// A sign-in refusal the HTTP table already names answers with that code and its text, so a
+// caller reads one chain_unavailable whichever route it came from.
+const SIGN_IN_AS_HTTP: Readonly<Partial<Record<SignInErrorCode, HttpErrorCode>>> = {
+  CHAIN_UNAVAILABLE: 'chain_unavailable',
 };
 
 const ANSWER_STATUS: Readonly<Record<AnswerErrorCode, number>> = {
@@ -247,7 +276,10 @@ function fixed(table: Readonly<Record<string, number>>, kind: keyof typeof FIXED
 
 function mapKnown(error: unknown): Mapped | null {
   if (error instanceof HttpError) return coded(error.status, error.code, error.message);
-  if (error instanceof SignInError) return coded(SIGN_IN_STATUS[error.code], error.code, error.message);
+  if (error instanceof SignInError) {
+    const shared = SIGN_IN_AS_HTTP[error.code];
+    return shared === undefined ? coded(SIGN_IN_STATUS[error.code], error.code, error.message) : coded(SIGN_IN_STATUS[error.code], shared, HTTP_ERROR_MESSAGES[shared]);
+  }
   if (error instanceof AnswerError) return coded(ANSWER_STATUS[error.code], error.code, error.message);
   if (error instanceof DecideError) return coded(DECIDE_STATUS[error.code], error.code, error.message);
   if (error instanceof AgentError) return coded(AGENT_STATUS[error.code], error.code, error.message);
@@ -273,8 +305,8 @@ function className(error: unknown): string {
   return typeof name === 'string' && SAFE_NAME.test(name) ? name : 'Unknown';
 }
 
-function errorJson(status: number, body: Record<string, string>): Response {
-  return Response.json(body, { status, headers: API_RESPONSE_HEADERS });
+function errorJson(status: number, body: Record<string, string>, challenge?: string): Response {
+  return Response.json(body, { status, headers: challenge === undefined ? API_RESPONSE_HEADERS : { ...API_RESPONSE_HEADERS, 'www-authenticate': challenge } });
 }
 
 // A database error's code is its SQLSTATE, which names the kind of failure without any of
@@ -293,7 +325,8 @@ function codeOf(error: unknown): string | null {
  * code is prefixed with the kind (chain_timeout) and the message is one fixed sentence per
  * class, whatever the error itself says. Anything else, including a database error whose
  * text carries SQL and parameters, becomes 500 { error: 'internal' } with nothing taken from
- * the error (C19).
+ * the error (C19). An HttpError 401 for a bearer credential (agent_unauthorized,
+ * jobs_unauthorized) carries that credential's WWW-Authenticate challenge.
  * The log line holds only the class name and its code. Never throws.
  */
 export function toErrorResponse(error: unknown): Response {
@@ -301,7 +334,8 @@ export function toErrorResponse(error: unknown): Response {
   if (known !== null) {
     const log = known.status >= 500 ? console.error : console.warn;
     log(`[ellai http] ${className(error)} ${known.logCode}`);
-    return errorJson(known.status, { error: known.code, message: known.message });
+    const challenge = error instanceof HttpError ? BEARER_CHALLENGES[error.code] : undefined;
+    return errorJson(known.status, { error: known.code, message: known.message }, challenge);
   }
   const code = codeOf(error);
   console.error(`[ellai http] ${className(error)}${code === null ? '' : ` ${code}`}`);

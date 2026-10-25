@@ -8,8 +8,10 @@
 // further reads still miss it, and leaves rows from before that window was kept waiting.
 // runJobsTick isolates each
 // owner's and each step's failure behind a fixed code, settles pending payments and remembers a
-// paid seller that answered with an error exactly once, expires, refills, sends and confirms
-// memories, warns on a low gas wallet, and takes at most LIMITS.jobsOwnersPerTick owners.
+// paid seller stored as delivering nothing exactly once (never one whose delivery is unknown),
+// records an outcome a paid call failed to record, expires, refills with the tick's own sleep,
+// sends and confirms memories, warns on a low gas wallet, and takes at most
+// LIMITS.jobsOwnersPerTick owners.
 // Does NOT cover: the real Sui chain, Tatum or the relayer (scripts/prove-jobs.ts does those
 // live), whether Sui accepts the refill bytes (packages/proof's prove-pay sent one live), two
 // connections racing on the owner lock (PGlite serves one connection), or what schedules the
@@ -33,6 +35,7 @@ import { type Database, createDb, migrate } from '../src/server/db/client.js';
 import { agents, decisions, memories, owners, payments, questions, refills } from '../src/server/db/schema.js';
 import { MEMORY_NAMESPACE } from '../src/server/memory/namespace.js';
 import { ownerDelegate } from '../src/server/memory/delegate.js';
+import { recordOutcome } from '../src/server/memory/outcome.js';
 import { expireDecisions } from '../src/server/jobs/expire.js';
 import { RefillError, refillIfNeeded } from '../src/server/jobs/refill.js';
 import { type JobsTickSummary, runJobsTick } from '../src/server/jobs/tick.js';
@@ -638,29 +641,32 @@ describe('runJobsTick', () => {
     for (const error of summary.errors) expect(error.code).toMatch(/^[A-Z][A-Z0-9_]*$/);
   });
 
-  it('settles each pending payment once, and remembers a paid seller that answered with an error exactly once across two ticks', async () => {
+  it('settles each pending payment once, and remembers a paid seller that delivered nothing exactly once across two ticks, never one whose delivery is unknown', async () => {
     const on = await freshDb();
     const w = await world(on);
-    const paid = async (sellerStatus: number | null, overrides: Partial<typeof payments.$inferInsert> = {}) =>
-      payment(w, await decision(w, 'paid', ago(120_000), on), { sellerStatus, signedAt: ago(120_000), ...overrides }, on);
-    const failedSeller = await paid(500);
-    const answered = await paid(200);
-    const silent = await paid(null);
-    const lost = await paid(null, { validUntilEpoch: 99n });
-    const wrong = await paid(200);
-    const notYet = await paid(null);
+    const paid = async (sellerStatus: number | null, delivered: boolean | null, overrides: Partial<typeof payments.$inferInsert> = {}) =>
+      payment(w, await decision(w, 'paid', ago(120_000), on), { sellerStatus, delivered, signedAt: ago(120_000), ...overrides }, on);
+    const failedSeller = await paid(500, false);
+    const answered = await paid(200, true);
+    const silent = await paid(null, false);
+    // The paid call could not store what the seller did, so Ellai does not know.
+    const unknown = await paid(null, null);
+    const lost = await paid(null, false, { validUntilEpoch: 99n });
+    const wrong = await paid(200, true);
+    const notYet = await paid(null, false);
     const { chain, state, calls } = stubChain(on);
     const readsOf = (digest: string) => calls.filter((call) => call === `getTransactionResult:${digest}`).length;
     const landed = new Map([
       [failedSeller.digest, settled(w.purse, RECIPIENT, PRICE)],
       [answered.digest, settled(w.purse, RECIPIENT, PRICE)],
       [silent.digest, settled(w.purse, RECIPIENT, PRICE)],
+      [unknown.digest, settled(w.purse, RECIPIENT, PRICE)],
       [wrong.digest, settled(w.purse, randomAddress(), PRICE)],
     ]);
     state.landed = (digest) => landed.get(digest) ?? null;
 
     const first = await tick(on, chain);
-    expect(first).toMatchObject({ owners: 1, paymentsVerified: 3, paymentsNotLanded: 1, paymentsMismatched: 1, outcomesRecorded: 2, errors: [] });
+    expect(first).toMatchObject({ owners: 1, paymentsVerified: 4, paymentsNotLanded: 1, paymentsMismatched: 1, outcomesRecorded: 2, errors: [] });
     const outcomes = await outcomesOf(w.ownerId, on);
     expect(outcomes.map((row) => row.decisionId).sort()).toEqual([failedSeller.decisionId, silent.decisionId].sort());
     for (const row of outcomes) expect(row).toMatchObject({ verdict: null, status: 'pending', writerPublicKey: ownerDelegate(MASTER, w.suiAddress).publicKeyHex });
@@ -674,6 +680,50 @@ describe('runJobsTick', () => {
     expect(second).toMatchObject({ owners: 1, paymentsVerified: 0, outcomesRecorded: 0, errors: [] });
     expect(await outcomesOf(w.ownerId, on)).toHaveLength(2);
     expect([readsOf(notYet.digest), readsOf(failedSeller.digest)]).toEqual([2, 1]);
+  });
+
+  it('records the outcome a paid call failed to record for a verified payment that delivered nothing, exactly once across two ticks', async () => {
+    const on = await freshDb();
+    const w = await world(on);
+    const verified = async (delivered: boolean | null) =>
+      payment(w, await decision(w, 'paid', ago(600_000), on), { settlement: 'verified', sellerStatus: delivered === true ? 200 : null, delivered, signedAt: ago(600_000) }, on);
+    const owed = await verified(false);
+    await verified(null);
+    await verified(true);
+    const remembered = await verified(false);
+    const delegatePublicKeyHex = ownerDelegate(MASTER, w.suiAddress).publicKeyHex;
+    const earlier = await recordOutcome({ db: on, ownerId: w.ownerId, decisionId: remembered.decisionId, delivered: false, delegatePublicKeyHex, now: ago(500_000) });
+    const { chain, calls } = stubChain(on);
+
+    expect(await tick(on, chain)).toMatchObject({ owners: 1, paymentsVerified: 0, outcomesRecorded: 1, errors: [] });
+    const outcomes = await outcomesOf(w.ownerId, on);
+    expect(outcomes.map((row) => row.decisionId).sort()).toEqual([owed.decisionId, remembered.decisionId].sort());
+    expect(outcomes.find((row) => row.decisionId === remembered.decisionId)?.id).toBe(earlier.memoryId);
+    expect(outcomes.find((row) => row.decisionId === owed.decisionId)).toMatchObject({ verdict: null, status: 'pending', writerPublicKey: delegatePublicKeyHex, createdAt: NOW });
+
+    expect(await tick(on, chain)).toMatchObject({ owners: 0, outcomesRecorded: 0, errors: [] });
+    expect(await outcomesOf(w.ownerId, on)).toHaveLength(2);
+    expect(calls.filter((call) => call.startsWith('getTransactionResult'))).toEqual([]);
+  });
+
+  it('hands its sleep to the refill job, which waits on it while it confirms a lost refill', async () => {
+    const on = await freshDb();
+    const w = await funded(on);
+    const lost = one(
+      await on
+        .insert(refills)
+        .values({ ownerId: w.ownerId, allowanceId: w.allowanceId, amountAtomic: REFILL, digest: randomDigest(), sentAt: ago(3_600_000), validUntilEpoch: 99n, status: 'pending' })
+        .returning(),
+    );
+    const { chain } = stubFor(w, REFILL, on);
+    const naps: number[] = [];
+    const sleep = async (ms: number) => {
+      naps.push(ms);
+    };
+    const summary = await runJobsTick({ db: on, chain, masterSecretHex: MASTER, gasKeypair: GAS, now: () => NOW, sleep });
+    expect(summary).toMatchObject({ owners: 1, refills: 0, errors: [] });
+    expect(naps).toEqual(Array(LIMITS.paymentReleaseReads).fill(LIMITS.settlementPollIntervalMs));
+    expect(one(await refillRows(w.ownerId, on))).toMatchObject({ id: lost.id, status: 'failed' });
   });
 
   it('refills a low purse, keeps an unknown send pending, and the next tick reads that digest before anything else', async () => {
