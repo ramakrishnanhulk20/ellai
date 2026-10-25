@@ -5,6 +5,7 @@ import { decisions, owners, payments } from '../../../../server/db/schema.js';
 import { withServerContext } from '../../../../server/http/context.js';
 import { HttpError, respond } from '../../../../server/http/errors.js';
 import { jsonResponse } from '../../../../server/http/json.js';
+import { limitOwnerChainReads } from '../../../../server/http/owner-limits.js';
 import { requireOwner } from '../../../../server/http/session.js';
 import { onboardingState } from '../../../../server/onboarding/state.js';
 
@@ -61,12 +62,16 @@ async function questionRate(db: Database, ownerId: string): Promise<{ asked: num
  * refused decisions and verified payments over the last 30 days, and questionsPer20: of the
  * latest 20 approved or asked decisions, how many were asked, with `window` saying how many
  * there were. The owner comes from the session alone (C13); 401 signed_out without one.
+ * Every call reads the purse through Tatum, so it counts toward the owner's
+ * LIMITS.ownerChainReadsPerMinute (C22): 429 too_many_requests beyond it.
  * Atomic amounts are decimal strings.
  */
 export async function GET(request: Request): Promise<Response> {
   return respond(() =>
     withServerContext(async (ctx) => {
       const { ownerId } = await requireOwner(request, ctx);
+      const limited = await limitOwnerChainReads(ctx, ownerId);
+      if (limited !== null) return limited;
       const now = ctx.now();
       const [owner] = await ctx.db
         .select({
