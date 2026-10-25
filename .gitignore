@@ -25,3 +25,7 @@ node_modules/
 next-env.d.ts
 dist/
 coverage/
+
+# Review notes
+REVIEW-BACKEND.md
+LABELS-RESULTS.md

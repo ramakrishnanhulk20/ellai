@@ -251,4 +251,26 @@ export const LIMITS = {
   paidFetchDeadlineMs: 240_000,
   /** Function duration requested by the slow routes, Vercel's maximum on every plan with Fluid compute. */
   slowRouteMaxDurationS: 300,
+  /** Failed settlement reads tolerated after a payment's window closes before it is treated as unverifiable and the owner paused (C8). */
+  settlementUnverifiableReads: 6,
+  /** How long signed payment material may land on chain, when the network accepts a timestamp bound on a gasless send. */
+  paymentMaterialTtlMs: 120_000,
+  /** Time one jobs tick may spend before it stops starting new owners, under the route's 300 s limit. */
+  tickTimeBudgetMs: 240_000,
+  /** Submit attempts a pending memory gets before it is marked failed. */
+  memoryWriteMaxAttempts: 5,
+  /** A memory write job still not done after this long is marked failed: six hours. */
+  memoryJobMaxAgeMs: 21_600_000,
+  /** Memory blob ids checked against the chain per owner per tick. */
+  blobConfirmBatch: 50,
+  /** Expired rows deleted per table per tick. */
+  pruneBatch: 1_000,
+  /** How long the seller reuses one current-epoch read for its challenges. */
+  epochCacheMs: 60_000,
+  /** Unpaid seller challenges issued per minute across every caller (C22). */
+  sellerChallengesPerMinuteGlobal: 300,
+  /** zkLogin sign-in checks against the chain per minute across every caller (C22). */
+  zkLoginChecksPerMinute: 30,
+  /** zkLogin sign-in checks against the chain per day across every caller (C22). */
+  zkLoginChecksPerDay: 2_000,
 } as const;
