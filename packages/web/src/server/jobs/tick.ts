@@ -3,7 +3,7 @@ import { type Chain, ChainError } from '@ellai/core/chain';
 import { LIMITS } from '@ellai/core/limits';
 import { MemoryError } from '@ellai/core/memory';
 import type { Ed25519Keypair } from '@mysten/sui/keypairs/ed25519';
-import { and, asc, eq, inArray, isNotNull, notExists, sql } from 'drizzle-orm';
+import { and, asc, eq, inArray, isNotNull, isNull, notExists, sql } from 'drizzle-orm';
 import { unionAll } from 'drizzle-orm/pg-core';
 import type { Database } from '../db/client.js';
 import { LIVE_DECISION_STATUSES, decisions, memories, owners, payments } from '../db/schema.js';
@@ -11,7 +11,9 @@ import { MemoryServiceError, ownerDelegate } from '../memory/delegate.js';
 import { recordOutcome } from '../memory/outcome.js';
 import { confirmMemoryJobs, submitPendingMemories } from '../memory/writer.js';
 import { settlePayment } from '../pay/settle.js';
+import { confirmBlobsOnChain } from './blobs.js';
 import { expireDecisions } from './expire.js';
+import { pruneExpiredRows } from './prune.js';
 import { RefillError, refillIfNeeded } from './refill.js';
 
 export interface JobsTickArgs {
@@ -37,6 +39,8 @@ export interface JobsTickSummary {
   memoriesSubmitted: number;
   memoriesConfirmed: number;
   memoriesFailed: number;
+  /** Confirmed memories whose blob this tick found among the owner's Walrus Blob objects. */
+  memoriesChainConfirmed: number;
   paymentsVerified: number;
   paymentsNotLanded: number;
   paymentsMismatched: number;
@@ -44,7 +48,11 @@ export interface JobsTickSummary {
   decisionsExpired: number;
   questionsClosed: number;
   refills: number;
+  /** Expired sign-in nonces, unpaid seller sales and ended sessions deleted by this tick. */
+  rowsPruned: number;
   gasWalletLow: boolean;
+  /** True when the tick stopped starting owners because LIMITS.tickTimeBudgetMs had passed. */
+  timeBudgetReached: boolean;
   errors: JobsTickError[];
 }
 
@@ -83,10 +91,14 @@ export function errorCode(error: unknown): string {
 }
 
 /**
- * Owners with work, oldest work first: pending memories (only for an owner with a Walrus Memory
- * account, the only kind the memory step can send), pending payments, payments owed an outcome
- * memory, open or asked decisions, and an allowance, dated by when it was checked or, before
- * that, when the owner joined.
+ * Owners with work, least recently visited first: never visited before any visited, then the
+ * oldest visit, and among equals the oldest work. Work is pending memories (only for an owner
+ * with a Walrus Memory account, the only kind the memory step can send), confirmed memories
+ * not yet found on chain, pending payments, payments owed an outcome memory, open or asked
+ * decisions, and an allowance, dated by when it was checked or, before that, when the owner
+ * joined. Ordering by the visit and not by the work is what lets every owner take a turn: an
+ * owner with an allowance always has work, so ordering by work alone served the same
+ * LIMITS.jobsOwnersPerTick owners every tick (C21).
  */
 async function ownersWithWork(db: Database): Promise<string[]> {
   const memoryWork = db
@@ -94,6 +106,11 @@ async function ownersWithWork(db: Database): Promise<string[]> {
     .from(memories)
     .innerJoin(owners, eq(owners.id, memories.ownerId))
     .where(and(eq(memories.status, 'pending'), isNotNull(owners.memwalAccountId)))
+    .groupBy(memories.ownerId);
+  const blobWork = db
+    .select({ ownerId: memories.ownerId, at: sql<Date>`min(coalesce(${memories.confirmedAt}, ${memories.createdAt}))`.as('at') })
+    .from(memories)
+    .where(and(eq(memories.status, 'confirmed'), isNotNull(memories.blobId), isNull(memories.chainConfirmedAt)))
     .groupBy(memories.ownerId);
   const paymentWork = db
     .select({ ownerId: payments.ownerId, at: sql<Date>`min(${payments.signedAt})`.as('at') })
@@ -114,20 +131,26 @@ async function ownersWithWork(db: Database): Promise<string[]> {
     .select({ ownerId: owners.id, at: sql<Date>`coalesce(${owners.allowanceCheckedAt}, ${owners.createdAt})`.as('at') })
     .from(owners)
     .where(isNotNull(owners.allowanceId));
-  const work = unionAll(memoryWork, paymentWork, outcomeWork, decisionWork, allowanceWork).as('work');
+  const work = unionAll(memoryWork, blobWork, paymentWork, outcomeWork, decisionWork, allowanceWork).as('work');
   const rows = await db
-    .select({ ownerId: work.ownerId })
+    .select({ ownerId: owners.id })
     .from(work)
-    .groupBy(work.ownerId)
-    .orderBy(sql`min(${work.at})`, work.ownerId)
+    .innerJoin(owners, eq(owners.id, work.ownerId))
+    .groupBy(owners.id)
+    .orderBy(sql`${owners.lastTickedAt} asc nulls first`, sql`min(${work.at})`, owners.id)
     .limit(LIMITS.jobsOwnersPerTick);
   return rows.map((row) => row.ownerId);
 }
 
 /**
- * One pass of Ellai's background work, bounded and safe to repeat. Handles at most
- * LIMITS.jobsOwnersPerTick owners with work, oldest work first. For each owner, in order:
+ * One pass of Ellai's background work, bounded and safe to repeat. First pruneExpiredRows
+ * deletes at most LIMITS.pruneBatch expired rows per table (C22). Then it handles at most
+ * LIMITS.jobsOwnersPerTick owners with work, least recently visited first (ownersWithWork), and
+ * starts no owner once LIMITS.tickTimeBudgetMs has passed on `now` since the tick began, which
+ * sets timeBudgetReached. For each owner, in order:
  * 1. memory (only with a Walrus Memory account): submitPendingMemories, then confirmMemoryJobs;
+ *    then, for every owner, confirmBlobsOnChain checks confirmed memories against the owner's
+ *    Walrus Blob objects on chain (C18);
  * 2. payments: every payment still 'pending', oldest first, is read once by settlePayment
  *    (tries 1; later ticks are the patience), which checks it against Ellai's own digest (C8);
  * 3. outcomes: every 'verified' payment stored as delivered false (never null) whose decision has
@@ -137,6 +160,8 @@ async function ownersWithWork(db: Database): Promise<string[]> {
  * 4. expireDecisions: stale open decisions and unanswered questions past their time;
  * 5. refillIfNeeded (only with an allowance), waiting with this tick's `sleep`: C7 and C23 at
  *    refill time.
+ * Then the owner's last_ticked_at is set to `now`, whatever the steps did, so a failing owner
+ * goes to the back of the line like any other.
  * Then the gas wallet's SUI is read once; below LIMITS.gasWalletLowMist, or unreadable, sets
  * gasWalletLow.
  * Every owner and every step is wrapped: a failure is recorded with the owner, the step and a
@@ -150,6 +175,7 @@ export async function runJobsTick(args: JobsTickArgs): Promise<JobsTickSummary> 
     memoriesSubmitted: 0,
     memoriesConfirmed: 0,
     memoriesFailed: 0,
+    memoriesChainConfirmed: 0,
     paymentsVerified: 0,
     paymentsNotLanded: 0,
     paymentsMismatched: 0,
@@ -157,7 +183,9 @@ export async function runJobsTick(args: JobsTickArgs): Promise<JobsTickSummary> 
     decisionsExpired: 0,
     questionsClosed: 0,
     refills: 0,
+    rowsPruned: 0,
     gasWalletLow: true,
+    timeBudgetReached: false,
     errors: [],
   };
   const step = async (ownerId: string, name: string, run: () => Promise<void>): Promise<void> => {
@@ -167,8 +195,18 @@ export async function runJobsTick(args: JobsTickArgs): Promise<JobsTickSummary> 
       summary.errors.push({ ownerId, step: name, code: errorCode(error) });
     }
   };
+  const startedMs = now().getTime();
+
+  await step('', 'prune', async () => {
+    const pruned = await pruneExpiredRows({ db, now: now() });
+    summary.rowsPruned += pruned.signinNonces + pruned.sellerSales + pruned.sessions;
+  });
 
   for (const ownerId of await ownersWithWork(db)) {
+    if (now().getTime() - startedMs >= LIMITS.tickTimeBudgetMs) {
+      summary.timeBudgetReached = true;
+      break;
+    }
     summary.owners += 1;
     await step(ownerId, 'owner', async () => {
       const [owner] = await db
@@ -187,6 +225,9 @@ export async function runJobsTick(args: JobsTickArgs): Promise<JobsTickSummary> 
           summary.memoriesFailed += confirmed.failed;
         });
       }
+      await step(ownerId, 'blobs', async () => {
+        summary.memoriesChainConfirmed += (await confirmBlobsOnChain({ db, chain, ownerId, now: now() })).confirmed;
+      });
 
       await step(ownerId, 'payments', async () => {
         const pending = await db
@@ -233,6 +274,9 @@ export async function runJobsTick(args: JobsTickArgs): Promise<JobsTickSummary> 
           if ((await refillIfNeeded({ db, chain, ownerId, masterSecretHex, gasKeypair, now: now(), sleep })) === 'refilled') summary.refills += 1;
         });
       }
+    });
+    await step(ownerId, 'visited', async () => {
+      await db.update(owners).set({ lastTickedAt: now() }).where(eq(owners.id, ownerId));
     });
   }
 

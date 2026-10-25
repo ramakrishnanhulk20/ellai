@@ -2,7 +2,7 @@ import { LIMITS } from '@ellai/core/limits';
 import { isValidTransactionDigest } from '@mysten/sui/utils';
 import { and, count, desc, eq, isNotNull, sql } from 'drizzle-orm';
 import type { Database } from '../db/client.js';
-import { type MEMORY_KINDS, decisions, memories, payments } from '../db/schema.js';
+import { type MEMORY_KINDS, decisions, memories, owners, payments } from '../db/schema.js';
 
 /** The public proof could not be read and there is no earlier copy to show. The message is fixed text. */
 export class ProofUnavailableError extends Error {
@@ -13,10 +13,13 @@ export class ProofUnavailableError extends Error {
 }
 
 /**
- * What /proof shows, every entry from Ellai's own records (C18): payments Ellai verified on
- * chain by its own digest, and memory writes Walrus Memory confirmed. It holds no memory
- * sentence, no purpose, no reason, no agent label and no owner or purse address, so nothing an
- * owner or an agent wrote is public. Atomic amounts are decimal strings and times ISO strings.
+ * What /proof shows, every entry from Ellai's own records and only for owners who chose to be
+ * shown (owners.public_proof), since each digest leads on chain to an owner's purse and wallet
+ * (C18): payments Ellai verified on chain by its own digest, and memory writes Walrus Memory
+ * confirmed whose blob the jobs tick then found on chain. The totals count those owners only.
+ * It holds no memory sentence, no purpose, no reason, no agent label and no owner or purse
+ * address, so nothing an owner or an agent wrote is public. Atomic amounts are decimal strings
+ * and times ISO strings; a memory's confirmedAt is when Walrus Memory confirmed it.
  */
 export interface PublicProof {
   totals: {
@@ -37,36 +40,48 @@ const EXPLORER_TX = 'https://suiscan.xyz/mainnet/tx/';
 const BLOB_ID = /^[A-Za-z0-9_-]{1,128}$/;
 
 /**
- * Reads the public proof from the database: five reads, no chain call. The 20 latest verified
- * payments, newest first, each with its explorer link; the 20 latest confirmed memories,
- * newest first, by blob id and kind only; and the totals. A digest that is not a Sui
- * transaction digest, or a blob id that is not plain base64url, is left out rather than
- * linked or shown.
+ * Reads the public proof from the database: five reads, no chain call, each joined to its
+ * owner and kept to owners with public_proof true. The 20 latest verified payments, newest
+ * first, each with its explorer link; the 20 latest memories confirmed by Walrus Memory and
+ * found on chain (chain_confirmed_at set), newest first, by blob id and kind only; and the
+ * totals, over the same owners, with an owner answer counted only once found on chain. A digest
+ * that is not a Sui transaction digest, or a blob id that is not plain base64url, is left out
+ * rather than linked or shown.
  */
 export async function readPublicProof(db: Database): Promise<PublicProof> {
   const decidedCount = (outcome: 'approved' | 'asked', rule?: 'learned') =>
     sql`count(*) filter (where ${rule === undefined ? eq(decisions.outcome, outcome) : and(eq(decisions.outcome, outcome), eq(decisions.rule, rule))})`.mapWith(Number);
+  const shown = eq(owners.publicProof, true);
+  const onChain = and(eq(memories.status, 'confirmed'), isNotNull(memories.blobId), isNotNull(memories.chainConfirmedAt));
   const [paid, answers, decided, latestPayments, latestMemories] = await Promise.all([
     db
       .select({ n: count(), total: sql<string>`coalesce(sum(${payments.amountAtomic}), 0)::text` })
       .from(payments)
-      .where(eq(payments.settlement, 'verified')),
+      .innerJoin(owners, eq(owners.id, payments.ownerId))
+      .where(and(eq(payments.settlement, 'verified'), shown)),
     db
       .select({ n: count() })
       .from(memories)
-      .where(and(eq(memories.kind, 'owner_decision'), eq(memories.status, 'confirmed'))),
-    db.select({ learned: decidedCount('approved', 'learned'), asked: decidedCount('asked') }).from(decisions),
+      .innerJoin(owners, eq(owners.id, memories.ownerId))
+      .where(and(eq(memories.kind, 'owner_decision'), onChain, shown)),
+    db
+      .select({ learned: decidedCount('approved', 'learned'), asked: decidedCount('asked') })
+      .from(decisions)
+      .innerJoin(owners, eq(owners.id, decisions.ownerId))
+      .where(shown),
     db
       .select({ digest: payments.digest, amountAtomic: payments.amountAtomic, sellerHost: decisions.sellerHost, signedAt: payments.signedAt })
       .from(payments)
       .innerJoin(decisions, and(eq(decisions.id, payments.decisionId), eq(decisions.ownerId, payments.ownerId)))
-      .where(eq(payments.settlement, 'verified'))
+      .innerJoin(owners, eq(owners.id, payments.ownerId))
+      .where(and(eq(payments.settlement, 'verified'), shown))
       .orderBy(desc(payments.signedAt), desc(payments.id))
       .limit(LATEST),
     db
       .select({ blobId: memories.blobId, kind: memories.kind, confirmedAt: memories.confirmedAt })
       .from(memories)
-      .where(and(eq(memories.status, 'confirmed'), isNotNull(memories.blobId), isNotNull(memories.confirmedAt)))
+      .innerJoin(owners, eq(owners.id, memories.ownerId))
+      .where(and(onChain, isNotNull(memories.confirmedAt), shown))
       .orderBy(desc(memories.confirmedAt), desc(memories.id))
       .limit(LATEST),
   ]);

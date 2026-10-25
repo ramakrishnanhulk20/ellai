@@ -28,6 +28,7 @@ const body = z
     approvalsNeeded: z.number().optional(),
     distanceCutoff: z.number().optional(),
     clearAutoPause: z.literal(true).optional(),
+    publicProof: z.boolean().optional(),
   })
   .refine((change) => Object.values(change).some((value) => value !== undefined));
 
@@ -40,6 +41,7 @@ const SETTINGS = {
   dailyBudgetAtomic: owners.dailyBudgetAtomic,
   approvalsNeeded: owners.approvalsNeeded,
   distanceCutoff: owners.distanceCutoff,
+  publicProof: owners.publicProof,
 };
 
 interface Settings {
@@ -49,6 +51,7 @@ interface Settings {
   dailyBudgetAtomic: bigint;
   approvalsNeeded: number;
   distanceCutoff: number;
+  publicProof: boolean;
 }
 
 // Only what the change touches is checked, so a value stored before these bounds existed can
@@ -78,11 +81,13 @@ function boundsProblem(current: Settings, change: Change): string | null {
 
 /**
  * Changes the signed-in owner's own limits: any of { paused, perPaymentMaxAtomic,
- * dailyBudgetAtomic, approvalsNeeded, distanceCutoff, clearAutoPause } in, at least one, the
- * amounts as decimal strings; the owner's settings after the change out, the same fields the
- * overview shows. The per-payment maximum must be within [LIMITS.minPaymentAtomic,
- * LIMITS.maxPaymentAtomic]; the daily budget within [the per-payment maximum after the
- * change, LIMITS.onboardingDailyLimitMaxAtomic]; approvals needed a whole number from 1 to 10;
+ * dailyBudgetAtomic, approvalsNeeded, distanceCutoff, clearAutoPause, publicProof } in, at
+ * least one, the amounts as decimal strings; the owner's settings after the change out, the
+ * fields the overview shows plus publicProof. publicProof true lists this owner's verified
+ * payments and on-chain memories on the public /proof page, and false takes them off at the
+ * page's next refresh; owners start with false. The per-payment maximum must be within
+ * [LIMITS.minPaymentAtomic, LIMITS.maxPaymentAtomic]; the daily budget within [the per-payment
+ * maximum after the change, LIMITS.onboardingDailyLimitMaxAtomic]; approvals needed a whole number from 1 to 10;
  * the distance cutoff above 0 and at most 1. Unpausing leaves an auto pause in place: only
  * clearAutoPause: true clears it, so an owner must acknowledge a settlement mismatch on purpose.
  * The owner row is locked FOR UPDATE for the read, the checks and the one update, so a change
@@ -113,6 +118,7 @@ export async function PATCH(request: Request): Promise<Response> {
             approvalsNeeded: change.approvalsNeeded,
             distanceCutoff: change.distanceCutoff === undefined ? undefined : Math.fround(change.distanceCutoff),
             autoPausedReason: change.clearAutoPause === true ? null : undefined,
+            publicProof: change.publicProof,
           })
           .where(eq(owners.id, ownerId))
           .returning(SETTINGS);

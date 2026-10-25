@@ -2,8 +2,9 @@
 // with a stub chain: Ellai's wallet check seller bound to APP_ORIGIN whatever Host says, its
 // 402 and its paid 200 with a stubbed settlement, and its body cap; the jobs tick refused
 // without the exact secret, with its own Bearer challenge, and run with it, its summary in fixed codes only, and old rate
-// counters pruned; the public proof listing only verified payments and confirmed memories,
-// with no sentence, purpose, label or owner address, at most 20 of each, read from the
+// counters pruned; the public proof listing only verified payments and memories found on chain,
+// only for owners who opted in and with totals over those owners only, with no sentence,
+// purpose, label or owner address, at most 20 of each, read from the
 // database at most once per cache window however many requests come, and its last good copy
 // or a 503 when a refresh fails; and the fixed status, code and wording toErrorResponse gives
 // every error class these routes and the agent tools can meet.
@@ -13,7 +14,7 @@
 // GitHub schedule that calls the tick, or several server instances each keeping their own
 // proof cache (each one still reads at most once per window).
 import { randomBytes } from 'node:crypto';
-import { type Chain, ChainError, type ExecutionResult } from '@ellai/core/chain';
+import { type Chain, ChainError, type ExecutionResult, type WalrusBlob } from '@ellai/core/chain';
 import { ChallengeError, parseChallenge } from '@ellai/core/challenge';
 import { canonicalSuiAddress } from '@ellai/core/keys';
 import { LIMITS } from '@ellai/core/limits';
@@ -34,6 +35,7 @@ import { agents, decisions, memories, owners, payments, rateCounters, sellerSale
 import type { ServerEnv } from '../src/server/env.js';
 import { setServerContextFactory } from '../src/server/http/context.js';
 import { HttpError, toErrorResponse } from '../src/server/http/errors.js';
+import { confirmBlobsOnChain } from '../src/server/jobs/blobs.js';
 import { MemoryServiceError } from '../src/server/memory/delegate.js';
 import { ProofUnavailableError } from '../src/server/public/proof.js';
 import { SellerError } from '../src/server/seller/challenge.js';
@@ -266,6 +268,7 @@ describe('POST /api/jobs/tick', () => {
       memoriesSubmitted: 0,
       memoriesConfirmed: 0,
       memoriesFailed: 0,
+      memoriesChainConfirmed: 0,
       paymentsVerified: 0,
       paymentsNotLanded: 0,
       paymentsMismatched: 0,
@@ -273,7 +276,9 @@ describe('POST /api/jobs/tick', () => {
       decisionsExpired: 1,
       questionsClosed: 0,
       refills: 0,
+      rowsPruned: 0,
       gasWalletLow: false,
+      timeBudgetReached: false,
       errors: [],
     });
     expect(getBalances).toHaveBeenCalledWith(GAS.toSuiAddress());
@@ -342,10 +347,10 @@ describe('GET /api/public/proof', () => {
 
   const at =(msAgo: number) => new Date(nowMs - msAgo);
 
-  async function proofOwner(): Promise<{ ownerId: string; agentId: string; suiAddress: string; purseAddress: string }> {
+  async function proofOwner(publicProof = true): Promise<{ ownerId: string; agentId: string; suiAddress: string; purseAddress: string }> {
     const suiAddress = canonicalSuiAddress(`0x${hex(32)}`);
     const purseAddress = canonicalSuiAddress(`0x${hex(32)}`);
-    const [owner] = await proofDb.db.insert(owners).values({ suiAddress, purseAddress }).returning({ id: owners.id });
+    const [owner] = await proofDb.db.insert(owners).values({ suiAddress, purseAddress, publicProof }).returning({ id: owners.id });
     const ownerId = owner?.id ?? '';
     const [agent] = await proofDb.db
       .insert(agents)
@@ -403,7 +408,14 @@ describe('GET /api/public/proof', () => {
     return digest;
   }
 
-  async function proofMemory(w: Party, kind: 'owner_decision' | 'outcome', status: 'confirmed' | 'pending' | 'failed', confirmedAt: Date | null): Promise<string | null> {
+  // A confirmed memory is found on chain at its confirmation unless the test says it never was.
+  async function proofMemory(
+    w: Party,
+    kind: 'owner_decision' | 'outcome',
+    status: 'confirmed' | 'pending' | 'failed',
+    confirmedAt: Date | null,
+    chainConfirmedAt: Date | null = status === 'confirmed' ? confirmedAt : null,
+  ): Promise<string | null> {
     const blobId = status === 'confirmed' ? randomBytes(32).toString('base64url') : null;
     await proofDb.db.insert(memories).values({
       ownerId: w.ownerId,
@@ -418,6 +430,7 @@ describe('GET /api/public/proof', () => {
       blobId,
       status,
       confirmedAt,
+      chainConfirmedAt,
     });
     return blobId;
   }
@@ -460,6 +473,51 @@ describe('GET /api/public/proof', () => {
     for (const secret of [MARKER, w.suiAddress, w.purseAddress, w.suiAddress.slice(2), w.purseAddress.slice(2), 'The owner said', 'Book the room']) {
       expect(text).not.toContain(secret);
     }
+  });
+
+  it('never lists or counts a memory Walrus Memory confirmed until the tick finds its blob among the owner\'s Blob objects on chain', async () => {
+    const w = await proofOwner();
+    const confirmedAt = at(60_000);
+    const blobId = (await proofMemory(w, 'owner_decision', 'confirmed', confirmedAt, null)) ?? '';
+    const listing = (ids: string[]) =>
+      ({
+        listOwnedWalrusBlobs: async (owner: string): Promise<WalrusBlob[]> =>
+          owner === w.suiAddress ? ids.map((id) => ({ objectId: canonicalSuiAddress(`0x${hex(32)}`), blobId: id, registeredEpoch: 1, endEpoch: 2, deletable: false })) : [],
+      }) as unknown as Chain;
+
+    const before = await proof();
+    expect([before.body.memories, before.body.totals.confirmedOwnerAnswers]).toEqual([[], 0]);
+    expect(await confirmBlobsOnChain({ db: proofDb.db, chain: listing([]), ownerId: w.ownerId, now: new Date(nowMs) })).toEqual({ checked: 1, confirmed: 0 });
+    nowMs += LIMITS.publicProofCacheMs;
+    expect((await proof()).body.memories).toEqual([]);
+
+    expect(await confirmBlobsOnChain({ db: proofDb.db, chain: listing([blobId]), ownerId: w.ownerId, now: new Date(nowMs) })).toEqual({ checked: 1, confirmed: 1 });
+    nowMs += LIMITS.publicProofCacheMs;
+    const after = await proof();
+    expect(after.body.memories).toEqual([{ blobId, kind: 'owner_decision', confirmedAt: confirmedAt.toISOString() }]);
+    expect(after.body.totals.confirmedOwnerAnswers).toBe(1);
+  });
+
+  it('never shows an owner who has not opted in, in the lists or the totals, until they opt in', async () => {
+    const shown = await proofOwner();
+    const hidden = await proofOwner(false);
+    const shownDigest = await proofPayment(shown, 'verified', at(60_000), 10_000n);
+    const hiddenDigest = await proofPayment(hidden, 'verified', at(30_000), 40_000n);
+    const shownBlob = await proofMemory(shown, 'owner_decision', 'confirmed', at(90_000));
+    const hiddenBlob = (await proofMemory(hidden, 'owner_decision', 'confirmed', at(45_000))) ?? '';
+    await proofDecision(hidden, { outcome: 'asked', rule: 'no_match', status: 'asked' });
+
+    const { text, body } = await proof();
+    expect(body.totals).toEqual({ verifiedPayments: 1, verifiedUsdcAtomic: '10000', confirmedOwnerAnswers: 1, approvedByLearning: 1, askedDecisions: 0 });
+    expect(body.payments.map((row) => row.digest)).toEqual([shownDigest]);
+    expect(body.memories.map((row) => row.blobId)).toEqual([shownBlob]);
+    for (const secret of [hiddenDigest, hiddenBlob, hidden.suiAddress, hidden.purseAddress]) expect(text).not.toContain(secret);
+
+    await proofDb.db.update(owners).set({ publicProof: true }).where(eq(owners.id, hidden.ownerId));
+    nowMs += LIMITS.publicProofCacheMs;
+    const opted = await proof();
+    expect(opted.body.payments.map((row) => row.digest)).toEqual([hiddenDigest, shownDigest]);
+    expect(opted.body.totals).toMatchObject({ verifiedPayments: 2, verifiedUsdcAtomic: '50000', askedDecisions: 1 });
   });
 
   it('reads the database at most once per window, however many requests arrive, and again after it', async () => {

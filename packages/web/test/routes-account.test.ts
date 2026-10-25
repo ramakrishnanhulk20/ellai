@@ -6,7 +6,8 @@
 // and twenty held at once by one owner; onboarding passing
 // the owner, chain and master secret to the onboarding functions and their summaries and
 // refusals back unchanged; settings held to their bounds at each edge, the auto pause cleared
-// only on request; and one shared per-owner limit on the routes that read Sui.
+// only on request, the public proof opt-in starting off and switched for the signed-in owner
+// only; and one shared per-owner limit on the routes that read Sui.
 // Does NOT cover: a real chain or wallet (the chain is stubbed and core's Walrus Memory builders
 // are stand-ins; onboarding.test and prove:onboarding cover those), two database connections
 // racing a settings change against signing (PGlite serves one connection, so the FOR UPDATE
@@ -175,7 +176,7 @@ async function signedInOwner(): Promise<Owner> {
   const { message } = await issueSignIn({ db, address: signer.toSuiAddress(), appOrigin: APP_ORIGIN, now: clock });
   const done = await completeSignIn({ db, message, signature: await sign(signer, message), appOrigin: APP_ORIGIN, masterSecretHex: MASTER, sessionSecretHex: SECRET, now: clock });
   const row = one(await db.select({ suiAddress: owners.suiAddress }).from(owners).where(eq(owners.id, done.ownerId)));
-  return { ownerId: done.ownerId, address: row.suiAddress, cookie: `ellai_session=${done.sessionToken}` };
+  return { ownerId: done.ownerId, address: row.suiAddress, cookie: `__Host-ellai_session=${done.sessionToken}` };
 }
 
 async function agentFor(ownerId: string, label = 'Travel agent'): Promise<string> {
@@ -739,14 +740,23 @@ interface SettingsBody {
   dailyBudgetAtomic: string;
   approvalsNeeded: number;
   distanceCutoff: number;
+  publicProof: boolean;
 }
 
-const DEFAULTS: SettingsBody = { paused: false, autoPausedReason: null, perPaymentMaxAtomic: '50000', dailyBudgetAtomic: '500000', approvalsNeeded: 2, distanceCutoff: 0.5 };
+const DEFAULTS: SettingsBody = { paused: false, autoPausedReason: null, perPaymentMaxAtomic: '50000', dailyBudgetAtomic: '500000', approvalsNeeded: 2, distanceCutoff: 0.5, publicProof: false };
 
 async function storedSettings(ownerId: string) {
   return one(
     await db
-      .select({ paused: owners.paused, autoPausedReason: owners.autoPausedReason, perPaymentMaxAtomic: owners.perPaymentMaxAtomic, dailyBudgetAtomic: owners.dailyBudgetAtomic, approvalsNeeded: owners.approvalsNeeded, distanceCutoff: owners.distanceCutoff })
+      .select({
+        paused: owners.paused,
+        autoPausedReason: owners.autoPausedReason,
+        perPaymentMaxAtomic: owners.perPaymentMaxAtomic,
+        dailyBudgetAtomic: owners.dailyBudgetAtomic,
+        approvalsNeeded: owners.approvalsNeeded,
+        distanceCutoff: owners.distanceCutoff,
+        publicProof: owners.publicProof,
+      })
       .from(owners)
       .where(eq(owners.id, ownerId)),
   );
@@ -757,8 +767,8 @@ describe('PATCH /api/owner/settings', () => {
     const owner = await signedInOwner();
     const other = await signedInOwner();
     const changed = await json<SettingsBody>(await patchSettings({ paused: true, perPaymentMaxAtomic: '200000', dailyBudgetAtomic: '1000000', approvalsNeeded: 3, distanceCutoff: 0.3 }, { cookie: owner.cookie }));
-    expect(changed).toEqual({ paused: true, autoPausedReason: null, perPaymentMaxAtomic: '200000', dailyBudgetAtomic: '1000000', approvalsNeeded: 3, distanceCutoff: 0.3 });
-    expect(await storedSettings(owner.ownerId)).toEqual({ paused: true, autoPausedReason: null, perPaymentMaxAtomic: 200_000n, dailyBudgetAtomic: 1_000_000n, approvalsNeeded: 3, distanceCutoff: 0.3 });
+    expect(changed).toEqual({ paused: true, autoPausedReason: null, perPaymentMaxAtomic: '200000', dailyBudgetAtomic: '1000000', approvalsNeeded: 3, distanceCutoff: 0.3, publicProof: false });
+    expect(await storedSettings(owner.ownerId)).toEqual({ paused: true, autoPausedReason: null, perPaymentMaxAtomic: 200_000n, dailyBudgetAtomic: 1_000_000n, approvalsNeeded: 3, distanceCutoff: 0.3, publicProof: false });
     expect(await json(await patchSettings({ approvalsNeeded: 4 }, { cookie: owner.cookie }))).toEqual({ ...changed, approvalsNeeded: 4 });
     expect(await json(await patchSettings({ paused: false }, { cookie: owner.cookie }))).toEqual({ ...changed, approvalsNeeded: 4, paused: false });
     expect(await storedSettings(other.ownerId)).toEqual({ ...DEFAULTS, perPaymentMaxAtomic: 50_000n, dailyBudgetAtomic: 500_000n });
@@ -810,10 +820,24 @@ describe('PATCH /api/owner/settings', () => {
       { clearAutoPause: false },
       { autoPausedReason: null },
       { paused: true, ownerId: MISSING_ID },
+      { publicProof: 'yes' },
+      { publicProof: null },
     ]) {
       await refusedWith(await patchSettings(sent, { cookie: owner.cookie }), 400, 'bad_body');
     }
     expect(await storedSettings(owner.ownerId)).toEqual({ ...DEFAULTS, perPaymentMaxAtomic: 50_000n, dailyBudgetAtomic: 500_000n });
+  });
+
+  it("turns this owner's place on the public proof on and off, starting off, and touches no other owner", async () => {
+    const owner = await signedInOwner();
+    const other = await signedInOwner();
+    expect((await storedSettings(owner.ownerId)).publicProof).toBe(false);
+    expect(await json<SettingsBody>(await patchSettings({ publicProof: true }, { cookie: owner.cookie }))).toEqual({ ...DEFAULTS, publicProof: true });
+    expect((await storedSettings(owner.ownerId)).publicProof).toBe(true);
+    expect((await storedSettings(other.ownerId)).publicProof).toBe(false);
+    expect((await json<SettingsBody>(await patchSettings({ paused: true }, { cookie: owner.cookie }))).publicProof).toBe(true);
+    expect((await json<SettingsBody>(await patchSettings({ publicProof: false }, { cookie: owner.cookie }))).publicProof).toBe(false);
+    expect((await storedSettings(owner.ownerId)).publicProof).toBe(false);
   });
 
   it('clears an auto pause only when clearAutoPause is sent', async () => {
@@ -839,13 +863,14 @@ describe('the session and origin requirements', () => {
     ['onboarding build', (cookie) => build({ step: 'memory_account' }, cookie === undefined ? {} : { cookie })],
     ['onboarding confirm', (cookie) => confirm({ step: 'memory_account', digest: DIGEST }, cookie === undefined ? {} : { cookie })],
     ['settings', (cookie) => patchSettings({ paused: true }, cookie === undefined ? {} : { cookie })],
+    ['settings public proof', (cookie) => patchSettings({ publicProof: true }, cookie === undefined ? {} : { cookie })],
   ];
 
   it.each(routes)('%s is 401 signed_out with no cookie, a junk cookie, or a session that has ended', async (_name, run) => {
     quiet();
     const owner = await signedInOwner();
-    await endSession({ db, token: owner.cookie.slice('ellai_session='.length), sessionSecretHex: SECRET, now: clock });
-    for (const cookie of [undefined, `ellai_session=${MARKER}`, 'ellai_session=', owner.cookie]) {
+    await endSession({ db, token: owner.cookie.slice('__Host-ellai_session='.length), sessionSecretHex: SECRET, now: clock });
+    for (const cookie of [undefined, `__Host-ellai_session=${MARKER}`, '__Host-ellai_session=', owner.cookie]) {
       const response = await run(cookie);
       expect(response.status).toBe(401);
       expect(await response.json()).toEqual({ error: 'signed_out', message: 'Sign in to Ellai to continue.' });
@@ -860,6 +885,7 @@ describe('the session and origin requirements', () => {
     ['onboarding build', (options) => build({ step: 'memory_account' }, options)],
     ['onboarding confirm', (options) => confirm({ step: 'memory_account', digest: DIGEST }, options)],
     ['settings', (options) => patchSettings({ paused: true }, options)],
+    ['settings public proof', (options) => patchSettings({ publicProof: true }, options)],
   ];
 
   it.each(changing)('%s is 403 cross_origin from another site or with no Origin, changing nothing', async (_name, run) => {

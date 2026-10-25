@@ -4,7 +4,7 @@
 // Tatum minute: the current epoch, a real settled USDC payment read with its status,
 // a dry run of garbage bytes, and both response size caps. Offline: whether a chain says
 // it sends an API key and, against stand-in gateway answers, executeTransaction's retry
-// and refusal rules and getAllowance's shape checks. Then, after a third fresh minute: a
+// and refusal rules and getAllowance's shape checks and rate window. Then, after a third fresh minute: a
 // real third-party USDC allowance read with its terms, an app-bound one refused, and a
 // wrongly signed transaction refused by the network.
 // Does NOT cover: a paid key's rate limits, the Walrus blob listing (the probe script
@@ -406,7 +406,23 @@ describe('getAllowance shape checks, against stand-in GraphQL bodies', () => {
       periodLimit: 500_000n,
       expirationMs: 1_800_000_000_000n,
       initialSharedVersion: 1_050_464_896n,
+      periodSpent: 0n,
+      periodEndMs: null,
     });
+  });
+
+  it("reads the current window's spend and its end, numbered from the first spend", async () => {
+    const anchored = allowanceBody((o) => {
+      Object.assign(o.asMoveObject.contents.json.settings.rate_limit, { spent: '300000', anchor_ms: '1761300000000', index: '2' });
+      o.asMoveObject.contents.json.current_spend = '700000';
+    });
+    const allowance = await withGraphql(anchored, () => chain.getAllowance(STAND_IN_ALLOWANCE));
+    expect(allowance).toMatchObject({ spentTotal: 700_000n, periodSpent: 300_000n, periodEndMs: 1_761_300_000_000n + 3n * 86_400_000n });
+    const unlimited = await withGraphql(
+      allowanceBody((o) => (o.asMoveObject.contents.json.settings.rate_limit = null)),
+      () => chain.getAllowance(STAND_IN_ALLOWANCE),
+    );
+    expect(unlimited).toMatchObject({ periodMs: null, periodLimit: null, periodSpent: null, periodEndMs: null });
   });
 
   it('refuses every shape that is not a direct allowance exactly as the module writes it', async () => {
@@ -422,6 +438,9 @@ describe('getAllowance shape checks, against stand-in GraphQL bodies', () => {
       ['contents naming another object', (o) => (o.asMoveObject.contents.json.id = `0x${'99'.repeat(32)}`)],
       ['an expiration past u64', (o) => (o.asMoveObject.contents.json.settings.expiration_timestamp_ms = '18446744073709551616')],
       ['a negative amount', (o) => (o.asMoveObject.contents.json.current_spend = '-1')],
+      ['window spending with no first spend time', (o) => (o.asMoveObject.contents.json.settings.rate_limit.spent = '1')],
+      ['a later window with no first spend time', (o) => (o.asMoveObject.contents.json.settings.rate_limit.index = '1')],
+      ['more spent in a window than its limit', (o) => Object.assign(o.asMoveObject.contents.json.settings.rate_limit, { anchor_ms: '1', spent: '500001' })],
     ];
     for (const [what, change] of refusals) {
       const failure = await withGraphql(allowanceBody(change), () => failureOf(chain.getAllowance(STAND_IN_ALLOWANCE)));

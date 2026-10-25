@@ -172,6 +172,28 @@ export interface AllowanceState {
   initialSharedVersion: bigint;
 }
 
+/**
+ * Where the allowance's rate limit stands, read in the same request as AllowanceState. The
+ * module keeps the amount spent in the window it last charged in, numbered from the time of
+ * its first spend, and starts a new window at the first spend after that one ends.
+ */
+export interface AllowanceWindow {
+  /**
+   * Spent inside the window the allowance last charged in. Null when there is no rate limit.
+   * It stops counting at periodEndMs: the next spend after that opens a new, empty window.
+   */
+  periodSpent: bigint | null;
+  /**
+   * When the window the allowance last charged in ends: its first spend's time plus (window
+   * number + 1) periods. Null when there is no rate limit, or nothing has been spent yet,
+   * since the first spend is what opens the first window.
+   */
+  periodEndMs: bigint | null;
+}
+
+/** What getAllowance reads: the allowance's terms and where its current rate window stands. */
+export type AllowanceReading = AllowanceState & AllowanceWindow;
+
 export interface WalrusBlob {
   objectId: string;
   /** Walrus's own text form (URL-safe base64 of the little-endian u256), the form Walrus Memory reports. */
@@ -196,7 +218,7 @@ export interface Chain {
   simulate(txBytes: Uint8Array): Promise<SimulationResult>;
   listOwnedWalrusBlobs(owner: string): Promise<WalrusBlob[]>;
   executeTransaction(txBytes: Uint8Array, signatures: string[]): Promise<ExecutionResult>;
-  getAllowance(objectId: string): Promise<AllowanceState>;
+  getAllowance(objectId: string): Promise<AllowanceReading>;
   /** Closes the gRPC channel so a script can exit. */
   close(): void;
 }
@@ -897,15 +919,18 @@ export function createChain(opts: { apiKey?: string }): Chain {
 
   /**
    * Reads a direct (not app-bound) allowance from Sui Mainnet through Tatum GraphQL, in
-   * one request. Every address and the coin type come out of the SDK normalisers.
+   * one request, with where its rate window stands (AllowanceWindow). Every address and the
+   * coin type come out of the SDK normalisers.
    * Refuses, as BAD_RESPONSE, anything that is not exactly the allowance module's shape
    * today: another object type, an app-bound allowance, one with no spender or with a
    * start time (Ellai never sets one, and the result has nowhere to report it), a
-   * calendar-month window, an unknown field, or a number out of range.
+   * calendar-month window, an unknown field, a number out of range, or a rate limit the
+   * module could not have written: spending with no first-spend time, or more spent in a
+   * window than its limit.
    * Throws ChainError: INVALID_INPUT for a malformed id, NOT_FOUND when no object has the
    * id (never issued, revoked, or not yet indexed), or any transport code.
    */
-  async function getAllowance(objectId: string): Promise<AllowanceState> {
+  async function getAllowance(objectId: string): Promise<AllowanceReading> {
     const id = inputAddress(objectId);
     const result = await bounded('getAllowance', (signal) =>
       graphql.query({ query: ALLOWANCE_QUERY, variables: { id }, signal }),
@@ -932,7 +957,21 @@ export function createChain(opts: { apiKey?: string }): Chain {
     if (settings.spender === null) throw badResponse('the allowance has no spender');
     if (settings.start_timestamp_ms !== null) throw badResponse('the allowance has a start time, which Ellai never sets');
     const rate = settings.rate_limit;
+    let window: AllowanceWindow = { periodSpent: null, periodEndMs: null };
+    if (rate !== null) {
+      const period = unsignedAtMost(rate.window.pos0, U64_MAX, 'the rate-limit period');
+      const limit = unsignedAtMost(rate.limit, U256_MAX, 'the rate-limit amount');
+      const spent = unsignedAtMost(rate.spent, U256_MAX, 'the amount spent in the window');
+      const index = unsignedAtMost(rate.index, U64_MAX, 'the window number');
+      const anchor = rate.anchor_ms === null ? null : unsignedAtMost(rate.anchor_ms, U64_MAX, 'the first spend time');
+      // The module stamps the first spend's time in the same step that records it, and aborts
+      // any spend that takes a window past its limit, so it never writes either of these.
+      if (anchor === null && (spent !== 0n || index !== 0n)) throw badResponse('the rate limit has spending but no first spend time');
+      if (spent > limit) throw badResponse('the window has more spent than its limit');
+      window = { periodSpent: spent, periodEndMs: anchor === null ? null : anchor + (index + 1n) * period };
+    }
     return {
+      ...window,
       funder: chainAddress(settings.funder, 'allowance funder'),
       spender: chainAddress(settings.spender, 'allowance spender'),
       coinType,

@@ -1,23 +1,27 @@
 // Covers: the jobs tick on PGlite with a stand-in chain and a stand-in relayer. expireDecisions
 // closes stale open decisions and old unanswered questions and nothing fresher. refillIfNeeded
 // refills a low purse once, signed by the purse and the gas wallet, with its row written before
-// the send; never while a refill is pending, past the daily count or past the float; never from
-// an allowance that is not this owner's, for this purse, in USDC, unexpired and with room; never
-// signs bytes that are not exactly the refill; keeps an unknown send pending and reads that
-// digest first next time; releases a lost refill only once its epoch window has closed and
-// further reads still miss it, and leaves rows from before that window was kept waiting.
-// runJobsTick isolates each
-// owner's and each step's failure behind a fixed code, settles pending payments and remembers a
-// paid seller stored as delivering nothing exactly once (never one whose delivery is unknown),
-// records an outcome a paid call failed to record, expires, refills with the tick's own sleep,
-// sends and confirms memories, warns on a low gas wallet, and takes at most
-// LIMITS.jobsOwnersPerTick owners.
+// the send and a dry run that must move exactly the refill before it; never while a refill is
+// pending, nor in the call that finds one landed, past the daily count, past the float, or on a
+// balance read that its own ledger contradicts; never from an allowance that is not this
+// owner's, for this purse, in USDC, unexpired and with room under its cap and in its rate
+// window; never signs bytes that are not exactly the refill; keeps an unknown send pending and
+// reads that digest first next time; releases a lost refill only once its epoch window has
+// closed and further reads still miss it, and leaves rows from before that window was kept
+// waiting. pruneExpiredRows deletes only dead anonymous rows, a bounded batch per table.
+// confirmBlobsOnChain marks a memory only when its blob id is among the owner's own Walrus Blob
+// objects. runJobsTick isolates each owner's and each step's failure behind a fixed code,
+// settles pending payments and remembers a paid seller stored as delivering nothing exactly once
+// (never one whose delivery is unknown), records an outcome a paid call failed to record,
+// expires, refills with the tick's own sleep, sends and confirms memories and then checks them
+// on chain, prunes, warns on a low gas wallet, takes at most LIMITS.jobsOwnersPerTick owners,
+// least recently visited first, and starts none once its time budget is spent.
 // Does NOT cover: the real Sui chain, Tatum or the relayer (scripts/prove-jobs.ts does those
-// live), whether Sui accepts the refill bytes (packages/proof's prove-pay sent one live), two
-// connections racing on the owner lock (PGlite serves one connection), or what schedules the
-// tick.
+// live), whether Sui accepts the refill bytes (packages/proof's prove-pay sent one live, after a
+// dry run of the same shape), two connections racing on the owner lock (PGlite serves one
+// connection), or what schedules the tick.
 import { randomBytes, randomUUID } from 'node:crypto';
-import type { AllowanceState, Balances, Chain, ExecutionResult, TransactionResult } from '@ellai/core/chain';
+import type { AllowanceReading, Balances, Chain, ExecutionResult, SimulationResult, TransactionResult, WalrusBlob } from '@ellai/core/chain';
 import { ChainError } from '@ellai/core/chain';
 import { AllowanceError, buildRefill } from '@ellai/core/allowance';
 import { canonicalSuiAddress, derivePurseKeypair } from '@ellai/core/keys';
@@ -32,11 +36,13 @@ import { verifyTransactionSignature } from '@mysten/sui/verify';
 import { and, eq } from 'drizzle-orm';
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { type Database, createDb, migrate } from '../src/server/db/client.js';
-import { agents, decisions, memories, owners, payments, questions, refills } from '../src/server/db/schema.js';
+import { agents, decisions, memories, owners, payments, questions, refills, sellerSales, sessions, signinNonces } from '../src/server/db/schema.js';
 import { MEMORY_NAMESPACE } from '../src/server/memory/namespace.js';
 import { ownerDelegate } from '../src/server/memory/delegate.js';
 import { recordOutcome } from '../src/server/memory/outcome.js';
+import { confirmBlobsOnChain } from '../src/server/jobs/blobs.js';
 import { expireDecisions } from '../src/server/jobs/expire.js';
+import { pruneExpiredRows } from '../src/server/jobs/prune.js';
 import { RefillError, refillIfNeeded } from '../src/server/jobs/refill.js';
 import { type JobsTickSummary, runJobsTick } from '../src/server/jobs/tick.js';
 
@@ -178,7 +184,7 @@ async function funded(on: Database = db, owner: Partial<typeof owners.$inferInse
   return { ...(await world(on, { allowanceId, ...owner })), allowanceId };
 }
 
-function allowanceFor(w: Funded, overrides: Partial<AllowanceState> = {}): AllowanceState {
+function allowanceFor(w: Funded, overrides: Partial<AllowanceReading> = {}): AllowanceReading {
   return {
     funder: w.suiAddress,
     spender: w.purse,
@@ -189,6 +195,8 @@ function allowanceFor(w: Funded, overrides: Partial<AllowanceState> = {}): Allow
     periodLimit: 500_000n,
     expirationMs: BigInt(NOW.getTime() + 30 * 86_400_000),
     initialSharedVersion: 7n,
+    periodSpent: 0n,
+    periodEndMs: null,
     ...overrides,
   };
 }
@@ -205,14 +213,18 @@ interface StubState {
   /** Balances by canonical address; an address not here reads as empty. */
   balances: Map<string, Partial<Balances>>;
   /** Allowances by id; an id not here, or an Error, throws. */
-  allowances: Map<string, AllowanceState | Error>;
+  allowances: Map<string, AllowanceReading | Error>;
   /** What a successful send moves. */
   changes: TransactionResult['balanceChanges'];
+  /** The dry run's verdict on these bytes. By default, a success that moves `changes`. */
+  simulate: (digest: string) => SimulationResult;
   execute: (digest: string) => ExecutionResult | Promise<ExecutionResult>;
   /** What the chain has for a digest, or null for NOT_FOUND. By default, whatever was sent. */
   landed: (digest: string) => TransactionResult | null;
   /** The epoch the chain reports now. */
   epoch: bigint;
+  /** Walrus Blob objects by canonical owner address; an address not here holds none. */
+  blobs: Map<string, WalrusBlob[]>;
 }
 
 /**
@@ -226,12 +238,14 @@ function stubChain(on: Database = db) {
     balances: new Map(),
     allowances: new Map(),
     changes: [],
+    simulate: () => ({ status: 'success', errorCode: null, balanceChanges: state.changes }),
     execute: (digest) => {
       sent.add(digest);
       return { digest, status: 'success', errorCode: null, balanceChanges: state.changes, createdObjects: [] };
     },
     landed: (digest) => (sent.has(digest) ? { status: 'success', balanceChanges: state.changes } : null),
     epoch: 100n,
+    blobs: new Map(),
   };
   const calls: string[] = [];
   const executions: Array<{ txBytes: Uint8Array; signatures: string[]; rowWritten: boolean }> = [];
@@ -260,6 +274,15 @@ function stubChain(on: Database = db) {
       const result = state.landed(digest);
       if (result === null) throw new ChainError('NOT_FOUND', 'not found (gRPC NOT_FOUND)');
       return result;
+    },
+    simulate: async (txBytes: Uint8Array) => {
+      const digest = TransactionDataBuilder.getDigestFromBytes(txBytes);
+      calls.push(`simulate:${digest}`);
+      return state.simulate(digest);
+    },
+    listOwnedWalrusBlobs: async (address: string) => {
+      calls.push(`listOwnedWalrusBlobs:${address}`);
+      return state.blobs.get(canonicalSuiAddress(address)) ?? [];
     },
     executeTransaction: async (txBytes: Uint8Array, signatures: string[]) => {
       const digest = TransactionDataBuilder.getDigestFromBytes(txBytes);
@@ -357,6 +380,7 @@ describe('refillIfNeeded', () => {
       `getBalances:${w.purse}`,
       'getCurrentEpoch',
       'getReferenceGasPrice',
+      `simulate:${row.digest}`,
       `executeTransaction:${row.digest}`,
       `getTransactionResult:${row.digest}`,
     ]);
@@ -391,6 +415,8 @@ describe('refillIfNeeded', () => {
     const oldest = await refillRow(w, ago(86_400_000 - 1), 'verified');
     await refillRow(w, ago(3_600_000), 'failed');
     await refillRow(w, ago(60_000), 'verified');
+    // Payments spent what the two verified refills brought, so only the count stands in the way.
+    await payment(w, await decision(w, 'paid', ago(30_000)), { amountAtomic: 2n * REFILL });
     expect(LIMITS.purseMaxRefillsPerDay).toBe(3);
     const { chain, calls, executions } = stubFor(w, 0n);
     expect(await refill(w, chain)).toBe('not_needed');
@@ -421,12 +447,17 @@ describe('refillIfNeeded', () => {
   });
 
   it("refuses, building and sending nothing, an allowance that is not this owner's, for this purse, in USDC, unexpired and with room", async () => {
-    const variants: Array<Partial<AllowanceState> | Error> = [
+    const windowOpen = BigInt(NOW.getTime() + 1);
+    const variants: Array<Partial<AllowanceReading> | Error> = [
       { funder: randomAddress() },
       { spender: randomAddress() },
       { coinType: SUI_TYPE },
       { expirationMs: BigInt(NOW.getTime()) },
       { spentTotal: 1_000_000n - REFILL + 1n },
+      // The current rate window, still open, has less left than one refill.
+      { periodSpent: 500_000n - REFILL + 1n, periodEndMs: windowOpen },
+      // A rate limit whose window cannot be placed counts as full.
+      { periodSpent: null },
       new ChainError('NOT_FOUND', 'not found'),
     ];
     for (const variant of variants) {
@@ -446,7 +477,77 @@ describe('refillIfNeeded', () => {
     expect(await refill(await world(), chain)).toBe('refused');
   });
 
-  it('keeps an unknown send outcome pending, and the next call reads that digest before anything else', async () => {
+  it('refills when the open rate window has exactly one refill left, or a full window has ended, since the next spend opens a new one', async () => {
+    for (const variant of [
+      { periodSpent: 500_000n - REFILL, periodEndMs: BigInt(NOW.getTime() + 1) },
+      { periodSpent: 500_000n, periodEndMs: BigInt(NOW.getTime()) },
+    ]) {
+      const w = await funded();
+      const { chain, state, executions } = stubFor(w, 0n);
+      state.allowances.set(w.allowanceId, allowanceFor(w, variant));
+      expect(await refill(w, chain)).toBe('refilled');
+      expect(executions).toHaveLength(1);
+    }
+  });
+
+  it('stops at the float when the balance read keeps saying the purse is empty, because it decides on its own ledger too', async () => {
+    // The review's reproduction: a missing balance entry reads as 0. Deciding on that read
+    // alone refilled three times in a day, 0.30 USDC, into a purse whose float is 0.20.
+    const w = await funded();
+    const { chain, executions } = stubFor(w, 0n);
+    const at = (minutes: number) => new Date(NOW.getTime() + minutes * 60_000);
+    const float = BigInt(LIMITS.purseMaxFloatAtomic);
+    const verifiedIn = async () => (await refillRows(w.ownerId)).filter((row) => row.status === 'verified').reduce((sum, row) => sum + row.amountAtomic, 0n);
+
+    const outcomes: string[] = [];
+    for (let minute = 0; minute < 4; minute++) outcomes.push(await refill(w, chain, at(minute)));
+    expect(outcomes).toEqual(['refilled', 'not_needed', 'not_needed', 'not_needed']);
+
+    // A signed payment counts as gone until it is released, which takes the ledger below the
+    // threshold, so one more refill goes. Even if that payment never lands, the purse holds
+    // no more than the float.
+    const spent = REFILL - LOW;
+    const signed = await payment(w, await decision(w, 'paid', NOW), { amountAtomic: spent });
+    expect(await refill(w, chain, at(4))).toBe('refilled');
+    expect(await refill(w, chain, at(5))).toBe('not_needed');
+    expect(executions).toHaveLength(2);
+    const inflow = await verifiedIn();
+    expect(inflow).toBe(2n * REFILL);
+    expect(inflow <= float).toBe(true);
+
+    await db.update(payments).set({ settlement: 'not_landed', releasedAt: at(6) }).where(eq(payments.id, signed.id));
+    expect(await refill(w, chain, at(7))).toBe('not_needed');
+    expect(executions).toHaveLength(2);
+  });
+
+  it('sends nothing, and marks the row failed, when the dry run fails, moves anything but the refill, or gives no verdict', async () => {
+    const verdicts: Array<(w: World) => SimulationResult> = [
+      () => ({ status: 'failure', errorCode: 'MOVE_ABORT', balanceChanges: [] }),
+      (w) => ({ status: 'success', errorCode: null, balanceChanges: [...refillChanges(w), { address: randomAddress(), coinType: USDC_TYPE_MAINNET, amount: 1n }] }),
+    ];
+    for (const verdict of verdicts) {
+      const w = await funded();
+      const { chain, state, calls, executions } = stubFor(w, 0n);
+      state.simulate = () => verdict(w);
+      await expect(refill(w, chain)).rejects.toEqual(new RefillError('DRY_RUN_FAILED', 'the refill dry run did not move exactly the refill, so nothing was sent'));
+      const row = one(await refillRows(w.ownerId));
+      expect(row.status).toBe('failed');
+      expect(calls).toContain(`simulate:${row.digest}`);
+      expect(calls.filter((call) => call.startsWith('executeTransaction'))).toEqual([]);
+      expect(executions).toHaveLength(0);
+    }
+
+    const w = await funded();
+    const { chain, state, executions } = stubFor(w, 0n);
+    state.simulate = () => {
+      throw new ChainError('TIMEOUT', 'Tatum simulate: timed out', true);
+    };
+    await expect(refill(w, chain)).rejects.toMatchObject({ name: 'ChainError', code: 'TIMEOUT' });
+    expect(one(await refillRows(w.ownerId)).status).toBe('failed');
+    expect(executions).toHaveLength(0);
+  });
+
+  it('keeps an unknown send outcome pending; the next call reads that digest first and, finding it landed, refills nothing more', async () => {
     const w = await funded();
     const { chain, state, calls, executions } = stubFor(w, 0n);
     state.execute = () => {
@@ -458,9 +559,9 @@ describe('refillIfNeeded', () => {
 
     calls.length = 0;
     state.landed = (digest) => (digest === row.digest ? { status: 'success', balanceChanges: refillChanges(w) } : null);
-    state.balances.set(w.purse, { usdcAddressBalance: REFILL });
-    expect(await refill(w, chain)).toBe('not_needed');
-    expect(calls[0]).toBe(`getTransactionResult:${row.digest}`);
+    // The purse still reads empty, as a lagging node would show it right after the refill landed.
+    expect(await refill(w, chain)).toBe('resolved_pending');
+    expect(calls).toEqual([`getTransactionResult:${row.digest}`]);
     expect(one(await refillRows(w.ownerId))).toMatchObject({ status: 'verified', verifiedAt: NOW });
     expect(executions).toHaveLength(1);
   });
@@ -486,6 +587,8 @@ describe('refillIfNeeded', () => {
 
     const odd = await funded();
     const stub = stubFor(odd, 0n);
+    // The dry run showed exactly the refill; what landed did not.
+    stub.state.simulate = () => ({ status: 'success', errorCode: null, balanceChanges: refillChanges(odd) });
     stub.state.changes = [...refillChanges(odd), { address: randomAddress(), coinType: USDC_TYPE_MAINNET, amount: 1n }];
     await expect(refill(odd, stub.chain)).rejects.toMatchObject({ name: 'RefillError', code: 'MISMATCH' });
     expect(one(await refillRows(odd.ownerId)).status).toBe('pending');
@@ -541,7 +644,7 @@ describe('refillIfNeeded', () => {
     let reads = 0;
     state.landed = (digest) => (digest === lost.digest && ++reads === 3 ? { status: 'success', balanceChanges: refillChanges(w) } : null);
     state.balances.set(w.purse, { usdcAddressBalance: REFILL });
-    expect(await refill(w, chain)).toBe('not_needed');
+    expect(await refill(w, chain)).toBe('resolved_pending');
     expect(reads).toBe(3);
     expect(one(await refillRows(w.ownerId))).toMatchObject({ id: lost.id, status: 'verified', verifiedAt: NOW });
   });
@@ -556,6 +659,62 @@ describe('refillIfNeeded', () => {
     expect(calls).toEqual([`getTransactionResult:${old.digest}`]);
     expect(executions).toHaveLength(0);
     expect(one(await refillRows(w.ownerId)).status).toBe('pending');
+  });
+});
+
+describe('pruneExpiredRows', () => {
+  const DAY = 86_400_000;
+  const nonce = (on: Database, expiresAt: Date, usedAt: Date | null = null) => on.insert(signinNonces).values({ nonce: hex(16), createdAt: ago(DAY * 2), expiresAt, usedAt });
+  const sale = (on: Database, expiresAt: Date, values: Partial<typeof sellerSales.$inferInsert> = {}) =>
+    on.insert(sellerSales).values({ challengeId: hex(16), amountAtomic: PRICE, recipient: RECIPIENT, issuedAt: ago(DAY * 2), expiresAt, ...values });
+  const session = (on: Database, w: World, expiresAt: Date, revokedAt: Date | null = null) =>
+    on.insert(sessions).values({ ownerId: w.ownerId, tokenHash: hex(32), createdAt: ago(DAY * 8), expiresAt, revokedAt });
+  const kept = async (on: Database) => ({
+    signinNonces: (await on.select().from(signinNonces)).length,
+    sellerSales: (await on.select().from(sellerSales)).length,
+    sessions: (await on.select().from(sessions)).length,
+  });
+
+  it('deletes only rows that can never be used again: expired nonces, unpaid expired sales and sessions ended over a day ago', async () => {
+    const on = await freshDb();
+    const w = await world(on);
+    await nonce(on, ago(1));
+    await nonce(on, ago(1), ago(DAY));
+    const liveNonce = hex(16);
+    await on.insert(signinNonces).values({ nonce: liveNonce, createdAt: NOW, expiresAt: new Date(NOW.getTime() + 1) });
+    await sale(on, ago(1));
+    await sale(on, new Date(NOW.getTime() + 1));
+    await sale(on, ago(DAY), { status: 'settled' });
+    await sale(on, ago(DAY), { status: 'rejected' });
+    // An issued sale holding a digest may have been paid, so it is never pruned as unpaid.
+    await sale(on, ago(DAY), { digest: randomDigest() });
+    await session(on, w, ago(DAY + 1));
+    await session(on, w, new Date(NOW.getTime() + DAY), ago(DAY + 1));
+    await session(on, w, ago(DAY - 1));
+    await session(on, w, new Date(NOW.getTime() + DAY), ago(DAY - 1));
+    await session(on, w, new Date(NOW.getTime() + DAY));
+
+    expect(await pruneExpiredRows({ db: on, now: NOW })).toEqual({ signinNonces: 2, sellerSales: 1, sessions: 2 });
+    expect(await kept(on)).toEqual({ signinNonces: 1, sellerSales: 4, sessions: 3 });
+    expect((await on.select({ nonce: signinNonces.nonce }).from(signinNonces)).map((row) => row.nonce)).toEqual([liveNonce]);
+    expect(await pruneExpiredRows({ db: on, now: NOW })).toEqual({ signinNonces: 0, sellerSales: 0, sessions: 0 });
+  });
+
+  it('deletes at most LIMITS.pruneBatch rows per table per call, and the tick runs it once and counts what went', async () => {
+    const on = await freshDb();
+    const w = await world(on);
+    for (let i = 0; i < 5; i++) {
+      await nonce(on, ago(DAY + i));
+      await sale(on, ago(DAY + i));
+      await session(on, w, ago(2 * DAY + i));
+    }
+    await withLimit('pruneBatch', 3, async () => {
+      expect(await pruneExpiredRows({ db: on, now: NOW })).toEqual({ signinNonces: 3, sellerSales: 3, sessions: 3 });
+      expect(await kept(on)).toEqual({ signinNonces: 2, sellerSales: 2, sessions: 2 });
+      const { chain } = stubChain(on);
+      expect(await tick(on, chain)).toMatchObject({ rowsPruned: 6, errors: [] });
+    });
+    expect(await kept(on)).toEqual({ signinNonces: 0, sellerSales: 0, sessions: 0 });
   });
 });
 
@@ -605,6 +764,75 @@ async function pendingMemory(w: World, sentence: string, createdAt: Date, on: Da
 }
 
 const outcomesOf = (ownerId: string, on: Database) => on.select().from(memories).where(and(eq(memories.ownerId, ownerId), eq(memories.kind, 'outcome')));
+
+const blob = (blobId: string): WalrusBlob => ({ objectId: randomAddress(), blobId, registeredEpoch: 1_000, endEpoch: 1_100, deletable: false });
+
+/** A memory Walrus Memory reported done with this blob id, not yet checked on chain. */
+async function confirmedMemory(w: World, blobId: string, confirmedAt: Date, on: Database): Promise<string> {
+  const row = one(
+    await on
+      .insert(memories)
+      .values({
+        ownerId: w.ownerId,
+        kind: 'owner_decision',
+        recipient: RECIPIENT,
+        amountAtomic: PRICE,
+        verdict: 'approve',
+        sellerHost: 'hotels.example',
+        sentence: 'On 2026-10-24 the owner approved a hotel search.',
+        namespace: MEMORY_NAMESPACE,
+        writerPublicKey: ownerDelegate(MASTER, w.suiAddress).publicKeyHex,
+        blobId,
+        status: 'confirmed',
+        confirmedAt,
+        createdAt: confirmedAt,
+      })
+      .returning({ id: memories.id }),
+  );
+  return row.id;
+}
+
+const chainConfirmedAt = async (id: string, on: Database) => one(await on.select({ at: memories.chainConfirmedAt }).from(memories).where(eq(memories.id, id))).at;
+
+describe('confirmBlobsOnChain', () => {
+  it("marks only memories whose blob id is among this owner's Walrus Blob objects, and asks the chain only when one is waiting", async () => {
+    const on = await freshDb();
+    const w = await world(on);
+    const other = await world(on);
+    const found = await confirmedMemory(w, 'blob-found', ago(120_000), on);
+    const missing = await confirmedMemory(w, 'blob-missing', ago(60_000), on);
+    // The same blob id under another owner proves nothing for this one.
+    const elsewhere = await confirmedMemory(other, 'blob-elsewhere', ago(60_000), on);
+    await pendingMemory(w, 'Not written yet.', ago(30_000), on);
+    const { chain, state, calls } = stubChain(on);
+    state.blobs.set(w.suiAddress, [blob('blob-found'), blob('blob-elsewhere')]);
+
+    expect(await confirmBlobsOnChain({ db: on, chain, ownerId: w.ownerId, now: NOW })).toEqual({ checked: 2, confirmed: 1 });
+    expect(calls).toEqual([`listOwnedWalrusBlobs:${w.suiAddress}`]);
+    expect([await chainConfirmedAt(found, on), await chainConfirmedAt(missing, on), await chainConfirmedAt(elsewhere, on)]).toEqual([NOW, null, null]);
+
+    calls.length = 0;
+    expect(await confirmBlobsOnChain({ db: on, chain, ownerId: other.ownerId, now: NOW })).toEqual({ checked: 1, confirmed: 0 });
+    const empty = await world(on);
+    expect(await confirmBlobsOnChain({ db: on, chain, ownerId: empty.ownerId, now: NOW })).toEqual({ checked: 0, confirmed: 0 });
+    expect(calls).toEqual([`listOwnedWalrusBlobs:${other.suiAddress}`]);
+    await expect(confirmBlobsOnChain({ db: on, chain, ownerId: 'not-a-uuid', now: NOW })).rejects.toThrow('the owner id is not a uuid');
+  });
+
+  it('checks at most LIMITS.blobConfirmBatch memories per call, oldest confirmation first', async () => {
+    const on = await freshDb();
+    const w = await world(on);
+    const ids: string[] = [];
+    for (let i = 0; i < 3; i++) ids.push(await confirmedMemory(w, `blob-${i}`, ago(60_000 * (3 - i)), on));
+    const { chain, state } = stubChain(on);
+    state.blobs.set(w.suiAddress, [blob('blob-0'), blob('blob-1'), blob('blob-2')]);
+    await withLimit('blobConfirmBatch', 2, async () => {
+      expect(await confirmBlobsOnChain({ db: on, chain, ownerId: w.ownerId, now: NOW })).toEqual({ checked: 2, confirmed: 2 });
+      expect(await chainConfirmedAt(ids[2] ?? '', on)).toBeNull();
+      expect(await confirmBlobsOnChain({ db: on, chain, ownerId: w.ownerId, now: NOW })).toEqual({ checked: 1, confirmed: 1 });
+    });
+  });
+});
 
 describe('runJobsTick', () => {
   it('records a failing step with the owner, the step and a fixed code only, and still runs the rest and the next owner', async () => {
@@ -758,12 +986,32 @@ describe('runJobsTick', () => {
         results: ids.map((id) => (done ? { job_id: id, status: 'done', blob_id: `blob-${id}` } : { job_id: id, status: 'running' })),
       }),
     });
-    const { chain } = stubChain(on);
+    const { chain, state } = stubChain(on);
     expect(await tick(on, chain)).toMatchObject({ owners: 1, memoriesSubmitted: 1, memoriesConfirmed: 0, memoriesFailed: 0, errors: [] });
     done = true;
-    expect(await tick(on, chain)).toMatchObject({ owners: 1, memoriesSubmitted: 0, memoriesConfirmed: 1, errors: [] });
+    expect(await tick(on, chain)).toMatchObject({ owners: 1, memoriesSubmitted: 0, memoriesConfirmed: 1, memoriesChainConfirmed: 0, errors: [] });
+    // Confirmed by the relayer but not yet seen on chain, so the owner still has work.
+    expect(await tick(on, chain)).toMatchObject({ owners: 1, memoriesChainConfirmed: 0, errors: [] });
+    state.blobs.set(w.suiAddress, [blob('blob-job-0')]);
+    expect(await tick(on, chain)).toMatchObject({ owners: 1, memoriesChainConfirmed: 1, errors: [] });
     expect(await tick(on, chain)).toMatchObject({ owners: 0 });
     expect(client.rememberBulk).toHaveBeenCalledTimes(1);
+  });
+
+  it('records a failing blob listing as the owner\'s blobs step and still runs the owner\'s other steps', async () => {
+    const on = await freshDb();
+    const w = await world(on);
+    await confirmedMemory(w, 'blob-a', ago(60_000), on);
+    const staleOpen = await decision(w, 'open', ago(LIMITS.staleOpenDecisionMs + 1), on);
+    const stub = stubChain(on);
+    const chain = {
+      ...stub.chain,
+      listOwnedWalrusBlobs: async () => {
+        throw new ChainError('LIMIT_EXCEEDED', 'Tatum listOwnedWalrusBlobs: more than 1000 blobs, refusing a partial list');
+      },
+    } as Chain;
+    expect(await tick(on, chain)).toMatchObject({ owners: 1, decisionsExpired: 1, errors: [{ ownerId: w.ownerId, step: 'blobs', code: 'CHAIN_LIMIT_EXCEEDED' }] });
+    expect(await statusOf(staleOpen, on)).toBe('expired');
   });
 
   it('warns when the gas wallet holds less SUI than the threshold, and not at it', async () => {
@@ -775,6 +1023,7 @@ describe('runJobsTick', () => {
       memoriesSubmitted: 0,
       memoriesConfirmed: 0,
       memoriesFailed: 0,
+      memoriesChainConfirmed: 0,
       paymentsVerified: 0,
       paymentsNotLanded: 0,
       paymentsMismatched: 0,
@@ -782,7 +1031,9 @@ describe('runJobsTick', () => {
       decisionsExpired: 0,
       questionsClosed: 0,
       refills: 0,
+      rowsPruned: 0,
       gasWalletLow: false,
+      timeBudgetReached: false,
       errors: [],
     });
     state.balances.set(GAS_ADDRESS, { suiTotal: BigInt(LIMITS.gasWalletLowMist) - 1n });
@@ -800,5 +1051,49 @@ describe('runJobsTick', () => {
     expect(await tick(on, chain)).toMatchObject({ owners: LIMITS.jobsOwnersPerTick, decisionsExpired: LIMITS.jobsOwnersPerTick, errors: [] });
     expect(await statusOf(ids[LIMITS.jobsOwnersPerTick] ?? '', on)).toBe('open');
     expect(await tick(on, chain)).toMatchObject({ owners: 1, decisionsExpired: 1 });
+  });
+
+  const visitedAt = async (w: World, on: Database) => one(await on.select({ at: owners.lastTickedAt }).from(owners).where(eq(owners.id, w.ownerId))).at;
+
+  it('visits the 26th owner within three ticks when 26 owners all have an allowance, which is work that never runs out', { timeout: 120_000 }, async () => {
+    const on = await freshDb();
+    const all: Funded[] = [];
+    for (let i = 0; i <= LIMITS.jobsOwnersPerTick; i++) {
+      // The 26th owner's allowance work is the newest, so ordering by work alone never reached it.
+      all.push(await funded(on, { allowanceCheckedAt: ago(60_000 * (LIMITS.jobsOwnersPerTick + 1 - i)) }));
+    }
+    const last = all[LIMITS.jobsOwnersPerTick] as Funded;
+    const { chain } = stubChain(on);
+    const tickAt = (at: Date) => runJobsTick({ db: on, chain, masterSecretHex: MASTER, gasKeypair: GAS, now: () => at, sleep: noSleep });
+
+    expect(await tickAt(NOW)).toMatchObject({ owners: LIMITS.jobsOwnersPerTick, timeBudgetReached: false, errors: [] });
+    expect(await visitedAt(last, on)).toBeNull();
+    const second = new Date(NOW.getTime() + 60_000);
+    expect(await tickAt(second)).toMatchObject({ owners: LIMITS.jobsOwnersPerTick, errors: [] });
+    expect(await visitedAt(last, on)).toEqual(second);
+    expect(await tickAt(new Date(NOW.getTime() + 120_000))).toMatchObject({ owners: LIMITS.jobsOwnersPerTick, errors: [] });
+    for (const w of all) expect(await visitedAt(w, on)).not.toBeNull();
+  });
+
+  it('starts no owner once the time budget has passed, and the next tick begins with the owners it left', async () => {
+    const on = await freshDb();
+    const all: Funded[] = [];
+    for (let i = 0; i < 4; i++) all.push(await funded(on, { allowanceCheckedAt: ago(60_000 * (4 - i)) }));
+    const stub = stubChain(on);
+    let clockMs = NOW.getTime();
+    // Each owner's refill step reads its allowance once, so each owner costs half the budget.
+    const chain = {
+      ...stub.chain,
+      getAllowance: async (id: string) => {
+        clockMs += LIMITS.tickTimeBudgetMs / 2;
+        return stub.chain.getAllowance(id);
+      },
+    } as Chain;
+    const tickNow = () => runJobsTick({ db: on, chain, masterSecretHex: MASTER, gasKeypair: GAS, now: () => new Date(clockMs), sleep: noSleep });
+
+    expect(await tickNow()).toMatchObject({ owners: 2, timeBudgetReached: true, errors: [] });
+    expect(await Promise.all(all.map((w) => visitedAt(w, on).then((at) => at !== null)))).toEqual([true, true, false, false]);
+    expect(await tickNow()).toMatchObject({ owners: 2, timeBudgetReached: true, errors: [] });
+    expect(await Promise.all(all.map((w) => visitedAt(w, on).then((at) => at !== null)))).toEqual([true, true, true, true]);
   });
 });
