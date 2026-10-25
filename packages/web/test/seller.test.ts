@@ -6,7 +6,8 @@
 // signature that is not the sender's, are refused after the claim and never executed; a
 // settlement mismatch or failure is refused and closed; an unknown execution outcome is read
 // back by its digest and settled if it landed, and otherwise left open to the same bytes alone,
-// so a retry delivers; a challenge pays once and one payment never pays
+// so a retry delivers; that retry is read at most once per recheck window, and the sale is
+// closed for good once its epoch window has closed and a final read misses; a challenge pays once and one payment never pays
 // two challenges; the unpaid rate limit per caller and for every caller together; one epoch
 // read per cache window; the wallet check summary and its blob cap; the pay-to
 // fallback; and no response ever carries the payment header, its bytes or its signature.
@@ -469,14 +470,85 @@ describe('settleWalletCheckPayment', () => {
     expect(calls.reads).toHaveLength(2 * LIMITS.chainReadAfterWriteTries);
 
     state.read = (digest) => (digest === signed.digest ? landed(Buffer.from(signed.txBytesBase64, 'base64')) : null);
-    const delivered = await paidCall(tenMinutesLater);
+    const nextWindow = new Date(tenMinutesLater.getTime() + LIMITS.sellerRecheckIntervalMs);
+    const delivered = await paidCall(nextWindow);
     expect(delivered.status).toBe(200);
     expect(JSON.parse(delivered.body)).toMatchObject({ address: CHECKED });
     const receipt = JSON.parse(Buffer.from(delivered.headers['X-PAYMENT-RESPONSE'] ?? '', 'base64').toString('utf8'));
     expect(receipt).toEqual({ success: true, network: 'sui:mainnet', transaction: signed.digest, payer: BUYER });
-    expect(await saleOf(payment.challengeId ?? '')).toMatchObject({ status: 'settled', digest: signed.digest, settledAt: tenMinutesLater });
+    expect(await saleOf(payment.challengeId ?? '')).toMatchObject({ status: 'settled', digest: signed.digest, settledAt: nextWindow });
 
-    expect((await paidCall(tenMinutesLater)).status).toBe(409);
+    expect((await paidCall(nextWindow)).status).toBe(409);
+    expect(calls.executions).toEqual([signed.digest]);
+  });
+
+  const executionUnknown = () => {
+    throw new ChainError('UPSTREAM', 'Tatum executeTransaction: gateway error; the transaction may have landed', true);
+  };
+
+  it('rechecks a waiting sale at most once per LIMITS.sellerRecheckIntervalMs window, answering one too soon as waiting, with Retry-After and no chain read (C21, C22)', async () => {
+    const { chain, calls } = stubChain({ execute: executionUnknown });
+    const payment = asBuyer(await call(chain));
+    const { header } = await pay(payment);
+    const at = (ms: number) => new Date(NOW.getTime() + ms);
+    const paidCall = (now: Date) => call(chain, { headers: { 'content-type': 'application/json', 'X-PAYMENT': header }, now });
+    expect(NOW.getTime() % LIMITS.sellerRecheckIntervalMs).toBe(0);
+
+    expect(JSON.parse((await paidCall(at(0))).body)).toEqual({ error: SETTLE_REASONS.unconfirmed });
+    const first = await paidCall(at(1_000));
+    expect(first.status).toBe(402);
+    expect(first.headers['Retry-After']).toBeUndefined();
+    expect(calls.reads).toHaveLength(2 * LIMITS.chainReadAfterWriteTries);
+
+    const tooSoon = await paidCall(at(2_000));
+    expect(tooSoon).toMatchObject({ status: 402, headers: { 'Retry-After': '28' } });
+    expect(JSON.parse(tooSoon.body)).toEqual({ error: SETTLE_REASONS.unconfirmed });
+    expect(await settle(chain, header, { now: at(LIMITS.sellerRecheckIntervalMs - 1) })).toEqual({
+      ok: false,
+      status: 402,
+      reason: SETTLE_REASONS.unconfirmed,
+      retryAfterSeconds: 1,
+    });
+    expect(calls.reads).toHaveLength(2 * LIMITS.chainReadAfterWriteTries);
+
+    expect((await paidCall(at(LIMITS.sellerRecheckIntervalMs))).status).toBe(402);
+    expect(calls.reads).toHaveLength(3 * LIMITS.chainReadAfterWriteTries);
+    expect(calls.executions).toHaveLength(1);
+  });
+
+  it('closes a waiting sale for good once the epoch is past its window and a final read is NOT_FOUND, and never reads it again (C21)', async () => {
+    const { chain, state, calls } = stubChain({ execute: executionUnknown });
+    const payment = asBuyer(await call(chain));
+    const { signed, header } = await pay(payment);
+    expect(payment.maxEpoch).toBe(EPOCH + 1n);
+    // Each step is past the epoch cache, so every recheck sees the epoch set before it.
+    const minutes = (n: number) => new Date(NOW.getTime() + n * 60_000);
+    const recheck = (now: Date) => settle(chain, header, { now });
+    const waiting = { ok: false, status: 402, reason: SETTLE_REASONS.unconfirmed };
+    const tries = LIMITS.chainReadAfterWriteTries;
+
+    expect(await recheck(minutes(0))).toEqual(waiting);
+    // At the window's last epoch the bytes can still land, so the sale waits.
+    state.epoch = EPOCH + 1n;
+    expect(await recheck(minutes(2))).toEqual(waiting);
+    expect(calls.reads).toHaveLength(2 * tries);
+
+    // Past the window, a final read the chain cannot answer leaves it waiting too.
+    state.epoch = EPOCH + 2n;
+    state.read = () => {
+      throw new ChainError('UPSTREAM', 'Tatum getTransactionResult: gateway error', true);
+    };
+    expect(await recheck(minutes(4))).toEqual(waiting);
+    expect(calls.reads).toHaveLength(3 * tries + 1);
+    expect(await saleOf(payment.challengeId ?? '')).toMatchObject({ status: 'rejected', digest: signed.digest, settledAt: null });
+
+    state.read = () => null;
+    expect(await recheck(minutes(6))).toEqual({ ok: false, status: 402, reason: SETTLE_REASONS.lapsed });
+    expect(calls.reads).toHaveLength(4 * tries + 2);
+    expect(await saleOf(payment.challengeId ?? '')).toMatchObject({ status: 'rejected', digest: signed.digest, settledAt: minutes(6) });
+
+    expect(await recheck(minutes(8))).toEqual({ ok: false, status: 409, reason: SETTLE_REASONS.used });
+    expect(calls.reads).toHaveLength(4 * tries + 2);
     expect(calls.executions).toEqual([signed.digest]);
   });
 

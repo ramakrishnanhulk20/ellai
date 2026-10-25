@@ -25,17 +25,15 @@ import { Ed25519Keypair } from '@mysten/sui/keypairs/ed25519';
 import { and, eq } from 'drizzle-orm';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import * as agentRunRoute from '../src/app/api/owner/agent/run/route.js';
-import { DEFAULT_PER_PAYMENT_MAX_ATOMIC, agentCatalog, documentedPriceAtomic } from '../src/server/agent/catalog.js';
+import { agentCatalog, documentedPriceAtomic } from '../src/server/agent/catalog.js';
 import { AGENT_SYSTEM_PROMPT } from '../src/server/agent/prompt.js';
 import {
   AGENT_ANSWERS,
   AGENT_MODEL,
-  AGENT_MODEL_RETRIES,
   AgentTaskError,
   BUILTIN_AGENT_LABEL,
   PAY_LIMIT_REASON,
   type PaidFetchInput,
-  RUN_MIN_LEFT_MS,
   TOOL_ERRORS,
   runAgentTask,
 } from '../src/server/agent/run.js';
@@ -221,7 +219,7 @@ describe('agentCatalog', () => {
         bodyExample: seller?.body,
         description: seller?.note,
       });
-      expect(documentedPriceAtomic(seller?.note ?? '')).toBeLessThanOrEqual(DEFAULT_PER_PAYMENT_MAX_ATOMIC);
+      expect(documentedPriceAtomic(seller?.note ?? '')).toBeLessThanOrEqual(BigInt(LIMITS.defaultPerPaymentMaxAtomic));
     }
     // Two whose 402 core refuses as MALFORMED, one priced over the default maximum, and a subscription.
     const urls = catalog.map((entry) => entry.url);
@@ -243,8 +241,8 @@ describe('agentCatalog', () => {
   it("keeps its default per-payment maximum equal to the owners table's default", async () => {
     const ownerId = await newOwner();
     const [owner] = await db.select({ perPaymentMaxAtomic: owners.perPaymentMaxAtomic }).from(owners).where(eq(owners.id, ownerId));
-    expect(owner?.perPaymentMaxAtomic).toBe(DEFAULT_PER_PAYMENT_MAX_ATOMIC);
-    expect(DEFAULT_PER_PAYMENT_MAX_ATOMIC).toBeLessThanOrEqual(BigInt(LIMITS.maxPaymentAtomic));
+    expect(owner?.perPaymentMaxAtomic).toBe(BigInt(LIMITS.defaultPerPaymentMaxAtomic));
+    expect(BigInt(LIMITS.defaultPerPaymentMaxAtomic)).toBeLessThanOrEqual(BigInt(LIMITS.maxPaymentAtomic));
   });
 
   it('refuses an app origin that is not an origin', () => {
@@ -501,7 +499,7 @@ describe('runAgentTask', () => {
     expect((await run(ownerId, client, stubGate(), { clock: () => new Date(now) })).status).toBe('done');
     // 230 s fit two tries of 60 s; 90 s do not; 30 s cut the wait itself. Each keeps 10 s spare.
     expect(options.map(({ timeout, maxRetries }) => ({ timeout, maxRetries }))).toEqual([
-      { timeout: LIMITS.agentModelTimeoutMs, maxRetries: AGENT_MODEL_RETRIES },
+      { timeout: LIMITS.agentModelTimeoutMs, maxRetries: LIMITS.agentModelRetries },
       { timeout: LIMITS.agentModelTimeoutMs, maxRetries: 0 },
       { timeout: 30_000, maxRetries: 0 },
     ]);
@@ -514,7 +512,7 @@ describe('runAgentTask', () => {
     const deadline = now + LIMITS.paidFetchDeadlineMs;
     const { client, create } = stubClient([calling(checkWallet('p1')), final('never asked for')]);
     const gate = vi.fn(async (_agentId: string, _input: PaidFetchInput, _deadlineAt: number): Promise<PaidFetchResult> => {
-      now = deadline - RUN_MIN_LEFT_MS + 1;
+      now = deadline - LIMITS.agentRunMinLeftMs + 1;
       return paid('{}');
     });
     expect(await run(ownerId, client, gate, { clock: () => new Date(now) })).toEqual({
@@ -527,13 +525,13 @@ describe('runAgentTask', () => {
     expect(now).toBeLessThan(deadline);
   });
 
-  it(`stops with less than ${RUN_MIN_LEFT_MS / 1_000} s of the run left, before calling the model or a seller`, async () => {
+  it(`stops with less than ${LIMITS.agentRunMinLeftMs / 1_000} s of the run left, before calling the model or a seller`, async () => {
     const start = clock.getTime();
     const deadline = start + LIMITS.paidFetchDeadlineMs;
     const gate = stubGate();
     // The first read of the clock starts the run; every later one finds it just inside its last 20 s.
     let reads = 0;
-    const late = () => new Date(reads++ === 0 ? start : deadline - RUN_MIN_LEFT_MS + 1);
+    const late = () => new Date(reads++ === 0 ? start : deadline - LIMITS.agentRunMinLeftMs + 1);
     const idle = stubClient([final('never asked for')]);
     expect(await run(await newOwner(), idle.client, gate, { clock: late })).toEqual({ status: 'stopped', answer: AGENT_ANSWERS.outOfTime, steps: [] });
     expect(idle.create).not.toHaveBeenCalled();
@@ -542,7 +540,7 @@ describe('runAgentTask', () => {
     let now = start;
     const slowModel = stubClient([
       () => {
-        now = deadline - RUN_MIN_LEFT_MS + 1;
+        now = deadline - LIMITS.agentRunMinLeftMs + 1;
         return calling(checkWallet('p1'));
       },
     ]);
@@ -672,6 +670,8 @@ describe('POST /api/owner/agent/run', () => {
     const badTask = await post({ task: 'a'.repeat(LIMITS.agentTaskMaxChars + 1) }, { cookie });
     expect(await badTask.text()).toBe(await toErrorResponse(new HttpError(400, 'bad_task')).text());
     expect(JSON.parse(await toErrorResponse(new HttpError(400, 'bad_task')).text())).toEqual({ error: 'bad_task', message: new AgentTaskError().message });
+    // The body cap holds the longest task at 12 bytes a code point once escaped, plus the key.
+    expect(LIMITS.agentTaskBodyMaxBytes).toBe(LIMITS.agentTaskMaxChars * 12 + 1_024);
     expect(seen).toEqual([]);
 
     const response = await post({ task: 'Check the Sui wallet 0x2' }, { cookie });
@@ -685,7 +685,7 @@ describe('POST /api/owner/agent/run', () => {
     expect(logged).toContain('[ellai agent] model_error 401');
   });
 
-  it(`builds the client with a ${LIMITS.agentModelTimeoutMs} ms wait a try and ${AGENT_MODEL_RETRIES} retry, so a busy model is tried twice at most`, async () => {
+  it(`builds the client with a ${LIMITS.agentModelTimeoutMs} ms wait a try and ${LIMITS.agentModelRetries} retry, so a busy model is tried twice at most`, async () => {
     const logs = quiet();
     useEnv({ ...ENV, ANTHROPIC_API_KEY: API_KEY });
     const sent: Array<{ timeoutSeconds: string | null; retryCount: string | null }> = [];
@@ -703,7 +703,7 @@ describe('POST /api/owner/agent/run', () => {
 
     const response = await post({ task: 'Check the Sui wallet 0x2' }, { cookie });
     expect(await response.json()).toEqual({ status: 'stopped', answer: AGENT_ANSWERS.modelUnavailable, steps: [] });
-    expect(AGENT_MODEL_RETRIES).toBe(1);
+    expect(LIMITS.agentModelRetries).toBe(1);
     expect(sent).toEqual([
       { timeoutSeconds: String(LIMITS.agentModelTimeoutMs / 1_000), retryCount: '0' },
       { timeoutSeconds: String(LIMITS.agentModelTimeoutMs / 1_000), retryCount: '1' },

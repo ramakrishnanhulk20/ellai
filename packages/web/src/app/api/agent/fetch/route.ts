@@ -1,7 +1,8 @@
+import { LIMITS } from '@ellai/core/limits';
 import { requireAgent, respondToAgent } from '../../../../server/http/agent-auth.js';
 import { withServerContext } from '../../../../server/http/context.js';
 import { jsonResponse, readJson } from '../../../../server/http/json.js';
-import { AGENT_BODY_CAP, agentPaidFetch, paidFetchInput } from '../../../../server/mcp/server.js';
+import { agentPaidFetch, paidFetchInput } from '../../../../server/mcp/server.js';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -27,7 +28,7 @@ export async function POST(request: Request): Promise<Response> {
   return respondToAgent(() =>
     withServerContext(async (ctx) => {
       const agent = await requireAgent(request, ctx);
-      const input = await readJson(request, paidFetchInput, AGENT_BODY_CAP);
+      const input = await readJson(request, paidFetchInput, LIMITS.agentBodyMaxBytes);
       return jsonResponse(await agentPaidFetch(ctx, agent, input));
     }),
   );

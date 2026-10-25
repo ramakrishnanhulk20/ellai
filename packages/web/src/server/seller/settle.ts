@@ -13,9 +13,13 @@ import { alias } from 'drizzle-orm/pg-core';
 import { z } from 'zod';
 import type { Database } from '../db/client.js';
 import { sellerSales } from '../db/schema.js';
-import { type ChallengeTerms, readSellerChallengeId, sellerResource, timestampOf } from './challenge.js';
+import { consumeShared } from '../http/ratelimit.js';
+import { type ChallengeTerms, cachedEpoch, readSellerChallengeId, sellerResource, timestampOf } from './challenge.js';
 
-export type SettleOutcome = { ok: true; digest: string; payer: string } | { ok: false; status: 402 | 409; reason: string };
+export type SettleOutcome =
+  | { ok: true; digest: string; payer: string }
+  /** `retryAfterSeconds` is set only on a recheck that came too soon: whole seconds, at least 1. */
+  | { ok: false; status: 402 | 409; reason: string; retryAfterSeconds?: number };
 
 // Every reason is fixed text: nothing from the header, the bytes or the chain is copied in,
 // because a reason goes back to whoever sent the payment and may be logged on the way (C19).
@@ -32,12 +36,15 @@ export const SETTLE_REASONS = {
   unconfirmed: 'the payment could not be confirmed on chain yet; send the same payment again to have it checked',
   failed: 'the payment did not succeed on chain',
   mismatch: 'the payment that landed is not the payment this challenge asks for',
+  lapsed: 'the payment did not land on chain before its epoch window closed; ask for a new challenge',
 } as const;
 
 type Sale = typeof sellerSales.$inferSelect;
 type Sleep = (ms: number) => Promise<void>;
 
 const timerSleep: Sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+// Named per sale, not per caller: the turn belongs to the sale, whoever presents its bytes.
+const RECHECK_QUOTA_PREFIX = 'seller-recheck:';
 const STRICT_BASE64 = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
 const base64Text = z.string().min(1).regex(STRICT_BASE64);
 
@@ -162,32 +169,63 @@ interface Closing {
   sleep: Sleep;
 }
 
+const thisWait = (closing: Closing) =>
+  and(eq(sellerSales.challengeId, closing.sale.challengeId), eq(sellerSales.status, 'rejected'), eq(sellerSales.digest, closing.digest), isNull(sellerSales.settledAt));
+
 /**
  * Ends the wait on the sale with the chain's answer for its digest: 'settled' when
  * verifySettlement finds exactly this payment, otherwise left 'rejected' with settled_at set,
  * which records that the chain's answer is in and that the sale can no longer be picked up again.
  */
 async function closeOn(result: Pick<TransactionResult, 'status' | 'balanceChanges'>, closing: Closing): Promise<SettleOutcome> {
-  const thisWait = and(
-    eq(sellerSales.challengeId, closing.sale.challengeId),
-    eq(sellerSales.status, 'rejected'),
-    eq(sellerSales.digest, closing.digest),
-    isNull(sellerSales.settledAt),
-  );
   const verdict = verifySettlement({ status: result.status, balanceChanges: result.balanceChanges }, closing.expected, closing.payer);
   if (!verdict.verified) {
-    await closing.db.update(sellerSales).set({ settledAt: closing.now }).where(thisWait);
+    await closing.db.update(sellerSales).set({ settledAt: closing.now }).where(thisWait(closing));
     return refusal(402, result.status === 'success' ? SETTLE_REASONS.mismatch : SETTLE_REASONS.failed);
   }
-  const settled = await closing.db.update(sellerSales).set({ status: 'settled', settledAt: closing.now }).where(thisWait).returning({ id: sellerSales.id });
+  const settled = await closing.db
+    .update(sellerSales)
+    .set({ status: 'settled', settledAt: closing.now })
+    .where(thisWait(closing))
+    .returning({ id: sellerSales.id });
   if (settled.length !== 1) return refusal(409, SETTLE_REASONS.used);
   return { ok: true, digest: closing.digest, payer: closing.payer };
 }
 
-/** Reads the digest (readOutcome) and closes on what it finds; while it finds nothing, the sale keeps waiting. */
+/**
+ * True once the cached epoch is past the bytes' max epoch. assertPlainUsdcSend has already held
+ * the bytes' ValidDuring window equal to `expected`'s, so its maxEpoch is the bytes' own. An
+ * epoch that cannot be read counts as a window still open.
+ */
+async function windowClosed(closing: Closing): Promise<boolean> {
+  const { maxEpoch } = closing.expected;
+  if (maxEpoch === null) return false;
+  try {
+    return (await cachedEpoch(closing.chain, closing.now.getTime())) > maxEpoch;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Reads the digest (readOutcome) and closes on what it finds. While it finds nothing the sale
+ * keeps waiting, unless the bytes' epoch window has closed, after which they can never land: then
+ * one more read, taken after that epoch was seen, that the chain answers NOT_FOUND closes the sale
+ * as rejected for good. Any other answer to that read leaves it waiting.
+ */
 async function confirmOnChain(closing: Closing): Promise<SettleOutcome> {
   const landed = await readOutcome(closing.chain, closing.digest, closing.sleep);
-  return landed === null ? refusal(402, SETTLE_REASONS.unconfirmed) : closeOn(landed, closing);
+  if (landed !== null) return closeOn(landed, closing);
+  if (!(await windowClosed(closing))) return refusal(402, SETTLE_REASONS.unconfirmed);
+  let final: TransactionResult;
+  try {
+    final = await closing.chain.getTransactionResult(closing.digest);
+  } catch (error) {
+    if (!(error instanceof ChainError && error.code === 'NOT_FOUND')) return refusal(402, SETTLE_REASONS.unconfirmed);
+    await closing.db.update(sellerSales).set({ settledAt: closing.now }).where(thisWait(closing));
+    return refusal(402, SETTLE_REASONS.lapsed);
+  }
+  return closeOn(final, closing);
 }
 
 /**
@@ -198,8 +236,11 @@ async function confirmOnChain(closing: Closing): Promise<SettleOutcome> {
  * challenge id (402 for an unknown one). A sale still waiting on the chain (its bytes were sent,
  * no outcome is recorded) is picked up again only by a header carrying those same bytes, whose
  * digest it holds (409 for any other), whatever the challenge's expiry, since the payment was
- * taken in time: the bytes and signature are checked again as below, then the digest is read as
- * after an unknown outcome. Otherwise the sale must still be 'issued' (409) and unexpired
+ * taken in time: the bytes and signature are checked again as below, then the sale's recheck is
+ * counted through consumeShared, at most one per sale in each fixed window of
+ * LIMITS.sellerRecheckIntervalMs whoever asks (one too soon is 402 unconfirmed with
+ * retryAfterSeconds, and reads nothing), then the digest is read as after an unknown outcome.
+ * Otherwise the sale must still be 'issued' (409) and unexpired
  * (402); the nonce and epoch window are read back out of the id, which also proves the id was
  * issued for this resource, recipient and amount (402 otherwise); then the sale is claimed with
  * one UPDATE from 'issued' to 'rejected' that must touch exactly one row, so a challenge is paid
@@ -218,7 +259,9 @@ async function confirmOnChain(closing: Closing): Promise<SettleOutcome> {
  * is unknown (any ChainError but core's own INVALID_INPUT refusal, which sends nothing), the
  * digest is read up to LIMITS.chainReadAfterWriteTries times and the sale closed on what is
  * found; if nothing is found the answer is 402 unconfirmed and the sale keeps waiting for the
- * same bytes. The bytes are never sent again.
+ * same bytes, until the seller's cached epoch (cachedEpoch) is past the bytes' max epoch: then
+ * one final read of the digest that is NOT_FOUND sets settled_at, leaving the sale 'rejected'
+ * for good (402 lapsed), and it is never read again. The bytes are never sent again.
  *
  * `sleep` waits between those reads; tests pass one that does not wait. Returns fixed-text
  * reasons only (SETTLE_REASONS). Throws only for database failures or an invalid `now`.
@@ -253,6 +296,9 @@ export async function settleWalletCheckPayment(args: {
     const expected = expectedPayment(sale, target, terms);
     const refused = await paymentRefusal(payment, expected);
     if (refused !== null) return refusal(402, refused);
+    // Counted only after the bytes check out, so nobody without them can use up the buyer's turn.
+    const turn = await consumeShared(db, `${RECHECK_QUOTA_PREFIX}${sale.id}`, 1, LIMITS.sellerRecheckIntervalMs, now);
+    if (!turn.allowed) return { ok: false, status: 402, reason: SETTLE_REASONS.unconfirmed, retryAfterSeconds: turn.retryAfterSeconds };
     return confirmOnChain({ db, chain, sale, digest, expected, payer: payment.sender, now, sleep });
   }
 

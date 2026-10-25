@@ -165,8 +165,10 @@ export const LIMITS = {
   /** Wait between those recalls. */
   memwalProofRecallDelayMs: 15_000,
   /**
-   * Hits one decision asks recall for. A result this long may have cut off a closer
-   * refusal or approval, so it counts as unclear and Ellai asks (C12).
+   * Hits one decision asks recall for. A result this long whose farthest hit is inside the
+   * owner's cutoff may have cut off closer approvals, never a refusal or a bad outcome, which
+   * are exact lookups (C11). So Ellai approves only when the approvals it can see already
+   * reach the owner's number, and otherwise asks (C12).
    */
   decideRecallLimit: 20,
   /** Longest wait for recall during a decision. Past it, the recall counts as failed and Ellai asks. */
@@ -189,8 +191,11 @@ export const LIMITS = {
   bearerTokenBytes: 32,
   /** Pending memories submitted to Walrus Memory in one bulk write, the relayer's per-call maximum. */
   pendingMemoryWriteBatch: 20,
-  /** Memory write jobs checked per owner in one confirmation pass. */
-  memoryJobConfirmBatch: 50,
+  /**
+   * Memory write jobs checked per owner in one confirmation pass, all in one status call. The
+   * relayer refuses more than 20 job ids per call (MAX_BULK_ITEMS in its services/server/src/types.rs).
+   */
+  memoryJobConfirmBatch: 20,
   /** Patience for a paid call to a seller Ellai has no recorded patience for. */
   netPaidTimeoutDefaultMs: 30_000,
   /** Characters of a seller's answer handed back to the agent; the rest is cut and marked as cut. */
@@ -263,14 +268,122 @@ export const LIMITS = {
   memoryJobMaxAgeMs: 21_600_000,
   /** Memory blob ids checked against the chain per owner per tick. */
   blobConfirmBatch: 50,
+  /**
+   * How long after Walrus Memory confirms a memory the tick keeps looking for its blob on chain:
+   * three days. Each look is a Tatum GraphQL listing that costs credits, and a blob still missing
+   * after this long is never shown on /proof (C18, C21).
+   */
+  blobChainCheckMaxAgeMs: 259_200_000,
+  /** How long after Walrus Memory confirms a memory before its blob is first looked for, since a blob that new may not be listed yet. */
+  blobChainCheckMinAgeMs: 60_000,
   /** Expired rows deleted per table per tick. */
   pruneBatch: 1_000,
   /** How long the seller reuses one current-epoch read for its challenges. */
   epochCacheMs: 60_000,
+  /**
+   * The fixed window in which one sale waiting on the chain may be read again, at most once:
+   * each recheck costs up to chainReadAfterWriteTries Tatum reads, and anyone holding the bytes
+   * can ask (C21, C22).
+   */
+  sellerRecheckIntervalMs: 30_000,
   /** Unpaid seller challenges issued per minute across every caller (C22). */
   sellerChallengesPerMinuteGlobal: 300,
   /** zkLogin sign-in checks against the chain per minute across every caller (C22). */
   zkLoginChecksPerMinute: 30,
   /** zkLogin sign-in checks against the chain per day across every caller (C22). */
   zkLoginChecksPerDay: 2_000,
+  /** The fixed window every count above named per minute is measured over (C22). */
+  rateWindowMinuteMs: 60_000,
+  /** The fixed window every count above named per hour is measured over (C22). */
+  rateWindowHourMs: 3_600_000,
+  /** The fixed window every count above named per day is measured over, except refills (purseRefillWindowMs). */
+  rateWindowDayMs: 86_400_000,
+  /** Sign-in requests one client may make in a minute, for the nonce and verify steps separately (C22). */
+  signInRequestsPerMinute: 10,
+  /** Sign-in requests every client together may make in a minute, for each step separately (C22). */
+  signInRequestsPerMinuteGlobal: 300,
+  /** Random bytes in a sign-in nonce: 128 bits, so a nonce cannot be guessed before it expires (C14). */
+  signinNonceBytes: 16,
+  /** Longest address the sign-in nonce step reads. A Sui address is 66 characters. */
+  signinAddressMaxChars: 128,
+  /** Longest sign-in message the verify step reads; completeSignIn refuses any longer than it issues. */
+  signinMessageMaxChars: 1_024,
+  /** Longest signature the verify step reads. A multisig with zkLogin members can reach 16 KiB. */
+  signinSignatureMaxChars: 16_384,
+  /** Largest sign-in nonce request body, in bytes: { address } is under 100. */
+  signinNonceBodyMaxBytes: 1_024,
+  /** Largest sign-in verify request body, in bytes: the longest message and signature it reads come to 17 KiB. */
+  signinVerifyBodyMaxBytes: 32_768,
+  /** Largest answer body, in bytes: { answer, reason } with reasonMaxChars code points at up to 12 bytes each once escaped as JSON. */
+  answerBodyMaxBytes: 8_192,
+  /** Largest new agent key body, in bytes: { label } of 60 code points at up to 12 bytes each once escaped. */
+  agentLabelBodyMaxBytes: 1_024,
+  /** Largest onboarding build body, in bytes: a step, two amounts of at most 19 digits and a day count. */
+  onboardingBuildBodyMaxBytes: 1_024,
+  /** Largest onboarding confirm body, in bytes: a step and a digest of at most 44 characters. */
+  onboardingConfirmBodyMaxBytes: 1_024,
+  /** Largest settings body, in bytes: seven settings, each a short number, amount or boolean. */
+  settingsBodyMaxBytes: 1_024,
+  /**
+   * Largest agent request body, in bytes. A seller body of challengeMaxBytes at up to 6 bytes a byte
+   * once escaped (196,608), a purpose (6,000), a URL (12,288) and a content type stay under 220,000.
+   */
+  agentBodyMaxBytes: 262_144,
+  /** Largest built-in agent task body, in bytes: agentTaskMaxChars code points at up to 12 bytes each, plus 1 KiB for the key. */
+  agentTaskBodyMaxBytes: 13_024,
+  /** Longest content type an agent may ask Ellai to forward; paidFetch then allows only a plain media type. */
+  agentContentTypeMaxChars: 512,
+  /** Longest decision id check_decision reads. A real one is a 36-character uuid. */
+  decisionIdMaxChars: 64,
+  /** Characters of a token's random part shown to tell keys apart: 36 of its 256 bits, far from guessable. */
+  tokenDisplayChars: 6,
+  /** Longest error sentence passed to a caller; a longer one is replaced by fixed text (C17). */
+  errorMessageMaxChars: 300,
+  /** Rows on one page of an owner's history when the query names no limit. */
+  ownerPageDefault: 20,
+  /** Most rows on one page of an owner's history; a larger limit is cut to this. */
+  ownerPageMax: 50,
+  /** Unanswered questions listed at once, so one page reads at most this times decideMaxCitedMemories citations. */
+  questionsPerPage: 50,
+  /** Latest verified payments and latest on-chain memories /proof lists (C22: it is one cached read). */
+  publicProofLatest: 20,
+  /** The span the overview counts decisions and verified payments over: 30 days. */
+  overviewCountWindowMs: 2_592_000_000,
+  /** Latest approved or asked decisions the overview's question rate is taken over; its questionsPer20 field is named for it. */
+  overviewQuestionWindow: 20,
+  /** Fewest approvals an owner may require before Ellai pays on its own; the owners table allows the same. */
+  approvalsNeededMin: 1,
+  /** Most approvals an owner may require; the owners table allows the same. */
+  approvalsNeededMax: 10,
+  /** Widest distance cutoff an owner may set: cosine distance 1 is unrelated, so a wider one would count opposites as alike. */
+  distanceCutoffMax: 1,
+  /** The per-payment maximum every owner starts with: 0.05 USDC, the owners table's default. Sellers priced above it are not offered to the built-in agent. */
+  defaultPerPaymentMaxAtomic: 50_000,
+  /** The span the daily budget counts signed payments over: any 24 hours (C4). */
+  dailyBudgetWindowMs: 86_400_000,
+  /** The span purseMaxRefillsPerDay is counted over: the 24 hours before now, every refill sent whatever its status. */
+  purseRefillWindowMs: 86_400_000,
+  /** The allowance's on-chain rate window: its daily limit is what the purse may draw in one fixed day. */
+  allowancePeriodMs: 86_400_000,
+  /**
+   * The fixed window a payment's failed settlement reads are counted in, shorter than
+   * rateCounterRetentionMs so pruning never deletes a count in use; a count cut by a window
+   * boundary starts again, which can delay the verdict but never hasten it.
+   */
+  settlementUnreadableWindowMs: 86_400_000,
+  /** How long an ended session row is kept, so a sign-out or a revoke can still be looked into. */
+  endedSessionKeepMs: 86_400_000,
+  /** A paid request ends at least this long before its call's deadline, so storing what the seller did and answering still fit. */
+  paidRequestMarginMs: 10_000,
+  /** Less of a built-in agent run than this left, and no model request or paid call is started. */
+  agentRunMinLeftMs: 20_000,
+  /** Every built-in agent model request ends at least this long before the run's deadline, so the answer still reaches the owner. */
+  agentModelMarginMs: 10_000,
+  /**
+   * Retries the model client makes after a failed request: one, not the SDK's two, since the owner
+   * is waiting on the page and a second failure in a row is reported rather than waited out.
+   */
+  agentModelRetries: 1,
+  /** Bulk writes one memory pass makes: what memwalPointsPerMinute holds at memwalBulkPoints each, since a pass holds its rows locked while core paces. */
+  memoryWritesPerPass: 3,
 } as const;

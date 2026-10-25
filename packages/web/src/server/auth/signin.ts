@@ -52,17 +52,14 @@ function refuse(code: SignInErrorCode): never {
   throw new SignInError(code);
 }
 
-const NONCE_BYTES = 16;
-const NONCE_PATTERN = new RegExp(`^[0-9a-f]{${NONCE_BYTES * 2}}$`);
+const NONCE_PATTERN = new RegExp(`^[0-9a-f]{${LIMITS.signinNonceBytes * 2}}$`);
 const ZKLOGIN_FLAG = SIGNATURE_SCHEME_TO_FLAG.ZkLogin;
 const MULTISIG_FLAG = SIGNATURE_SCHEME_TO_FLAG.MultiSig;
-const MINUTE_MS = 60_000;
-const DAY_MS = 86_400_000;
 
 /** The checks against Sui that every zkLogin sign-in shares, whoever sends it (C22). */
 export const ZKLOGIN_CHECK_QUOTAS = [
-  { name: 'zklogin-checks:minute', limit: LIMITS.zkLoginChecksPerMinute, windowMs: MINUTE_MS },
-  { name: 'zklogin-checks:day', limit: LIMITS.zkLoginChecksPerDay, windowMs: DAY_MS },
+  { name: 'zklogin-checks:minute', limit: LIMITS.zkLoginChecksPerMinute, windowMs: LIMITS.rateWindowMinuteMs },
+  { name: 'zklogin-checks:day', limit: LIMITS.zkLoginChecksPerDay, windowMs: LIMITS.rateWindowDayMs },
 ] as const;
 
 interface Site {
@@ -261,7 +258,7 @@ export async function issueSignIn(args: { db: Database; address: string; appOrig
   } catch {
     refuse('BAD_ADDRESS');
   }
-  const nonce = randomBytes(NONCE_BYTES).toString('hex');
+  const nonce = randomBytes(LIMITS.signinNonceBytes).toString('hex');
   const expiresAt = new Date(now.getTime() + LIMITS.signinNonceTtlMs);
   await args.db.insert(signinNonces).values({ nonce, createdAt: now, expiresAt });
   return { nonce, message: formatSignInMessage({ ...site, address, nonce, issuedAt: now, expiresAt }), expiresAt };
@@ -311,7 +308,7 @@ export async function completeSignIn(args: {
   if (typeof args.message !== 'string') refuse('BAD_MESSAGE');
   // Every message this site issues has the same length, so anything longer is refused
   // before it is split or parsed.
-  const issuedLength = formatSignInMessage({ ...site, address: canonicalSuiAddress('0x1'), nonce: '0'.repeat(NONCE_BYTES * 2), issuedAt: now, expiresAt: now }).length;
+  const issuedLength = formatSignInMessage({ ...site, address: canonicalSuiAddress('0x1'), nonce: '0'.repeat(LIMITS.signinNonceBytes * 2), issuedAt: now, expiresAt: now }).length;
   if (args.message.length > issuedLength) refuse('BAD_MESSAGE');
   const fields = parseSignInMessage(args.message, site);
   const thisNonce = eq(signinNonces.nonce, fields.nonce);

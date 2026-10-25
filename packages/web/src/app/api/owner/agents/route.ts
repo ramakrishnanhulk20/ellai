@@ -1,9 +1,10 @@
+import { LIMITS } from '@ellai/core/limits';
 import { z } from 'zod';
 import { createAgentToken, listAgents } from '../../../../server/auth/agents.js';
 import { withServerContext } from '../../../../server/http/context.js';
 import { respond } from '../../../../server/http/errors.js';
 import { jsonResponse, readJson } from '../../../../server/http/json.js';
-import { OWNER_BODY_CAPS, limitAgentCreates } from '../../../../server/http/owner-limits.js';
+import { limitAgentCreates } from '../../../../server/http/owner-limits.js';
 import { requireSameOrigin } from '../../../../server/http/origin.js';
 import { requireOwner } from '../../../../server/http/session.js';
 
@@ -44,7 +45,7 @@ export async function POST(request: Request): Promise<Response> {
       requireSameOrigin(request, ctx.env.APP_ORIGIN);
       const { ownerId } = await requireOwner(request, ctx);
       await limitAgentCreates(ctx, ownerId);
-      const { label } = await readJson(request, body, OWNER_BODY_CAPS.agent);
+      const { label } = await readJson(request, body, LIMITS.agentLabelBodyMaxBytes);
       const created = await createAgentToken({ db: ctx.db, ownerId, label, kind: 'external', sessionSecretHex: ctx.env.SESSION_SECRET, now: ctx.now() });
       // Named here as well as in the shared headers, so the one response holding a bearer
       // token stays out of every cache even if those defaults ever change.

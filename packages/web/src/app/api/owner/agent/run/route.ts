@@ -1,7 +1,7 @@
 import Anthropic from '@anthropic-ai/sdk';
 import { LIMITS } from '@ellai/core/limits';
 import { z } from 'zod';
-import { AGENT_MODEL_RETRIES, AgentTaskError, type PaidFetchInput, runAgentTask } from '../../../../../server/agent/run.js';
+import { AgentTaskError, type PaidFetchInput, runAgentTask } from '../../../../../server/agent/run.js';
 import { withServerContext } from '../../../../../server/http/context.js';
 import { HttpError, respond } from '../../../../../server/http/errors.js';
 import { jsonResponse, readJson } from '../../../../../server/http/json.js';
@@ -19,8 +19,6 @@ export const dynamic = 'force-dynamic';
 export const maxDuration = 300;
 
 const CLAUDE_API = 'https://api.anthropic.com';
-// Each code point of the task is at most 12 bytes once escaped as JSON, plus room for the key.
-const TASK_BODY_MAX_BYTES = LIMITS.agentTaskMaxChars * 12 + 1_024;
 // runAgentTask trims the task and counts it in code points; this only bounds what is read.
 const body = z.strictObject({ task: z.string() });
 
@@ -32,7 +30,7 @@ const body = z.strictObject({ task: z.string() });
 // request's timeout, retries and abort signal from the run's deadline (C21).
 function claudeClient(apiKey: string | undefined): Anthropic | null {
   if (apiKey === undefined) return null;
-  return new Anthropic({ apiKey, baseURL: CLAUDE_API, logLevel: 'off', timeout: LIMITS.agentModelTimeoutMs, maxRetries: AGENT_MODEL_RETRIES });
+  return new Anthropic({ apiKey, baseURL: CLAUDE_API, logLevel: 'off', timeout: LIMITS.agentModelTimeoutMs, maxRetries: LIMITS.agentModelRetries });
 }
 
 /**
@@ -51,7 +49,7 @@ export async function POST(request: Request): Promise<Response> {
     withServerContext(async (ctx) => {
       requireSameOrigin(request, ctx.env.APP_ORIGIN);
       const { ownerId } = await requireOwner(request, ctx);
-      const { task } = await readJson(request, body, TASK_BODY_MAX_BYTES);
+      const { task } = await readJson(request, body, LIMITS.agentTaskBodyMaxBytes);
       const paidFetchFor = async (agentId: string, input: PaidFetchInput, deadlineAt: number): Promise<PaidFetchResult> => {
         const fetched = await agentPaidFetch(
           ctx,

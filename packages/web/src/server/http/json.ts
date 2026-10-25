@@ -1,19 +1,6 @@
 import type { z } from 'zod';
 import { API_RESPONSE_HEADERS, HttpError } from './errors.js';
 
-/**
- * The largest body, in bytes, each route reads. Each is a few times the most its schema can
- * legitimately hold, so no honest request comes near it.
- */
-export const BODY_CAPS = {
-  /** { address }: a Sui address is 66 characters. */
-  nonce: 1_024,
-  /** { message, signature }: a multisig with zkLogin members can sign with up to 16 KiB. */
-  verify: 32_768,
-  /** { answer, reason }: 300 code points, each at most 12 bytes once escaped as JSON. */
-  answer: 8_192,
-} as const;
-
 const JSON_MEDIA_TYPE = 'application/json';
 
 // JSON on the wire is UTF-8 (RFC 8259), so a body that names any other charset is refused

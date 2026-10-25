@@ -9,7 +9,6 @@ import { and, eq, isNull, or } from 'drizzle-orm';
 import type { Database } from '../db/client.js';
 import { owners } from '../db/schema.js';
 import { ownerDelegate } from '../memory/delegate.js';
-import { DAY_MS } from './build.js';
 import { checkNow, checkStep, loadOwner, OnboardingError, type OnboardingStep, type OwnerRow } from './state.js';
 
 const { ChangedObject_IdOperation: IdOperation } = GrpcTypes;
@@ -146,7 +145,7 @@ function allowanceProblem(state: AllowanceState, ownerAddress: string, purseAddr
   if (state.coinType !== USDC_TYPE_MAINNET) return 'the allowance is not over Sui Mainnet USDC';
   const capMax = BigInt(LIMITS.onboardingLifetimeCapMaxAtomic);
   if (state.lifetimeCap === null || state.lifetimeCap <= 0n || state.lifetimeCap > capMax) return 'the total cap is missing or over the onboarding maximum';
-  if (state.periodMs !== BigInt(DAY_MS)) return 'the rate-limit window is not one day';
+  if (state.periodMs !== BigInt(LIMITS.allowancePeriodMs)) return 'the rate-limit window is not one day';
   const dailyMax = BigInt(LIMITS.onboardingDailyLimitMaxAtomic);
   if (state.periodLimit === null || state.periodLimit <= 0n || state.periodLimit > dailyMax || state.periodLimit > state.lifetimeCap) {
     return 'the daily limit is missing, over the onboarding maximum, or over the total cap';

@@ -12,10 +12,9 @@ import { checkNow, checkStep, loadOwner, OnboardingError, type OnboardingStep } 
 
 /** Stored on chain next to Ellai's key on the owner's Walrus Memory account. */
 export const DELEGATE_LABEL = 'Ellai';
-/** The allowance's rate-limit window: the daily limit is what the purse may draw in one fixed day. */
-export const DAY_MS = 86_400_000;
-
-const MAX_DAYS = Math.floor(LIMITS.onboardingAllowanceMaxMs / DAY_MS);
+// A unit conversion: the owner sets how long the allowance runs as a count of days.
+const MS_PER_DAY = 86_400_000;
+const MAX_DAYS = Math.floor(LIMITS.onboardingAllowanceMaxMs / MS_PER_DAY);
 // The allowance's nonce field is a u32.
 const NONCE_RANGE = 2 ** 32;
 
@@ -53,10 +52,10 @@ function checkAllowance(request: unknown, now: Date): AllowanceTerms {
   if (typeof cap !== 'bigint' || cap < daily || cap > capMax) {
     bad(`the total cap must be at least the daily limit and at most ${formatUsdc(capMax)} USDC`);
   }
-  if (typeof days !== 'number' || !Number.isSafeInteger(days) || days < 1 || days * DAY_MS > LIMITS.onboardingAllowanceMaxMs) {
+  if (typeof days !== 'number' || !Number.isSafeInteger(days) || days < 1 || days * MS_PER_DAY > LIMITS.onboardingAllowanceMaxMs) {
     bad(`the allowance must run a whole number of days, from 1 to ${MAX_DAYS}`);
   }
-  return { dailyLimitAtomic: daily, lifetimeCapAtomic: cap, expirationMs: now.getTime() + days * DAY_MS };
+  return { dailyLimitAtomic: daily, lifetimeCapAtomic: cap, expirationMs: now.getTime() + days * MS_PER_DAY };
 }
 
 function utcMinute(ms: number): string {
@@ -73,8 +72,8 @@ function utcMinute(ms: number): string {
  * - add_delegate: adds Ellai's derived delegate key for this owner, named "Ellai", to the
  *   recorded account (core buildAddDelegateTx). Needs the account recorded first.
  * - allowance: the owner lets their own purse draw Sui Mainnet USDC from the owner's address
- *   balance: at most dailyLimitAtomic per fixed day, lifetimeCapAtomic in total, ending
- *   `days` whole days after `now` (core buildIssueAllowance, epoch and gas price read through
+ *   balance: at most dailyLimitAtomic per LIMITS.allowancePeriodMs (a fixed day),
+ *   lifetimeCapAtomic in total, ending `days` whole days after `now` (core buildIssueAllowance, epoch and gas price read through
  *   `chain`). Daily limit in (0, LIMITS.onboardingDailyLimitMaxAtomic], total cap in
  *   [daily limit, LIMITS.onboardingLifetimeCapMaxAtomic], days from 1 to the
  *   LIMITS.onboardingAllowanceMaxMs span. The owner pays gas, at most LIMITS.issueGasBudgetMist,
@@ -144,7 +143,7 @@ export async function buildOnboardingTx(args: {
       spender: purseAddress,
       terms: {
         lifetimeCapAtomic: terms.lifetimeCapAtomic,
-        periodMs: BigInt(DAY_MS),
+        periodMs: BigInt(LIMITS.allowancePeriodMs),
         periodLimitAtomic: terms.dailyLimitAtomic,
         expirationMs: BigInt(terms.expirationMs),
       },

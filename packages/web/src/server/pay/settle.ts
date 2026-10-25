@@ -36,9 +36,6 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 // payments has no column for the count, so it lives in the shared counter table under its own
 // prefix, which no other counter's key starts with.
 const UNREADABLE_KEY_PREFIX = 'settlement-unreadable:';
-// Shorter than LIMITS.rateCounterRetentionMs, so pruning never deletes a count still in use. A
-// count cut by a window boundary starts again, which can delay the verdict but never hasten it.
-const UNREADABLE_WINDOW_MS = 86_400_000;
 
 type Read = { kind: 'landed'; result: TransactionResult } | { kind: 'missing' } | { kind: 'unknown' };
 
@@ -61,7 +58,8 @@ async function stored(db: Database, ownerId: string, paymentId: string): Promise
 /** Counts one more pass whose read failed for this payment, in one atomic upsert, and returns the count so far. */
 async function countFailedRead(db: Database, paymentId: string, now: Date): Promise<number> {
   if (!(now instanceof Date) || Number.isNaN(now.getTime())) throw new Error('the current time is not a date');
-  const windowStart = new Date(Math.floor(now.getTime() / UNREADABLE_WINDOW_MS) * UNREADABLE_WINDOW_MS);
+  const windowMs = LIMITS.settlementUnreadableWindowMs;
+  const windowStart = new Date(Math.floor(now.getTime() / windowMs) * windowMs);
   const [counter] = await db
     .insert(rateCounters)
     .values({ key: `${UNREADABLE_KEY_PREFIX}${paymentId}`, windowStart, count: 1 })
@@ -91,8 +89,8 @@ async function countFailedRead(db: Database, paymentId: string, now: Date): Prom
  * mismatch_reason UNVERIFIABLE and, in the same transaction, sets the owner's
  * auto_paused_reason to SETTLEMENT_UNVERIFIABLE, so decide refuses every later payment until the
  * owner reviews it (C8, C21). Until then it stays 'pending' and counts against the budget. The
- * count is kept per payment in fixed windows of a day, so passes that fail on either side of
- * a window boundary are counted again from one.
+ * count is kept per payment in fixed windows of LIMITS.settlementUnreadableWindowMs, so passes
+ * that fail on either side of a window boundary are counted again from one.
  *
  * A payment already past 'pending' is returned as it is. Writes only from 'pending', so two
  * passes never overwrite each other. Throws for an unknown payment or tries out of range.

@@ -60,7 +60,7 @@ export async function GET(request: Request): Promise<Response> {
       const { rows, nextBefore } = cutPage(read, query.limit);
 
       // Each decision cites at most LIMITS.decideMaxCitedMemories memories, so one page reads
-      // at most PAGE_MAX times that many citation rows.
+      // at most LIMITS.ownerPageMax times that many citation rows.
       const decisionIds = rows.map((row) => row.decisionId);
       const cited =
         decisionIds.length === 0

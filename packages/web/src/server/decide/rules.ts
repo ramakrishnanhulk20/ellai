@@ -49,8 +49,8 @@ export interface BadOutcome {
 
 export interface DecideFacts {
   settings: OwnerSettings;
-  /** Everything signed in the last 24 hours and not released, in atomic USDC. */
-  spentLast24hAtomic: bigint;
+  /** What already counts against the daily budget, in atomic USDC: pay/liability.ts heldOrSpentAtomic (C4). */
+  heldOrSpentAtomic: bigint;
   amountAtomic: bigint;
   recipient: string;
   /** Used only to word the reason. */
@@ -122,7 +122,7 @@ export function rulesBeforeRecall(facts: Omit<DecideFacts, 'recall'>): RuleResul
       `This payment of ${formatUsdc(amountAtomic)} USDC is over your limit of ${formatUsdc(settings.perPaymentMaxAtomic)} USDC per payment.`,
     );
   }
-  if (facts.spentLast24hAtomic + amountAtomic > settings.dailyBudgetAtomic) {
+  if (facts.heldOrSpentAtomic + amountAtomic > settings.dailyBudgetAtomic) {
     return result(
       'refused',
       'over_daily_budget',
@@ -154,12 +154,15 @@ export function rulesBeforeRecall(facts: Omit<DecideFacts, 'recall'>): RuleResul
 function rulesAfterRecall(facts: DecideFacts): RuleResult {
   const { settings, recall } = facts;
   const host = hostLabel(facts.sellerHost);
-  // A full result can hide a closer approval only while its farthest hit is still inside the
-  // owner's cutoff; past it, the hidden hits are farther still and never count (C12). Written
-  // as "not at or past" so a cutoff that is not a number asks.
-  if (recall.kind === 'failed' || (recall.cutOffAt !== null && !(recall.cutOffAt >= settings.distanceCutoff))) {
+  if (recall.kind === 'failed') {
     return result('asked', 'recall_unavailable', 'Ellai could not check your past answers just now, so it is asking you.');
   }
+  // Past the owner's cutoff, every hit the limit hid is farther still and never counts. Inside
+  // it, the hidden hits can only be more approvals: refusals (C11) and bad outcomes were already
+  // looked up exactly in rulesBeforeRecall. So the visible approvals may still approve, but
+  // falling short of approvalsNeeded proves nothing (C12). Written as "not at or past" so a
+  // cutoff that is not a number counts as cut inside it.
+  const cutInside = recall.cutOffAt !== null && !(recall.cutOffAt >= settings.distanceCutoff);
   // Keyed by memory id, so a hit the relayer repeats counts once.
   const matching = new Map<string, bigint>();
   for (const hit of recall.hits) {
@@ -183,6 +186,9 @@ function rulesAfterRecall(facts: DecideFacts): RuleResult {
       [...matching.keys()],
     );
   }
+  if (cutInside) {
+    return result('asked', 'recall_unavailable', 'Ellai found more past answers like this than it can check at once, so it is asking you.');
+  }
   if (matching.size === 0) return result('asked', 'no_match', `You have not approved a payment like this to ${host} yet.`);
   return result(
     'asked',
@@ -195,9 +201,13 @@ function rulesAfterRecall(facts: DecideFacts): RuleResult {
  * Decides one payment with fixed rules, first match wins:
  * 1 paused, 2 over the per-payment maximum, 3 over the daily budget, 4 a past refusal of
  * this recipient (refuse); 5 a bad outcome the owner has not yet said yes past (ask); 6 a matching grant
- * (approve); 7 recall failed, or came back full with its farthest hit inside the cutoff
- * (ask); 8 enough close owner approvals for this
- * recipient at or above this amount (approve); 9 otherwise ask. An ask from rules 5 to 9 is
+ * (approve); 7 recall failed (ask, recall_unavailable); 8 at least approvalsNeeded close owner
+ * approvals for this recipient at or above this amount among the hits returned (approve,
+ * learned), whether or not the result came back full; 9 a result that came back full with its
+ * farthest hit inside the cutoff, or a cutoff that is not a number, and too few approvals among
+ * the hits returned (ask, recall_unavailable), since the hits the limit hid could have been the
+ * missing approvals; 10 otherwise ask (no_match). A full result can never hide a refusal or a
+ * bad outcome, because rules 4 and 5 find those by exact lookup. An ask from rules 5 to 10 is
  * refused instead when the agent's question queue is full. Pure: no database, no network.
  */
 export function applyRules(facts: DecideFacts): RuleResult {

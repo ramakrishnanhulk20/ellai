@@ -295,6 +295,7 @@ describe('GET /api/owner/overview', () => {
         dailyBudgetAtomic: '500000',
         approvalsNeeded: 2,
         distanceCutoff: 0.5,
+        publicProof: false,
       },
       onboarding: { memoryAccount: 'missing', delegate: 'missing', allowance: 'missing', purseAddress },
       purse: { usdcAtomic: '123456' },
@@ -302,6 +303,18 @@ describe('GET /api/owner/overview', () => {
       questionsPer20: { asked: 0, window: 0 },
     });
     expect(getBalances).toHaveBeenCalledWith(purseAddress);
+  });
+
+  it("shows whether /proof lists the owner, off until the owner opts in, and never another owner's setting", async () => {
+    const owner = await signedInOwner();
+    const other = await signedInOwner();
+    await db.update(owners).set({ publicProof: true }).where(eq(owners.id, other.ownerId));
+    const shown = async (cookie: string) => ((await (await overview(cookie)).json()) as { owner: { publicProof: unknown } }).owner.publicProof;
+    expect(await shown(owner.cookie)).toBe(false);
+    await db.update(owners).set({ publicProof: true }).where(eq(owners.id, owner.ownerId));
+    expect(await shown(owner.cookie)).toBe(true);
+    await db.update(owners).set({ publicProof: false }).where(eq(owners.id, owner.ownerId));
+    expect(await shown(owner.cookie)).toBe(false);
   });
 
   it('writes every atomic amount as an exact decimal string, even past 2^53', async () => {

@@ -33,7 +33,6 @@ export interface PublicProof {
   memories: Array<{ blobId: string; kind: (typeof MEMORY_KINDS)[number]; confirmedAt: string }>;
 }
 
-const LATEST = 20;
 const EXPLORER_TX = 'https://suiscan.xyz/mainnet/tx/';
 // The shape core's memory client already demands of every blob id it accepts from the relayer,
 // checked again on the way out because this page is where a stranger will read it.
@@ -41,9 +40,10 @@ const BLOB_ID = /^[A-Za-z0-9_-]{1,128}$/;
 
 /**
  * Reads the public proof from the database: five reads, no chain call, each joined to its
- * owner and kept to owners with public_proof true. The 20 latest verified payments, newest
- * first, each with its explorer link; the 20 latest memories confirmed by Walrus Memory and
- * found on chain (chain_confirmed_at set), newest first, by blob id and kind only; and the
+ * owner and kept to owners with public_proof true. The latest LIMITS.publicProofLatest verified
+ * payments, newest first, each with its explorer link; the latest LIMITS.publicProofLatest
+ * memories confirmed by Walrus Memory and found on chain (chain_confirmed_at set), newest
+ * first, by blob id and kind only; and the
  * totals, over the same owners, with an owner answer counted only once found on chain. A digest
  * that is not a Sui transaction digest, or a blob id that is not plain base64url, is left out
  * rather than linked or shown.
@@ -76,14 +76,14 @@ export async function readPublicProof(db: Database): Promise<PublicProof> {
       .innerJoin(owners, eq(owners.id, payments.ownerId))
       .where(and(eq(payments.settlement, 'verified'), shown))
       .orderBy(desc(payments.signedAt), desc(payments.id))
-      .limit(LATEST),
+      .limit(LIMITS.publicProofLatest),
     db
       .select({ blobId: memories.blobId, kind: memories.kind, confirmedAt: memories.confirmedAt })
       .from(memories)
       .innerJoin(owners, eq(owners.id, memories.ownerId))
       .where(and(onChain, isNotNull(memories.confirmedAt), shown))
       .orderBy(desc(memories.confirmedAt), desc(memories.id))
-      .limit(LATEST),
+      .limit(LIMITS.publicProofLatest),
   ]);
   return {
     totals: {

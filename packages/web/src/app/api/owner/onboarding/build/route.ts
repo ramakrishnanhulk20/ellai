@@ -1,8 +1,9 @@
+import { LIMITS } from '@ellai/core/limits';
 import { z } from 'zod';
 import { withServerContext } from '../../../../../server/http/context.js';
 import { respond } from '../../../../../server/http/errors.js';
 import { jsonResponse, readJson } from '../../../../../server/http/json.js';
-import { OWNER_BODY_CAPS, atomicAmountText, limitOwnerChainReads, onboardingChainFailure } from '../../../../../server/http/owner-limits.js';
+import { atomicAmountText, limitOwnerChainReads, onboardingChainFailure } from '../../../../../server/http/owner-limits.js';
 import { requireSameOrigin } from '../../../../../server/http/origin.js';
 import { requireOwner } from '../../../../../server/http/session.js';
 import { buildOnboardingTx } from '../../../../../server/onboarding/build.js';
@@ -34,7 +35,7 @@ export async function POST(request: Request): Promise<Response> {
       const { ownerId } = await requireOwner(request, ctx);
       const limited = await limitOwnerChainReads(ctx, ownerId);
       if (limited !== null) return limited;
-      const { step, allowance: terms } = await readJson(request, body, OWNER_BODY_CAPS.onboardingBuild);
+      const { step, allowance: terms } = await readJson(request, body, LIMITS.onboardingBuildBodyMaxBytes);
       try {
         const built = await buildOnboardingTx({ db: ctx.db, ownerId, step, allowance: terms, chain: ctx.chain, masterSecretHex: ctx.env.ELLAI_MASTER_SECRET, now: ctx.now() });
         return jsonResponse(built);

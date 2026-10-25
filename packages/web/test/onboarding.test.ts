@@ -22,9 +22,11 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vites
 import { type Database, createDb, migrate } from '../src/server/db/client.js';
 import { owners } from '../src/server/db/schema.js';
 import { ownerDelegate } from '../src/server/memory/delegate.js';
-import { buildOnboardingTx, DAY_MS } from '../src/server/onboarding/build.js';
+import { buildOnboardingTx } from '../src/server/onboarding/build.js';
 import { confirmOnboardingTx } from '../src/server/onboarding/confirm.js';
 import { type OnboardingStep, OnboardingError, onboardingState } from '../src/server/onboarding/state.js';
+
+const DAY_MS = 86_400_000;
 
 vi.mock('@ellai/core/memory', async (importOriginal) => ({
   ...(await importOriginal<typeof import('@ellai/core/memory')>()),
@@ -84,7 +86,7 @@ function goodAllowance(owner: Owner): AllowanceState {
     coinType: USDC_TYPE_MAINNET,
     lifetimeCap: 1_000_000n,
     spentTotal: 0n,
-    periodMs: BigInt(DAY_MS),
+    periodMs: BigInt(LIMITS.allowancePeriodMs),
     periodLimit: 500_000n,
     expirationMs: BigInt(NOW.getTime() + 30 * DAY_MS),
     initialSharedVersion: 1n,
@@ -221,7 +223,7 @@ describe('confirmOnboardingTx', () => {
       { lifetimeCap: null },
       { periodLimit: 1_000_001n },
       { periodLimit: null, periodMs: null },
-      { periodMs: BigInt(DAY_MS) * 7n },
+      { periodMs: BigInt(LIMITS.allowancePeriodMs) * 7n },
       { expirationMs: maxEnd + 1n },
       { expirationMs: BigInt(NOW.getTime()) },
       { expirationMs: null },

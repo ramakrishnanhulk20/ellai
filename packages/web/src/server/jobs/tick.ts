@@ -3,15 +3,15 @@ import { type Chain, ChainError } from '@ellai/core/chain';
 import { LIMITS } from '@ellai/core/limits';
 import { MemoryError } from '@ellai/core/memory';
 import type { Ed25519Keypair } from '@mysten/sui/keypairs/ed25519';
-import { and, asc, eq, inArray, isNotNull, isNull, notExists, sql } from 'drizzle-orm';
+import { and, asc, eq, inArray, isNotNull, notExists, sql } from 'drizzle-orm';
 import { unionAll } from 'drizzle-orm/pg-core';
 import type { Database } from '../db/client.js';
 import { LIVE_DECISION_STATUSES, decisions, memories, owners, payments } from '../db/schema.js';
 import { MemoryServiceError, ownerDelegate } from '../memory/delegate.js';
 import { recordOutcome } from '../memory/outcome.js';
-import { confirmMemoryJobs, submitPendingMemories } from '../memory/writer.js';
+import { confirmMemoryJobs, isKeyRefused, submitPendingMemories } from '../memory/writer.js';
 import { settlePayment } from '../pay/settle.js';
-import { confirmBlobsOnChain } from './blobs.js';
+import { awaitingChainCheck, confirmBlobsOnChain } from './blobs.js';
 import { expireDecisions } from './expire.js';
 import { pruneExpiredRows } from './prune.js';
 import { RefillError, refillIfNeeded } from './refill.js';
@@ -94,13 +94,14 @@ export function errorCode(error: unknown): string {
  * Owners with work, least recently visited first: never visited before any visited, then the
  * oldest visit, and among equals the oldest work. Work is pending memories (only for an owner
  * with a Walrus Memory account, the only kind the memory step can send), confirmed memories
- * not yet found on chain, pending payments, payments owed an outcome memory, open or asked
+ * not yet found on chain that confirmBlobsOnChain would check at `now` (awaitingChainCheck),
+ * pending payments, payments owed an outcome memory, open or asked
  * decisions, and an allowance, dated by when it was checked or, before that, when the owner
  * joined. Ordering by the visit and not by the work is what lets every owner take a turn: an
  * owner with an allowance always has work, so ordering by work alone served the same
  * LIMITS.jobsOwnersPerTick owners every tick (C21).
  */
-async function ownersWithWork(db: Database): Promise<string[]> {
+async function ownersWithWork(db: Database, now: Date): Promise<string[]> {
   const memoryWork = db
     .select({ ownerId: memories.ownerId, at: sql<Date>`min(${memories.createdAt})`.as('at') })
     .from(memories)
@@ -110,7 +111,7 @@ async function ownersWithWork(db: Database): Promise<string[]> {
   const blobWork = db
     .select({ ownerId: memories.ownerId, at: sql<Date>`min(coalesce(${memories.confirmedAt}, ${memories.createdAt}))`.as('at') })
     .from(memories)
-    .where(and(eq(memories.status, 'confirmed'), isNotNull(memories.blobId), isNull(memories.chainConfirmedAt)))
+    .where(awaitingChainCheck(now))
     .groupBy(memories.ownerId);
   const paymentWork = db
     .select({ ownerId: payments.ownerId, at: sql<Date>`min(${payments.signedAt})`.as('at') })
@@ -148,11 +149,13 @@ async function ownersWithWork(db: Database): Promise<string[]> {
  * LIMITS.jobsOwnersPerTick owners with work, least recently visited first (ownersWithWork), and
  * starts no owner once LIMITS.tickTimeBudgetMs has passed on `now` since the tick began, which
  * sets timeBudgetReached. For each owner, in order:
- * 1. memory (only with a Walrus Memory account): submitPendingMemories, then confirmMemoryJobs;
- *    then, for every owner, confirmBlobsOnChain checks confirmed memories against the owner's
- *    Walrus Blob objects on chain (C18);
+ * 1. memory (only with a Walrus Memory account): submitPendingMemories, then confirmMemoryJobs,
+ *    which is skipped when the submit ended with core's DELEGATE refusal, so that code is
+ *    recorded once per owner per tick; then, for every owner, confirmBlobsOnChain checks
+ *    confirmed memories against the owner's Walrus Blob objects on chain (C18);
  * 2. payments: every payment still 'pending', oldest first, is read once by settlePayment
- *    (tries 1; later ticks are the patience), which checks it against Ellai's own digest (C8);
+ *    (tries 1; later ticks are the patience), which checks it against Ellai's own digest (C8)
+ *    and counts its failed reads on this tick's `now`;
  * 3. outcomes: every 'verified' payment stored as delivered false (never null) whose decision has
  *    no outcome memory yet, oldest first, becomes a delivered=false outcome memory through
  *    recordOutcome, idempotent per decision. That takes in a payment step 2 has just verified
@@ -202,7 +205,7 @@ export async function runJobsTick(args: JobsTickArgs): Promise<JobsTickSummary> 
     summary.rowsPruned += pruned.signinNonces + pruned.sellerSales + pruned.sessions;
   });
 
-  for (const ownerId of await ownersWithWork(db)) {
+  for (const ownerId of await ownersWithWork(db, new Date(startedMs))) {
     if (now().getTime() - startedMs >= LIMITS.tickTimeBudgetMs) {
       summary.timeBudgetReached = true;
       break;
@@ -216,14 +219,23 @@ export async function runJobsTick(args: JobsTickArgs): Promise<JobsTickSummary> 
       if (owner === undefined) return;
 
       if (owner.memwalAccountId !== null) {
+        let keyRefused = false;
         await step(ownerId, 'memory_submit', async () => {
-          summary.memoriesSubmitted += (await submitPendingMemories({ db, ownerId, masterSecretHex, now: now() })).submitted;
+          try {
+            summary.memoriesSubmitted += (await submitPendingMemories({ db, ownerId, masterSecretHex, now: now() })).submitted;
+          } catch (error) {
+            keyRefused = isKeyRefused(error);
+            throw error;
+          }
         });
-        await step(ownerId, 'memory_confirm', async () => {
-          const confirmed = await confirmMemoryJobs({ db, ownerId, masterSecretHex, now: now() });
-          summary.memoriesConfirmed += confirmed.confirmed;
-          summary.memoriesFailed += confirmed.failed;
-        });
+        // The relayer would refuse the same key again, so the confirm step would only record the code twice.
+        if (!keyRefused) {
+          await step(ownerId, 'memory_confirm', async () => {
+            const confirmed = await confirmMemoryJobs({ db, ownerId, masterSecretHex, now: now() });
+            summary.memoriesConfirmed += confirmed.confirmed;
+            summary.memoriesFailed += confirmed.failed;
+          });
+        }
       }
       await step(ownerId, 'blobs', async () => {
         summary.memoriesChainConfirmed += (await confirmBlobsOnChain({ db, chain, ownerId, now: now() })).confirmed;
@@ -238,7 +250,7 @@ export async function runJobsTick(args: JobsTickArgs): Promise<JobsTickSummary> 
           .limit(PAYMENTS_PER_OWNER);
         for (const payment of pending) {
           await step(ownerId, 'payment', async () => {
-            const settled = await settlePayment({ db, ownerId, paymentId: payment.id, chain, tries: 1, intervalMs: LIMITS.settlementPollIntervalMs, sleep });
+            const settled = await settlePayment({ db, ownerId, paymentId: payment.id, chain, tries: 1, intervalMs: LIMITS.settlementPollIntervalMs, sleep, now });
             if (settled === 'verified') summary.paymentsVerified += 1;
             else if (settled === 'not_landed') summary.paymentsNotLanded += 1;
             else if (settled === 'mismatch') summary.paymentsMismatched += 1;

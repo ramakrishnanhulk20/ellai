@@ -264,9 +264,34 @@ describe('clientKey', () => {
   it("takes the first X-Forwarded-For entry on Vercel, and pools anything that is not an address", () => {
     vi.stubEnv('VERCEL', '1');
     expect(clientKey(forwarded(' 203.0.113.9 , 10.0.0.1'))).toBe('203.0.113.9');
-    expect(clientKey(forwarded('2001:DB8::1'))).toBe('2001:db8::1');
-    expect(clientKey(forwarded('not-an-address'))).toBe('unknown');
+    expect(clientKey(forwarded('2001:DB8::1'))).toBe('2001:db8:0:0::/64');
+    for (const junk of ['not-an-address', '01.2.3.4', '[2001:db8::1]', '2001:db8::/64', ':::1', '1:2:3:4:5:6:7:8:9']) {
+      expect(clientKey(forwarded(junk))).toBe('unknown');
+    }
     expect(clientKey(forwarded())).toBe('unknown');
+  });
+
+  it('keys an IPv6 client on its /64, so one host cannot step past a per-client limit by changing address (C22)', () => {
+    vi.stubEnv('VERCEL', '1');
+    const key = (address: string) => clientKey(forwarded(address));
+    expect(key('2001:db8:aa:bb::1')).toBe(key('2001:db8:aa:bb:ffff:ffff:ffff:fffe'));
+    expect(key('2001:db8:aa:bb::1')).toBe('2001:db8:aa:bb::/64');
+    expect(key('2001:db8:aa:bb::1')).not.toBe(key('2001:db8:aa:bc::1'));
+    expect(key('2001:db8::1')).not.toBe(key('2001:db9::1'));
+    // Every spelling of one address: compressed, expanded, upper case, zone, dotted tail.
+    const spellings = ['2001:db8::1', '2001:0db8:0000:0000:0000:0000:0000:0001', '2001:DB8:0:0:0:0:0:1', '2001:db8::1%eth0', '2001:db8::0.0.0.1'];
+    expect(new Set(spellings.map(key))).toEqual(new Set(['2001:db8:0:0::/64']));
+    expect(key('::1')).toBe('0:0:0:0::/64');
+    expect(key('::')).toBe('0:0:0:0::/64');
+  });
+
+  it('keys an IPv4-mapped IPv6 address as the IPv4 address it carries, in either spelling', () => {
+    vi.stubEnv('VERCEL', '1');
+    const key = (address: string) => clientKey(forwarded(address));
+    for (const mapped of ['::ffff:203.0.113.9', '::FFFF:203.0.113.9', '::ffff:cb00:7109', '0:0:0:0:0:ffff:203.0.113.9']) expect(key(mapped)).toBe('203.0.113.9');
+    expect(key('::ffff:203.0.113.9')).toBe(key('203.0.113.9'));
+    // Only the mapped prefix is an IPv4 address; any other bits in front make it IPv6.
+    expect(key('1::ffff:203.0.113.9')).toBe('1:0:0:0::/64');
   });
 });
 

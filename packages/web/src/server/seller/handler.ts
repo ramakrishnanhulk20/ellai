@@ -32,7 +32,6 @@ export const HANDLER_MESSAGES = {
   internal: 'The seller hit an unexpected error.',
 } as const;
 
-const MINUTE_MS = 60_000;
 const MS_PER_SECOND = 1_000;
 const PAYMENT_HEADER = 'x-payment';
 const PAYMENT_RESPONSE_HEADER = 'X-PAYMENT-RESPONSE';
@@ -83,7 +82,8 @@ function requestedAddress(body: string): string | null {
  */
 async function countUnpaid(db: Database, callerKey: string, nowMs: number): Promise<{ allowed: boolean; retryAfterSeconds: number }> {
   if (typeof callerKey !== 'string' || callerKey === '') throw new SellerError('the caller key is missing');
-  const windowStartMs = Math.floor(nowMs / MINUTE_MS) * MINUTE_MS;
+  const minuteMs = LIMITS.rateWindowMinuteMs;
+  const windowStartMs = Math.floor(nowMs / minuteMs) * minuteMs;
   const key = `${RATE_KEY_PREFIX}${createHash('sha256').update(callerKey, 'utf8').digest('hex')}`;
   const [counter] = await db
     .insert(rateCounters)
@@ -93,7 +93,7 @@ async function countUnpaid(db: Database, callerKey: string, nowMs: number): Prom
   if (counter === undefined) throw new SellerError('the rate counter returned no row');
   return {
     allowed: counter.count <= LIMITS.sellerChallengesPerMinute,
-    retryAfterSeconds: Math.max(1, Math.ceil((windowStartMs + MINUTE_MS - nowMs) / MS_PER_SECOND)),
+    retryAfterSeconds: Math.max(1, Math.ceil((windowStartMs + minuteMs - nowMs) / MS_PER_SECOND)),
   };
 }
 
@@ -117,7 +117,7 @@ async function handle(args: Parameters<typeof handleWalletCheck>[0]): Promise<Se
     if (!limit.allowed) return json(429, { error: HANDLER_MESSAGES.rate }, { 'Retry-After': String(limit.retryAfterSeconds) });
     // Client keys cost nothing to vary, so the per-caller count alone never bounds the rows
     // stored or the chain reads.
-    const shared = await consumeShared(db, SHARED_QUOTA, LIMITS.sellerChallengesPerMinuteGlobal, MINUTE_MS, args.now);
+    const shared = await consumeShared(db, SHARED_QUOTA, LIMITS.sellerChallengesPerMinuteGlobal, LIMITS.rateWindowMinuteMs, args.now);
     if (!shared.allowed) return json(429, { error: HANDLER_MESSAGES.busy }, { 'Retry-After': String(shared.retryAfterSeconds) });
     try {
       const challenge = await issueWalletCheckChallenge({ db, chain, resourceUrl: args.url, payTo: args.payTo, now: args.now });
@@ -128,7 +128,9 @@ async function handle(args: Parameters<typeof handleWalletCheck>[0]): Promise<Se
   }
 
   const settled = await settleWalletCheckPayment({ db, chain, paymentHeader: payment.value, resourceUrl: args.url, now: args.now, sleep: args.sleep });
-  if (!settled.ok) return json(settled.status, { error: settled.reason });
+  if (!settled.ok) {
+    return json(settled.status, { error: settled.reason }, settled.retryAfterSeconds === undefined ? {} : { 'Retry-After': String(settled.retryAfterSeconds) });
+  }
   const paid = receipt(settled.digest, settled.payer);
   try {
     return json(200, await walletCheck({ chain, address }), paid);
@@ -149,7 +151,8 @@ async function handle(args: Parameters<typeof handleWalletCheck>[0]): Promise<Se
  * LIMITS.sellerChallengesPerMinuteGlobal in one minute it is 429 with Retry-After too (C22).
  * Otherwise it is a fresh 402 challenge from issueWalletCheckChallenge (503 when one cannot be
  * issued). With
- * X-PAYMENT, settleWalletCheckPayment must take the payment (its 402 or 409 otherwise) before
+ * X-PAYMENT, settleWalletCheckPayment must take the payment (its 402 or 409 otherwise, with
+ * Retry-After on a recheck of a waiting sale that came too soon) before
  * the wallet check is read, waiting with `sleep` between its chain reads when an outcome is
  * unknown; the 200 carries the check as JSON and X-PAYMENT-RESPONSE with the digest. If the
  * check cannot be read after the payment settled, the answer is 502 with the same receipt.

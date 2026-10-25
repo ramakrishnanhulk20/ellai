@@ -1,3 +1,4 @@
+import { LIMITS } from '@ellai/core/limits';
 import { KNOWN_SELLERS, type Seller } from '@ellai/core/sellers';
 
 export interface CatalogEntry {
@@ -17,13 +18,6 @@ const JSON_TYPE = 'application/json';
 const EXAMPLE_ADDRESS = '0x0000000000000000000000000000000000000000000000000000000000000002';
 const API_VERSION_SEGMENT = /^v[0-9]+$/;
 const SLUG = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
-
-/**
- * The per-payment maximum every owner starts with, in atomic USDC: 0.05 USDC. It mirrors the
- * default of owners.per_payment_max_atomic in db/schema.ts. A seller priced above it is refused
- * for every owner who has not raised their own maximum, so it is not offered.
- */
-export const DEFAULT_PER_PAYMENT_MAX_ATOMIC = 50_000n;
 
 const USDC_DECIMALS = 6;
 // Each note in core's list states its price once, as in "0.01 USDC".
@@ -75,11 +69,12 @@ export function documentedPriceAtomic(note: string): bigint | null {
 }
 
 // A price the note does not state clearly is treated as too high, so the agent is never pointed
-// at a seller the gate would refuse at default limits.
+// at a seller the gate would refuse at default limits: one priced above the per-payment maximum
+// every owner starts with is refused for every owner who has not raised it.
 function payableAtDefaults(seller: Seller): boolean {
   if (NOT_OFFERED.has(sameUrl(seller.url))) return false;
   const price = documentedPriceAtomic(seller.note);
-  return price !== null && price <= DEFAULT_PER_PAYMENT_MAX_ATOMIC;
+  return price !== null && price <= BigInt(LIMITS.defaultPerPaymentMaxAtomic);
 }
 
 function walletCheckUrl(appOrigin: string): string {
@@ -93,7 +88,7 @@ function walletCheckUrl(appOrigin: string): string {
  * The only sellers the built-in agent can call (C7, C20): Ellai's own wallet check at
  * appOrigin + /api/sell/wallet-check, then every seller in core's KNOWN_SELLERS with a
  * documented body and content type, with that body as the example, that the gate can pay at
- * default limits: its note states one price of at most DEFAULT_PER_PAYMENT_MAX_ATOMIC, and it
+ * default limits: its note states one price of at most LIMITS.defaultPerPaymentMaxAtomic, and it
  * is not one of the sellers named in NOT_OFFERED (two whose 402 core refuses as MALFORMED, and
  * a subscription). Each id is a slug made from the seller's host and path. The model names an
  * id; the URL, method and content type always come from here. Throws Error when appOrigin is

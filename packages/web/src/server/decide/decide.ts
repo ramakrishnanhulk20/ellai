@@ -16,6 +16,7 @@ import {
   payments,
   questions,
 } from '../db/schema.js';
+import { heldOrSpentAtomic } from '../pay/liability.js';
 import {
   type BadOutcome,
   type DecideFacts,
@@ -86,7 +87,6 @@ interface Request {
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const HEX_32_BYTES = /^[0-9a-f]{64}$/;
-const DAY_MS = 86_400_000;
 const FAILED: RecallResult = { kind: 'failed' };
 
 function bad(message: string): never {
@@ -274,10 +274,8 @@ async function badOutcomes(q: Queryable, r: Request): Promise<BadOutcome[]> {
 
 async function gatherFacts(q: Queryable, r: Request, settings: OwnerSettings, maxPending: number): Promise<Omit<DecideFacts, 'recall'>> {
   const { payment } = r;
-  const [spent] = await q
-    .select({ total: sql<string>`coalesce(sum(${payments.amountAtomic}), 0)::text` })
-    .from(payments)
-    .where(and(eq(payments.ownerId, r.ownerId), gte(payments.signedAt, new Date(r.now.getTime() - DAY_MS)), isNull(payments.releasedAt)));
+  // The same sum signing checks under the owner lock, so decide never approves what signing refuses (C4).
+  const held = await heldOrSpentAtomic(q, r.ownerId, r.now);
 
   // Any status: an answer binds from the moment it is recorded, before its Walrus write lands (C11, C12).
   const refusals = await q
@@ -316,7 +314,7 @@ async function gatherFacts(q: Queryable, r: Request, settings: OwnerSettings, ma
 
   return {
     settings,
-    spentLast24hAtomic: BigInt(spent?.total ?? '0'),
+    heldOrSpentAtomic: held,
     amountAtomic: payment.amount,
     recipient: payment.recipient,
     sellerHost: payment.sellerHost,
@@ -412,8 +410,10 @@ const STATUS_FOR = { approved: 'open', refused: 'refused', asked: 'asked' } as c
  * - Otherwise the facts are read and rules 1 to 6 run. Recall is called only when they
  *   decide nothing, outside any lock, with LIMITS.decideRecallTimeoutMs; a throw, a
  *   timeout, a malformed answer or a hit without a finite distance counts as failed (C12).
- *   A result of LIMITS.decideRecallLimit hits asks only while its farthest hit is inside the
- *   owner's distance cutoff, since only then could the limit have hidden a closer approval.
+ *   A result of LIMITS.decideRecallLimit hits whose farthest hit is inside the owner's distance
+ *   cutoff approves only when the approvals it shows already reach approvalsNeeded, and
+ *   otherwise asks, since the limit can have hidden closer approvals but never a refusal or a
+ *   bad outcome, which are exact lookups (applyRules).
  * - Then, in one transaction that first locks the owner row FOR UPDATE, every fact is read
  *   again and the rules run again, so two decides for one owner can never both spend one
  *   grant or both fit under the daily budget. If that pass needs a recall the first did not

@@ -2,7 +2,7 @@
 // fail-closed recall) with fast-check properties for the three outcomes that must never be
 // "approved"; then decide on PGlite: reuse of a live decision, pending refusals, one-time
 // grants, the agent and purpose checks, which recall hits may count, bad outcomes, the
-// 24-hour budget window and the question cap.
+// daily budget (the 24-hour window and pending payments however old) and the question cap.
 // Does NOT cover: the live Walrus relayer or its ranking (recall is a stub everywhere here),
 // the pay flow that moves an approved decision on, any HTTP or MCP route, or two connections
 // blocking on the owner row lock. PGlite serves one connection and runs one transaction at a
@@ -21,6 +21,7 @@ import { answerQuestion } from '../src/server/decide/answer.js';
 import { type DecideArgs, DecideError, type Recall, decide } from '../src/server/decide/decide.js';
 import { type BadOutcome, type DecideFacts, type RecallHit, type RecallResult, applyRules } from '../src/server/decide/rules.js';
 import { querySentence } from '../src/server/decide/sentences.js';
+import { heldOrSpentAtomic } from '../src/server/pay/liability.js';
 
 const RECIPIENT = `0x${'11'.repeat(32)}`;
 const OTHER_RECIPIENT = `0x${'22'.repeat(32)}`;
@@ -52,7 +53,7 @@ function facts(overrides: Partial<DecideFacts> = {}, settings: Partial<DecideFac
       distanceCutoff: 0.5,
       ...settings,
     },
-    spentLast24hAtomic: 0n,
+    heldOrSpentAtomic: 0n,
     amountAtomic: 10_000n,
     recipient: RECIPIENT,
     sellerHost: 'hotels.example',
@@ -85,7 +86,7 @@ describe('applyRules', () => {
     const everything = facts(
       {
         amountAtomic: 60_000n,
-        spentLast24hAtomic: 495_000n,
+        heldOrSpentAtomic: 495_000n,
         refusalMemoryIds: [refusal],
         badOutcomes: [badOutcome()],
         grantId: randomUUID(),
@@ -98,7 +99,7 @@ describe('applyRules', () => {
       [{}, 'refused', 'paused'],
       [{ settings: { ...everything.settings, paused: false } }, 'refused', 'over_payment_max'],
       [{ amountAtomic: 10_000n }, 'refused', 'over_daily_budget'],
-      [{ spentLast24hAtomic: 0n }, 'refused', 'refused_recipient'],
+      [{ heldOrSpentAtomic: 0n }, 'refused', 'refused_recipient'],
       [{ refusalMemoryIds: [] }, 'asked', 'bad_outcome'],
       [{ badOutcomes: [] }, 'approved', 'grant'],
       [{ grantId: undefined }, 'asked', 'recall_unavailable'],
@@ -163,13 +164,36 @@ describe('applyRules', () => {
     expect(applyRules(facts({ recall: hits([first, { ...first }]) })).rule).toBe('no_match');
   });
 
-  it('asks when recall failed, and when a full result ends inside the cutoff even with enough approvals', () => {
-    expect(applyRules(facts({ recall: { kind: 'failed' } }))).toMatchObject({ outcome: 'asked', rule: 'recall_unavailable' });
-    const three = [approval(), approval(), approval()];
-    for (const cutOffAt of [0.1, 0.4999]) {
-      expect(applyRules(facts({ recall: hits(three, cutOffAt) }))).toMatchObject({ outcome: 'asked', rule: 'recall_unavailable' });
+  const CUT_REASON = 'Ellai found more past answers like this than it can check at once, so it is asking you.';
+
+  it('asks when recall failed, and when a full result ends inside the cutoff with too few approvals in view', () => {
+    expect(applyRules(facts({ recall: { kind: 'failed' } }))).toMatchObject({
+      outcome: 'asked',
+      rule: 'recall_unavailable',
+      reason: 'Ellai could not check your past answers just now, so it is asking you.',
+    });
+    for (const cutOffAt of [0.1, 0.4999, Number.NaN]) {
+      expect(applyRules(facts({ recall: hits([approval()], cutOffAt) }))).toMatchObject({ outcome: 'asked', rule: 'recall_unavailable', reason: CUT_REASON, citedMemoryIds: [] });
+      expect(applyRules(facts({ recall: hits([], cutOffAt) }))).toMatchObject({ outcome: 'asked', rule: 'recall_unavailable', reason: CUT_REASON });
     }
-    expect(applyRules(facts({ recall: hits(three, 1.2) }, { distanceCutoff: Number.NaN })).rule).toBe('recall_unavailable');
+    expect(applyRules(facts({ recall: hits([approval(), approval()], 1.2) }, { distanceCutoff: Number.NaN }))).toMatchObject({
+      rule: 'recall_unavailable',
+      reason: CUT_REASON,
+    });
+    expect(applyRules(facts({ pendingQuestions: 5, maxPending: 5, recall: hits([approval()], 0.1) })).rule).toBe('too_many_pending');
+  });
+
+  it('approves from a full result ending inside the cutoff once the approvals in view reach approvalsNeeded, since hidden hits can only add approvals', () => {
+    const three = [approval(), approval(), approval()];
+    for (const cutOffAt of [0.1, 0.4999, Number.NaN]) {
+      const decided = applyRules(facts({ recall: hits(three, cutOffAt) }, { approvalsNeeded: 3 }));
+      expect(decided).toMatchObject({ outcome: 'approved', rule: 'learned' });
+      expect(decided.citedMemoryIds.sort()).toEqual(three.map((hit) => hit.memoryId).sort());
+      expect(applyRules(facts({ recall: hits(three.slice(1), cutOffAt) }, { approvalsNeeded: 3 })).rule).toBe('recall_unavailable');
+      // A refusal or a bad outcome is found by exact lookup, so no cut result can hide one.
+      expect(applyRules(facts({ recall: hits(three, cutOffAt), refusalMemoryIds: [randomUUID()] })).rule).toBe('refused_recipient');
+      expect(applyRules(facts({ recall: hits(three, cutOffAt), badOutcomes: [badOutcome()] })).rule).toBe('bad_outcome');
+    }
   });
 
   it('runs the rules on a full result whose farthest hit is at or past the cutoff, since every hidden hit is farther still', () => {
@@ -249,7 +273,7 @@ describe('applyRules properties', () => {
       approvalsNeeded: fc.integer({ min: -1, max: 12 }),
       distanceCutoff: fc.double({ min: -1, max: 3 }),
     }),
-    spentLast24hAtomic: fc.bigInt({ min: 0n, max: 5_000_000n }),
+    heldOrSpentAtomic: fc.bigInt({ min: 0n, max: 5_000_000n }),
     amountAtomic: amount,
     recipient: fc.constant(RECIPIENT),
     sellerHost: fc.string(),
@@ -293,12 +317,35 @@ describe('applyRules properties', () => {
     );
   });
 
-  it('never learns from a full result whose farthest hit is inside the cutoff', () => {
+  it('approves from a full result cut inside the cutoff only with approvalsNeeded matching approvals in view, and never past a refusal', () => {
     fc.assert(
-      fc.property(anyFacts, fc.array(hit, { maxLength: 25 }), fc.double({ min: 1e-6, max: 4, noNaN: true }), (f, list, gap) => {
-        const cutOffAt = f.settings.distanceCutoff - gap;
-        return applyRules({ ...f, grantId: undefined, recall: hits(list, cutOffAt) }).rule !== 'learned';
-      }),
+      fc.property(
+        anyFacts,
+        fc.array(hit, { maxLength: 25 }),
+        fc.double({ min: 1e-6, max: 4, noNaN: true }),
+        fc.option(fc.uuid(), { nil: undefined }),
+        (f, list, gap, refusal) => {
+          const cutOffAt = f.settings.distanceCutoff - gap;
+          const refusalMemoryIds = refusal === undefined ? f.refusalMemoryIds : [refusal, ...f.refusalMemoryIds];
+          const decided = applyRules({ ...f, grantId: undefined, refusalMemoryIds, recall: hits(list, cutOffAt) });
+          if (decided.outcome !== 'approved') return true;
+          if (refusalMemoryIds.length > 0) return false;
+          const inView = new Set(
+            list
+              .filter(
+                (h) =>
+                  h.countsAsOwnerDecision &&
+                  h.verdict === 'approve' &&
+                  h.recipient === f.recipient &&
+                  h.amountAtomic >= f.amountAtomic &&
+                  h.distance < f.settings.distanceCutoff,
+              )
+              .map((h) => h.memoryId),
+          );
+          const needed = f.settings.approvalsNeeded;
+          return decided.rule === 'learned' && Number.isInteger(needed) && needed >= 1 && inView.size >= needed;
+        },
+      ),
       runs,
     );
   });
@@ -623,14 +670,22 @@ describe('decide', () => {
     expect(learned).toMatchObject({ outcome: 'approved', rule: 'learned' });
     expect(learned.citedMemoryIds.sort()).toEqual(pair.map((m) => m.id).sort());
 
+    // Cut inside the cutoff: the two approvals in view are enough, and one alone is not.
     const inside = await run(w, { recall: async () => [...at(pair, 0.1), ...at(others, 0.45)], purpose: `${PURPOSE} inside` });
-    expect(inside).toMatchObject({ outcome: 'asked', rule: 'recall_unavailable' });
+    expect(inside).toMatchObject({ outcome: 'approved', rule: 'learned' });
+    expect(inside.citedMemoryIds.sort()).toEqual(pair.map((m) => m.id).sort());
+    const short = await run(w, { recall: async () => [...at(pair.slice(1), 0.1), ...at(others, 0.45), { blobId: hex(16), distance: 0.45 }], purpose: `${PURPOSE} short` });
+    expect(short).toMatchObject({
+      outcome: 'asked',
+      rule: 'recall_unavailable',
+      reason: 'Ellai found more past answers like this than it can check at once, so it is asking you.',
+    });
   });
 
-  it('asks when recall throws, returns a hit without a finite distance, comes back full inside the cutoff, or times out', async () => {
+  it('asks when recall throws, returns a hit without a finite distance, comes back full inside the cutoff short of approvals, or times out', async () => {
     const w = await world();
     const pair = [await approvalMemory(w), await approvalMemory(w)];
-    const full = [...pair, ...Array.from({ length: LIMITS.decideRecallLimit - 2 }, () => ({ blobId: hex(16) }))];
+    const full = [...pair.slice(1), ...Array.from({ length: LIMITS.decideRecallLimit - 1 }, () => ({ blobId: hex(16) }))];
     const failing: Recall[] = [
       async () => {
         throw new Error('relayer down');
@@ -734,16 +789,30 @@ describe('decide', () => {
     expect((await run(w, { recall: recallOf(pair), now: new Date(NOW.getTime() + 60_000) })).rule).toBe('grant');
   });
 
+  const hoursAgo = (hours: number) => new Date(NOW.getTime() - hours * 3_600_000);
+
   it('counts every signed, unreleased payment of the last 24 hours against the daily budget', async () => {
     const w = await world({ dailyBudgetAtomic: 30_000n });
-    const hoursAgo = (hours: number) => new Date(NOW.getTime() - hours * 3_600_000);
     // Delivered, so the only rule these payments can trip is the budget.
     await signedPayment(w, 15_000n, hoursAgo(1), { delivered: true });
     await signedPayment(w, 40_000n, hoursAgo(2), { releasedAt: hoursAgo(1), delivered: true });
-    await signedPayment(w, 40_000n, hoursAgo(25), { delivered: true });
+    await signedPayment(w, 40_000n, hoursAgo(25), { settlement: 'verified', delivered: true });
 
     expect((await run(w, { payment: payment(NOW, { amount: 15_000n }), purpose: `${PURPOSE} fits` })).rule).toBe('no_match');
     expect(await run(w, { payment: payment(NOW, { amount: 15_001n }), purpose: `${PURPOSE} over` })).toMatchObject({
+      outcome: 'refused',
+      rule: 'over_daily_budget',
+    });
+  });
+
+  it('counts a payment signed 25 hours ago that is still pending, exactly as signing does (C4)', async () => {
+    const w = await world({ dailyBudgetAtomic: 30_000n });
+    const { payment: old } = await signedPayment(w, 20_000n, hoursAgo(25), { delivered: true });
+    expect(old.settlement).toBe('pending');
+    expect(await heldOrSpentAtomic(db, w.ownerId, NOW)).toBe(20_000n);
+
+    expect((await run(w, { payment: payment(NOW, { amount: 10_000n }), purpose: `${PURPOSE} fits` })).rule).toBe('no_match');
+    expect(await run(w, { payment: payment(NOW, { amount: 10_001n }), purpose: `${PURPOSE} over` })).toMatchObject({
       outcome: 'refused',
       rule: 'over_daily_budget',
     });

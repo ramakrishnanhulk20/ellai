@@ -45,7 +45,6 @@ export class RefillError extends Error {
 }
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-const DAY_MS = 86_400_000;
 const U32_LIMIT = 2 ** 32;
 const SUI_TYPE = normalizeStructTag(SUI_TYPE_ARG);
 
@@ -107,9 +106,9 @@ interface Ledger {
 }
 
 /**
- * Whether a refill is still pending, every refill sent in the 24 hours before `now` (landed,
- * failed, or not yet known), and the purse balance by Ellai's own records. Payments are counted
- * by owner, since each owner has exactly one purse and pays only from it (C7).
+ * Whether a refill is still pending, every refill sent in the LIMITS.purseRefillWindowMs before
+ * `now` (landed, failed, or not yet known), and the purse balance by Ellai's own records.
+ * Payments are counted by owner, since each owner has exactly one purse and pays only from it (C7).
  */
 async function refillLedger(db: DbHandle, ownerId: string, now: Date): Promise<Ledger> {
   const [pending] = await db
@@ -120,7 +119,7 @@ async function refillLedger(db: DbHandle, ownerId: string, now: Date): Promise<L
   const [sent] = await db
     .select({ n: count() })
     .from(refills)
-    .where(and(eq(refills.ownerId, ownerId), gte(refills.sentAt, new Date(now.getTime() - DAY_MS))));
+    .where(and(eq(refills.ownerId, ownerId), gte(refills.sentAt, new Date(now.getTime() - LIMITS.purseRefillWindowMs))));
   const [refilled] = await db
     .select({ total: sql<string>`coalesce(sum(${refills.amountAtomic}), 0)::text` })
     .from(refills)
@@ -294,8 +293,8 @@ async function resolvePending(
  * 3. The purse's USDC address balance and the chain facts (epoch, gas price, the allowance's
  *    initial shared version, a random nonce) are read before any lock.
  * 4. In one transaction holding the owner row FOR UPDATE: any refill still pending is
- *    'skipped_pending', so two calls can never refill twice; every refill sent in the last 24
- *    hours is counted, and core's refillDecision decides on the larger of the balance read and
+ *    'skipped_pending', so two calls can never refill twice; every refill sent in the last
+ *    LIMITS.purseRefillWindowMs is counted, and core's refillDecision decides on the larger of the balance read and
  *    Ellai's ledger (purseForDecision), 'not_needed' when it says no (C23). The refill is
  *    built with buildRefill, checked with assertRefill, signed by the derived purse and by the
  *    gas wallet as sponsor, and its row is written with the digest of the signed bytes, their

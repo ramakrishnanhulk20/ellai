@@ -1,10 +1,11 @@
+import { LIMITS } from '@ellai/core/limits';
 import { eq } from 'drizzle-orm';
 import { z } from 'zod';
 import { VERDICTS, owners } from '../../../../../../server/db/schema.js';
 import { answerQuestion } from '../../../../../../server/decide/answer.js';
 import { withServerContext } from '../../../../../../server/http/context.js';
 import { HttpError, respond } from '../../../../../../server/http/errors.js';
-import { BODY_CAPS, jsonResponse, readJson } from '../../../../../../server/http/json.js';
+import { jsonResponse, readJson } from '../../../../../../server/http/json.js';
 import { requireSameOrigin } from '../../../../../../server/http/origin.js';
 import { requireOwner } from '../../../../../../server/http/session.js';
 import { ownerDelegate } from '../../../../../../server/memory/delegate.js';
@@ -32,7 +33,7 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
       requireSameOrigin(request, ctx.env.APP_ORIGIN);
       const { ownerId } = await requireOwner(request, ctx);
       const { id } = await params;
-      const { answer, reason } = await readJson(request, body, BODY_CAPS.answer);
+      const { answer, reason } = await readJson(request, body, LIMITS.answerBodyMaxBytes);
       const [owner] = await ctx.db.select({ suiAddress: owners.suiAddress }).from(owners).where(eq(owners.id, ownerId));
       if (owner === undefined) throw new HttpError(401, 'signed_out');
       const { publicKeyHex } = ownerDelegate(ctx.env.ELLAI_MASTER_SECRET, owner.suiAddress);

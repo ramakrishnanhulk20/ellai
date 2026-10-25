@@ -80,7 +80,7 @@ export const TOO_MANY_REQUESTS = { error: 'too_many_requests', message: HTTP_ERR
 
 // The known classes promise fixed text plus values Ellai checked itself. This holds them to
 // it on the way out, since the next reader may be a page or an agent (C17).
-const SAFE_MESSAGE = /^[^\p{Cc}]{1,300}$/u;
+const SAFE_MESSAGE = new RegExp(`^[^\\p{Cc}]{1,${LIMITS.errorMessageMaxChars}}$`, 'u');
 
 /**
  * A refusal the HTTP layer makes itself. The message comes from the code alone, so it can

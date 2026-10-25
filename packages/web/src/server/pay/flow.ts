@@ -47,9 +47,6 @@ export interface PaidFetchArgs {
 
 const HTTP_PAYMENT_REQUIRED = 402;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-// The paid request ends at least this long before the deadline, so storing what the seller did
-// and answering the agent still fit before it.
-const PAID_REQUEST_MARGIN_MS = 10_000;
 
 const REASONS = {
   notAllowed: 'This agent is not allowed to pay for this account.',
@@ -176,11 +173,11 @@ async function afterPayment<T>(step: 'seller_status' | 'settlement' | 'outcome',
 
 /**
  * How long the paid request may wait: the seller's patience, cut so the request ends
- * PAID_REQUEST_MARGIN_MS before the deadline. Null when that leaves less than safeFetch's
+ * LIMITS.paidRequestMarginMs before the deadline. Null when that leaves less than safeFetch's
  * shortest wait, or the clock cannot be read, because then the payment must not be signed.
  */
 function paidWaitMs(sellerUrl: string, deadlineMs: number, now: Date): number | null {
-  const wait = Math.min(paidTimeoutMs(sellerUrl), deadlineMs - now.getTime() - PAID_REQUEST_MARGIN_MS);
+  const wait = Math.min(paidTimeoutMs(sellerUrl), deadlineMs - now.getTime() - LIMITS.paidRequestMarginMs);
   // Written so NaN fails the comparison.
   return wait >= LIMITS.netTimeoutMinMs ? wait : null;
 }
@@ -191,7 +188,7 @@ function paidWaitMs(sellerUrl: string, deadlineMs: number, now: Date): number | 
  * sent would hold the daily budget until its epoch window closed.
  */
 function sendWaitMs(plannedMs: number, deadlineMs: number, now: Date): number {
-  const left = deadlineMs - now.getTime() - PAID_REQUEST_MARGIN_MS;
+  const left = deadlineMs - now.getTime() - LIMITS.paidRequestMarginMs;
   if (!(left >= LIMITS.netTimeoutMinMs)) return LIMITS.netTimeoutMinMs;
   return Math.min(plannedMs, left);
 }
@@ -251,7 +248,7 @@ async function closeDecision(db: Database, ownerId: string, decisionId: string, 
  *    live decision reused for the same request never pays: an asked one comes back as asked,
  *    an approved one is 'failed' because its payment is already under way (C5).
  * 7. The paid request may wait the seller's own patience (paidTimeoutMs), cut so it ends
- *    PAID_REQUEST_MARGIN_MS (10 s) before the deadline. When that leaves less than
+ *    LIMITS.paidRequestMarginMs (10 s) before the deadline. When that leaves less than
  *    LIMITS.netTimeoutMinMs, the result is 'failed' with a fixed reason and the decision is
  *    closed as 'failed' before anything is signed or sent (C21).
  * 8. signForDecision checks the agent is still active, the pause, the per-payment maximum, a

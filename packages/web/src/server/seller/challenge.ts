@@ -127,6 +127,16 @@ async function challengeEpoch(chain: Chain, nowMs: number): Promise<bigint> {
   return (await cache.reading).epoch;
 }
 
+/**
+ * The chain's current epoch from the same cache challengeEpoch keeps, so a seller rechecking a
+ * sale spends no more epoch reads than issuing does (C22). A reading is never later than the
+ * real epoch, since epochs only go up, so a window it shows as closed has closed. Throws as
+ * challengeEpoch does.
+ */
+export function cachedEpoch(chain: Chain, nowMs: number): Promise<bigint> {
+  return challengeEpoch(chain, nowMs);
+}
+
 const Commitment = bcs.struct('EllaiSellerChallenge', {
   domain: bcs.string(),
   nonce: bcs.u32(),

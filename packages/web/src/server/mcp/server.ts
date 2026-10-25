@@ -24,15 +24,6 @@ export interface AgentPrincipal {
   agentId: string;
 }
 
-/**
- * The largest agent request body read, in bytes. A seller body of LIMITS.challengeMaxBytes at up
- * to 6 bytes per byte once escaped as JSON (196,608), a purpose of LIMITS.purposeMaxChars code
- * points at up to 12 bytes each (6,000), a URL of TEXT_CAPS.sellerUrl characters at up to 6
- * (12,288) and a content type come to under 220,000, so no honest request comes near it.
- */
-export const AGENT_BODY_CAP = 262_144;
-// isPlainContentType in paidFetch decides what is forwarded; this only bounds what reaches it.
-const CONTENT_TYPE_MAX_CHARS = 512;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 // Counted as paidFetch and decide count it: trimmed, in code points.
@@ -50,7 +41,8 @@ export const paidFetchInput = z.strictObject({
     .refine((text) => Buffer.byteLength(text, 'utf8') <= LIMITS.challengeMaxBytes, { message: `at most ${LIMITS.challengeMaxBytes} bytes` })
     .describe(`The request body to send with a POST, at most ${LIMITS.challengeMaxBytes} bytes. Leave it out for a GET.`)
     .optional(),
-  contentType: z.string().max(CONTENT_TYPE_MAX_CHARS).describe('The content type of the body, such as application/json.').optional(),
+  // isPlainContentType in paidFetch decides what is forwarded; this only bounds what reaches it.
+  contentType: z.string().max(LIMITS.agentContentTypeMaxChars).describe('The content type of the body, such as application/json.').optional(),
   purpose: z
     .string()
     .refine(purposeFits, { message: `1 to ${LIMITS.purposeMaxChars} characters` })
@@ -59,7 +51,7 @@ export const paidFetchInput = z.strictObject({
 export type PaidFetchInput = z.output<typeof paidFetchInput>;
 
 const checkDecisionInput = z.strictObject({
-  decisionId: z.string().max(64).describe('The decisionId from an earlier paid_fetch answer.'),
+  decisionId: z.string().max(LIMITS.decisionIdMaxChars).describe('The decisionId from an earlier paid_fetch answer.'),
 });
 
 /** paidFetch's result with a flag saying seller.body is the seller's own text (C17). */
@@ -199,11 +191,11 @@ export function createMcpServer(ctx: ServerContext, agent: AgentPrincipal): McpS
  * Answers one MCP Streamable HTTP POST for an authenticated agent, statelessly: a new server
  * and transport for this request alone, closed when it is answered, so no session or agent
  * state outlives it. Answers are plain JSON, never an event stream, and carry no-store and
- * nosniff. The transport refuses a body over AGENT_BODY_CAP with 413 before parsing it.
+ * nosniff. The transport refuses a body over LIMITS.agentBodyMaxBytes with 413 before parsing it.
  */
 export async function handleMcpRequest(request: Request, ctx: ServerContext, agent: AgentPrincipal): Promise<Response> {
   const server = createMcpServer(ctx, agent);
-  const transport = new WebStandardStreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true, maxRequestBodySize: AGENT_BODY_CAP });
+  const transport = new WebStandardStreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true, maxRequestBodySize: LIMITS.agentBodyMaxBytes });
   try {
     await server.connect(transport);
     const answered = await transport.handleRequest(request);

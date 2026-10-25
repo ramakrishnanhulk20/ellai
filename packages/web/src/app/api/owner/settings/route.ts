@@ -6,7 +6,7 @@ import { formatUsdc } from '../../../../server/decide/sentences.js';
 import { withServerContext } from '../../../../server/http/context.js';
 import { HttpError, respond } from '../../../../server/http/errors.js';
 import { jsonResponse, readJson } from '../../../../server/http/json.js';
-import { OWNER_BODY_CAPS, atomicAmountText } from '../../../../server/http/owner-limits.js';
+import { atomicAmountText } from '../../../../server/http/owner-limits.js';
 import { requireSameOrigin } from '../../../../server/http/origin.js';
 import { requireOwner } from '../../../../server/http/session.js';
 
@@ -16,9 +16,6 @@ export const dynamic = 'force-dynamic';
 const MIN_PAYMENT = BigInt(LIMITS.minPaymentAtomic);
 const MAX_PAYMENT = BigInt(LIMITS.maxPaymentAtomic);
 const MAX_DAILY_BUDGET = BigInt(LIMITS.onboardingDailyLimitMaxAtomic);
-// The range the owners table's own check allows.
-const APPROVALS_MIN = 1;
-const APPROVALS_MAX = 10;
 
 const body = z
   .strictObject({
@@ -69,13 +66,13 @@ function boundsProblem(current: Settings, change: Change): string | null {
     return 'The daily budget must be at least the per-payment maximum.';
   }
   const approvals = change.approvalsNeeded;
-  if (approvals !== undefined && (!Number.isSafeInteger(approvals) || approvals < APPROVALS_MIN || approvals > APPROVALS_MAX)) {
-    return `Approvals needed must be a whole number from ${APPROVALS_MIN} to ${APPROVALS_MAX}.`;
+  if (approvals !== undefined && (!Number.isSafeInteger(approvals) || approvals < LIMITS.approvalsNeededMin || approvals > LIMITS.approvalsNeededMax)) {
+    return `Approvals needed must be a whole number from ${LIMITS.approvalsNeededMin} to ${LIMITS.approvalsNeededMax}.`;
   }
   // Checked as the real column will hold it, so a value that rounds to 0 there is refused
   // and what was checked is exactly what is stored.
   const cutoff = change.distanceCutoff === undefined ? undefined : Math.fround(change.distanceCutoff);
-  if (cutoff !== undefined && !(cutoff > 0 && cutoff <= 1)) return 'The distance cutoff must be above 0 and at most 1.';
+  if (cutoff !== undefined && !(cutoff > 0 && cutoff <= LIMITS.distanceCutoffMax)) return `The distance cutoff must be above 0 and at most ${LIMITS.distanceCutoffMax}.`;
   return null;
 }
 
@@ -87,8 +84,9 @@ function boundsProblem(current: Settings, change: Change): string | null {
  * payments and on-chain memories on the public /proof page, and false takes them off at the
  * page's next refresh; owners start with false. The per-payment maximum must be within
  * [LIMITS.minPaymentAtomic, LIMITS.maxPaymentAtomic]; the daily budget within [the per-payment
- * maximum after the change, LIMITS.onboardingDailyLimitMaxAtomic]; approvals needed a whole number from 1 to 10;
- * the distance cutoff above 0 and at most 1. Unpausing leaves an auto pause in place: only
+ * maximum after the change, LIMITS.onboardingDailyLimitMaxAtomic]; approvals needed a whole
+ * number from LIMITS.approvalsNeededMin to LIMITS.approvalsNeededMax; the distance cutoff above 0
+ * and at most LIMITS.distanceCutoffMax. Unpausing leaves an auto pause in place: only
  * clearAutoPause: true clears it, so an owner must acknowledge a settlement mismatch on purpose.
  * The owner row is locked FOR UPDATE for the read, the checks and the one update, so a change
  * cannot interleave with signing, which takes the same lock. The owner comes from the session
@@ -101,7 +99,7 @@ export async function PATCH(request: Request): Promise<Response> {
     withServerContext(async (ctx) => {
       requireSameOrigin(request, ctx.env.APP_ORIGIN);
       const { ownerId } = await requireOwner(request, ctx);
-      const change = await readJson(request, body, OWNER_BODY_CAPS.settings);
+      const change = await readJson(request, body, LIMITS.settingsBodyMaxBytes);
 
       const outcome = await ctx.db.transaction(async (tx) => {
         const [current] = await tx.select(SETTINGS).from(owners).where(eq(owners.id, ownerId)).for('update');

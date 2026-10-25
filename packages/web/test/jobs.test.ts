@@ -33,10 +33,10 @@ import { Ed25519Keypair } from '@mysten/sui/keypairs/ed25519';
 import { TransactionDataBuilder } from '@mysten/sui/transactions';
 import { SUI_TYPE_ARG, normalizeStructTag } from '@mysten/sui/utils';
 import { verifyTransactionSignature } from '@mysten/sui/verify';
-import { and, eq } from 'drizzle-orm';
+import { and, eq, isNull } from 'drizzle-orm';
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { type Database, createDb, migrate } from '../src/server/db/client.js';
-import { agents, decisions, memories, owners, payments, questions, refills, sellerSales, sessions, signinNonces } from '../src/server/db/schema.js';
+import { agents, decisions, memories, owners, payments, questions, rateCounters, refills, sellerSales, sessions, signinNonces } from '../src/server/db/schema.js';
 import { MEMORY_NAMESPACE } from '../src/server/memory/namespace.js';
 import { ownerDelegate } from '../src/server/memory/delegate.js';
 import { recordOutcome } from '../src/server/memory/outcome.js';
@@ -819,6 +819,31 @@ describe('confirmBlobsOnChain', () => {
     await expect(confirmBlobsOnChain({ db: on, chain, ownerId: 'not-a-uuid', now: NOW })).rejects.toThrow('the owner id is not a uuid');
   });
 
+  it('checks only memories confirmed between the minimum and maximum age ago, both ends included, and lists nothing when none is in range', async () => {
+    const on = await freshDb();
+    const w = await world(on);
+    const tooNew = await confirmedMemory(w, 'blob-too-new', ago(LIMITS.blobChainCheckMinAgeMs - 1), on);
+    const newest = await confirmedMemory(w, 'blob-newest', ago(LIMITS.blobChainCheckMinAgeMs), on);
+    const oldest = await confirmedMemory(w, 'blob-oldest', ago(LIMITS.blobChainCheckMaxAgeMs), on);
+    const tooOld = await confirmedMemory(w, 'blob-too-old', ago(LIMITS.blobChainCheckMaxAgeMs + 1), on);
+    const { chain, state, calls } = stubChain(on);
+    state.blobs.set(w.suiAddress, ['blob-too-new', 'blob-newest', 'blob-oldest', 'blob-too-old'].map(blob));
+    const at = async () => Promise.all([tooNew, newest, oldest, tooOld].map((id) => chainConfirmedAt(id, on)));
+
+    expect(await confirmBlobsOnChain({ db: on, chain, ownerId: w.ownerId, now: NOW })).toEqual({ checked: 2, confirmed: 2 });
+    expect(await at()).toEqual([null, NOW, NOW, null]);
+    calls.length = 0;
+    expect(await confirmBlobsOnChain({ db: on, chain, ownerId: w.ownerId, now: NOW })).toEqual({ checked: 0, confirmed: 0 });
+    expect(calls).toEqual([]);
+
+    // A millisecond on, the too-new memory is old enough, and the too-old one stays unchecked for good.
+    const later = new Date(NOW.getTime() + 1);
+    expect(await confirmBlobsOnChain({ db: on, chain, ownerId: w.ownerId, now: later })).toEqual({ checked: 1, confirmed: 1 });
+    expect(await at()).toEqual([later, NOW, NOW, null]);
+    expect(LIMITS.blobChainCheckMaxAgeMs).toBe(3 * 86_400_000);
+    expect(LIMITS.blobChainCheckMinAgeMs).toBe(60_000);
+  });
+
   it('checks at most LIMITS.blobConfirmBatch memories per call, oldest confirmation first', async () => {
     const on = await freshDb();
     const w = await world(on);
@@ -910,6 +935,27 @@ describe('runJobsTick', () => {
     expect([readsOf(notYet.digest), readsOf(failedSeller.digest)]).toEqual([2, 1]);
   });
 
+  it("counts a payment's failed settlement reads on the tick's own clock, not the wall clock", async () => {
+    const on = await freshDb();
+    const w = await world(on);
+    const unreadable = await payment(w, await decision(w, 'paid', ago(120_000), on), { validUntilEpoch: 99n }, on);
+    const stub = stubChain(on);
+    const chain = {
+      ...stub.chain,
+      getTransactionResult: async () => {
+        throw new ChainError('UPSTREAM', 'Tatum getTransactionResult: gateway error', true);
+      },
+    } as Chain;
+    // Years from the wall clock, so a count filed under the wall clock's day cannot pass.
+    const clock = new Date('2031-01-01T12:00:00Z');
+    const tickAt = () => runJobsTick({ db: on, chain, masterSecretHex: MASTER, gasKeypair: GAS, now: () => clock, sleep: noSleep });
+    const counters = () => on.select().from(rateCounters).where(eq(rateCounters.key, `settlement-unreadable:${unreadable.id}`));
+
+    expect(await tickAt()).toMatchObject({ owners: 1, paymentsMismatched: 0, errors: [] });
+    expect(await tickAt()).toMatchObject({ owners: 1, errors: [] });
+    expect(await counters()).toEqual([{ key: `settlement-unreadable:${unreadable.id}`, windowStart: new Date('2031-01-01T00:00:00Z'), count: 2 }]);
+  });
+
   it('records the outcome a paid call failed to record for a verified payment that delivered nothing, exactly once across two ticks', async () => {
     const on = await freshDb();
     const w = await world(on);
@@ -986,16 +1032,66 @@ describe('runJobsTick', () => {
         results: ids.map((id) => (done ? { job_id: id, status: 'done', blob_id: `blob-${id}` } : { job_id: id, status: 'running' })),
       }),
     });
-    const { chain, state } = stubChain(on);
-    expect(await tick(on, chain)).toMatchObject({ owners: 1, memoriesSubmitted: 1, memoriesConfirmed: 0, memoriesFailed: 0, errors: [] });
+    const { chain, state, calls } = stubChain(on);
+    const minutesOn = (minutes: number) =>
+      runJobsTick({ db: on, chain, masterSecretHex: MASTER, gasKeypair: GAS, now: () => new Date(NOW.getTime() + minutes * 60_000), sleep: noSleep });
+    const listings = () => calls.filter((call) => call.startsWith('listOwnedWalrusBlobs')).length;
+    expect(await minutesOn(0)).toMatchObject({ owners: 1, memoriesSubmitted: 1, memoriesConfirmed: 0, memoriesFailed: 0, errors: [] });
     done = true;
-    expect(await tick(on, chain)).toMatchObject({ owners: 1, memoriesSubmitted: 0, memoriesConfirmed: 1, memoriesChainConfirmed: 0, errors: [] });
-    // Confirmed by the relayer but not yet seen on chain, so the owner still has work.
-    expect(await tick(on, chain)).toMatchObject({ owners: 1, memoriesChainConfirmed: 0, errors: [] });
+    expect(await minutesOn(1)).toMatchObject({ owners: 1, memoriesSubmitted: 0, memoriesConfirmed: 1, memoriesChainConfirmed: 0, errors: [] });
+    // Confirmed this tick, too new to be listed yet, so the chain is not asked.
+    expect(listings()).toBe(0);
+    // Confirmed by the relayer a minute ago but not yet seen on chain, so the owner still has work.
+    expect(await minutesOn(2)).toMatchObject({ owners: 1, memoriesChainConfirmed: 0, errors: [] });
     state.blobs.set(w.suiAddress, [blob('blob-job-0')]);
-    expect(await tick(on, chain)).toMatchObject({ owners: 1, memoriesChainConfirmed: 1, errors: [] });
-    expect(await tick(on, chain)).toMatchObject({ owners: 0 });
+    expect(await minutesOn(3)).toMatchObject({ owners: 1, memoriesChainConfirmed: 1, errors: [] });
+    expect(await minutesOn(4)).toMatchObject({ owners: 0 });
+    expect(listings()).toBe(2);
     expect(client.rememberBulk).toHaveBeenCalledTimes(1);
+  });
+
+  it('records a refused delegate key once per owner per tick, skipping the confirm step after the submit met it', async () => {
+    const on = await freshDb();
+    const w = await world(on, { memwalAccountId: randomAddress() });
+    await pendingMemory(w, 'On 2026-10-24 the owner approved a hotel search.', ago(120_000), on);
+    await on.insert(memories).values({
+      ownerId: w.ownerId,
+      kind: 'owner_decision',
+      recipient: RECIPIENT,
+      amountAtomic: PRICE,
+      verdict: 'approve',
+      sellerHost: 'hotels.example',
+      sentence: 'On 2026-10-23 the owner approved a hotel search.',
+      namespace: MEMORY_NAMESPACE,
+      writerPublicKey: ownerDelegate(MASTER, w.suiAddress).publicKeyHex,
+      status: 'pending',
+      jobId: 'job-sent',
+      submittedAt: ago(60_000),
+      createdAt: ago(180_000),
+    });
+    const unauthorized = () => Promise.reject(Object.assign(new Error('unauthorized'), { status: 401 }));
+    const client = relayer({ rememberBulk: unauthorized, getRememberBulkStatus: unauthorized });
+    const { chain } = stubChain(on);
+
+    expect((await tick(on, chain)).errors).toEqual([{ ownerId: w.ownerId, step: 'memory_submit', code: 'MEMORY_DELEGATE' }]);
+    expect(client.rememberBulk).toHaveBeenCalledTimes(1);
+    expect(client.getRememberBulkStatus).not.toHaveBeenCalled();
+
+    // With nothing left to send, the confirm step is the one that meets the refusal, still once.
+    await on.update(memories).set({ status: 'failed' }).where(and(eq(memories.ownerId, w.ownerId), isNull(memories.jobId)));
+    expect((await tick(on, chain)).errors).toEqual([{ ownerId: w.ownerId, step: 'memory_confirm', code: 'MEMORY_DELEGATE' }]);
+    expect(client.getRememberBulkStatus).toHaveBeenCalledTimes(1);
+  });
+
+  it('gives an owner whose only unchecked memory is past the maximum age no blob work and no listing', async () => {
+    const on = await freshDb();
+    const w = await world(on);
+    const old = await confirmedMemory(w, 'blob-old', ago(LIMITS.blobChainCheckMaxAgeMs + 1), on);
+    const { chain, state, calls } = stubChain(on);
+    state.blobs.set(w.suiAddress, [blob('blob-old')]);
+    expect(await tick(on, chain)).toMatchObject({ owners: 0, memoriesChainConfirmed: 0, errors: [] });
+    expect(calls.filter((call) => call.startsWith('listOwnedWalrusBlobs'))).toEqual([]);
+    expect(await chainConfirmedAt(old, on)).toBeNull();
   });
 
   it('records a failing blob listing as the owner\'s blobs step and still runs the owner\'s other steps', async () => {

@@ -6,7 +6,6 @@ import { rateCounters } from '../db/schema.js';
 import { clientKey } from './client.js';
 import { HttpError } from './errors.js';
 
-const MINUTE_MS = 60_000;
 const MS_PER_SECOND = 1_000;
 // Every key is stored as this prefix and a SHA-256, so a row never holds a client address
 // in clear, always fits the column cap, and cannot collide with the seller's own counters.
@@ -20,12 +19,6 @@ export interface SharedTurn {
   /** Whole seconds, at least 1, until the window that was counted ends. */
   retryAfterSeconds: number;
 }
-
-/** Sign-in requests allowed in one fixed minute, for each step (nonce and verify) separately. */
-export const SIGN_IN_RATE_LIMITS = {
-  perClientPerMinute: 10,
-  globalPerMinute: 300,
-} as const;
 
 /**
  * Counts one request against `key` in the fixed window of `windowMs` that holds `now`, and says
@@ -54,9 +47,9 @@ export async function consumeWindow(db: Database, key: string, limit: number, wi
   return counter.count <= limit;
 }
 
-/** consumeWindow over the fixed minute that holds `now`, with the same refusals. */
+/** consumeWindow over the fixed minute (LIMITS.rateWindowMinuteMs) that holds `now`, with the same refusals. */
 export async function consume(db: Database, key: string, perMinute: number, now: Date): Promise<boolean> {
-  return consumeWindow(db, key, perMinute, MINUTE_MS, now);
+  return consumeWindow(db, key, perMinute, LIMITS.rateWindowMinuteMs, now);
 }
 
 /**
@@ -91,14 +84,14 @@ export async function pruneRateCounters(db: Database, now: Date): Promise<number
 }
 
 /**
- * Holds one sign-in step to SIGN_IN_RATE_LIMITS: first for this client, keyed on the address
- * the platform vouches for (C22), then for everyone together. A client already over its own
- * limit is turned away before it can spend the shared one.
+ * Holds one sign-in step to LIMITS.signInRequestsPerMinute for this client, keyed on the address
+ * the platform vouches for (C22), then to LIMITS.signInRequestsPerMinuteGlobal for everyone
+ * together. A client already over its own limit is turned away before it can spend the shared one.
  * Throws HttpError 429 rate_limited when either limit is passed.
  */
 export async function limitSignIn(db: Database, request: Request, step: 'nonce' | 'verify', now: Date): Promise<void> {
-  const ownTurn = await consume(db, `signin:${step}:client:${clientKey(request)}`, SIGN_IN_RATE_LIMITS.perClientPerMinute, now);
-  if (!ownTurn || !(await consume(db, `signin:${step}:global`, SIGN_IN_RATE_LIMITS.globalPerMinute, now))) {
+  const ownTurn = await consume(db, `signin:${step}:client:${clientKey(request)}`, LIMITS.signInRequestsPerMinute, now);
+  if (!ownTurn || !(await consume(db, `signin:${step}:global`, LIMITS.signInRequestsPerMinuteGlobal, now))) {
     throw new HttpError(429, 'rate_limited');
   }
 }

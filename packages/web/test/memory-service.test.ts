@@ -243,6 +243,9 @@ describe('submitPendingMemories', () => {
   });
 
   it('sends each row of a refused write alone on the next pass, so row B is written while row A is refused again', async () => {
+    // A pass makes no more writes than one relayer pacing window holds, so core never sleeps with rows locked.
+    expect(LIMITS.memoryWritesPerPass * LIMITS.memwalBulkPoints).toBeLessThanOrEqual(LIMITS.memwalPointsPerMinute);
+    expect(LIMITS.memoryWritesPerPass).toBe(3);
     const owner = await newOwner();
     const a = await pendingMemory(owner);
     const b = await pendingMemory(owner);
@@ -357,18 +360,20 @@ describe('confirmMemoryJobs', () => {
   });
 
   it('fails only the job whose answer fails its checks, reading each job alone, and asks about no more than the relayer allows per call', async () => {
+    // The relayer's own cap on job ids per status call.
+    expect(LIMITS.memoryJobConfirmBatch).toBe(20);
     const owner = await newOwner();
     const ids: string[] = [];
-    for (let i = 0; i < LIMITS.memwalBulkMaxItems + 2; i++) ids.push(await pendingMemory(owner, { jobId: `job-many-${i}` }));
+    for (let i = 0; i < LIMITS.memoryJobConfirmBatch + 2; i++) ids.push(await pendingMemory(owner, { jobId: `job-many-${i}` }));
     const client = relayer({
       getRememberBulkStatus: async (asked: string[]) => ({
         results: asked.map((id) => (id === 'job-many-3' ? { job_id: id, status: 'done' } : { job_id: id, status: 'running' })),
       }),
     });
-    expect(await confirmMemoryJobs(writer(owner))).toEqual({ confirmed: 0, failed: 1, pending: LIMITS.memwalBulkMaxItems - 1 });
+    expect(await confirmMemoryJobs(writer(owner))).toEqual({ confirmed: 0, failed: 1, pending: LIMITS.memoryJobConfirmBatch - 1 });
     const asked = client.getRememberBulkStatus.mock.calls.map((call) => call[0] as unknown as string[]);
-    expect(asked[0]).toHaveLength(LIMITS.memwalBulkMaxItems);
-    expect(asked.slice(1)).toEqual(ids.slice(0, LIMITS.memwalBulkMaxItems).map((_, i) => [`job-many-${i}`]));
+    expect(asked[0]).toHaveLength(LIMITS.memoryJobConfirmBatch);
+    expect(asked.slice(1)).toEqual(ids.slice(0, LIMITS.memoryJobConfirmBatch).map((_, i) => [`job-many-${i}`]));
     for (const [i, id] of ids.entries()) {
       expect(await row(id)).toMatchObject({ status: i === 3 ? 'failed' : 'pending', blobId: null, jobId: `job-many-${i}` });
     }

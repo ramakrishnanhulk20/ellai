@@ -16,16 +16,19 @@ export interface WriterArgs {
 type MemoryClient = ReturnType<typeof ownerMemoryClient>['client'];
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-// The relayer refuses more than 20 job ids in one status call (MAX_BULK_ITEMS in its
-// services/server/src/types.rs), so one confirmation pass can never check more than that.
-const CONFIRM_BATCH = Math.min(LIMITS.memoryJobConfirmBatch, LIMITS.memwalBulkMaxItems);
 const HTTP_SERVICE_UNAVAILABLE = 503;
-// The bulk writes one pacing window holds. Core paces each client by sleeping, and a pass holds
-// its rows locked while it writes, so a pass never makes more writes than fit without a wait.
-const WRITES_PER_PASS = Math.max(1, Math.floor(LIMITS.memwalPointsPerMinute / LIMITS.memwalBulkPoints));
 // Coarser than the repeat check in core: everything core folds into one space is dropped
 // here, so two sentences core calls repeats always share a key and are never sent together.
 const IGNORED_IN_KEY = /[\s\p{Cc}\p{Cf}]/gu;
+
+/**
+ * True for core's DELEGATE refusal (a 401 or 403 from the relayer): the owner removed Ellai's
+ * delegate key from their account, so every relayer call for them fails the same way until
+ * they add it back.
+ */
+export function isKeyRefused(error: unknown): error is MemoryError {
+  return error instanceof MemoryError && error.code === 'DELEGATE';
+}
 
 function checkArgs(args: WriterArgs): { ownerId: string } {
   if (typeof args.ownerId !== 'string' || !UUID.test(args.ownerId)) throw new MemoryServiceError('BAD_INPUT', 'the owner id is not a uuid');
@@ -94,7 +97,7 @@ async function attemptWrite(client: MemoryClient, watch: ReturnType<typeof watch
     };
   } catch (error) {
     if (watch.state() === 'maybe_stored') return { kind: 'uncertain' };
-    if (error instanceof MemoryError && error.code === 'DELEGATE') return { kind: 'key_refused', error };
+    if (isKeyRefused(error)) return { kind: 'key_refused', error };
     return { kind: 'refused', error, aboutTheRows: error instanceof MemoryError && error.code === 'WRITE' };
   }
 }
@@ -160,8 +163,9 @@ function firstOfEachSentence<T extends { sentence: string }>(rows: T[]): T[] {
  *
  * A row that has never been tried goes in one bulk write with the other untried rows. A row
  * that was in a refused write goes alone, so one row the relayer will never take cannot keep
- * refusing the rest. Rows tried before go first, oldest first, and a pass makes at most as
- * many writes as one relayer pacing window holds. Every attempt adds one to submit_attempts
+ * refusing the rest. Rows tried before go first, oldest first, and a pass makes at most
+ * LIMITS.memoryWritesPerPass writes, what one relayer pacing window holds: core paces each
+ * client by sleeping, and the pass holds its rows locked while it writes. Every attempt adds one to submit_attempts
  * and sets submitted_at to `now`.
  *
  * - Accepted: the job ids are stored.
@@ -216,7 +220,7 @@ export async function submitPendingMemories(args: WriterArgs): Promise<{ submitt
       const live = claimed.filter((row) => row.submitAttempts < LIMITS.memoryWriteMaxAttempts);
       const writes = [...live.filter((row) => row.submitAttempts > 0).map((row) => [row]), firstOfEachSentence(live.filter((row) => row.submitAttempts === 0))]
         .filter((rows) => rows.length > 0)
-        .slice(0, WRITES_PER_PASS);
+        .slice(0, LIMITS.memoryWritesPerPass);
 
       let submitted = 0;
       let uncertain = 0;
@@ -263,8 +267,8 @@ const refusedAnswer = (error: unknown) => error instanceof MemoryError && error.
  * Core refuses a whole status answer when one entry in it fails its checks, so after that
  * refusal each job is read on its own, and a job whose own answer still fails is 'invalid'
  * instead of holding up the others. Any other failure leaves every job not yet read 'unread'
- * and is handed back. Reading alone costs one relayer point per job, at most the relayer's
- * 20 per call, which fits one pacing window with the first read.
+ * and is handed back. Reading alone costs one relayer point per job, at most
+ * LIMITS.memoryJobConfirmBatch, which fits one pacing window with the first read.
  */
 async function readJobs(client: MemoryClient, jobIds: string[]): Promise<{ reads: JobRead[]; error?: unknown }> {
   try {
@@ -287,8 +291,8 @@ async function readJobs(client: MemoryClient, jobIds: string[]): Promise<{ reads
 }
 
 /**
- * Confirms the owner's sent memories: in one transaction, claims up to CONFIRM_BATCH rows
- * (LIMITS.memoryJobConfirmBatch, held to the relayer's 20 job ids per status call) of this
+ * Confirms the owner's sent memories: in one transaction, claims up to
+ * LIMITS.memoryJobConfirmBatch rows (the relayer's limit of job ids per status call) of this
  * owner that are pending and have a job id, oldest first, with FOR UPDATE SKIP LOCKED, and
  * reads them with one checkJobs call, or one per job when core refuses that answer.
  *
@@ -319,7 +323,7 @@ export async function confirmMemoryJobs(args: WriterArgs): Promise<{ confirmed: 
         .from(memories)
         .where(and(eq(memories.ownerId, ownerId), eq(memories.status, 'pending'), isNotNull(memories.jobId)))
         .orderBy(asc(memories.createdAt), asc(memories.id))
-        .limit(CONFIRM_BATCH)
+        .limit(LIMITS.memoryJobConfirmBatch)
         .for('update', { skipLocked: true });
       const rows = sent.flatMap((row) => (row.jobId === null ? [] : [{ ...row, jobId: row.jobId }]));
       if (rows.length === 0) return { counts: { confirmed: 0, failed: 0, pending: 0 } };
@@ -328,7 +332,7 @@ export async function confirmMemoryJobs(args: WriterArgs): Promise<{ confirmed: 
         client,
         rows.map((row) => row.jobId),
       );
-      if (error instanceof MemoryError && error.code === 'DELEGATE') throw error;
+      if (isKeyRefused(error)) throw error;
 
       const pastAge = (row: (typeof rows)[number]) => now.getTime() - (row.submittedAt ?? row.createdAt).getTime() >= LIMITS.memoryJobMaxAgeMs;
       const done: Array<{ id: string; blobId: string }> = [];

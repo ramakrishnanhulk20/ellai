@@ -13,19 +13,6 @@ import { AGENT_SYSTEM_PROMPT } from './prompt.js';
 
 /** The cheapest model that does the job (6n). */
 export const AGENT_MODEL = 'claude-haiku-5-5';
-/**
- * Retries the model client makes after a failed request. One, not the SDK's two: the owner is
- * waiting on the page, and a second failure in a row is reported rather than waited out. The
- * SDK's timeout applies to each try, so with this retry one request can take twice its timeout
- * plus the SDK's wait between tries; runAgentTask asks for no retry when two tries would not
- * fit before the run's deadline.
- */
-export const AGENT_MODEL_RETRIES = 1;
-/** Less of the run than this left, and no model request or paid call is started. */
-export const RUN_MIN_LEFT_MS = 20_000;
-// Every model request ends at least this long before the run's deadline, so the answer still
-// reaches the owner inside the route's time.
-const RUN_MARGIN_MS = 10_000;
 export const BUILTIN_AGENT_LABEL = 'Built-in agent';
 
 export type AgentRunStatus = 'done' | 'needs_key' | 'stopped' | 'limit' | 'refused';
@@ -96,8 +83,7 @@ export class AgentTaskError extends Error {
 }
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-const HOUR_MS = 3_600_000;
-const DAY_MS = 86_400_000;
+// At least the 32 bytes tokens.ts demands of a session secret.
 const SECRET_BYTES = 32;
 
 const listSellersInput = z.strictObject({});
@@ -141,11 +127,11 @@ async function countRun(db: Database, key: string, windowMs: number, limit: numb
 
 // The owner's own limit is checked first, so an owner already over it cannot spend the shared one.
 async function runLimit(db: Database, ownerId: string, now: Date): Promise<string | null> {
-  if (!(await countRun(db, `agent-run-owner:${ownerId}`, HOUR_MS, LIMITS.agentRunsPerOwnerPerHour, now))) {
+  if (!(await countRun(db, `agent-run-owner:${ownerId}`, LIMITS.rateWindowHourMs, LIMITS.agentRunsPerOwnerPerHour, now))) {
     console.warn('[ellai agent] run_limit owner');
     return AGENT_ANSWERS.ownerLimit;
   }
-  if (!(await countRun(db, 'agent-run-all', DAY_MS, LIMITS.agentRunsPerDay, now))) {
+  if (!(await countRun(db, 'agent-run-all', LIMITS.rateWindowDayMs, LIMITS.agentRunsPerDay, now))) {
     console.warn('[ellai agent] run_limit all');
     return AGENT_ANSWERS.globalLimit;
   }
@@ -203,23 +189,25 @@ function toolsFor(catalog: ReadonlyArray<CatalogEntry>): Anthropic.Tool[] {
   ];
 }
 
-/** True while at least RUN_MIN_LEFT_MS of the run is left. Written so an unreadable clock (NaN) is false. */
+/** True while at least LIMITS.agentRunMinLeftMs of the run is left. Written so an unreadable clock (NaN) is false. */
 function timeLeft(deadlineAt: number, now: Date): boolean {
-  return deadlineAt - now.getTime() >= RUN_MIN_LEFT_MS;
+  return deadlineAt - now.getTime() >= LIMITS.agentRunMinLeftMs;
 }
 
 /**
  * How the next model request is held to the run's deadline: each try waits the smaller of
- * LIMITS.agentModelTimeoutMs and the time left less RUN_MARGIN_MS, the retry is dropped when two
- * tries would not fit in that, and the signal ends the request, the SDK's wait between tries
- * included, at that point whatever the API's retry-after asks for. Null when too little is left.
+ * LIMITS.agentModelTimeoutMs and the time left less LIMITS.agentModelMarginMs. The SDK's timeout
+ * is per try, so with LIMITS.agentModelRetries one request could take twice it plus the SDK's
+ * wait between tries; the retry is dropped when two tries would not fit, and the signal ends
+ * the request at that point, the wait between tries included, whatever the API's retry-after
+ * asks for. Null when too little is left.
  */
 function modelRequestOptions(deadlineAt: number, now: Date): { timeout: number; maxRetries: number; signal: AbortSignal } | null {
   if (!timeLeft(deadlineAt, now)) return null;
   // The SDK takes only whole milliseconds.
-  const budget = Math.floor(deadlineAt - now.getTime() - RUN_MARGIN_MS);
+  const budget = Math.floor(deadlineAt - now.getTime() - LIMITS.agentModelMarginMs);
   const timeout = Math.min(LIMITS.agentModelTimeoutMs, budget);
-  return { timeout, maxRetries: 2 * timeout <= budget ? AGENT_MODEL_RETRIES : 0, signal: AbortSignal.timeout(budget) };
+  return { timeout, maxRetries: 2 * timeout <= budget ? LIMITS.agentModelRetries : 0, signal: AbortSignal.timeout(budget) };
 }
 
 function textOf(message: Anthropic.Message): string {
@@ -320,9 +308,9 @@ async function runTool(
  *
  * The run has one deadline, LIMITS.paidFetchDeadlineMs after it starts (C21). Every paid call
  * gets it as `deadlineAt`, so paidFetch answers by then. Every model request waits at most the
- * smaller of LIMITS.agentModelTimeoutMs and the time left less 10 s, with no retry when two such
- * tries would not fit, and is aborted, retry wait included, at that point. With less than
- * RUN_MIN_LEFT_MS left, no model request or paid call is started: the run ends 'stopped' with
+ * smaller of LIMITS.agentModelTimeoutMs and the time left less LIMITS.agentModelMarginMs, with no
+ * retry when two such tries would not fit, and is aborted, retry wait included, at that point.
+ * With less than LIMITS.agentRunMinLeftMs left, no model request or paid call is started: the run ends 'stopped' with
  * AGENT_ANSWERS.outOfTime, or with the halted answer when a payment was already asked or refused.
  *
  * `steps` lists every call that reached the gate, with Ellai's outcome, reason and digest.

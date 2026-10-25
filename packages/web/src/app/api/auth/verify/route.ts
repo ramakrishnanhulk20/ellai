@@ -1,9 +1,10 @@
+import { LIMITS } from '@ellai/core/limits';
 import { z } from 'zod';
 import { sessionCookie } from '../../../../server/auth/sessions.js';
 import { completeSignIn } from '../../../../server/auth/signin.js';
 import { withServerContext } from '../../../../server/http/context.js';
 import { respond } from '../../../../server/http/errors.js';
-import { BODY_CAPS, jsonResponse, readJson } from '../../../../server/http/json.js';
+import { jsonResponse, readJson } from '../../../../server/http/json.js';
 import { requireSameOrigin } from '../../../../server/http/origin.js';
 import { limitSignIn } from '../../../../server/http/ratelimit.js';
 import { cookieIsSecure } from '../../../../server/http/session.js';
@@ -13,7 +14,7 @@ export const dynamic = 'force-dynamic';
 
 // completeSignIn refuses any message longer than the ones it issues; these bounds only keep
 // a hostile body from reaching it at all.
-const body = z.strictObject({ message: z.string().max(1_024), signature: z.string().max(16_384) });
+const body = z.strictObject({ message: z.string().max(LIMITS.signinMessageMaxChars), signature: z.string().max(LIMITS.signinSignatureMaxChars) });
 
 /**
  * Finishes a wallet sign-in: { message, signature } in, { ownerId } out, with the session
@@ -36,7 +37,7 @@ export async function POST(request: Request): Promise<Response> {
       requireSameOrigin(request, ctx.env.APP_ORIGIN);
       const now = ctx.now();
       await limitSignIn(ctx.db, request, 'verify', now);
-      const { message, signature } = await readJson(request, body, BODY_CAPS.verify);
+      const { message, signature } = await readJson(request, body, LIMITS.signinVerifyBodyMaxBytes);
       const signedIn = await completeSignIn({
         db: ctx.db,
         message,

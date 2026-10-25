@@ -1,9 +1,10 @@
+import { LIMITS } from '@ellai/core/limits';
 import { z } from 'zod';
 import { TEXT_CAPS } from '../../../../../server/db/schema.js';
 import { withServerContext } from '../../../../../server/http/context.js';
 import { respond } from '../../../../../server/http/errors.js';
 import { jsonResponse, readJson } from '../../../../../server/http/json.js';
-import { OWNER_BODY_CAPS, limitOwnerChainReads, onboardingChainFailure } from '../../../../../server/http/owner-limits.js';
+import { limitOwnerChainReads, onboardingChainFailure } from '../../../../../server/http/owner-limits.js';
 import { requireSameOrigin } from '../../../../../server/http/origin.js';
 import { requireOwner } from '../../../../../server/http/session.js';
 import { confirmOnboardingTx } from '../../../../../server/onboarding/confirm.js';
@@ -32,7 +33,7 @@ export async function POST(request: Request): Promise<Response> {
       const { ownerId } = await requireOwner(request, ctx);
       const limited = await limitOwnerChainReads(ctx, ownerId);
       if (limited !== null) return limited;
-      const { step, digest } = await readJson(request, body, OWNER_BODY_CAPS.onboardingConfirm);
+      const { step, digest } = await readJson(request, body, LIMITS.onboardingConfirmBodyMaxBytes);
       try {
         const { recorded } = await confirmOnboardingTx({ db: ctx.db, ownerId, step, digest, chain: ctx.chain, masterSecretHex: ctx.env.ELLAI_MASTER_SECRET, now: ctx.now() });
         return jsonResponse({ recorded });
