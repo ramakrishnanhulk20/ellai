@@ -21,5 +21,7 @@ reference/
 node_modules/
 .next/
 .next-verify/
+# Next rewrites this on every switch between next dev and next build
+next-env.d.ts
 dist/
 coverage/
