@@ -15,6 +15,13 @@
       "when": 1792924920591,
       "tag": "0001_outgoing_ronan",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1792937269288,
+      "tag": "0002_rapid_major_mapleleaf",
+      "breakpoints": true
     }
   ]
 }

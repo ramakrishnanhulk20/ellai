@@ -192,6 +192,12 @@ function useGrant(grant: Grant, decision: Decision, ownerId: string = grant.owne
 const MIGRATIONS_FOLDER = fileURLToPath(new URL('../src/server/db/migrations', import.meta.url));
 const ADDED_IN_0001 = ['agents_one_live_builtin_per_owner', 'decisions_owner_created_at_idx', 'memories_owner_created_at_idx'];
 
+/** Every migration the folder holds, so a later migration never breaks the step tests. */
+async function journalLength(): Promise<number> {
+  const journal = JSON.parse(await readFile(join(MIGRATIONS_FOLDER, 'meta', '_journal.json'), 'utf8')) as { entries: unknown[] };
+  return journal.entries.length;
+}
+
 /**
  * A fresh database migrated through 0000 alone, from a copy of the folder whose journal stops
  * there, so it is exactly what a database migrated before 0001 existed looks like.
@@ -285,7 +291,7 @@ describe('migrations', () => {
       await migrate(stepped.db);
       const after = await migrationFacts(stepped.db);
       expect(after).toEqual(await migrationFacts(db));
-      expect(after.applied).toBe(2);
+      expect(after.applied).toBe(await journalLength());
       expect(after.refillEpoch).toEqual([{ data_type: 'bigint', is_nullable: 'YES' }]);
       expect(after.indexes.map((index) => index.indexname)).toEqual(ADDED_IN_0001);
       expect(after.indexes.map((index) => index.indexdef)).toEqual([
@@ -326,8 +332,15 @@ describe('migrations', () => {
       expect(before.map((rowsOfTable) => rowsOfTable.length)).toEqual([1, 2, 1, 1, 1, 1]);
 
       await migrate(on);
-      expect((await migrationFacts(on)).applied).toBe(2);
-      expect(await Promise.all(tables.map((table) => everyRow(on, table)))).toEqual(before);
+      expect((await migrationFacts(on)).applied).toBe(await journalLength());
+      // Later migrations add columns; every column a row had before must hold the same value after.
+      const parsed = (tablesRows: unknown[][]) => tablesRows.map((rowsOfTable) => rowsOfTable.map((row) => JSON.parse(String(row)) as Record<string, unknown>));
+      const beforeRows = parsed(before);
+      const afterRows = parsed(await Promise.all(tables.map((table) => everyRow(on, table))));
+      const asBefore = afterRows.map((rowsOfTable, i) =>
+        rowsOfTable.map((row, j) => Object.fromEntries(Object.keys(beforeRows[i]?.[j] ?? {}).map((key) => [key, row[key]]))),
+      );
+      expect(asBefore).toEqual(beforeRows);
       expect(await on.select({ validUntilEpoch: refills.validUntilEpoch, status: refills.status }).from(refills)).toEqual([{ validUntilEpoch: null, status: 'pending' }]);
 
       const builtin = () => on.insert(agents).values({ ownerId, label: 'Second demo agent', kind: 'builtin', tokenHash: hex(32), tokenPrefix: 'ellai_agent_' });

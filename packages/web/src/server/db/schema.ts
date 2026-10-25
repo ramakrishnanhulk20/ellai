@@ -124,6 +124,10 @@ export const owners = pgTable(
     distanceCutoff: real('distance_cutoff').notNull().default(0.5),
     paused: boolean('paused').notNull().default(false),
     autoPausedReason: text('auto_paused_reason'),
+    // The proof page names an owner's payments only with their say, since each digest leads to their wallet.
+    publicProof: boolean('public_proof').notNull().default(false),
+    // The jobs tick visits owners least recently visited first, so no owner waits behind the earliest ones.
+    lastTickedAt: at('last_ticked_at'),
     createdAt: createdAt(),
   },
   (t) => [
@@ -260,8 +264,12 @@ export const memories = pgTable(
     jobId: text('job_id'),
     blobId: text('blob_id').unique(),
     status: text('status', { enum: MEMORY_STATUSES }).notNull().default('pending'),
+    submitAttempts: integer('submit_attempts').notNull().default(0),
+    submittedAt: at('submitted_at'),
     createdAt: createdAt(),
     confirmedAt: at('confirmed_at'),
+    // Set only after the blob id was found among the owner's Walrus Blob objects on chain.
+    chainConfirmedAt: at('chain_confirmed_at'),
   },
   (t) => [
     unique('memories_id_owner_id_unique').on(t.id, t.ownerId),
