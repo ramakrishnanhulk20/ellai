@@ -72,6 +72,8 @@ export const TEXT_CAPS = {
   namespace: 64,
   relayerId: 128,
   rateKey: 200,
+  /** A GraphQL page cursor is opaque; Sui's are base64 well under this. */
+  pageCursor: 512,
 } as const;
 
 const RESTRICT = { onDelete: 'restrict' } as const;
@@ -128,10 +130,14 @@ export const owners = pgTable(
     publicProof: boolean('public_proof').notNull().default(false),
     // The jobs tick visits owners least recently visited first, so no owner waits behind the earliest ones.
     lastTickedAt: at('last_ticked_at'),
+    // Where the chain check of this owner's Walrus Blob objects stopped, since one tick reads a
+    // bounded number of pages and anyone can send Blob objects to an address.
+    blobScanCursor: text('blob_scan_cursor'),
     createdAt: createdAt(),
   },
   (t) => [
     check('owners_approvals_needed_range', sql`${t.approvalsNeeded} between 1 and 10`),
+    maxLength('owners_blob_scan_cursor_length', t.blobScanCursor, TEXT_CAPS.pageCursor),
     check('owners_distance_cutoff_range', sql`${t.distanceCutoff} > 0 and ${t.distanceCutoff} <= 2`),
     maxLength('owners_sui_address_length', t.suiAddress, TEXT_CAPS.suiId),
     maxLength('owners_memwal_account_id_length', t.memwalAccountId, TEXT_CAPS.suiId),
@@ -140,23 +146,33 @@ export const owners = pgTable(
   ],
 );
 
-export const signinNonces = pgTable('signin_nonces', {
-  nonce: text('nonce').primaryKey(),
-  createdAt: createdAt(),
-  expiresAt: at('expires_at').notNull(),
-  usedAt: at('used_at'),
-});
+// Anonymous callers can fill these three tables up to the global caps, so pruning finds expired
+// rows through an index instead of sorting the table.
+export const signinNonces = pgTable(
+  'signin_nonces',
+  {
+    nonce: text('nonce').primaryKey(),
+    createdAt: createdAt(),
+    expiresAt: at('expires_at').notNull(),
+    usedAt: at('used_at'),
+  },
+  (t) => [index('signin_nonces_expires_at_idx').on(t.expiresAt)],
+);
 
-export const sessions = pgTable('sessions', {
-  id: uuid('id').primaryKey().defaultRandom(),
-  ownerId: uuid('owner_id')
-    .notNull()
-    .references(() => owners.id, RESTRICT),
-  tokenHash: text('token_hash').notNull().unique(),
-  createdAt: createdAt(),
-  expiresAt: at('expires_at').notNull(),
-  revokedAt: at('revoked_at'),
-});
+export const sessions = pgTable(
+  'sessions',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    ownerId: uuid('owner_id')
+      .notNull()
+      .references(() => owners.id, RESTRICT),
+    tokenHash: text('token_hash').notNull().unique(),
+    createdAt: createdAt(),
+    expiresAt: at('expires_at').notNull(),
+    revokedAt: at('revoked_at'),
+  },
+  (t) => [index('sessions_expires_at_idx').on(t.expiresAt)],
+);
 
 export const agents = pgTable(
   'agents',
@@ -395,11 +411,18 @@ export const payments = pgTable(
     settlement: text('settlement', { enum: SETTLEMENTS }).notNull().default('pending'),
     verifiedAt: at('verified_at'),
     mismatchReason: text('mismatch_reason'),
+    // When this payment's delivery or settlement was last written, so an owner's yes clears a
+    // bad outcome only if the question came after the owner could have seen it (C32).
+    outcomeAt: at('outcome_at').notNull().defaultNow(),
+    // Separate settlement passes whose read failed after the window closed; kept on the row so
+    // the count outlives however long the tick takes to come back to this owner (C8, C21).
+    settlementFailedReads: integer('settlement_failed_reads').notNull().default(0),
   },
   (t) => [
     sameOwner('payments_decision_same_owner_fk', [t.decisionId, t.ownerId], [decisions.id, decisions.ownerId]),
     index('payments_owner_signed_at_idx').on(t.ownerId, t.signedAt),
     positive('payments_amount_positive', t.amountAtomic),
+    check('payments_settlement_failed_reads_nonnegative', sql`${t.settlementFailedReads} >= 0`),
     oneOf('payments_settlement_known', t.settlement, SETTLEMENTS),
     maxLength('payments_recipient_length', t.recipient, TEXT_CAPS.suiId),
     maxLength('payments_mismatch_reason_length', t.mismatchReason, TEXT_CAPS.mismatchReason),
@@ -445,6 +468,7 @@ export const sellerSales = pgTable(
     status: text('status', { enum: SALE_STATUSES }).notNull().default('issued'),
   },
   (t) => [
+    index('seller_sales_expires_at_idx').on(t.expiresAt),
     oneOf('seller_sales_status_known', t.status, SALE_STATUSES),
     maxLength('seller_sales_payer_length', t.payer, TEXT_CAPS.suiId),
     maxLength('seller_sales_digest_length', t.digest, TEXT_CAPS.digest),

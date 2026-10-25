@@ -22,6 +22,13 @@
       "when": 1792937269288,
       "tag": "0002_rapid_major_mapleleaf",
       "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "7",
+      "when": 1792942300865,
+      "tag": "0003_adorable_the_hand",
+      "breakpoints": true
     }
   ]
 }
