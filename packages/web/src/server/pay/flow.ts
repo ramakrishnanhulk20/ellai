@@ -1,9 +1,9 @@
 import { createHash } from 'node:crypto';
 import { type Chain, ChainError } from '@ellai/core/chain';
-import { type CanonicalPayment, ChallengeError, type Dialect, parseChallenge } from '@ellai/core/challenge';
+import { type CanonicalPayment, ChallengeError, parseChallenge } from '@ellai/core/challenge';
 import { LIMITS } from '@ellai/core/limits';
 import { NetError, type SafeRequest, type SafeResponse, type safeFetch } from '@ellai/core/net';
-import { PaymentError, paymentHeader } from '@ellai/core/payment';
+import { PaymentError, checkPayable, paymentHeader } from '@ellai/core/payment';
 import { and, eq, inArray, isNull } from 'drizzle-orm';
 import type { Database } from '../db/client.js';
 import { SELLER_METHODS, TEXT_CAPS, agents, decisions, memories, owners, payments } from '../db/schema.js';
@@ -47,9 +47,6 @@ export interface PaidFetchArgs {
 
 const HTTP_PAYMENT_REQUIRED = 402;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-// The one dialect core's signPayment and paymentHeader accept. Any other is refused before
-// decide, so the owner is never asked about a payment Ellai would then refuse to make.
-const PAYABLE_DIALECT: Dialect = 'x402-v1-t2000';
 // The paid request ends at least this long before the deadline, so storing what the seller did
 // and answering the agent still fit before it.
 const PAID_REQUEST_MARGIN_MS = 10_000;
@@ -77,6 +74,8 @@ interface SignRefusalAnswer {
 }
 
 const SIGN_REFUSALS: Record<Exclude<SignRefusal, 'over_payment_max'>, SignRefusalAnswer> = {
+  // The same answer loadParty gives a revoked agent, so it learns nothing from when it was revoked (C13).
+  agent_revoked: { outcome: 'refused', status: 'refused', reason: REASONS.notAllowed },
   // decide's own sentence for its paused rule, so the agent reads one reason whichever check caught it.
   paused: { outcome: 'refused', status: 'refused', reason: 'Automatic payments are paused for this account.' },
   over_daily_budget: { outcome: 'refused', status: 'refused', reason: 'This payment would take the last 24 hours past your daily budget.' },
@@ -240,8 +239,10 @@ async function closeDecision(db: Database, ownerId: string, decisionId: string, 
  * 2. The unpaid request goes through deps.fetch (safeFetch, C20). A NetError is 'failed'.
  * 3. Any answer but 402 is 'free': the answer goes back and no decision is recorded.
  * 4. parseChallenge reads the 402 into one canonical payment; a ChallengeError is 'refused'
- *    with no decision recorded (C1, C3). So is a payment in any dialect but x402-v1-t2000,
- *    the only one Ellai can sign.
+ *    with no decision recorded (C1, C3). So is a payment core's checkPayable refuses: any
+ *    dialect but x402-v1-t2000, the only one Ellai can sign, or a payment that lacks the t2000
+ *    binding fields or carries an epoch window Sui would refuse, so the owner is never asked
+ *    about a payment Ellai would then refuse to sign.
  * 5. When this owner already signed the same request (same request key) and that payment may
  *    still be under way (see paymentInFlight), the result is 'failed' and neither decide nor
  *    signing runs (C5).
@@ -253,12 +254,13 @@ async function closeDecision(db: Database, ownerId: string, decisionId: string, 
  *    PAID_REQUEST_MARGIN_MS (10 s) before the deadline. When that leaves less than
  *    LIMITS.netTimeoutMinMs, the result is 'failed' with a fixed reason and the decision is
  *    closed as 'failed' before anything is signed or sent (C21).
- * 8. signForDecision checks the pause, the per-payment maximum, a payment already under way for
- *    the same request (step 5's check again) and the budget under the owner lock and signs at
- *    that moment (C4, C5, C6, C7, C8). A refusal there, or a chain or build failure, is
- *    'refused' (paused or over the maximum, with decide's own reasons for those rules, or over
- *    the daily budget) or 'failed' (a payment already in progress gets step 5's reason), and the
- *    decision is closed as 'refused' or 'failed' so the request can be decided again.
+ * 8. signForDecision checks the agent is still active, the pause, the per-payment maximum, a
+ *    payment already under way for the same request (step 5's check again) and the budget under
+ *    the owner lock and signs at that moment (C4, C5, C6, C7, C8, C13). A refusal there, or a
+ *    chain or build failure, is 'refused' (a revoked agent, with step 1's reason; paused or over
+ *    the maximum, with decide's own reasons for those rules; or over the daily budget) or
+ *    'failed' (a payment already in progress gets step 5's reason), and the decision is closed
+ *    as 'refused' or 'failed' so the request can be decided again.
  * 9. The paid request is the same request plus the payment header, with step 7's wait measured
  *    again after signing and never below LIMITS.netTimeoutMinMs. Its status, or null when it
  *    never answered, is stored with the payment, and so is delivered: true for a 2xx answer,
@@ -304,7 +306,12 @@ export async function paidFetch(args: PaidFetchArgs): Promise<PaidFetchResult> {
     if (error instanceof ChallengeError) return bare('refused', `Ellai could not read this seller's price safely (${error.code}).`);
     throw error;
   }
-  if (payment.dialect !== PAYABLE_DIALECT) return bare('refused', REASONS.dialect);
+  try {
+    checkPayable(payment);
+  } catch (error) {
+    if (!(error instanceof PaymentError)) throw error;
+    return bare('refused', error.code === 'UNSUPPORTED_DIALECT' ? REASONS.dialect : `Ellai cannot pay this kind of payment request (${error.code}).`);
+  }
   const bodyHash = createHash('sha256')
     .update(request.body ?? '', 'utf8')
     .digest('hex');
@@ -347,7 +354,7 @@ export async function paidFetch(args: PaidFetchArgs): Promise<PaidFetchResult> {
 
   let signing: SignResult;
   try {
-    signing = await signForDecision({ db, ownerId, decisionId, payment, masterSecretHex: args.secrets.masterSecretHex, chain: deps.chain, now: deps.now() });
+    signing = await signForDecision({ db, ownerId, decisionId, payment, masterSecretHex: args.secrets.masterSecretHex, chain: deps.chain, now: deps.now });
   } catch (error) {
     // A throw means the signing transaction never committed, so no payment exists and the
     // decision can be closed. A failure to close it must not hide the first error.
@@ -400,6 +407,7 @@ export async function paidFetch(args: PaidFetchArgs): Promise<PaidFetchResult> {
         tries: LIMITS.settlementInlineTries,
         intervalMs: LIMITS.settlementInlineIntervalMs,
         sleep: bounded.sleep,
+        now: deps.now,
       }),
     )) ?? 'pending';
   // A normal paid call is already on chain and in payments; only a bad one becomes a memory,

@@ -5,14 +5,24 @@ import { LIMITS } from '@ellai/core/limits';
 import { PaymentError, type SignedPayment, signPayment } from '@ellai/core/payment';
 import { KNOWN_SELLERS } from '@ellai/core/sellers';
 import { normalizeStructTag } from '@mysten/sui/utils';
-import { and, eq, gt, gte, isNull, ne, sql } from 'drizzle-orm';
+import { and, eq, gt, ne, or } from 'drizzle-orm';
 import type { Database } from '../db/client.js';
-import { decisions, owners, payments } from '../db/schema.js';
+import { agents, decisions, owners, payments } from '../db/schema.js';
+import { heldOrSpentAtomic } from './liability.js';
 
 /** The database, or a transaction open on it. */
 export type DbHandle = Database | Parameters<Parameters<Database['transaction']>[0]>[0];
 
-export type SignRefusal = 'expired' | 'wrong_epoch' | 'paused' | 'over_payment_max' | 'over_daily_budget' | 'purse_short' | 'not_open' | 'in_flight';
+export type SignRefusal =
+  | 'expired'
+  | 'wrong_epoch'
+  | 'agent_revoked'
+  | 'paused'
+  | 'over_payment_max'
+  | 'over_daily_budget'
+  | 'purse_short'
+  | 'not_open'
+  | 'in_flight';
 
 /** A refusal over the per-payment maximum carries the maximum it was checked against, so the reason can name it. */
 export type SignResult =
@@ -27,7 +37,8 @@ export interface SignArgs {
   payment: CanonicalPayment;
   masterSecretHex: string;
   chain: Chain;
-  now: Date;
+  /** Read once, after the chain reads and under the owner lock. */
+  now: () => Date;
 }
 
 /**
@@ -38,7 +49,6 @@ export interface SignArgs {
 export const PURSE_KEY_MISMATCH = 'purse_key_mismatch';
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-const DAY_MS = 86_400_000;
 
 // Each side of every comparison goes through the same SDK normaliser that produced the
 // canonical payment (standard 2), and anything it cannot read compares unequal.
@@ -78,10 +88,15 @@ export function paidTimeoutMs(sellerUrl: string): number {
 /**
  * True when this owner already signed a payment for this request key that may still be under
  * way: its decision is 'paid' (and is not `excludeDecisionId`), it has not been released as
- * 'not_landed', and it was signed less than the price's validity, plus the seller's paid
- * patience, plus the inline settlement reads ago (C5). A 'paid' decision has left decide's live
- * statuses, so decide alone would decide and sign the same request again. Pass a transaction
- * that holds the owner lock to read every payment a racing call has already committed.
+ * 'not_landed', and either its settlement is still 'pending' or it was signed less than the
+ * price's validity, plus the seller's paid patience, plus the inline settlement reads ago (C5).
+ * A pending payment counts whatever its age: Sui refuses a timestamp bound on a gasless send, so
+ * its bytes can land until its epoch window (valid_until_epoch) closes, and only settlePayment,
+ * once that window has closed, releases it or records how it landed (A1-2). The time window
+ * covers a payment that has landed while the paid call that sent it may still be running. A
+ * 'paid' decision has left decide's live statuses, so decide alone would decide and sign the
+ * same request again. Pass a transaction that holds the owner lock to read every payment a
+ * racing call has already committed.
  */
 export async function paymentInFlight(db: DbHandle, ownerId: string, key: string, sellerUrl: string, now: Date, excludeDecisionId?: string): Promise<boolean> {
   const windowMs = LIMITS.paymentValidityMs + paidTimeoutMs(sellerUrl) + LIMITS.settlementInlineTries * LIMITS.settlementInlineIntervalMs;
@@ -96,7 +111,7 @@ export async function paymentInFlight(db: DbHandle, ownerId: string, key: string
         eq(decisions.status, 'paid'),
         excludeDecisionId === undefined ? undefined : ne(decisions.id, excludeDecisionId),
         ne(payments.settlement, 'not_landed'),
-        gt(payments.signedAt, new Date(now.getTime() - windowMs)),
+        or(eq(payments.settlement, 'pending'), gt(payments.signedAt, new Date(now.getTime() - windowMs))),
       ),
     )
     .limit(1);
@@ -121,13 +136,19 @@ function decidedThis(decision: typeof decisions.$inferSelect, payment: Canonical
  * balance; a balance below the amount is 'purse_short'. Then in one transaction: locks the
  * owner row FOR UPDATE and the decision row after it, in the order every other writer takes
  * them. The decision must be this owner's, 'open', and name the canonical payment's
- * recipient, amount, asset and network ('not_open' otherwise). An owner that is paused or has
- * an auto_paused_reason is 'paused', and an amount over per_payment_max_atomic is
- * 'over_payment_max'; either way the decision becomes 'refused' in the same transaction.
+ * recipient, amount, asset and network ('not_open' otherwise). Only then is `now` read, once:
+ * that reading is the time the price's expiry is checked against, the end of the budget
+ * window, and the stored signed_at, so the time spent on the reads and the lock waits counts
+ * against the price; an unreadable time is 'expired'. A decision whose agent has been revoked
+ * (or is not this owner's) is 'agent_revoked', an owner that is paused or has an
+ * auto_paused_reason is 'paused', and an amount over per_payment_max_atomic is
+ * 'over_payment_max'; each way the decision becomes 'refused' in the same transaction.
  * Another decision under the decision's own stored request key with a payment that may still
  * be under way (paymentInFlight, read under the lock) is 'in_flight', and the decision becomes
- * 'failed' in the same transaction (C5). Everything this owner signed in the 24 hours before `now` and has not released counts,
- * settled or not; going past daily_budget_atomic is 'over_daily_budget'. The purse key is
+ * 'failed' in the same transaction (C5). What counts against the budget is heldOrSpentAtomic,
+ * read under the lock: every unreleased payment still pending whatever its age, and everything
+ * else signed in the last 24 hours and not released; going past daily_budget_atomic with this
+ * payment is 'over_daily_budget'. The purse key is
  * derived from the master secret and the owner's address, and must give the recorded purse
  * address: if it does not, the owner's auto_paused_reason is set to PURSE_KEY_MISMATCH, that
  * is committed, and the answer is 'not_open'. Then core's signPayment builds, checks and signs the plain USDC send (its
@@ -139,13 +160,11 @@ function decidedThis(decision: typeof decisions.$inferSelect, payment: Canonical
  * (UNSUPPORTED_DIALECT, BUILD_FAILED, MISMATCH); either way nothing is written.
  */
 export async function signForDecision(args: SignArgs): Promise<SignResult> {
-  const { db, payment, now, chain } = args;
+  const { db, payment, chain } = args;
   if (typeof args.ownerId !== 'string' || !UUID.test(args.ownerId) || typeof args.decisionId !== 'string' || !UUID.test(args.decisionId)) {
     return { refusal: 'not_open' };
   }
   if (typeof payment?.amount !== 'bigint' || payment.amount <= 0n) return { refusal: 'not_open' };
-  // signPayment calls an unreadable time expired too, and the budget window needs a real one.
-  if (!(now instanceof Date) || Number.isNaN(now.getTime())) return { refusal: 'expired' };
   const ownerId = args.ownerId.toLowerCase();
   const decisionId = args.decisionId.toLowerCase();
 
@@ -175,9 +194,25 @@ export async function signForDecision(args: SignArgs): Promise<SignResult> {
     const [decision] = await tx.select().from(decisions).where(thisDecision).for('update');
     if (decision === undefined || decision.status !== 'open' || !decidedThis(decision, payment)) return { refusal: 'not_open' };
 
+    // Taken after both Tatum reads and the lock waits, so time they used counts against the
+    // price's expiry, and this one reading is the expiry check, the budget window and signed_at.
+    const now = args.now();
+    // signPayment calls an unreadable time expired too, and the budget window needs a real one.
+    if (!(now instanceof Date) || Number.isNaN(now.getTime())) return { refusal: 'expired' };
+
+    const close = (status: 'refused' | 'failed') => tx.update(decisions).set({ status }).where(and(thisDecision, eq(decisions.status, 'open')));
+    // decide checked the agent before its recall. revokeAgent takes the owner lock too, so a
+    // revocation committed since then is seen here, and no payment is signed for it (C13).
+    const [agent] = await tx
+      .select({ revokedAt: agents.revokedAt })
+      .from(agents)
+      .where(and(eq(agents.id, decision.agentId), eq(agents.ownerId, ownerId)));
+    if (agent === undefined || agent.revokedAt !== null) {
+      await close('refused');
+      return { refusal: 'agent_revoked' };
+    }
     // decide read these settings before its recall, so a pause (a settlement mismatch, or the
     // owner's own) or a lower maximum set since then is caught only here, under the lock (C4, C8).
-    const close = (status: 'refused' | 'failed') => tx.update(decisions).set({ status }).where(and(thisDecision, eq(decisions.status, 'open')));
     if (owner.paused || owner.autoPausedReason !== null) {
       await close('refused');
       return { refusal: 'paused' };
@@ -195,11 +230,7 @@ export async function signForDecision(args: SignArgs): Promise<SignResult> {
     }
 
     // Read under the owner lock, so a payment signed by a racing call is already counted here.
-    const [spent] = await tx
-      .select({ total: sql<string>`coalesce(sum(${payments.amountAtomic}), 0)::text` })
-      .from(payments)
-      .where(and(eq(payments.ownerId, ownerId), gte(payments.signedAt, new Date(now.getTime() - DAY_MS)), isNull(payments.releasedAt)));
-    if (BigInt(spent?.total ?? '0') + payment.amount > owner.dailyBudgetAtomic) return { refusal: 'over_daily_budget' };
+    if ((await heldOrSpentAtomic(tx, ownerId, now)) + payment.amount > owner.dailyBudgetAtomic) return { refusal: 'over_daily_budget' };
 
     const purse = derivePurseKeypair(args.masterSecretHex, owner.suiAddress);
     if (!sameAddress(purse.toSuiAddress(), owner.purseAddress)) {

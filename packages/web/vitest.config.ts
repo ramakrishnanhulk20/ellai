@@ -6,7 +6,9 @@ export default defineConfig({
     environment: 'node',
     // Each file starts its own in-memory Postgres and migrates it; with one worker per core
     // those start-ups crowd each other past the default 10 s hook limit on this machine.
+    // Tests that build their own database inside the body hit the same wall at the 5 s test limit.
     maxWorkers: 6,
     hookTimeout: 60_000,
+    testTimeout: 30_000,
   },
 });

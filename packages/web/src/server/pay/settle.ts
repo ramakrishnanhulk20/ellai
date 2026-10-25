@@ -2,9 +2,9 @@ import { type Chain, ChainError, type TransactionResult } from '@ellai/core/chai
 import type { CanonicalPayment } from '@ellai/core/challenge';
 import { LIMITS } from '@ellai/core/limits';
 import { verifySettlement } from '@ellai/core/payment';
-import { and, eq } from 'drizzle-orm';
+import { and, eq, sql } from 'drizzle-orm';
 import type { Database } from '../db/client.js';
-import { decisions, owners, payments } from '../db/schema.js';
+import { decisions, owners, payments, rateCounters } from '../db/schema.js';
 import type { Settlement } from './result.js';
 
 export interface SettleArgs {
@@ -16,12 +16,29 @@ export interface SettleArgs {
   tries: number;
   intervalMs: number;
   sleep: (ms: number) => Promise<void>;
+  /** The clock failed reads are counted against; the wall clock when left out. */
+  now?: () => Date;
 }
 
 /** Set as the owner's auto_paused_reason when a payment landed and was not the approved one (C8). */
 export const SETTLEMENT_MISMATCH = 'settlement_mismatch';
 
+/**
+ * Set as the owner's auto_paused_reason when a payment's settlement could not be read on
+ * LIMITS.settlementUnverifiableReads separate passes after its epoch window closed (C8, C21).
+ */
+export const SETTLEMENT_UNVERIFIABLE = 'settlement_unverifiable';
+
+/** The mismatch_reason of a payment closed that way: Ellai cannot say whether it landed. */
+export const UNVERIFIABLE = 'unverifiable';
+
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+// payments has no column for the count, so it lives in the shared counter table under its own
+// prefix, which no other counter's key starts with.
+const UNREADABLE_KEY_PREFIX = 'settlement-unreadable:';
+// Shorter than LIMITS.rateCounterRetentionMs, so pruning never deletes a count still in use. A
+// count cut by a window boundary starts again, which can delay the verdict but never hasten it.
+const UNREADABLE_WINDOW_MS = 86_400_000;
 
 type Read = { kind: 'landed'; result: TransactionResult } | { kind: 'missing' } | { kind: 'unknown' };
 
@@ -41,25 +58,48 @@ async function stored(db: Database, ownerId: string, paymentId: string): Promise
   return row?.settlement ?? 'pending';
 }
 
+/** Counts one more pass whose read failed for this payment, in one atomic upsert, and returns the count so far. */
+async function countFailedRead(db: Database, paymentId: string, now: Date): Promise<number> {
+  if (!(now instanceof Date) || Number.isNaN(now.getTime())) throw new Error('the current time is not a date');
+  const windowStart = new Date(Math.floor(now.getTime() / UNREADABLE_WINDOW_MS) * UNREADABLE_WINDOW_MS);
+  const [counter] = await db
+    .insert(rateCounters)
+    .values({ key: `${UNREADABLE_KEY_PREFIX}${paymentId}`, windowStart, count: 1 })
+    .onConflictDoUpdate({ target: [rateCounters.key, rateCounters.windowStart], set: { count: sql`${rateCounters.count} + 1` } })
+    .returning({ count: rateCounters.count });
+  if (counter === undefined) throw new Error('the failed read counter returned no row');
+  return counter.count;
+}
+
 /**
  * Reads one signed payment's transaction from chain by the digest Ellai stored when it signed,
  * never one a seller or an agent reported, and records what it finds (C8, C4, C21).
  *
  * Up to `tries` reads, `intervalMs` apart. A NOT_FOUND keeps looking. A landed transaction goes
  * through core's verifySettlement against the decision's recipient, amount, asset and network
- * and the owner's recorded purse: 'verified' sets verified_at; 'mismatch' stores verifySettlement's
- * fixed reason and, in the same transaction, sets the owner's auto_paused_reason to
+ * and the purse that signed it (payments.purse_address): 'verified' sets verified_at;
+ * 'mismatch' stores verifySettlement's fixed reason and, in the same transaction, sets the owner's auto_paused_reason to
  * SETTLEMENT_MISMATCH, so decide refuses every later payment until the owner reviews it. When
  * every read missed, the chain's epoch is read: only once it is past valid_until_epoch, and
  * LIMITS.paymentReleaseReads further reads taken after it all still miss, is the payment
- * 'not_landed', with released_at set so it stops counting against the daily budget. Any other
- * chain error, or a window still open, leaves 'pending' for a later pass.
+ * 'not_landed', with released_at set so it stops counting against the daily budget. A window
+ * still open, or an epoch that cannot be read, leaves 'pending' for a later pass.
+ *
+ * A read that fails with any error but NOT_FOUND ends the pass. Once the epoch is past
+ * valid_until_epoch, the pass is counted as one failed pass for this payment, and the pass that
+ * brings the count to LIMITS.settlementUnverifiableReads makes the payment 'mismatch' with
+ * mismatch_reason UNVERIFIABLE and, in the same transaction, sets the owner's
+ * auto_paused_reason to SETTLEMENT_UNVERIFIABLE, so decide refuses every later payment until the
+ * owner reviews it (C8, C21). Until then it stays 'pending' and counts against the budget. The
+ * count is kept per payment in fixed windows of a day, so passes that fail on either side of
+ * a window boundary are counted again from one.
  *
  * A payment already past 'pending' is returned as it is. Writes only from 'pending', so two
  * passes never overwrite each other. Throws for an unknown payment or tries out of range.
  */
 export async function settlePayment(args: SettleArgs): Promise<Settlement> {
   const { db, chain, sleep } = args;
+  const now = args.now ?? (() => new Date());
   if (!Number.isSafeInteger(args.tries) || args.tries < 1 || args.tries > LIMITS.settlementPollTries) {
     throw new RangeError(`tries must be 1 to ${LIMITS.settlementPollTries}`);
   }
@@ -70,15 +110,17 @@ export async function settlePayment(args: SettleArgs): Promise<Settlement> {
   const paymentId = args.paymentId.toLowerCase();
 
   const [row] = await db
-    .select({ payment: payments, decision: decisions, purseAddress: owners.purseAddress })
+    .select({ payment: payments, decision: decisions })
     .from(payments)
     .innerJoin(decisions, and(eq(decisions.id, payments.decisionId), eq(decisions.ownerId, payments.ownerId)))
-    .innerJoin(owners, eq(owners.id, payments.ownerId))
     .where(and(eq(payments.id, paymentId), eq(payments.ownerId, ownerId)));
   if (row === undefined) throw new Error('there is no such payment for this owner');
   if (row.payment.settlement !== 'pending') return row.payment.settlement;
 
-  const { decision, purseAddress } = row;
+  const { decision } = row;
+  // The purse that signed these bytes, which is the one debited even if the owner's purse on
+  // record has changed since.
+  const { purseAddress } = row.payment;
   // Only the t2000 dialect is ever signed, and verifySettlement reads nothing but the
   // recipient, amount, asset and network, all of them the decision's own canonical fields.
   const approved: CanonicalPayment = {
@@ -98,32 +140,41 @@ export async function settlePayment(args: SettleArgs): Promise<Settlement> {
   };
   const stillPending = and(eq(payments.id, paymentId), eq(payments.ownerId, ownerId), eq(payments.settlement, 'pending'));
 
+  // The owner row is locked first, in the order every other writer takes it.
+  const mismatch = async (reason: string, pauseReason: string): Promise<Settlement> => {
+    const marked = await db.transaction(async (tx) => {
+      await tx.select({ id: owners.id }).from(owners).where(eq(owners.id, ownerId)).for('update');
+      const done = await tx.update(payments).set({ settlement: 'mismatch', mismatchReason: reason }).where(stillPending).returning({ id: payments.id });
+      if (done.length === 0) return false;
+      await tx.update(owners).set({ autoPausedReason: pauseReason }).where(eq(owners.id, ownerId));
+      return true;
+    });
+    return marked ? 'mismatch' : stored(db, ownerId, paymentId);
+  };
+
   const judge = async (result: TransactionResult): Promise<Settlement> => {
     const verdict = verifySettlement(result, approved, purseAddress);
     if (verdict.verified) {
       const done = await db.update(payments).set({ settlement: 'verified', verifiedAt: new Date() }).where(stillPending).returning({ id: payments.id });
       return done.length > 0 ? 'verified' : stored(db, ownerId, paymentId);
     }
-    const marked = await db.transaction(async (tx) => {
-      await tx.select({ id: owners.id }).from(owners).where(eq(owners.id, ownerId)).for('update');
-      const done = await tx
-        .update(payments)
-        .set({ settlement: 'mismatch', mismatchReason: verdict.reason })
-        .where(stillPending)
-        .returning({ id: payments.id });
-      if (done.length === 0) return false;
-      await tx.update(owners).set({ autoPausedReason: SETTLEMENT_MISMATCH }).where(eq(owners.id, ownerId));
-      return true;
-    });
-    return marked ? 'mismatch' : stored(db, ownerId, paymentId);
+    return mismatch(verdict.reason, SETTLEMENT_MISMATCH);
+  };
+
+  // Called only once the window has closed, when the bytes can no longer land, so waiting
+  // longer would leave the payment pending, and holding the budget, with nothing left to learn.
+  const unreadable = async (): Promise<Settlement> => {
+    if ((await countFailedRead(db, paymentId, now())) < LIMITS.settlementUnverifiableReads) return 'pending';
+    return mismatch(UNVERIFIABLE, SETTLEMENT_UNVERIFIABLE);
   };
 
   const { digest, validUntilEpoch } = row.payment;
-  for (let attempt = 0; attempt < args.tries; attempt++) {
+  let failed = false;
+  for (let attempt = 0; attempt < args.tries && !failed; attempt++) {
     if (attempt > 0) await sleep(args.intervalMs);
     const seen = await read(chain, digest);
-    if (seen.kind === 'unknown') return 'pending';
     if (seen.kind === 'landed') return judge(seen.result);
+    failed = seen.kind === 'unknown';
   }
 
   let epoch: bigint;
@@ -133,11 +184,12 @@ export async function settlePayment(args: SettleArgs): Promise<Settlement> {
     return 'pending';
   }
   if (epoch <= validUntilEpoch) return 'pending';
+  if (failed) return unreadable();
   // One lagging node must not release a payment that landed in the last moments of its window.
   for (let attempt = 0; attempt < LIMITS.paymentReleaseReads; attempt++) {
     await sleep(args.intervalMs);
     const seen = await read(chain, digest);
-    if (seen.kind === 'unknown') return 'pending';
+    if (seen.kind === 'unknown') return unreadable();
     if (seen.kind === 'landed') return judge(seen.result);
   }
   const released = await db

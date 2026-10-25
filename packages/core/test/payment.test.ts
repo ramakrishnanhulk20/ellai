@@ -1,5 +1,6 @@
 // Covers: building the t2000 gasless USDC send from a canonical payment parsed out of a
-// saved live 402, offline and deterministically; assertPlainUsdcSend refusing every
+// saved live 402, offline and deterministically; checkPayable refusing what the build
+// refuses, with the same code; assertPlainUsdcSend refusing every
 // hand-built variant the work order names; signPayment's expiry and epoch refusals and
 // what it signs; t2000's own seller verifier, run offline, accepting Ellai's header
 // (byte for byte the header t2000's payer makes) and rejecting tampered bytes; and
@@ -27,6 +28,7 @@ import type { SafeResponse } from '../src/net.js';
 import {
   assertPlainUsdcSend,
   buildPaymentBytes,
+  checkPayable,
   PaymentError,
   paymentHeader,
   signPayment,
@@ -149,6 +151,39 @@ describe('buildPaymentBytes', () => {
   it('refuses any dialect but t2000 x402 v1', async () => {
     const v2 = paymentFrom('adversarial', 'v2-mainnet');
     expect((await refusalOf(buildPaymentBytes(v2, payer.toSuiAddress()))).code).toBe('UNSUPPORTED_DIALECT');
+  });
+});
+
+describe('checkPayable', () => {
+  /** A live challenge with its t2000 extra.suimpp block taken out, as a plain x402 v1 seller sends it. */
+  function withoutSuimpp(): CanonicalPayment {
+    const fixture = load('live', LIVE);
+    const body = JSON.parse(fixture.body) as { accepts: Array<{ extra: Record<string, unknown> }> };
+    for (const option of body.accepts) delete option.extra.suimpp;
+    const response: SafeResponse = { status: fixture.status, headers: fixture.headers, bodyText: JSON.stringify(body), url: fixture.url, host: new URL(fixture.url).hostname };
+    return parseChallenge(response, NOW);
+  }
+
+  async function codeOf(run: () => unknown): Promise<string> {
+    return (await refusalOf(Promise.resolve().then(run))).code;
+  }
+
+  it('passes a payment buildPaymentBytes can build', () => {
+    expect(() => checkPayable(payment)).not.toThrow();
+  });
+
+  it('refuses, with the code buildPaymentBytes gives, a v2 payment and a v1 payment with no t2000 binding fields', async () => {
+    const v2 = paymentFrom('adversarial', 'v2-mainnet');
+    const plainV1 = withoutSuimpp();
+    expect(plainV1).toMatchObject({ dialect: 'x402-v1-t2000', challengeId: null, nonce: null, minEpoch: null, maxEpoch: null });
+    for (const [unpayable, code] of [
+      [v2, 'UNSUPPORTED_DIALECT'],
+      [plainV1, 'BUILD_FAILED'],
+      [{ ...payment, maxEpoch: (payment.minEpoch ?? 0n) + 2n }, 'BUILD_FAILED'],
+    ] as const) {
+      expect(await codeOf(() => checkPayable(unpayable))).toBe(code);
+      expect(await codeOf(() => buildPaymentBytes(unpayable, payer.toSuiAddress()))).toBe(code);
+    }
   });
 });
 

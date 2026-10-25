@@ -3,7 +3,8 @@
 // copy is broken) and on adversarial challenges. Each adversarial fixture is a live 402
 // with one thing changed, named in its "note": ambiguity, disagreeing copies, bad
 // amounts, assets, networks and ids, expiry, size and depth caps, mixed dialects,
-// __proto__ keys, and a t2000 escrow job entry.
+// __proto__ keys, a key named twice in the body or the header copy, and a t2000 escrow
+// job entry.
 // Does NOT cover: whether the seller is honest, whether the recipient belongs to the
 // host (trust is keyed on the recipient elsewhere), the epoch window against the live
 // chain, or the network fetch itself (net.test.ts covers that).
@@ -141,6 +142,8 @@ describe('parseChallenge on adversarial challenges', () => {
       'v1-and-v2-in-one-body',
       'proto-key',
       'escrow-terms',
+      'duplicate-key-body',
+      'duplicate-key-header',
     ]) {
       expect(names).toContain(required);
     }
@@ -184,6 +187,20 @@ describe('parseChallenge on adversarial challenges', () => {
       minEpoch: null,
       maxEpoch: null,
     });
+  });
+
+  it('refuses an object that names a key twice, in the body or the header copy, though the copy JSON.parse keeps is payable', () => {
+    const body = load('adversarial', 'duplicate-key-body');
+    const header = load('adversarial', 'duplicate-key-header');
+    expect(refusalOf(body).message).toBe('body names one key twice');
+    expect(refusalOf(header).message).toBe('PAYMENT-REQUIRED header names one key twice');
+
+    // The second payTo is spelled payTo, so this drops only the first copy.
+    const lastOnly = { ...body, body: body.body.replace(/"payTo":"0x[0-9a-f]+",/, '') };
+    expect(parseChallenge(responseOf(lastOnly), NOW).recipient).toBe('0x5dd4bd4f04ef4c3913acd4f9837fbb86aef946142aa37195a05af74e627a4f7c');
+    const decoded = Buffer.from(header.headers['payment-required'] ?? '', 'base64').toString('utf8').replace('"amount":"990000",', '');
+    const headerLastOnly = { ...header, headers: { ...header.headers, 'payment-required': Buffer.from(decoded, 'utf8').toString('base64') } };
+    expect(parseChallenge(responseOf(headerLastOnly), NOW).amount).toBe(20_000n);
   });
 
   it('never copies seller text into a refusal message', () => {

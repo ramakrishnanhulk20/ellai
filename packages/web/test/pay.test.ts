@@ -1,22 +1,28 @@
 // Covers: paidFetch on PGlite with a stand-in seller and a stand-in chain: the free answer, an
 // unreadable price, asks and refusals that never sign, an approval signed once by the owner's
 // derived purse and sent as the same request plus the payment header, the pause, the per-payment
-// maximum and the daily budget checked again at signing, a short purse, an expired price, a
-// decision that no longer matches its payment, a purse that moved, a request already in flight
-// (open, or signed and still able to land, up to the edge of that window), a twin decision
+// maximum and the daily budget checked again at signing, a pending payment of any age counted
+// against the budget, an agent revoked before signing, a short purse, an expired price, a price
+// that runs out while the chain is read (the clock is read after), a decision that no longer
+// matches its payment, a purse that moved, a request already in flight (open, pending until
+// its epoch window closes, or landed up to the edge of the paid call's window), a twin decision
 // opened once the first was paid and refused under the signing lock, the same request
-// decided again once its payment was released, an x402 v2 price refused before decide, a seller
-// that fails after payment or never answers (delivered false), a status write that fails and
-// leaves delivered null with no outcome, a status write, settlement read or outcome memory that fails after
-// payment and still leaves 'paid', a settlement mismatch pausing the owner, the release of a payment
-// that never landed, the call's deadline (the paid request's wait cut to it, nothing signed when
-// too little time is left, settlement reads stopped at it), six-decimal amounts in reasons, and
-// reasons that never carry agent or seller text.
+// decided again once its payment was released, an x402 v2 price and a v1 price without the
+// t2000 binding fields refused before decide, a seller that fails after payment or never
+// answers (delivered false), a status write that fails and leaves delivered null with no
+// outcome, a status write, settlement read or outcome memory that fails after payment and still
+// leaves 'paid', a settlement mismatch pausing the owner, a settlement checked against the purse
+// that signed it, reads that keep failing after the window closed marking the payment
+// unverifiable and pausing the owner, the release of a payment that never landed, the call's
+// deadline (the paid request's wait cut to it, nothing signed when too little time is left,
+// settlement reads stopped at it), six-decimal amounts in reasons, and reasons that never carry
+// agent or seller text.
 // Does NOT cover: a real seller, the real Sui chain or Tatum (npm run prove:flow does those
 // live), safeFetch's own network checks (core's net tests), two connections racing on the owner
 // lock (PGlite serves one connection, so racing calls here run one transaction at a time),
 // two identical requests whose in-flight check and decide interleave on separate connections,
-// or the jobs tick that settles payments the inline reads left pending.
+// a revocation racing the signing lock on another connection, or the jobs tick that settles
+// payments the inline reads left pending.
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { ChainError, type Chain, type TransactionResult } from '@ellai/core/chain';
 import { type CanonicalPayment, parseChallenge } from '@ellai/core/challenge';
@@ -30,13 +36,14 @@ import { verifyTransactionSignature } from '@mysten/sui/verify';
 import { and, eq } from 'drizzle-orm';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { type Database, createDb, migrate } from '../src/server/db/client.js';
-import { agents, decisions, memories, owners, payments } from '../src/server/db/schema.js';
+import { agents, decisions, memories, owners, payments, questions } from '../src/server/db/schema.js';
 import { type Recall, decide } from '../src/server/decide/decide.js';
 import { ownerDelegate } from '../src/server/memory/delegate.js';
 import { MEMORY_NAMESPACE } from '../src/server/memory/namespace.js';
 import { recordOutcome } from '../src/server/memory/outcome.js';
 import { type PaidFetchArgs, paidFetch } from '../src/server/pay/flow.js';
-import { SETTLEMENT_MISMATCH, settlePayment } from '../src/server/pay/settle.js';
+import { heldOrSpentAtomic } from '../src/server/pay/liability.js';
+import { SETTLEMENT_MISMATCH, SETTLEMENT_UNVERIFIABLE, UNVERIFIABLE, settlePayment } from '../src/server/pay/settle.js';
 import { PURSE_KEY_MISMATCH, signForDecision } from '../src/server/pay/sign.js';
 
 // Both run as written unless a test makes one fail once, to show a failure after payment.
@@ -263,6 +270,8 @@ const outcomeRows = (ownerId: string) => db.select().from(memories).where(and(eq
 const decisionRows = (ownerId: string) => db.select().from(decisions).where(eq(decisions.ownerId, ownerId));
 const ownerRow = async (ownerId: string) => one(await db.select().from(owners).where(eq(owners.id, ownerId)));
 const paidCalls = (fetch: ReturnType<typeof seller>) => fetch.mock.calls.filter(([, init]) => init.headers?.['X-PAYMENT'] !== undefined);
+/** What a paid request answered 200 would have stored, for payments signed here without sending one. */
+const storeDelivered = (ownerId: string) => db.update(payments).set({ sellerStatus: 200, delivered: true }).where(eq(payments.ownerId, ownerId));
 
 async function approvedDecision(w: World, recall: Recall, purpose: string): Promise<{ decisionId: string; payment: CanonicalPayment }> {
   const payment = parseChallenge(challenge(SELLER_URL), NOW.getTime());
@@ -386,12 +395,34 @@ describe('paidFetch', () => {
     const first = await approvedDecision(w, recall, 'first search');
     const second = await approvedDecision(w, recall, 'second search');
     const { chain } = stubChain(w);
-    const sign = (d: typeof first) => signForDecision({ db, ownerId: w.ownerId, decisionId: d.decisionId, payment: d.payment, masterSecretHex: MASTER, chain, now: NOW });
+    const sign = (d: typeof first) => signForDecision({ db, ownerId: w.ownerId, decisionId: d.decisionId, payment: d.payment, masterSecretHex: MASTER, chain, now: () => NOW });
 
     expect(await sign(first)).toHaveProperty('signed');
     expect(await sign(second)).toEqual({ refusal: 'over_daily_budget' });
     expect(await paymentRows(w.ownerId)).toHaveLength(1);
     expect(one(await db.select().from(decisions).where(eq(decisions.id, second.decisionId))).status).toBe('open');
+  });
+
+  it('counts a payment still pending whatever its age, so one signed 25 hours ago blocks a second over the budget', async () => {
+    const w = await world({ dailyBudgetAtomic: 15_000n });
+    const { recall } = await approvals(w);
+    const { chain } = stubChain(w);
+    const sign = (d: { decisionId: string; payment: CanonicalPayment }) =>
+      signForDecision({ db, ownerId: w.ownerId, ...d, masterSecretHex: MASTER, chain, now: () => NOW });
+
+    const first = await approvedDecision(w, recall, 'first search');
+    const second = await approvedDecision(w, recall, 'second search');
+    expect(await sign(first)).toHaveProperty('signed');
+    const old = one(await paymentRows(w.ownerId));
+    await db.update(payments).set({ signedAt: new Date(NOW.getTime() - 25 * 3_600_000) }).where(eq(payments.id, old.id));
+    expect(await heldOrSpentAtomic(db, w.ownerId, NOW)).toBe(PRICE);
+
+    expect(await sign(second)).toEqual({ refusal: 'over_daily_budget' });
+    expect(await paymentRows(w.ownerId)).toHaveLength(1);
+
+    await db.update(payments).set({ settlement: 'verified', verifiedAt: NOW }).where(eq(payments.id, old.id));
+    expect(await heldOrSpentAtomic(db, w.ownerId, NOW)).toBe(0n);
+    expect(await sign(second)).toHaveProperty('signed');
   });
 
   it('refuses at signing, with decide\'s paused reason, an owner paused after decide approved, and signs nothing', async () => {
@@ -421,11 +452,38 @@ describe('paidFetch', () => {
     await db.update(owners).set({ perPaymentMaxAtomic: PRICE }).where(eq(owners.id, w.ownerId));
     const direct = await approvedDecision(w, recall, 'signed directly');
     await db.update(owners).set(lowered).where(eq(owners.id, w.ownerId));
-    const signed = await signForDecision({ db, ownerId: w.ownerId, ...direct, masterSecretHex: MASTER, chain: stubChain(w).chain, now: NOW });
+    const signed = await signForDecision({ db, ownerId: w.ownerId, ...direct, masterSecretHex: MASTER, chain: stubChain(w).chain, now: () => NOW });
     expect(signed).toEqual({ refusal: 'over_payment_max', perPaymentMaxAtomic: PRICE - 1n });
     expect(one(await db.select().from(decisions).where(eq(decisions.id, direct.decisionId))).status).toBe('refused');
     expect(await paymentRows(w.ownerId)).toHaveLength(0);
     expect(paidCalls(fetch)).toHaveLength(0);
+  });
+
+  it('refuses at signing the decision of an agent revoked after decide approved, with no payment row', async () => {
+    const w = await world();
+    const { recallFor } = await approvals(w);
+    const base = stubChain(w);
+    const revoking = {
+      ...base.chain,
+      getCurrentEpoch: async () => {
+        await db.update(agents).set({ revokedAt: NOW }).where(eq(agents.id, w.agentId));
+        return base.state.epoch;
+      },
+    } as Chain;
+    const fetch = seller();
+    const result = await run(w, { fetch, chain: revoking, recallFor });
+    expect(result).toMatchObject({ outcome: 'refused', rule: 'learned', reason: 'This agent is not allowed to pay for this account.', payment: null });
+    expect(one(await decisionRows(w.ownerId)).status).toBe('refused');
+    expect(await paymentRows(w.ownerId)).toHaveLength(0);
+    expect(paidCalls(fetch)).toHaveLength(0);
+
+    const direct = await world();
+    const approved = await approvedDecision(direct, (await approvals(direct)).recall, 'signed directly');
+    await db.update(agents).set({ revokedAt: NOW }).where(eq(agents.id, direct.agentId));
+    const signed = await signForDecision({ db, ownerId: direct.ownerId, ...approved, masterSecretHex: MASTER, chain: stubChain(direct).chain, now: () => NOW });
+    expect(signed).toEqual({ refusal: 'agent_revoked' });
+    expect(one(await decisionRows(direct.ownerId)).status).toBe('refused');
+    expect(await paymentRows(direct.ownerId)).toHaveLength(0);
   });
 
   it('fails without signing when the purse holds less than the payment', async () => {
@@ -453,21 +511,48 @@ describe('paidFetch', () => {
     expect(await paymentRows(w.ownerId)).toHaveLength(0);
   });
 
+  it('reads the clock after the chain reads, so a price that runs out while Sui answers is expired and nothing is signed', async () => {
+    const w = await world();
+    const { recall, recallFor } = await approvals(w);
+    let clock = NOW.getTime();
+    const base = stubChain(w);
+    // The balance read takes the whole of the price's validity.
+    const slow = {
+      ...base.chain,
+      getBalances: async (address: string) => {
+        clock += LIMITS.paymentValidityMs;
+        return base.chain.getBalances(address);
+      },
+    } as Chain;
+
+    const direct = await approvedDecision(w, recall, 'signed directly');
+    const signed = await signForDecision({ db, ownerId: w.ownerId, ...direct, masterSecretHex: MASTER, chain: slow, now: () => new Date(clock) });
+    expect(signed).toEqual({ refusal: 'expired' });
+    expect(await paymentRows(w.ownerId)).toHaveLength(0);
+
+    clock = NOW.getTime();
+    const fetch = seller();
+    const result = await run(w, { fetch, chain: slow, recallFor, now: () => new Date(clock) });
+    expect(result).toMatchObject({ outcome: 'failed', rule: 'learned', reason: "The seller's price expired before Ellai could pay it.", payment: null });
+    expect(paidCalls(fetch)).toHaveLength(0);
+    expect(await paymentRows(w.ownerId)).toHaveLength(0);
+  });
+
   it('refuses to sign a decision whose stored amount is not the payment amount, or that is not open', async () => {
     const w = await world();
     const { recall } = await approvals(w);
     const { chain } = stubChain(w);
     const sign = (d: { decisionId: string; payment: CanonicalPayment }) =>
-      signForDecision({ db, ownerId: w.ownerId, ...d, masterSecretHex: MASTER, chain, now: NOW });
+      signForDecision({ db, ownerId: w.ownerId, ...d, masterSecretHex: MASTER, chain, now: () => NOW });
     const changed = await approvedDecision(w, recall, PURPOSE);
     await db.update(decisions).set({ amountAtomic: PRICE + 1n }).where(eq(decisions.id, changed.decisionId));
     expect(await sign(changed)).toEqual({ refusal: 'not_open' });
     expect(await paymentRows(w.ownerId)).toHaveLength(0);
 
     const paid = await approvedDecision(w, recall, 'paid once');
+    const asked = await approvedDecision(w, recall, 'still asked');
     expect(await sign(paid)).toHaveProperty('signed');
     expect(await sign(paid)).toEqual({ refusal: 'not_open' });
-    const asked = await approvedDecision(w, recall, 'still asked');
     await db.update(decisions).set({ status: 'asked' }).where(eq(decisions.id, asked.decisionId));
     expect(await sign(asked)).toEqual({ refusal: 'not_open' });
     expect(await paymentRows(w.ownerId)).toHaveLength(1);
@@ -523,11 +608,12 @@ describe('paidFetch', () => {
     const { recall } = await approvals(w);
     const { chain } = stubChain(w);
     const sign = (d: { decisionId: string; payment: CanonicalPayment }) =>
-      signForDecision({ db, ownerId: w.ownerId, ...d, masterSecretHex: MASTER, chain, now: NOW });
+      signForDecision({ db, ownerId: w.ownerId, ...d, masterSecretHex: MASTER, chain, now: () => NOW });
     const decisionRow = async (id: string) => one(await db.select().from(decisions).where(eq(decisions.id, id)));
 
     const first = await approvedDecision(w, recall, PURPOSE);
     expect(await sign(first)).toHaveProperty('signed');
+    await storeDelivered(w.ownerId);
     // The live-request index allows one open decision per request key, so the twin opens only
     // after the first has signed: the state a twin whose early check ran while the first was
     // still open reaches.
@@ -541,26 +627,51 @@ describe('paidFetch', () => {
     expect(one(await paymentRows(w.ownerId)).decisionId).toBe(first.decisionId);
   });
 
-  it('fails the same request without deciding or signing while its signed payment may still land', async () => {
+  it('fails the same request without deciding or signing while its pending payment may still land, until its epoch window closes', async () => {
     const w = await world();
     const { recallFor } = await approvals(w);
-    const { chain, calls } = stubChain(w, { landed: () => null });
+    const { chain, state, calls } = stubChain(w, { landed: () => null });
     const fetch = seller();
     const first = await run(w, { fetch, chain, recallFor });
     expect(first).toMatchObject({ outcome: 'paid', payment: { settlement: 'pending' } });
     expect(one(await decisionRows(w.ownerId)).status).toBe('paid');
+    const row = one(await paymentRows(w.ownerId));
+    expect(row.validUntilEpoch).toBe(101n);
 
+    const inProgress = { outcome: 'failed', decisionId: null, rule: null, reason: 'A payment for this same request is already in progress.', citedMemories: [], seller: null, payment: null };
     const windowMs = LIMITS.paymentValidityMs + LIMITS.netPaidTimeoutDefaultMs + LIMITS.settlementInlineTries * LIMITS.settlementInlineIntervalMs;
-    const again = await run(w, { fetch, chain, recallFor, now: () => new Date(NOW.getTime() + windowMs - 1) });
-    expect(again).toEqual({ outcome: 'failed', decisionId: null, rule: null, reason: 'A payment for this same request is already in progress.', citedMemories: [], seller: null, payment: null });
+    const dayLater = new Date(NOW.getTime() + 30 * 3_600_000);
+    // Ellai's own window has long passed, but the chain is still inside the payment's epoch window.
+    for (const at of [new Date(NOW.getTime() + windowMs - 1), new Date(NOW.getTime() + windowMs), dayLater]) {
+      expect(await run(w, { fetch, chain, recallFor, now: () => at })).toEqual(inProgress);
+    }
+    const settle = () => settlePayment({ db, ownerId: w.ownerId, paymentId: row.id, chain, tries: 1, intervalMs: 5, sleep: noSleep });
+    state.epoch = 101n;
+    expect(await settle()).toBe('pending');
+    expect(await run(w, { fetch, chain, recallFor, now: () => dayLater })).toEqual(inProgress);
     // Only signing reads the purse balance, so one read is one signature.
     expect(calls.balances).toEqual([w.purse]);
     expect(paidCalls(fetch)).toHaveLength(1);
-    expect(await paymentRows(w.ownerId)).toHaveLength(1);
     expect(await decisionRows(w.ownerId)).toHaveLength(1);
 
-    const later = await run(w, { fetch, chain, recallFor, now: () => new Date(NOW.getTime() + windowMs) });
-    expect(later.outcome).toBe('paid');
+    state.epoch = 102n;
+    expect(await settle()).toBe('not_landed');
+    state.landed = () => settled(w.purse, RECIPIENT, PRICE);
+    const after = seller(ok, (url) => challenge(url, { minEpoch: 102n }));
+    expect(await run(w, { fetch: after, chain, recallFor, now: () => dayLater })).toMatchObject({ outcome: 'paid', payment: { settlement: 'verified' } });
+    expect(await paymentRows(w.ownerId)).toHaveLength(2);
+  });
+
+  it('counts a payment that landed as in flight only while the paid call that sent it may still be running', async () => {
+    const w = await world();
+    const { recallFor } = await approvals(w);
+    const fetch = seller();
+    expect(await run(w, { fetch, recallFor })).toMatchObject({ outcome: 'paid', payment: { settlement: 'verified' } });
+
+    const windowMs = LIMITS.paymentValidityMs + LIMITS.netPaidTimeoutDefaultMs + LIMITS.settlementInlineTries * LIMITS.settlementInlineIntervalMs;
+    const edge = await run(w, { fetch, recallFor, now: () => new Date(NOW.getTime() + windowMs - 1) });
+    expect(edge).toMatchObject({ outcome: 'failed', decisionId: null, reason: 'A payment for this same request is already in progress.' });
+    expect((await run(w, { fetch, recallFor, now: () => new Date(NOW.getTime() + windowMs) })).outcome).toBe('paid');
     expect(await paymentRows(w.ownerId)).toHaveLength(2);
   });
 
@@ -602,6 +713,26 @@ describe('paidFetch', () => {
     const result = await run(w, { fetch, chain, recallFor: () => recall });
     expect(result).toEqual({ outcome: 'refused', decisionId: null, rule: null, reason: "Ellai cannot pay this seller's payment format yet.", citedMemories: [], seller: null, payment: null });
     expect(await decisionRows(w.ownerId)).toHaveLength(0);
+    expect(recall).not.toHaveBeenCalled();
+    expect(calls).toEqual({ epochs: 0, balances: [], reads: [] });
+    expect(paidCalls(fetch)).toHaveLength(0);
+  });
+
+  it('refuses before decide an x402 v1 price with no t2000 binding fields, so the owner is never asked about it', async () => {
+    const w = await world();
+    const { chain, calls } = stubChain(w);
+    const recall = vi.fn(async () => []);
+    const plainV1 = (url: string) => {
+      const body = JSON.parse(challenge(url).bodyText) as { accepts: Array<{ extra: Record<string, unknown> }> };
+      for (const option of body.accepts) delete option.extra.suimpp;
+      return response(url, 402, JSON.stringify(body), { 'content-type': JSON_TYPE });
+    };
+    expect(parseChallenge(plainV1(SELLER_URL), NOW.getTime())).toMatchObject({ dialect: 'x402-v1-t2000', challengeId: null, minEpoch: null });
+    const fetch = seller(ok, plainV1);
+    const result = await run(w, { fetch, chain, recallFor: () => recall });
+    expect(result).toEqual({ outcome: 'refused', decisionId: null, rule: null, reason: 'Ellai cannot pay this kind of payment request (BUILD_FAILED).', citedMemories: [], seller: null, payment: null });
+    expect(await decisionRows(w.ownerId)).toHaveLength(0);
+    expect(await db.select().from(questions).where(eq(questions.ownerId, w.ownerId))).toHaveLength(0);
     expect(recall).not.toHaveBeenCalled();
     expect(calls).toEqual({ epochs: 0, balances: [], reads: [] });
     expect(paidCalls(fetch)).toHaveLength(0);
@@ -735,6 +866,53 @@ describe('paidFetch', () => {
     // One read inside the tries, then every release read but the last one misses.
     misses = LIMITS.paymentReleaseReads;
     expect(await settlePayment({ db, ownerId: w.ownerId, paymentId: row.id, chain: late, tries: 1, intervalMs: 5, sleep: noSleep })).toBe('verified');
+  });
+
+  it('verifies a settlement against the purse that signed it, even after the purse on record changed', async () => {
+    const w = await world();
+    const { recallFor } = await approvals(w);
+    const { chain, state } = stubChain(w, { landed: () => null });
+    expect((await run(w, { chain, recallFor })).payment?.settlement).toBe('pending');
+    const row = one(await paymentRows(w.ownerId));
+    expect(row.purseAddress).toBe(w.purse);
+    await db.update(owners).set({ purseAddress: canonicalSuiAddress(`0x${hex(32)}`) }).where(eq(owners.id, w.ownerId));
+    state.landed = () => settled(w.purse, RECIPIENT, PRICE);
+    expect(await settlePayment({ db, ownerId: w.ownerId, paymentId: row.id, chain, tries: 1, intervalMs: 5, sleep: noSleep })).toBe('verified');
+    expect((await ownerRow(w.ownerId)).autoPausedReason).toBeNull();
+  });
+
+  it('marks a payment unverifiable and pauses the owner once its reads keep failing after its window closed, and the next decide refuses paused', async () => {
+    const w = await world();
+    const { recallFor } = await approvals(w);
+    const { chain, state } = stubChain(w, { landed: () => null });
+    expect((await run(w, { chain, recallFor })).payment?.settlement).toBe('pending');
+    const row = one(await paymentRows(w.ownerId));
+    const gatewayError = async () => {
+      throw new ChainError('UPSTREAM', 'gateway error (HTTP 502)', true);
+    };
+    const unreadable = { ...chain, getTransactionResult: gatewayError } as Chain;
+    const settle = (on: Chain) => settlePayment({ db, ownerId: w.ownerId, paymentId: row.id, chain: on, tries: 1, intervalMs: 5, sleep: noSleep, now: () => NOW });
+    const passes = LIMITS.settlementUnverifiableReads;
+
+    // Failed passes count only once the chain shows the window closed: not while the epoch
+    // cannot be read, and not while the bytes could still land.
+    for (let i = 0; i < passes; i++) expect(await settle({ ...unreadable, getCurrentEpoch: gatewayError } as Chain)).toBe('pending');
+    state.epoch = 101n;
+    for (let i = 0; i < passes; i++) expect(await settle(unreadable)).toBe('pending');
+    state.epoch = 102n;
+    for (let i = 1; i < passes; i++) expect(await settle(unreadable)).toBe('pending');
+    expect(one(await paymentRows(w.ownerId)).settlement).toBe('pending');
+    expect((await ownerRow(w.ownerId)).autoPausedReason).toBeNull();
+
+    expect(await settle(unreadable)).toBe('mismatch');
+    expect(one(await paymentRows(w.ownerId))).toMatchObject({ settlement: 'mismatch', mismatchReason: UNVERIFIABLE, releasedAt: null, verifiedAt: null });
+    expect((await ownerRow(w.ownerId)).autoPausedReason).toBe(SETTLEMENT_UNVERIFIABLE);
+    expect(await settle(chain)).toBe('mismatch');
+
+    const fetch = seller();
+    expect(await run(w, { fetch, chain, recallFor, purpose: 'try again' })).toMatchObject({ outcome: 'refused', rule: 'paused', payment: null });
+    expect(paidCalls(fetch)).toHaveLength(0);
+    expect(await paymentRows(w.ownerId)).toHaveLength(1);
   });
 
   it('cuts the paid request to end 10 s before the deadline, measured again after signing', async () => {

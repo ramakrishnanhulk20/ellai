@@ -118,11 +118,55 @@ function exceedsDepth(text: string, maxDepth: number): boolean {
   return false;
 }
 
+/**
+ * True when any object in `text` names one key twice, at any depth. JSON.parse keeps the last
+ * copy and other parsers keep the first, so a seller could show Ellai one value and its own
+ * verifier another. Each key is decoded by JSON.parse itself before it is compared, so "a" and
+ * "a" are one key. Only called on text JSON.parse has already accepted; anything it cannot
+ * read counts as a repeat, so it fails closed.
+ */
+function repeatsKey(text: string): boolean {
+  // One entry per open object or array: the keys seen so far, or null for an array.
+  const open: Array<Set<string> | null> = [];
+  let keyNext = false;
+  for (let i = 0; i < text.length; i += 1) {
+    const char = text[i];
+    if (char === '"') {
+      let end = i + 1;
+      while (end < text.length && text[end] !== '"') end += text[end] === '\\' ? 2 : 1;
+      if (end >= text.length) return true;
+      const keys = open[open.length - 1];
+      if (keyNext && keys) {
+        const key: unknown = JSON.parse(text.slice(i, end + 1));
+        if (typeof key !== 'string' || keys.has(key)) return true;
+        keys.add(key);
+        keyNext = false;
+      }
+      i = end;
+    } else if (char === '{') {
+      open.push(new Set());
+      keyNext = true;
+    } else if (char === '[') {
+      open.push(null);
+      keyNext = false;
+    } else if (char === '}' || char === ']') {
+      open.pop();
+      keyNext = false;
+    } else if (char === ',') {
+      keyNext = Boolean(open[open.length - 1]);
+    }
+  }
+  return false;
+}
+
 function checkSize(text: string, what: string): void {
   if (Buffer.byteLength(text, 'utf8') > LIMITS.challengeMaxBytes) refuse('TOO_LARGE', `${what} is over the size cap`);
 }
 
-/** Size and depth are checked on the raw text, before JSON.parse ever runs. Returns null for text that is not a JSON object. */
+/**
+ * Size and depth are checked on the raw text, before JSON.parse ever runs. Returns null for text
+ * that is not a JSON object, and refuses an object that names one key twice at any depth (C3).
+ */
 function jsonObject(text: string, what: string): JsonRecord | null {
   checkSize(text, what);
   const trimmed = text.trimStart();
@@ -134,7 +178,9 @@ function jsonObject(text: string, what: string): JsonRecord | null {
   } catch {
     return null;
   }
-  return isRecord(value) ? value : null;
+  if (!isRecord(value)) return null;
+  if (repeatsKey(trimmed)) refuse('MALFORMED', `${what} names one key twice`);
+  return value;
 }
 
 function base64JsonObject(value: string): JsonRecord {
@@ -471,7 +517,8 @@ function sellerOf(res: SafeResponse): { url: string; host: string } {
  * Reads two dialects, x402 v1 as t2000 sellers send it (JSON body, mirrored in a
  * WWW-Authenticate "Payment" header) and x402 v2 (base64 PAYMENT-REQUIRED header and
  * or JSON body). Exactly one option may pay USDC on Sui Mainnet; every copy of a value
- * must agree once read by the same parser; the amount must be whole atomic units
+ * must agree once read by the same parser; no object in the body or the header copy may
+ * name one key twice, since parsers differ on which copy wins; the amount must be whole atomic units
  * within LIMITS. The result is a new frozen object built field by field, never a merge
  * of seller JSON.
  *

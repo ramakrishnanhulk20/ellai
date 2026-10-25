@@ -76,7 +76,7 @@ function addressOrFail(value: unknown, what: string): string {
  * Re-checks a canonical payment before anything is built from it, so a payment that
  * did not come from parseChallenge still cannot reach a signature outside the limits.
  */
-function sendTerms(payment: CanonicalPayment, payer: string): SendTerms {
+function payableTerms(payment: CanonicalPayment): Omit<SendTerms, 'payer'> {
   if (payment?.dialect !== SUPPORTED_DIALECT) fail('UNSUPPORTED_DIALECT', 'only the t2000 x402 v1 dialect can be paid');
   if (payment.network !== DEPLOYMENT_NETWORK) fail('BUILD_FAILED', 'the payment is not on Sui Mainnet');
   let asset: string | null;
@@ -106,14 +106,25 @@ function sendTerms(payment: CanonicalPayment, payer: string): SendTerms {
   if (minEpoch > maxEpoch || maxEpoch - minEpoch > BigInt(LIMITS.paymentMaxEpochSpan)) {
     fail('BUILD_FAILED', 'the epoch window is not one Sui accepts');
   }
-  return {
-    payer: addressOrFail(payer, 'the payer'),
-    recipient,
-    amount: payment.amount,
-    minEpoch,
-    maxEpoch,
-    nonce: Number(payment.nonce),
-  };
+  return { recipient, amount: payment.amount, minEpoch, maxEpoch, nonce: Number(payment.nonce) };
+}
+
+function sendTerms(payment: CanonicalPayment, payer: string): SendTerms {
+  const terms = payableTerms(payment);
+  return { payer: addressOrFail(payer, 'the payer'), ...terms };
+}
+
+/**
+ * Runs, on the payment alone, every check buildPaymentBytes and signPayment run before they
+ * build: the dialect, network, asset, amount limits, recipient, the t2000 challenge id and
+ * nonce, and an epoch window Sui accepts. A caller runs it before asking anyone to approve a
+ * payment, so nobody is asked about one Ellai would then refuse to sign. Does not cover the
+ * payer, expiry or the chain's current epoch, which are only known at signing.
+ * Throws PaymentError: UNSUPPORTED_DIALECT for any dialect but x402-v1-t2000, BUILD_FAILED
+ * for any other check.
+ */
+export function checkPayable(payment: CanonicalPayment): void {
+  payableTerms(payment);
 }
 
 /** The same calls, in the same order, as t2000's own payer (buildX402SignedPayment). */
