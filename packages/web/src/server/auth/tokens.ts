@@ -1,6 +1,5 @@
 import { createHmac, randomBytes } from 'node:crypto';
 import { LIMITS } from '@ellai/core/limits';
-import { TEXT_CAPS } from '../db/schema.js';
 
 // Each kind of token has its own prefix, so a session token is never accepted where an
 // agent token is expected or the other way round, and neither can ever equal a record id.
@@ -12,6 +11,9 @@ export type BearerTokenPrefix = typeof SESSION_TOKEN_PREFIX | typeof AGENT_TOKEN
 const BODY_CHARS = Math.ceil((LIMITS.bearerTokenBytes * 4) / 3);
 const BODY_PATTERN = new RegExp(`^[A-Za-z0-9_-]{${BODY_CHARS}}$`);
 const SECRET_PATTERN = /^(?:[0-9a-f]{2}){32,}$/i;
+// Six characters of the random part tell an owner's keys apart at a glance. They give away 36
+// of the token's 256 random bits, which leaves far more than any guess could cover.
+const DISPLAY_BODY_CHARS = 6;
 
 function secretKey(secretHex: string): Buffer {
   // Buffer.from(hex) silently stops at the first bad character, which would quietly
@@ -44,7 +46,8 @@ export function isBearerToken(token: unknown, prefix: BearerTokenPrefix): token 
  * unpadded base64url.
  * Returns the token, which is shown to its holder once and never stored; its HMAC-SHA256
  * under the session secret as 64 hex characters, which is what the database stores and
- * looks up; and its first TEXT_CAPS.tokenPrefix characters for display.
+ * looks up; and, for display, the prefix and the first 6 characters of the random part
+ * (ellai_agent_AbC12x), so two keys can be told apart.
  * Throws if the prefix is not one of the two token prefixes, or if secretHex is not at
  * least 32 bytes written as hex. The message never contains the secret.
  */
@@ -52,7 +55,7 @@ export function newBearerToken(prefix: BearerTokenPrefix, secretHex: string): { 
   const key = secretKey(secretHex);
   if (prefix !== SESSION_TOKEN_PREFIX && prefix !== AGENT_TOKEN_PREFIX) throw new Error('Unknown bearer token prefix');
   const token = prefix + randomBytes(LIMITS.bearerTokenBytes).toString('base64url');
-  return { token, hash: keyedHash(token, key), displayPrefix: token.slice(0, TEXT_CAPS.tokenPrefix) };
+  return { token, hash: keyedHash(token, key), displayPrefix: token.slice(0, prefix.length + DISPLAY_BODY_CHARS) };
 }
 
 /**

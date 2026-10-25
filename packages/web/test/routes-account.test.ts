@@ -2,7 +2,8 @@
 // PGlite with a stub chain: the session requirement on every one and same origin on every one
 // that changes state; decision and memory history holding only the owner's own rows, newest
 // first, paged by before and limit without losing or repeating rows that share a millisecond;
-// agent tokens shown once and never again, and revoking one stopping it; onboarding passing
+// agent tokens shown once and never again, revoking one stopping it, at most ten made an hour
+// and twenty held at once by one owner; onboarding passing
 // the owner, chain and master secret to the onboarding functions and their summaries and
 // refusals back unchanged; settings held to their bounds at each edge, the auto pause cleared
 // only on request; and one shared per-owner limit on the routes that read Sui.
@@ -11,6 +12,7 @@
 // racing a settings change against signing (PGlite serves one connection, so the FOR UPDATE
 // lock is not raced here), or how a page renders agent text (no pages exist yet).
 import { randomBytes } from 'node:crypto';
+import { readFile } from 'node:fs/promises';
 import { type Chain, ChainError } from '@ellai/core/chain';
 import { LIMITS } from '@ellai/core/limits';
 import { buildCreateAccountTx, findMemoryAccount, MemoryError } from '@ellai/core/memory';
@@ -39,6 +41,7 @@ import { type Database, createDb, migrate } from '../src/server/db/client.js';
 import { agents, decisionCitations, decisions, memories, owners, payments } from '../src/server/db/schema.js';
 import type { ServerEnv } from '../src/server/env.js';
 import { type ServerContextFactory, setServerContextFactory } from '../src/server/http/context.js';
+import { HttpError, type HttpErrorCode } from '../src/server/http/errors.js';
 import { MEMORY_NAMESPACE } from '../src/server/memory/namespace.js';
 import { buildOnboardingTx } from '../src/server/onboarding/build.js';
 import { confirmOnboardingTx } from '../src/server/onboarding/confirm.js';
@@ -80,6 +83,7 @@ const ENV: ServerEnv = {
 const MISSING_ID = '00000000-0000-4000-8000-000000000000';
 const DIGEST = 'AQ2cfEAh3AiC1SBMkH64f4MP4QsvTettKfhLXErgNcFh';
 const DAY_MS = 86_400_000;
+const HOUR_MS = 3_600_000;
 
 const FIRST_MINUTE = Math.floor(Date.now() / 60_000) * 60_000;
 let minutesUsed = 0;
@@ -415,6 +419,7 @@ describe('GET /api/owner/decisions', () => {
   });
 
   it('refuses a query it cannot read exactly with 400 bad_query', async () => {
+    quiet();
     const owner = await signedInOwner();
     for (const query of [
       '?before=yesterday',
@@ -472,6 +477,7 @@ describe('GET /api/owner/memories', () => {
   });
 
   it('pages by before and limit like decisions, ties included, capped at 50', async () => {
+    quiet();
     const owner = await signedInOwner();
     const ids: string[] = [];
     // 54 at their own seconds, then the 6 oldest all in one millisecond.
@@ -503,7 +509,7 @@ describe('GET and POST /api/owner/agents', () => {
     expect(created.headers.get('cache-control')).toBe('no-store');
     const { agentId, token, displayPrefix } = await json<{ agentId: string; token: string; displayPrefix: string }>(created);
     expect(token).toMatch(/^ellai_agent_[A-Za-z0-9_-]{43}$/);
-    expect(displayPrefix).toBe(token.slice(0, 12));
+    expect(displayPrefix).toBe(token.slice(0, 'ellai_agent_'.length + 6));
     expect(await authenticateAgent({ db, token, sessionSecretHex: SECRET })).toEqual({ ownerId: owner.ownerId, agentId });
 
     const hash = hashBearerToken(token, SECRET);
@@ -549,6 +555,36 @@ describe('GET and POST /api/owner/agents', () => {
     expect(await agentList(owner.cookie)).toEqual([]);
     const longest = await json<{ agentId: string }>(await createAgent({ label: '\u{1F600}'.repeat(60) }, { cookie: owner.cookie }));
     expect((await agentList(owner.cookie)).map((a) => a.agentId)).toEqual([longest.agentId]);
+  });
+
+  it('turns away the 11th create in one hour for one owner with 429, others and the next hour untouched', async () => {
+    quiet();
+    const owner = await signedInOwner();
+    const other = await signedInOwner();
+    expect(LIMITS.agentCreatesPerHour).toBe(10);
+    // The first call is a bad body: it is counted before the body is read.
+    await refusedWith(await createAgent({}, { cookie: owner.cookie }), 400, 'bad_body');
+    for (let i = 2; i <= 10; i += 1) expect((await createAgent({ label: `Agent ${i}` }, { cookie: owner.cookie })).status).toBe(200);
+    const refused = await createAgent({ label: 'One more' }, { cookie: owner.cookie });
+    expect(refused.status).toBe(429);
+    expect(await refused.json()).toEqual({ error: 'too_many_agent_creates', message: new HttpError(429, 'too_many_agent_creates').message });
+    expect(await agentList(owner.cookie)).toHaveLength(9);
+
+    expect((await createAgent({ label: 'Theirs' }, { cookie: other.cookie })).status).toBe(200);
+    clock = new Date(Math.floor(clock.getTime() / HOUR_MS) * HOUR_MS + HOUR_MS);
+    expect((await createAgent({ label: 'Next hour' }, { cookie: owner.cookie })).status).toBe(200);
+  });
+
+  it('refuses a 21st live agent with 409 too_many_agents, and takes one again after a revoke', async () => {
+    quiet();
+    const owner = await signedInOwner();
+    const held = [];
+    for (let i = 0; i < LIMITS.agentsPerOwnerMax; i += 1) held.push(await agentFor(owner.ownerId, `Agent ${i + 1}`));
+    const refused = await createAgent({ label: 'Agent 21' }, { cookie: owner.cookie });
+    expect(refused.status).toBe(409);
+    expect(await refused.json()).toEqual({ error: 'too_many_agents', message: 'an owner may hold at most 20 agents at once; revoke one first' });
+    expect(await json(await revoke(held[0] ?? '', { cookie: owner.cookie }))).toEqual({ revoked: true });
+    expect((await createAgent({ label: 'Agent 21' }, { cookie: owner.cookie })).status).toBe(200);
   });
 });
 
@@ -729,6 +765,7 @@ describe('PATCH /api/owner/settings', () => {
   });
 
   it('holds every bound at its edge, refusing just past it with nothing changed', async () => {
+    quiet();
     const owner = await signedInOwner();
     const ok = async (change: Record<string, unknown>) => expect((await patchSettings(change, { cookie: owner.cookie })).status).toBe(200);
     const refused = async (change: Record<string, unknown>) => {
@@ -840,6 +877,36 @@ describe('the session and origin requirements', () => {
     expect(await authenticateAgent({ db, token, sessionSecretHex: SECRET })).not.toBeNull();
     expect(vi.mocked(buildOnboardingTx)).not.toHaveBeenCalled();
     expect(vi.mocked(confirmOnboardingTx)).not.toHaveBeenCalled();
+  });
+});
+
+describe('error answers', () => {
+  const ROUTES = ['decisions', 'memories', 'agents', 'agents/[id]', 'onboarding', 'onboarding/build', 'onboarding/confirm', 'settings', 'overview'];
+
+  it('come from the one table in errors.ts: no owner route, nor the helpers they share, writes an error body by hand', async () => {
+    const files = [...ROUTES.map((route) => `../src/app/api/owner/${route}/route.ts`), '../src/server/http/owner-limits.ts'];
+    for (const file of files) {
+      const source = await readFile(new URL(file, import.meta.url), 'utf8');
+      expect([file, source.match(/\berror\s*:\s*['"`]/)?.[0] ?? null]).toEqual([file, null]);
+    }
+  });
+
+  it("answer each refusal with exactly the status, code and text errors.ts holds for it", async () => {
+    quiet();
+    const owner = await signedInOwner();
+    const table = (status: number, code: HttpErrorCode) => ({ status, body: { error: code, message: new HttpError(status, code).message } });
+    const seen = async (response: Response) => ({ status: response.status, body: (await response.json()) as { error: string; message: string } });
+
+    expect(await seen(await listDecisions(owner.cookie, '?limit=0'))).toEqual(table(400, 'bad_query'));
+    expect(await seen(await listMemories(owner.cookie, '?before=yesterday'))).toEqual(table(400, 'bad_query'));
+    vi.mocked(buildCreateAccountTx).mockRejectedValueOnce(new MemoryError('DELEGATE', MARKER));
+    expect(await seen(await build({ step: 'memory_account' }, { cookie: owner.cookie }))).toEqual(table(422, 'chain_refused'));
+    vi.mocked(buildCreateAccountTx).mockRejectedValueOnce(new ChainError('TIMEOUT', MARKER, true));
+    expect(await seen(await build({ step: 'memory_account' }, { cookie: owner.cookie }))).toEqual(table(503, 'chain_unavailable'));
+
+    const bound = await seen(await patchSettings({ approvalsNeeded: 11 }, { cookie: owner.cookie }));
+    expect(bound).toEqual({ status: 400, body: { error: 'out_of_bounds', message: 'Approvals needed must be a whole number from 1 to 10.' } });
+    expect(new HttpError(400, 'out_of_bounds', bound.body.message).message).toBe(bound.body.message);
   });
 });
 

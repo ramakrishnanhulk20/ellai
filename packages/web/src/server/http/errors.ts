@@ -32,7 +32,16 @@ export type HttpErrorCode =
   | 'bad_json'
   | 'bad_body'
   | 'agent_unauthorized'
-  | 'jobs_unauthorized';
+  | 'jobs_unauthorized'
+  | 'too_many_agent_creates'
+  | 'bad_query'
+  | 'out_of_bounds'
+  | 'too_many_requests'
+  | 'chain_refused'
+  | 'chain_unavailable';
+
+/** The one code whose refusal may say which bound was passed, in a sentence Ellai wrote. */
+export type BoundsHttpErrorCode = 'out_of_bounds';
 
 const HTTP_ERROR_MESSAGES: Readonly<Record<HttpErrorCode, string>> = {
   cross_origin: 'This request did not come from the Ellai app.',
@@ -45,24 +54,47 @@ const HTTP_ERROR_MESSAGES: Readonly<Record<HttpErrorCode, string>> = {
   bad_body: 'The request body does not have the fields this endpoint takes.',
   agent_unauthorized: 'Send a valid Ellai agent token as Authorization: Bearer <token>.',
   jobs_unauthorized: 'This endpoint needs the jobs secret.',
+  too_many_agent_creates: 'Too many agent keys were made this hour. Try again later.',
+  bad_query: 'The query string does not have the values this endpoint takes.',
+  out_of_bounds: 'A value in the request is outside the bounds this endpoint allows.',
+  too_many_requests: 'Too many requests. Try again in a minute.',
+  chain_refused: 'Sui does not allow this step for your Walrus Memory account right now.',
+  chain_unavailable: 'Ellai could not read Sui just now. Try again in a minute.',
 };
+
+// The known classes promise fixed text plus values Ellai checked itself. This holds them to
+// it on the way out, since the next reader may be a page or an agent (C17).
+const SAFE_MESSAGE = /^[^\p{Cc}]{1,300}$/u;
 
 /**
  * A refusal the HTTP layer makes itself. The message comes from the code alone, so it can
- * never carry anything the caller sent (C19). Throws RangeError for a status that is not 4xx
- * or 5xx, which is a server bug.
+ * never carry anything the caller sent (C19). The one exception is out_of_bounds, which may
+ * carry a sentence naming the bound that was passed; it must be fixed text and limits Ellai
+ * wrote, never the caller's value, and one that is not a single short line is replaced by the
+ * code's own text. Throws RangeError for a status that is not 4xx or 5xx, which is a server bug.
  */
 export class HttpError extends Error {
   readonly status: number;
   readonly code: HttpErrorCode;
 
-  constructor(status: number, code: HttpErrorCode) {
+  constructor(status: number, code: HttpErrorCode);
+  constructor(status: number, code: BoundsHttpErrorCode, detail: string);
+  constructor(status: number, code: HttpErrorCode, detail?: string) {
     if (!Number.isInteger(status) || status < 400 || status > 599) throw new RangeError('an HTTP error status must be 400 to 599');
-    super(HTTP_ERROR_MESSAGES[code]);
+    const detailed = code === 'out_of_bounds' && typeof detail === 'string' && SAFE_MESSAGE.test(detail);
+    super(detailed ? detail : HTTP_ERROR_MESSAGES[code]);
     this.name = 'HttpError';
     this.status = status;
     this.code = code;
   }
+}
+
+/**
+ * The JSON answer for one HttpError, exactly as toErrorResponse gives it, for a helper that
+ * returns its refusal rather than throwing it. Logs nothing: the caller logs its own line.
+ */
+export function httpErrorResponse(error: HttpError): Response {
+  return errorJson(error.status, { error: error.code, message: error.message });
 }
 
 // Typed as complete records, so a code added to one of these classes without a status here
@@ -96,6 +128,7 @@ const DECIDE_STATUS: Readonly<Record<DecideErrorCode, number>> = {
 const AGENT_STATUS: Readonly<Record<AgentErrorCode, number>> = {
   BAD_INPUT: 400,
   NOT_FOUND: 404,
+  TOO_MANY_AGENTS: 409,
 };
 
 const ONBOARDING_STATUS: Readonly<Record<OnboardingErrorCode, number>> = {
@@ -189,9 +222,6 @@ const FIXED_MESSAGES = {
 } as const;
 
 const FALLBACK_MESSAGE = 'The request was refused.';
-// The known classes promise fixed text plus values Ellai checked itself. This holds them to
-// it on the way out, since the next reader may be a page or an agent (C17).
-const SAFE_MESSAGE = /^[^\p{Cc}]{1,300}$/u;
 const SAFE_NAME = /^[A-Za-z_$][\w$]{0,63}$/;
 const SAFE_CODE = /^[A-Za-z0-9_]{1,40}$/;
 

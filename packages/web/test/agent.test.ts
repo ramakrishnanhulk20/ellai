@@ -1,14 +1,16 @@
 // Covers: the built-in agent's run on PGlite with a stub Claude client (an object whose
 // messages.create returns scripted replies) and a stub gate in place of paidFetch: the
-// catalog; the plain needs-key answer; a full run through list_sellers and paid_fetch; tool
-// inputs checked before anything runs, so an unknown seller or a url field reaches no fetch
-// and the URL is always the catalog's; 'asked' and 'refused' ending the run; the tool cap; a
-// refusal stop; SDK errors kept out of the answer and the log; the hourly and daily run
-// limits; the one built-in agent row per owner; and the exact shape of every request sent.
-// Then POST /api/owner/agent/run as Next calls it: the session and same-origin checks, the
-// needs-key answer without ANTHROPIC_API_KEY, body and task refusals, and, with a key and a
-// stubbed fetch under the real SDK, that the key goes only to Anthropic and neither it nor
-// the API's error text reaches the response or the log.
+// catalog, cut to sellers the gate can pay at default limits; the plain needs-key answer; a
+// full run through list_sellers and paid_fetch; tool inputs checked before anything runs, so an
+// unknown seller or a url field reaches no fetch and the URL is always the catalog's; 'asked',
+// 'refused' and a pay limit ending the run; the tool cap; a refusal stop; SDK errors kept out
+// of the answer and the log; the hourly and daily run limits; the one built-in agent row per
+// owner; and the exact shape of every request sent. Then POST /api/owner/agent/run as Next
+// calls it: the session and same-origin checks, the needs-key answer without
+// ANTHROPIC_API_KEY, body and task refusals, and, with a key and a stubbed fetch under the
+// real SDK, that the key goes only to Anthropic and neither it nor the API's error text
+// reaches the response or the log, each try's timeout and the one retry, and the owner's
+// per-minute pay limit shared with outside agents.
 // Does NOT cover: a live model call (no key in tests; the head chef runs that proof), what
 // paidFetch itself decides or pays (pay.test.ts does), how well Haiku picks a seller, or two
 // database connections starting a first run at once (PGlite serves one connection).
@@ -21,13 +23,15 @@ import { Ed25519Keypair } from '@mysten/sui/keypairs/ed25519';
 import { and, eq } from 'drizzle-orm';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import * as agentRunRoute from '../src/app/api/owner/agent/run/route.js';
-import { agentCatalog } from '../src/server/agent/catalog.js';
+import { DEFAULT_PER_PAYMENT_MAX_ATOMIC, agentCatalog, documentedPriceAtomic } from '../src/server/agent/catalog.js';
 import { AGENT_SYSTEM_PROMPT } from '../src/server/agent/prompt.js';
 import {
   AGENT_ANSWERS,
   AGENT_MODEL,
+  AGENT_MODEL_RETRIES,
   AgentTaskError,
   BUILTIN_AGENT_LABEL,
+  PAY_LIMIT_REASON,
   type PaidFetchInput,
   TOOL_ERRORS,
   runAgentTask,
@@ -35,8 +39,9 @@ import {
 import { revokeAgent } from '../src/server/auth/agents.js';
 import { completeSignIn, issueSignIn } from '../src/server/auth/signin.js';
 import { type Database, createDb, migrate } from '../src/server/db/client.js';
-import { agents, rateCounters } from '../src/server/db/schema.js';
+import { agents, owners, rateCounters } from '../src/server/db/schema.js';
 import type { ServerEnv } from '../src/server/env.js';
+import { AgentLimitError, limitAgentFetch } from '../src/server/http/agent-auth.js';
 import { setServerContextFactory } from '../src/server/http/context.js';
 import { type PaidFetchResult, bare } from '../src/server/pay/result.js';
 
@@ -175,19 +180,52 @@ async function builtinAgents(ownerId: string) {
 }
 
 describe('agentCatalog', () => {
-  it("lists Ellai's wallet check first, then every known seller with its documented request, under unique slugs", () => {
+  it("lists Ellai's wallet check first, then the known sellers the gate can pay at default limits, each with its documented request", () => {
     const catalog = agentCatalog(`${APP_ORIGIN}/`);
     expect(catalog[0]).toMatchObject({ id: 'ellai-wallet-check', url: WALLET_CHECK_URL, method: 'POST', contentType: 'application/json' });
     expect(JSON.parse(catalog[0]?.bodyExample ?? '')).toEqual({ address: expect.any(String) });
-    const documented = KNOWN_SELLERS.filter((seller) => seller.body !== undefined && seller.contentType !== undefined);
-    expect(catalog.slice(1).map(({ url, method, contentType, bodyExample }) => ({ url, method, contentType, bodyExample }))).toEqual(
-      documented.map((seller) => ({ url: seller.url, method: seller.method, contentType: seller.contentType, bodyExample: seller.body })),
-    );
-    const ids = catalog.map((entry) => entry.id);
-    expect(new Set(ids).size).toBe(ids.length);
-    for (const id of ids) expect(id).toMatch(/^[a-z0-9]+(-[a-z0-9]+)*$/);
-    expect(ids).toContain('suimpp-hotels-search-flexible');
+    expect(catalog.map((entry) => entry.id)).toEqual([
+      'ellai-wallet-check',
+      'agentproof-preflight',
+      'agentproof-mcp',
+      'suimpp-hotels-search-flexible',
+      'suimpp-flights-search-flexible',
+      'jp-task-policy-evidence-classify',
+      'piptradedex-markets',
+      'agentproof-mcp-verify',
+    ]);
+    for (const entry of catalog.slice(1)) {
+      const seller = KNOWN_SELLERS.find((known) => known.url === entry.url);
+      expect({ method: entry.method, contentType: entry.contentType, bodyExample: entry.bodyExample, description: entry.description }).toEqual({
+        method: seller?.method,
+        contentType: seller?.contentType,
+        bodyExample: seller?.body,
+        description: seller?.note,
+      });
+      expect(documentedPriceAtomic(seller?.note ?? '')).toBeLessThanOrEqual(DEFAULT_PER_PAYMENT_MAX_ATOMIC);
+    }
+    // Two whose 402 core refuses as MALFORMED, one priced over the default maximum, and a subscription.
+    const urls = catalog.map((entry) => entry.url);
+    for (const dropped of ['/inspect', '/palette', '/v1/deep-verify', '/subscribe']) {
+      expect(KNOWN_SELLERS.some((seller) => seller.url.endsWith(dropped))).toBe(true);
+      expect(urls.some((url) => url.endsWith(dropped))).toBe(false);
+    }
     expect(Object.isFrozen(catalog) && Object.isFrozen(catalog[0])).toBe(true);
+  });
+
+  it('reads one stated price from a note, in atomic USDC, and nothing from a note with none or two', () => {
+    expect(documentedPriceAtomic('JMPR hotel search in plain words, 0.01 USDC, LLM-planned')).toBe(10_000n);
+    expect(documentedPriceAtomic('AgentProof MCP server check, 0.05 USDC, deterministic')).toBe(50_000n);
+    expect(documentedPriceAtomic('t2000 alert bot subscription, 1.00 USDC, exactly the hard limit')).toBe(1_000_000n);
+    expect(documentedPriceAtomic('a check with no price at all')).toBeNull();
+    expect(documentedPriceAtomic('0.01 USDC now, 0.25 USDC later')).toBeNull();
+  });
+
+  it("keeps its default per-payment maximum equal to the owners table's default", async () => {
+    const ownerId = await newOwner();
+    const [owner] = await db.select({ perPaymentMaxAtomic: owners.perPaymentMaxAtomic }).from(owners).where(eq(owners.id, ownerId));
+    expect(owner?.perPaymentMaxAtomic).toBe(DEFAULT_PER_PAYMENT_MAX_ATOMIC);
+    expect(DEFAULT_PER_PAYMENT_MAX_ATOMIC).toBeLessThanOrEqual(BigInt(LIMITS.maxPaymentAtomic));
   });
 
   it('refuses an app origin that is not an origin', () => {
@@ -309,6 +347,21 @@ describe('runAgentTask', () => {
       expect(gate).toHaveBeenCalledTimes(1);
       expect(create).toHaveBeenCalledTimes(2);
     }
+  });
+
+  it("records a 'failed' step and ends 'stopped' at once when the gate turns a call away for a pay limit", async () => {
+    const ownerId = await newOwner();
+    const { client, create } = stubClient([calling(checkWallet('p1'), checkWallet('p2')), final('never asked for')]);
+    const gate = vi.fn(async (): Promise<PaidFetchResult> => {
+      throw new AgentLimitError();
+    });
+    expect(await run(ownerId, client, gate)).toEqual({
+      status: 'stopped',
+      answer: AGENT_ANSWERS.payLimit,
+      steps: [{ sellerId: 'ellai-wallet-check', outcome: 'failed', reason: PAY_LIMIT_REASON, digest: null }],
+    });
+    expect(gate).toHaveBeenCalledTimes(1);
+    expect(create).toHaveBeenCalledTimes(1);
   });
 
   it(`stops the run with a fixed answer when it would pass ${LIMITS.agentMaxToolCalls} tool calls`, async () => {
@@ -453,9 +506,10 @@ describe('POST /api/owner/agent/run', () => {
 
   beforeEach(() => useEnv(ENV));
 
-  it('runs on Node and is never cached or prerendered', () => {
+  it('runs on Node, is never cached or prerendered, and has a 60 second ceiling of its own', () => {
     expect(agentRunRoute.runtime).toBe('nodejs');
     expect(agentRunRoute.dynamic).toBe('force-dynamic');
+    expect(agentRunRoute.maxDuration).toBe(60);
   });
 
   it('is 401 signed_out without a session, whatever the body names', async () => {
@@ -523,5 +577,64 @@ describe('POST /api/owner/agent/run', () => {
     const logged = logs.flatMap((spy) => spy.mock.calls.flat()).join(' ');
     expect(logged).not.toContain(MARKER);
     expect(logged).toContain('[ellai agent] model_error 401');
+  });
+
+  it(`builds the client with a ${LIMITS.agentModelTimeoutMs} ms wait a try and ${AGENT_MODEL_RETRIES} retry, so a busy model is tried twice at most`, async () => {
+    const logs = quiet();
+    useEnv({ ...ENV, ANTHROPIC_API_KEY: API_KEY });
+    const sent: Array<{ timeoutSeconds: string | null; retryCount: string | null }> = [];
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const request = new Request(input, init);
+        // The SDK states each try's timeout and its retry number in these two headers.
+        sent.push({ timeoutSeconds: request.headers.get('x-stainless-timeout'), retryCount: request.headers.get('x-stainless-retry-count') });
+        const overloaded = { type: 'error', error: { type: 'overloaded_error', message: 'Overloaded' } };
+        return new Response(JSON.stringify(overloaded), { status: 529, headers: { 'content-type': 'application/json', 'retry-after-ms': '1' } });
+      }),
+    );
+    const { cookie } = await signedIn();
+
+    const response = await post({ task: 'Check the Sui wallet 0x2' }, { cookie });
+    expect(await response.json()).toEqual({ status: 'stopped', answer: AGENT_ANSWERS.modelUnavailable, steps: [] });
+    expect(AGENT_MODEL_RETRIES).toBe(1);
+    expect(sent).toEqual([
+      { timeoutSeconds: String(LIMITS.agentModelTimeoutMs / 1_000), retryCount: '0' },
+      { timeoutSeconds: String(LIMITS.agentModelTimeoutMs / 1_000), retryCount: '1' },
+    ]);
+    expect(logs.flatMap((spy) => spy.mock.calls.flat()).join(' ')).toContain('[ellai agent] model_error 529');
+  });
+
+  it("counts the built-in agent's purchases against the owner's per-minute pay limit its outside agents share", async () => {
+    const [warn] = quiet();
+    useEnv({ ...ENV, ANTHROPIC_API_KEY: API_KEY });
+    const { ownerId, cookie } = await signedIn();
+    // Two outside agents use the owner's whole minute, each staying within its own limit.
+    for (const agentId of ['00000000-0000-4000-8000-0000000000b1', '00000000-0000-4000-8000-0000000000b2']) {
+      for (let call = 0; call < LIMITS.agentCallsPerMinute; call += 1) await limitAgentFetch(db, { ownerId, agentId }, clock);
+    }
+    expect(LIMITS.ownerPayRequestsPerMinute).toBe(2 * LIMITS.agentCallsPerMinute);
+    const toolUse = {
+      id: 'msg_limit',
+      type: 'message',
+      role: 'assistant',
+      model: AGENT_MODEL,
+      content: [use('t1', 'paid_fetch', { sellerId: 'ellai-wallet-check', body: WALLET_BODY, purpose: PURPOSE })],
+      stop_reason: 'tool_use',
+      stop_sequence: null,
+      usage: { input_tokens: 10, output_tokens: 10 },
+    };
+    const anthropic = vi.fn(async () => new Response(JSON.stringify(toolUse), { status: 200, headers: { 'content-type': 'application/json' } }));
+    vi.stubGlobal('fetch', anthropic);
+
+    const response = await post({ task: 'Check the Sui wallet 0x2' }, { cookie });
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({
+      status: 'stopped',
+      answer: AGENT_ANSWERS.payLimit,
+      steps: [{ sellerId: 'ellai-wallet-check', outcome: 'failed', reason: PAY_LIMIT_REASON, digest: null }],
+    });
+    expect(anthropic).toHaveBeenCalledTimes(1);
+    expect(warn?.mock.calls.map((call) => call.join(' '))).toEqual(['[ellai http] owner_pay too_many_requests']);
   });
 });

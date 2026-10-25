@@ -222,7 +222,7 @@ describe('POST /api/jobs/tick', () => {
     expect(getBalances).not.toHaveBeenCalled();
   });
 
-  it('runs the tick with the secret, answering with its summary, and prunes counters older than an hour', async () => {
+  it('runs the tick with the secret, answering with its summary, and prunes counters older than the retention window', async () => {
     const { stub, getBalances } = gasChain(async () => ({ usdcAddressBalance: 0n, usdcCoinBalance: 0n, suiTotal: 2_000_000_000n }));
     chain = stub;
     const suiAddress = canonicalSuiAddress(`0x${hex(32)}`);
@@ -252,8 +252,9 @@ describe('POST /api/jobs/tick', () => {
     });
     const minute = (msAgo: number) => new Date(Math.floor((clock.getTime() - msAgo) / 60_000) * 60_000);
     await db.insert(rateCounters).values([
-      { key: 'http:old', windowStart: minute(2 * 3_600_000), count: 3 },
-      { key: 'seller-challenge:old', windowStart: minute(3_600_000 + 60_000), count: 1 },
+      { key: 'http:old', windowStart: minute(26 * 3_600_000), count: 3 },
+      { key: 'seller-challenge:old', windowStart: minute(LIMITS.rateCounterRetentionMs + 120_000), count: 1 },
+      { key: 'agent-run-all:day', windowStart: minute(2 * 3_600_000), count: 1 },
       { key: 'http:recent', windowStart: minute(60_000), count: 1 },
     ]);
 
@@ -275,7 +276,10 @@ describe('POST /api/jobs/tick', () => {
       errors: [],
     });
     expect(getBalances).toHaveBeenCalledWith(GAS.toSuiAddress());
-    expect((await db.select({ key: rateCounters.key }).from(rateCounters)).map((row) => row.key)).toEqual(['http:recent']);
+    const kept = (await db.select({ key: rateCounters.key }).from(rateCounters)).map((row) => row.key);
+    expect(kept).toEqual(expect.arrayContaining(['agent-run-all:day', 'http:recent']));
+    expect(kept).not.toContain('http:old');
+    expect(kept).not.toContain('seller-challenge:old');
   });
 
   it('reports a failure as a fixed code and never the error text', async () => {

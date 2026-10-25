@@ -1,6 +1,5 @@
-import { requireAgent } from '../../../../../server/http/agent-auth.js';
+import { requireAgent, respondToAgent } from '../../../../../server/http/agent-auth.js';
 import { withServerContext } from '../../../../../server/http/context.js';
-import { respond } from '../../../../../server/http/errors.js';
 import { jsonResponse } from '../../../../../server/http/json.js';
 import { agentDecision } from '../../../../../server/mcp/server.js';
 
@@ -14,10 +13,11 @@ export const dynamic = 'force-dynamic';
  * same request, and the grant pays once.
  * Only the agent that made the decision can read it (C13): another agent's decision, even the
  * same owner's, a missing one and a malformed id are the same 404 not_found. 401
- * agent_unauthorized without a valid token.
+ * agent_unauthorized without a valid token, 429 too_many_requests past
+ * LIMITS.agentDecisionReadsPerMinute for this agent, shared with check_decision.
  */
 export async function GET(request: Request, { params }: { params: Promise<{ id: string }> }): Promise<Response> {
-  return respond(() =>
+  return respondToAgent(() =>
     withServerContext(async (ctx) => {
       const agent = await requireAgent(request, ctx);
       const { id } = await params;

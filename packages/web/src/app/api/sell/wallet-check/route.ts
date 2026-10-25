@@ -2,6 +2,7 @@ import { LIMITS } from '@ellai/core/limits';
 import { clientKey } from '../../../../server/http/client.js';
 import { withServerContext } from '../../../../server/http/context.js';
 import { API_RESPONSE_HEADERS, respond } from '../../../../server/http/errors.js';
+import { readCappedBody } from '../../../../server/http/json.js';
 import { HANDLER_MESSAGES, handleWalletCheck, sellerPayTo } from '../../../../server/seller/handler.js';
 
 export const runtime = 'nodejs';
@@ -9,32 +10,12 @@ export const dynamic = 'force-dynamic';
 
 const RESOURCE_PATH = '/api/sell/wallet-check';
 
-// handleWalletCheck refuses a body over LIMITS.challengeMaxBytes; this stops reading as soon as
-// the cap is passed, because Content-Length can be missing or lie. Null for a body over the cap,
-// one that fails to arrive, or bytes that are not UTF-8.
+// handleWalletCheck refuses a body over LIMITS.challengeMaxBytes; the reader stops at that cap.
+// Null for a body over the cap, one that fails to arrive, or bytes that are not UTF-8, which the
+// seller answers with its own 400 rather than the agent API's error codes.
 async function readBodyText(request: Request): Promise<string | null> {
-  if (request.body === null) return '';
-  const reader = request.body.getReader();
-  const chunks: Uint8Array[] = [];
-  let total = 0;
   try {
-    for (;;) {
-      const chunk = await reader.read();
-      if (chunk.done) break;
-      total += chunk.value.byteLength;
-      if (total > LIMITS.challengeMaxBytes) {
-        await reader.cancel().catch(() => undefined);
-        return null;
-      }
-      chunks.push(chunk.value);
-    }
-  } catch {
-    return null;
-  } finally {
-    reader.releaseLock();
-  }
-  try {
-    return new TextDecoder('utf-8', { fatal: true }).decode(Buffer.concat(chunks));
+    return new TextDecoder('utf-8', { fatal: true }).decode(await readCappedBody(request, LIMITS.challengeMaxBytes));
   } catch {
     return null;
   }

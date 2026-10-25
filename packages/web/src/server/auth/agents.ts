@@ -1,9 +1,10 @@
-import { and, asc, eq, isNull } from 'drizzle-orm';
+import { LIMITS } from '@ellai/core/limits';
+import { and, asc, count, eq, isNull } from 'drizzle-orm';
 import type { Database } from '../db/client.js';
 import { AGENT_KINDS, TEXT_CAPS, agents, owners } from '../db/schema.js';
 import { AGENT_TOKEN_PREFIX, hashBearerToken, isBearerToken, newBearerToken } from './tokens.js';
 
-export type AgentErrorCode = 'BAD_INPUT' | 'NOT_FOUND';
+export type AgentErrorCode = 'BAD_INPUT' | 'NOT_FOUND' | 'TOO_MANY_AGENTS';
 
 /** Every refusal from the agent functions. The message is fixed text and never repeats input. */
 export class AgentError extends Error {
@@ -56,9 +57,11 @@ function checkLabel(label: unknown): string {
  * Creates an agent for an owner and its bearer token (C13). Only the token's hash and its
  * display prefix are stored; the token itself is returned here once and can never be read
  * back. The label is trimmed and must be 1 to TEXT_CAPS.agentLabel characters with no
- * control characters.
- * Throws AgentError: BAD_INPUT, NOT_FOUND (no such owner). Throws Error if `now` is not a
- * date or the secret is malformed.
+ * control characters. An owner holds at most LIMITS.agentsPerOwnerMax agents that are not
+ * revoked, of either kind: the count and the insert run in one transaction holding the owner
+ * row FOR UPDATE, so two creates at once can never both take the last place.
+ * Throws AgentError: BAD_INPUT, NOT_FOUND (no such owner), TOO_MANY_AGENTS (the owner already
+ * holds the most). Throws Error if `now` is not a date or the secret is malformed.
  */
 export async function createAgentToken(args: {
   db: Database;
@@ -74,15 +77,23 @@ export async function createAgentToken(args: {
   const now = checkNow(args.now);
   const minted = newBearerToken(AGENT_TOKEN_PREFIX, args.sessionSecretHex);
 
-  // Owners are never deleted, so an owner seen here still exists at the insert.
-  const [owner] = await args.db.select({ id: owners.id }).from(owners).where(eq(owners.id, ownerId));
-  if (owner === undefined) throw new AgentError('NOT_FOUND', 'there is no such owner');
-  const [agent] = await args.db
-    .insert(agents)
-    .values({ ownerId, label, kind: args.kind, tokenHash: minted.hash, tokenPrefix: minted.displayPrefix, createdAt: now })
-    .returning({ id: agents.id });
-  if (agent === undefined) throw new Error('The agent insert returned no row');
-  return { agentId: agent.id, token: minted.token, displayPrefix: minted.displayPrefix };
+  return args.db.transaction(async (tx) => {
+    const [owner] = await tx.select({ id: owners.id }).from(owners).where(eq(owners.id, ownerId)).for('update');
+    if (owner === undefined) throw new AgentError('NOT_FOUND', 'there is no such owner');
+    const [held] = await tx
+      .select({ n: count() })
+      .from(agents)
+      .where(and(eq(agents.ownerId, ownerId), isNull(agents.revokedAt)));
+    if ((held?.n ?? 0) >= LIMITS.agentsPerOwnerMax) {
+      throw new AgentError('TOO_MANY_AGENTS', `an owner may hold at most ${LIMITS.agentsPerOwnerMax} agents at once; revoke one first`);
+    }
+    const [agent] = await tx
+      .insert(agents)
+      .values({ ownerId, label, kind: args.kind, tokenHash: minted.hash, tokenPrefix: minted.displayPrefix, createdAt: now })
+      .returning({ id: agents.id });
+    if (agent === undefined) throw new Error('The agent insert returned no row');
+    return { agentId: agent.id, token: minted.token, displayPrefix: minted.displayPrefix };
+  });
 }
 
 /**

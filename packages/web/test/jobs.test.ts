@@ -4,7 +4,9 @@
 // the send; never while a refill is pending, past the daily count or past the float; never from
 // an allowance that is not this owner's, for this purse, in USDC, unexpired and with room; never
 // signs bytes that are not exactly the refill; keeps an unknown send pending and reads that
-// digest first next time. runJobsTick isolates each
+// digest first next time; releases a lost refill only once its epoch window has closed and
+// further reads still miss it, and leaves rows from before that window was kept waiting.
+// runJobsTick isolates each
 // owner's and each step's failure behind a fixed code, settles pending payments and remembers a
 // paid seller that answered with an error exactly once, expires, refills, sends and confirms
 // memories, warns on a low gas wallet, and takes at most LIMITS.jobsOwnersPerTick owners.
@@ -206,6 +208,8 @@ interface StubState {
   execute: (digest: string) => ExecutionResult | Promise<ExecutionResult>;
   /** What the chain has for a digest, or null for NOT_FOUND. By default, whatever was sent. */
   landed: (digest: string) => TransactionResult | null;
+  /** The epoch the chain reports now. */
+  epoch: bigint;
 }
 
 /**
@@ -224,6 +228,7 @@ function stubChain(on: Database = db) {
       return { digest, status: 'success', errorCode: null, balanceChanges: state.changes, createdObjects: [] };
     },
     landed: (digest) => (sent.has(digest) ? { status: 'success', balanceChanges: state.changes } : null),
+    epoch: 100n,
   };
   const calls: string[] = [];
   const executions: Array<{ txBytes: Uint8Array; signatures: string[]; rowWritten: boolean }> = [];
@@ -231,7 +236,7 @@ function stubChain(on: Database = db) {
     usesApiKey: false,
     getCurrentEpoch: async () => {
       calls.push('getCurrentEpoch');
-      return 100n;
+      return state.epoch;
     },
     getReferenceGasPrice: async () => {
       calls.push('getReferenceGasPrice');
@@ -273,8 +278,12 @@ function stubFor(w: Funded, purseUsdc: bigint, on: Database = db) {
   return stub;
 }
 
-const refill = (w: World, chain: Chain, now: Date = NOW, on: Database = db) =>
-  refillIfNeeded({ db: on, chain, ownerId: w.ownerId, masterSecretHex: MASTER, gasKeypair: GAS, now });
+const noNap = async (_ms: number) => undefined;
+const refill = (w: World, chain: Chain, now: Date = NOW, on: Database = db, sleep: (ms: number) => Promise<void> = noNap) =>
+  refillIfNeeded({ db: on, chain, ownerId: w.ownerId, masterSecretHex: MASTER, gasKeypair: GAS, now, sleep });
+const sendTimesOut = () => {
+  throw new ChainError('TIMEOUT', 'Tatum executeTransaction: timed out; the transaction may have landed', true);
+};
 const refillRows = (ownerId: string, on: Database = db) => on.select().from(refills).where(eq(refills.ownerId, ownerId));
 
 async function refillRow(w: Funded, sentAt: Date, status: 'pending' | 'verified' | 'failed', on: Database = db) {
@@ -479,6 +488,71 @@ describe('refillIfNeeded', () => {
     expect(one(await refillRows(odd.ownerId)).status).toBe('pending');
     await expect(refill(odd, stub.chain)).rejects.toMatchObject({ code: 'MISMATCH' });
     expect(stub.executions).toHaveLength(1);
+  });
+
+  it('fails a lost refill only once its epoch window has closed and three more reads miss it, and may then refill', async () => {
+    const w = await funded();
+    const { chain, state, calls, executions } = stubFor(w, 0n);
+    const send = state.execute;
+    state.execute = sendTimesOut;
+    await expect(refill(w, chain)).rejects.toMatchObject({ name: 'ChainError', code: 'TIMEOUT' });
+    const lost = one(await refillRows(w.ownerId));
+    const expiration = bcs.TransactionData.parse(executions[0]?.txBytes ?? new Uint8Array()).V1?.expiration;
+    const signedMaxEpoch = expiration?.$kind === 'ValidDuring' ? expiration.ValidDuring.maxEpoch : undefined;
+    expect([lost.status, lost.validUntilEpoch, signedMaxEpoch]).toEqual(['pending', 101n, '101']);
+
+    const naps: number[] = [];
+    const sleep = async (ms: number) => {
+      naps.push(ms);
+    };
+    state.execute = send;
+    state.epoch = 101n;
+    calls.length = 0;
+    expect(await refill(w, chain, NOW, db, sleep)).toBe('skipped_pending');
+    expect(calls).toEqual([`getTransactionResult:${lost.digest}`, 'getCurrentEpoch']);
+    expect(naps).toEqual([]);
+
+    state.epoch = 102n;
+    calls.length = 0;
+    expect(await refill(w, chain, NOW, db, sleep)).toBe('refilled');
+    expect(LIMITS.paymentReleaseReads).toBe(3);
+    expect(naps).toEqual([LIMITS.settlementPollIntervalMs, LIMITS.settlementPollIntervalMs, LIMITS.settlementPollIntervalMs]);
+    const readLost = `getTransactionResult:${lost.digest}`;
+    expect(calls.slice(0, 5)).toEqual([readLost, 'getCurrentEpoch', readLost, readLost, readLost]);
+    const rows = await refillRows(w.ownerId);
+    expect(rows.map((row) => [row.digest === lost.digest, row.status, row.validUntilEpoch]).sort()).toEqual([
+      [false, 'verified', 103n],
+      [true, 'failed', 101n],
+    ]);
+    expect(executions).toHaveLength(2);
+  });
+
+  it('records a lost refill that one of the later reads finds, instead of failing it', async () => {
+    const w = await funded();
+    const { chain, state } = stubFor(w, 0n);
+    state.execute = sendTimesOut;
+    await expect(refill(w, chain)).rejects.toMatchObject({ code: 'TIMEOUT' });
+    const lost = one(await refillRows(w.ownerId));
+
+    state.epoch = 102n;
+    let reads = 0;
+    state.landed = (digest) => (digest === lost.digest && ++reads === 3 ? { status: 'success', balanceChanges: refillChanges(w) } : null);
+    state.balances.set(w.purse, { usdcAddressBalance: REFILL });
+    expect(await refill(w, chain)).toBe('not_needed');
+    expect(reads).toBe(3);
+    expect(one(await refillRows(w.ownerId))).toMatchObject({ id: lost.id, status: 'verified', verifiedAt: NOW });
+  });
+
+  it('keeps a pending refill written before valid_until_epoch was kept waiting, however late the epoch', async () => {
+    const w = await funded();
+    const old = await refillRow(w, ago(7 * 86_400_000), 'pending');
+    expect(old.validUntilEpoch).toBeNull();
+    const { chain, state, calls, executions } = stubFor(w, 0n);
+    state.epoch = 1_000_000n;
+    expect(await refill(w, chain)).toBe('skipped_pending');
+    expect(calls).toEqual([`getTransactionResult:${old.digest}`]);
+    expect(executions).toHaveLength(0);
+    expect(one(await refillRows(w.ownerId)).status).toBe('pending');
   });
 });
 

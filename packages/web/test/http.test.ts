@@ -1,19 +1,24 @@
-// Covers: the HTTP plumbing under every route: error responses and their log lines, the
-// same-origin check, the client key, the rate counter, the capped JSON reader, bigint-safe
-// responses, the session requirement, and how request contexts are opened and closed,
-// including the default PGlite path and the per-request Neon pool.
+// Covers: the HTTP plumbing under every route: error responses and their log lines, the one
+// table of HTTP error codes, the same-origin check, the client key, the rate counter over a
+// minute or a longer window, pruning old counters while keeping every window still read, the
+// capped body and JSON readers and the
+// seller route reading with the capped one, bigint-safe responses, the session requirement, and
+// how request contexts are opened and closed, including the default PGlite path and the
+// per-request Neon pool.
 // Does NOT cover: the routes themselves (routes-auth and routes-owner do), a real Postgres
 // server (the pool test points at a closed port), Vercel's own handling of X-Forwarded-For,
 // or two database connections racing one counter (PGlite serves one connection, so the race
 // is run with Promise.all on that one).
 import { createHash, randomBytes } from 'node:crypto';
+import { LIMITS } from '@ellai/core/limits';
 import { PaymentError } from '@ellai/core/payment';
 import { Ed25519Keypair } from '@mysten/sui/keypairs/ed25519';
 import { Pool } from '@neondatabase/serverless';
-import { eq, like } from 'drizzle-orm';
+import { eq, inArray, like } from 'drizzle-orm';
 import { DrizzleQueryError } from 'drizzle-orm/errors';
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import { z } from 'zod';
+import * as sellRoute from '../src/app/api/sell/wallet-check/route.js';
 import { AgentError } from '../src/server/auth/agents.js';
 import { endSession } from '../src/server/auth/sessions.js';
 import { SignInError, completeSignIn, issueSignIn } from '../src/server/auth/signin.js';
@@ -24,10 +29,11 @@ import { DecideError } from '../src/server/decide/decide.js';
 import type { ServerEnv } from '../src/server/env.js';
 import { clientKey } from '../src/server/http/client.js';
 import { type ServerContext, getServerContext, setServerContextFactory, withServerContext } from '../src/server/http/context.js';
-import { HttpError, toErrorResponse } from '../src/server/http/errors.js';
-import { jsonResponse, readJson } from '../src/server/http/json.js';
+import { HttpError, httpErrorResponse, toErrorResponse } from '../src/server/http/errors.js';
+import { jsonResponse, readCappedBody, readJson } from '../src/server/http/json.js';
+import { HANDLER_MESSAGES } from '../src/server/seller/handler.js';
 import { requireSameOrigin } from '../src/server/http/origin.js';
-import { consume } from '../src/server/http/ratelimit.js';
+import { consume, consumeWindow, pruneRateCounters } from '../src/server/http/ratelimit.js';
 import { requireOwner } from '../src/server/http/session.js';
 import { OnboardingError } from '../src/server/onboarding/state.js';
 import { SellerError } from '../src/server/seller/challenge.js';
@@ -106,6 +112,7 @@ describe('toErrorResponse', () => {
     [new AnswerError('ANSWERED', 'this question has already been answered'), 409, 'answered'],
     [new DecideError('REQUEST_MISMATCH', 'the request does not match'), 409, 'request_mismatch'],
     [new AgentError('NOT_FOUND', 'there is no such agent for this owner'), 404, 'not_found'],
+    [new AgentError('TOO_MANY_AGENTS', 'an owner may hold at most 20 agents at once; revoke one first'), 409, 'too_many_agents'],
     [new OnboardingError('NOT_LANDED', 'Sui does not show the transaction yet'), 409, 'not_landed'],
     [new PaymentError('EXPIRED', 'the payment has expired'), 409, 'expired'],
   ])('maps %s to its status, its code and its own fixed message', async (error, status, code) => {
@@ -183,6 +190,34 @@ describe('toErrorResponse', () => {
 
   it('refuses to build an HttpError with a status that is not an error', () => {
     expect(() => new HttpError(200, 'not_found')).toThrow(RangeError);
+  });
+});
+
+describe('the one table of HTTP error codes', () => {
+  it.each([
+    [400, 'bad_query', 'The query string does not have the values this endpoint takes.'],
+    [400, 'out_of_bounds', 'A value in the request is outside the bounds this endpoint allows.'],
+    [429, 'too_many_requests', 'Too many requests. Try again in a minute.'],
+    [429, 'too_many_agent_creates', 'Too many agent keys were made this hour. Try again later.'],
+    [422, 'chain_refused', 'Sui does not allow this step for your Walrus Memory account right now.'],
+    [503, 'chain_unavailable', 'Ellai could not read Sui just now. Try again in a minute.'],
+  ] as const)('answers %s %s with its fixed text, the same whether thrown or returned', async (status, code, message) => {
+    const logs = captureLogs();
+    for (const response of [toErrorResponse(new HttpError(status, code)), httpErrorResponse(new HttpError(status, code))]) {
+      expect(response.status).toBe(status);
+      expect(response.headers.get('cache-control')).toBe('no-store');
+      expect(await response.json()).toEqual({ error: code, message });
+    }
+    expect(logs.lines()).toEqual([`[ellai http] HttpError ${code}`]);
+  });
+
+  it('lets out_of_bounds alone carry a sentence of its own, and only a single short line', () => {
+    const fallback = 'A value in the request is outside the bounds this endpoint allows.';
+    expect(new HttpError(400, 'out_of_bounds', 'The daily budget must be at most 5.000000 USDC.').message).toBe('The daily budget must be at most 5.000000 USDC.');
+    for (const unsafe of ['', `two\nlines ${MARKER}`, 'x'.repeat(301)]) expect(new HttpError(400, 'out_of_bounds', unsafe).message).toBe(fallback);
+    // The typecheck refuses a sentence for any other code; one forced through is dropped.
+    const forced = HttpError as unknown as new (status: number, code: string, detail: string) => HttpError;
+    expect(new forced(400, 'bad_query', MARKER).message).toBe('The query string does not have the values this endpoint takes.');
   });
 });
 
@@ -268,6 +303,55 @@ describe('consume', () => {
   });
 });
 
+const HOUR_MS = 3_600_000;
+const DAY_MS = 86_400_000;
+
+describe('consumeWindow', () => {
+  const hour = new Date('2026-10-25T09:00:00.000Z');
+  const at = (ms: number) => new Date(hour.getTime() + ms);
+
+  it('counts in fixed hours: up to the limit in one, refused past it, open again in the next', async () => {
+    const key = `test:${hex(4)}`;
+    const results = [];
+    for (let i = 0; i < 3; i += 1) results.push(await consumeWindow(db, key, 2, HOUR_MS, at(i * 20 * 60_000)));
+    expect(results).toEqual([true, true, false]);
+    expect(await consumeWindow(db, key, 2, HOUR_MS, at(HOUR_MS - 1))).toBe(false);
+    expect(await consumeWindow(db, key, 2, HOUR_MS, at(HOUR_MS))).toBe(true);
+  });
+
+  it('refuses a window pruning could delete while it still counts, and takes a day', async () => {
+    for (const windowMs of [0, -1, 1.5, LIMITS.rateCounterRetentionMs, LIMITS.rateCounterRetentionMs + 1]) {
+      await expect(consumeWindow(untouchable, 'k', 1, windowMs, hour)).rejects.toThrow('shorter than the counter retention');
+    }
+    expect(await consumeWindow(db, `test:${hex(4)}`, 1, DAY_MS, hour)).toBe(true);
+  });
+});
+
+describe('pruneRateCounters', () => {
+  it('keeps every window newer than the retention, a day window at its oldest included, whatever earlier time it is given', async () => {
+    expect(LIMITS.rateCounterRetentionMs).toBe(25 * HOUR_MS);
+    // Years before every other counter in this file, so these rows are the only ones it can prune.
+    const dayStart = Date.parse('2020-03-01T00:00:00.000Z');
+    const now = new Date(dayStart + DAY_MS - 1);
+    const key = (name: string) => `test:prune-${name}-${hex(4)}`;
+    const dayWindow = { key: key('day'), windowStart: new Date(dayStart), count: 200 };
+    const atRetention = { key: key('edge'), windowStart: new Date(now.getTime() - LIMITS.rateCounterRetentionMs), count: 1 };
+    const pastRetention = { key: key('old'), windowStart: new Date(now.getTime() - LIMITS.rateCounterRetentionMs - 1), count: 1 };
+    await db.insert(rateCounters).values([dayWindow, atRetention, pastRetention]);
+    const left = async () =>
+      (await db.select({ key: rateCounters.key }).from(rateCounters).where(inArray(rateCounters.key, [dayWindow.key, atRetention.key, pastRetention.key])))
+        .map((row) => row.key)
+        .sort();
+
+    // The jobs route passes an hour before now, a cut-off from when every window was a minute.
+    expect(await pruneRateCounters(db, new Date(now.getTime() - HOUR_MS))).toBe(0);
+    expect(await left()).toEqual([dayWindow.key, atRetention.key, pastRetention.key].sort());
+    expect(await pruneRateCounters(db, now)).toBe(1);
+    expect(await left()).toEqual([dayWindow.key, atRetention.key].sort());
+    await expect(pruneRateCounters(untouchable, new Date(Number.NaN))).rejects.toThrow('not a date');
+  });
+});
+
 describe('readJson', () => {
   const schema = z.strictObject({ address: z.string() });
   const json = (body: BodyInit | null, type = 'application/json') => post(body, { 'content-type': type });
@@ -338,6 +422,69 @@ describe('readJson', () => {
 
   it('refuses a cap that is not a positive integer', async () => {
     await expect(readJson(json('{}'), schema, 0)).rejects.toThrow('the body cap must be a positive integer');
+  });
+});
+
+describe('readCappedBody', () => {
+  // Counts what the reader pulled, to show it stops soon after the cap rather than reading on.
+  function counted(bytes: number): { stream: ReadableStream<Uint8Array>; pulled: () => number } {
+    let sent = 0;
+    const stream = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        if (sent >= bytes) return controller.close();
+        const size = Math.min(256, bytes - sent);
+        controller.enqueue(new Uint8Array(size).fill(0x61));
+        sent += size;
+      },
+    });
+    return { stream, pulled: () => sent };
+  }
+
+  it('returns the exact bytes up to the cap, and zero bytes for a request with no body', async () => {
+    expect(Buffer.from(await readCappedBody(post('{"a":1}'), 7)).toString('utf8')).toBe('{"a":1}');
+    expect(await readCappedBody(post(null), 7)).toEqual(new Uint8Array(0));
+  });
+
+  it('refuses a body past the cap whether Content-Length says so, lies, or is absent, and stops reading', async () => {
+    const declared = post('{}', { 'content-length': '101' });
+    expect(await httpError(() => readCappedBody(declared, 100))).toMatchObject({ status: 400, code: 'body_too_large' });
+    expect(declared.bodyUsed).toBe(false);
+    const lying = post('a'.repeat(500), { 'content-length': '5' });
+    expect(await httpError(() => readCappedBody(lying, 100))).toMatchObject({ status: 400, code: 'body_too_large' });
+    const { stream, pulled } = counted(10_000_000);
+    expect(await httpError(() => readCappedBody(post(stream), 1_000))).toMatchObject({ status: 400, code: 'body_too_large' });
+    expect(pulled()).toBeLessThan(10_000);
+  });
+
+  it('refuses a body that fails to arrive, and a cap that is not a positive integer', async () => {
+    const broken = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        controller.error(new Error(MARKER));
+      },
+    });
+    expect(await httpError(() => readCappedBody(post(broken), 100))).toMatchObject({ status: 400, code: 'bad_json' });
+    await expect(readCappedBody(post('{}'), 0)).rejects.toThrow('the body cap must be a positive integer');
+  });
+
+  it("is what the seller route reads with: past the cap or not UTF-8 is the seller's own 400, before anything else is touched", async () => {
+    setServerContextFactory(async () => ({ db: untouchable, chain: untouchable as unknown as ServerContext['chain'], env: ENV, now: () => new Date() }));
+    try {
+      const sell = (body: BodyInit, headers: Record<string, string> = {}) =>
+        sellRoute.POST(new Request(`${APP_ORIGIN}/api/sell/wallet-check`, { method: 'POST', headers: { 'content-type': 'application/json', ...headers }, body, duplex: 'half' } as RequestInit));
+      const { stream, pulled } = counted(10_000_000);
+      for (const response of [
+        await sell(stream),
+        await sell('{}', { 'content-length': String(LIMITS.challengeMaxBytes + 1) }),
+        await sell(new Uint8Array([0x7b, 0x22, 0xff, 0xfe, 0x22, 0x7d])),
+      ]) {
+        expect(response.status).toBe(400);
+        expect(response.headers.get('cache-control')).toBe('no-store');
+        expect(await response.json()).toEqual({ error: HANDLER_MESSAGES.body });
+      }
+      expect(pulled()).toBeLessThan(LIMITS.challengeMaxBytes + 1_024);
+    } finally {
+      setServerContextFactory(null);
+    }
   });
 });
 

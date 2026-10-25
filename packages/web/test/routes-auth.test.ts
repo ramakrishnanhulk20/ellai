@@ -1,16 +1,21 @@
 // Covers: the sign-in routes called as Next would call them, with Request objects, on PGlite:
-// nonce, verify and logout end to end with a real Ed25519 key; the session cookie and its
-// flags; the same-origin check on all three; the per-client and overall rate limits, keyed on
-// the platform's client address; and the fixed 400s for a bad body.
+// nonce, verify and logout end to end with a real Ed25519 key; a zkLogin sign-in whose proof
+// verify sends, once, to the chain client it was given, and nothing read for any other key;
+// the session cookie and its flags; the same-origin check on all three; the per-client and
+// overall rate limits, keyed on the platform's client address; and the fixed 400s for a bad
+// body.
 // Does NOT cover: the owner routes (routes-owner does, including a cookie from this verify
-// opening the overview), zkLogin or other key types (auth.test.ts covers them on the functions
-// below these routes), a browser enforcing the cookie flags, or Vercel's own rewriting of
+// opening the overview), Sui's own check of a zkLogin proof (the gRPC client is a stub here,
+// and no real proof is made), other key types (auth.test.ts covers them on the functions below
+// these routes), a browser enforcing the cookie flags, or Vercel's own rewriting of
 // X-Forwarded-For.
 import { randomBytes } from 'node:crypto';
 import type { Chain } from '@ellai/core/chain';
 import { canonicalSuiAddress } from '@ellai/core/keys';
 import type { Signer } from '@mysten/sui/cryptography';
 import { Ed25519Keypair } from '@mysten/sui/keypairs/ed25519';
+import { toBase64 } from '@mysten/sui/utils';
+import { computeZkLoginAddressFromSeed, getZkLoginSignature } from '@mysten/sui/zklogin';
 import { count, eq } from 'drizzle-orm';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import * as logoutRoute from '../src/app/api/auth/logout/route.js';
@@ -37,9 +42,12 @@ const HTTPS_ENV: ServerEnv = {
   JOBS_SECRET: hex(32),
   APP_ORIGIN,
 };
-// Nothing in sign-in reads the chain, so any use of it fails the test.
+// The stand-in for Sui's zkLogin check through the gRPC client, the one part of the chain sign-in
+// may use. Every other use of the chain fails the test.
+const verifyZkLoginSignature = vi.fn<(input: { bytes: string; signature: string; intentScope: string; address: string }) => Promise<{ success: boolean; errors: string[] }>>();
 const chain = new Proxy({} as Chain, {
-  get() {
+  get(_target, property) {
+    if (property === 'grpc') return { core: { verifyZkLoginSignature } };
     throw new Error('the chain was touched');
   },
 });
@@ -67,6 +75,8 @@ beforeEach(() => {
   env = HTTPS_ENV;
   minutesUsed += 1;
   clock = new Date(FIRST_MINUTE + minutesUsed * 60_000 + 1_000);
+  verifyZkLoginSignature.mockReset();
+  verifyZkLoginSignature.mockRejectedValue(new Error('no zkLogin check was expected'));
 });
 
 afterEach(() => {
@@ -159,6 +169,7 @@ describe('sign-in', () => {
     expect(session.ownerId).toBe(ownerId);
     const [owner] = await db.select().from(owners).where(eq(owners.id, ownerId));
     expect(owner?.suiAddress).toBe(canonicalSuiAddress(signer.toSuiAddress()));
+    expect(verifyZkLoginSignature).not.toHaveBeenCalled();
   });
 
   it('leaves Secure off only when the app runs on plain-http localhost', async () => {
@@ -223,6 +234,55 @@ describe('sign-in', () => {
     const response = await nonceRoute.POST(call('/api/auth/nonce', options));
     expect(response.status).toBe(400);
     expect((await response.json()) as { error: string }).toMatchObject({ error: code });
+  });
+});
+
+describe('zkLogin sign-in', () => {
+  // A well-formed zkLogin signature for a Google account. Its proof is not real: what Sui would
+  // say about it is the stub's answer.
+  const ISS = 'https://accounts.google.com';
+  const ADDRESS_SEED = '13322897930163218532266430409510394316985274769125667290600321564259466511711';
+  const zkLoginAddress = canonicalSuiAddress(computeZkLoginAddressFromSeed(BigInt(ADDRESS_SEED), ISS, false));
+
+  async function zkLoginSigned(): Promise<{ message: string; signature: string }> {
+    const issued = await nonce({ address: zkLoginAddress });
+    const { message } = (await issued.json()) as { message: string };
+    const signature = getZkLoginSignature({
+      inputs: {
+        proofPoints: { a: ['1', '2', '1'], b: [['1', '0'], ['3', '4'], ['1', '0']], c: ['5', '6', '1'] },
+        issBase64Details: { value: 'yJpc3MiOiJodHRwczovL2FjY291bnRzLmdvb2dsZS5jb20iLC', indexMod4: 1 },
+        headerBase64: 'eyJhbGciOiJSUzI1NiIsImtpZCI6IjEifQ',
+        addressSeed: ADDRESS_SEED,
+      },
+      maxEpoch: '10',
+      userSignature: await sign(Ed25519Keypair.generate(), message),
+    });
+    return { message, signature };
+  }
+
+  it('signs in a zkLogin wallet, its proof checked once through the chain client the route passes', async () => {
+    verifyZkLoginSignature.mockResolvedValue({ success: true, errors: [] });
+    const { message, signature } = await zkLoginSigned();
+    const response = await verify({ message, signature });
+    expect(response.status).toBe(200);
+    const { ownerId } = (await response.json()) as { ownerId: string };
+    expect(verifyZkLoginSignature.mock.calls).toEqual([[{ bytes: toBase64(new TextEncoder().encode(message)), signature, intentScope: 'PersonalMessage', address: zkLoginAddress }]]);
+    expect(response.headers.get('set-cookie')).toMatch(/^ellai_session=ellai_session_/);
+    const [owner] = await db.select().from(owners).where(eq(owners.id, ownerId));
+    expect(owner?.suiAddress).toBe(zkLoginAddress);
+  });
+
+  it('refuses with 401 and no session a zkLogin proof the chain rejects, or cannot check at all', async () => {
+    verifyZkLoginSignature.mockResolvedValueOnce({ success: false, errors: ['the proof does not verify'] });
+    verifyZkLoginSignature.mockRejectedValueOnce(new Error('UNAVAILABLE: the gateway did not answer'));
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const { message, signature } = await zkLoginSigned();
+      const response = await verify({ message, signature });
+      expect(response.status).toBe(401);
+      expect(await response.json()).toEqual({ error: 'bad_signature', message: 'the signature does not prove the address in the message signed it' });
+      expect(response.headers.get('set-cookie')).toBeNull();
+    }
+    expect(verifyZkLoginSignature).toHaveBeenCalledTimes(2);
   });
 });
 

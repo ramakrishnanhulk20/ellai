@@ -1,20 +1,24 @@
-import { requireAgent } from '../../../server/http/agent-auth.js';
+import { requireAgent, respondToAgent } from '../../../server/http/agent-auth.js';
 import { withServerContext } from '../../../server/http/context.js';
-import { API_RESPONSE_HEADERS, respond } from '../../../server/http/errors.js';
+import { API_RESPONSE_HEADERS } from '../../../server/http/errors.js';
 import { handleMcpRequest } from '../../../server/mcp/server.js';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
+// Seconds this route may run, set here so the ceiling is Ellai's choice and not the platform's
+// default. paid_fetch can wait up to LIMITS.netPaidTimeoutMaxMs on the seller, then read the chain.
+export const maxDuration = 60;
 
 /**
  * Ellai as an MCP server over Streamable HTTP, stateless: each POST carries one JSON-RPC
  * message or batch and gets plain JSON back. Tools: paid_fetch and check_decision, the same
  * as POST /api/agent/fetch and GET /api/agent/decisions/[id]. The bearer agent token is
  * checked before anything is read (C13); 401 agent_unauthorized without a valid one. A tool
- * failure is a tool result with isError and the same fixed JSON the HTTP routes send.
+ * failure is a tool result with isError and the same fixed JSON the HTTP routes send, the
+ * per-minute limits' too_many_requests included.
  */
 export async function POST(request: Request): Promise<Response> {
-  return respond(() =>
+  return respondToAgent(() =>
     withServerContext(async (ctx) => {
       const agent = await requireAgent(request, ctx);
       return handleMcpRequest(request, ctx, agent);

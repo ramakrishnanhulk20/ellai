@@ -3,8 +3,8 @@ import { LIMITS } from '@ellai/core/limits';
 import { MemoryError } from '@ellai/core/memory';
 import { z } from 'zod';
 import type { ServerContext } from './context.js';
-import { jsonResponse } from './json.js';
-import { consume } from './ratelimit.js';
+import { HttpError, httpErrorResponse } from './errors.js';
+import { consume, consumeWindow } from './ratelimit.js';
 
 /**
  * The largest body, in bytes, each owner route reads. Each is a few times the most its schema
@@ -29,26 +29,33 @@ export const PAGE_MAX = 50;
 export const PAGE_READ = PAGE_MAX + 1;
 
 const OWNER_CHAIN_KEY_PREFIX = 'owner-chain:';
-
-// errors.ts names no code for these, and another change to it is in flight, so each is a fixed
-// body of its own. None carries anything the caller sent or anything an upstream said (C19).
-const TOO_MANY_REQUESTS = { error: 'too_many_requests', message: 'Too many requests. Try again in a minute.' } as const;
-const BAD_QUERY = { error: 'bad_query', message: 'The query string does not have the values this endpoint takes.' } as const;
-const CHAIN_REFUSED = { error: 'chain_refused', message: 'Sui does not allow this step for your Walrus Memory account right now.' } as const;
-const CHAIN_UNAVAILABLE = { error: 'chain_unavailable', message: 'Ellai could not read Sui just now. Try again in a minute.' } as const;
+const AGENT_CREATE_KEY_PREFIX = 'owner-agent-create:';
+const HOUR_MS = 3_600_000;
 
 /**
  * Counts one request to an owner route that reads Sui through Tatum against this owner's
  * LIMITS.ownerChainReadsPerMinute (C22). The key is the owner the session named, never
  * anything the caller sends, and every route that calls this shares it, so spreading calls
  * across routes buys nothing. A request over the limit still counts.
- * Returns null within the limit, and beyond it the 429 { error: 'too_many_requests' }
- * response the route must return as it is.
+ * Returns null within the limit, and beyond it errors.ts's 429 too_many_requests response,
+ * which the route must return as it is.
  */
 export async function limitOwnerChainReads(ctx: ServerContext, ownerId: string): Promise<Response | null> {
   if (await consume(ctx.db, `${OWNER_CHAIN_KEY_PREFIX}${ownerId}`, LIMITS.ownerChainReadsPerMinute, ctx.now())) return null;
   console.warn('[ellai http] owner_chain too_many_requests');
-  return jsonResponse(TOO_MANY_REQUESTS, { status: 429 });
+  return httpErrorResponse(new HttpError(429, 'too_many_requests'));
+}
+
+/**
+ * Counts one agent creation against this owner's LIMITS.agentCreatesPerHour, in the fixed hour
+ * that holds the context's clock (C22). The key is the owner the session named, never anything
+ * the caller sends, and a request over the limit still counts. Throws HttpError 429
+ * too_many_agent_creates beyond the limit.
+ */
+export async function limitAgentCreates(ctx: ServerContext, ownerId: string): Promise<void> {
+  if (!(await consumeWindow(ctx.db, `${AGENT_CREATE_KEY_PREFIX}${ownerId}`, LIMITS.agentCreatesPerHour, HOUR_MS, ctx.now()))) {
+    throw new HttpError(429, 'too_many_agent_creates');
+  }
 }
 
 /**
@@ -83,7 +90,7 @@ function single(params: URLSearchParams, name: string): string | null | undefine
 /**
  * Reads ?before=<ISO 8601 UTC time>&limit=<whole number> from a history route's URL. limit
  * defaults to PAGE_DEFAULT and is cut to PAGE_MAX. Returns null, which the route answers with
- * badQueryResponse, for a parameter given twice, a before that is not an ISO time in UTC to
+ * HttpError 400 bad_query, for a parameter given twice, a before that is not an ISO time in UTC to
  * at most the millisecond, or a limit that is not a whole number of at least 1. Other
  * parameters are ignored: the owner comes from the session, never the URL (C13).
  */
@@ -102,11 +109,6 @@ export function readPageQuery(request: Request): PageQuery | null {
   if (limitText !== null && !PAGE_LIMIT_TEXT.test(limitText)) return null;
   const limit = limitText === null ? PAGE_DEFAULT : Math.min(Number(limitText), PAGE_MAX);
   return { before, limit };
-}
-
-/** The 400 { error: 'bad_query' } answer for a query readPageQuery refused. */
-export function badQueryResponse(): Response {
-  return jsonResponse(BAD_QUERY, { status: 400 });
 }
 
 /**
@@ -137,20 +139,21 @@ export function cutPage<Row extends { createdAt: Date }>(rows: readonly Row[], l
 }
 
 /**
- * The answer for a failure from core while an onboarding step is built or confirmed, which
- * errors.ts does not map, or null for anything else, which the route rethrows. A Walrus Memory
- * account or delegate refusal (Sui already shows the account, the key, a frozen account or a
- * closed registry) is 422 chain_refused; Tatum not answering is 503 chain_unavailable. Only
- * the class and code are logged.
+ * The answer for a failure from core while an onboarding step is built or confirmed, or null
+ * for anything else, which the route rethrows. Onboarding reads these classes differently from
+ * every other route, so they are mapped here, onto errors.ts's codes: a Walrus Memory account
+ * or delegate refusal (Sui already shows the account, the key, a frozen account or a closed
+ * registry) is 422 chain_refused; Tatum not answering is 503 chain_unavailable. Only the class
+ * and code of the failure are logged.
  */
 export function onboardingChainFailure(error: unknown): Response | null {
   if (error instanceof MemoryError && (error.code === 'ACCOUNT' || error.code === 'DELEGATE')) {
     console.warn(`[ellai http] MemoryError ${error.code}`);
-    return jsonResponse(CHAIN_REFUSED, { status: 422 });
+    return httpErrorResponse(new HttpError(422, 'chain_refused'));
   }
   if (error instanceof MemoryError || error instanceof ChainError) {
     console.warn(`[ellai http] ${error.name} ${error.code}`);
-    return jsonResponse(CHAIN_UNAVAILABLE, { status: 503 });
+    return httpErrorResponse(new HttpError(503, 'chain_unavailable'));
   }
   return null;
 }

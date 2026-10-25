@@ -1,14 +1,16 @@
 // Covers: wallet sign-in end to end on PGlite with real Ed25519, Secp256k1, Secp256r1 and
 // multisig keys; the message shape and every refusal of a message, a signature or a nonce;
-// the owner row and its derived purse; sessions, their cookie and their end; agent tokens
-// and their revocation; that one kind of token never works as the other or as a record id;
+// the owner row and its derived purse; sessions, their cookie and their end; agent tokens,
+// their display prefixes, the cap on live agents per owner, and their revocation; that one
+// kind of token never works as the other or as a record id;
 // that malformed tokens never reach the database; and that no refusal repeats a token, a
 // signature or the message.
 // Does NOT cover: zkLogin with a chain client (there is no network here, so only the
-// refusal without one is proven), passkey or ML-DSA signatures, real wallet software, two
-// database connections racing for one nonce (PGlite serves one connection, so the race is
-// run with Promise.all on that one connection), or the routes that will call these
-// functions with their same-origin check and rate limits.
+// refusal without one is proven; routes-auth runs one through a stub client), passkey or
+// ML-DSA signatures, real wallet software, two database connections racing for one nonce or
+// for an owner's last agent place (PGlite serves one connection, so each race is run with
+// Promise.all on that one connection), or the routes that will call these functions with
+// their same-origin check and rate limits.
 import { createHmac, randomBytes } from 'node:crypto';
 import { derivePurseKeypair } from '@ellai/core/keys';
 import { LIMITS } from '@ellai/core/limits';
@@ -27,7 +29,7 @@ import { endSession, readSessionCookie, resolveSession, sessionCookie } from '..
 import { SignInError, type SignInErrorCode, completeSignIn, issueSignIn } from '../src/server/auth/signin.js';
 import { AGENT_TOKEN_PREFIX, type BearerTokenPrefix, SESSION_TOKEN_PREFIX, hashBearerToken, isBearerToken, newBearerToken } from '../src/server/auth/tokens.js';
 import { type Database, createDb, migrate } from '../src/server/db/client.js';
-import { agents, owners, sessions, signinNonces } from '../src/server/db/schema.js';
+import { TEXT_CAPS, agents, owners, sessions, signinNonces } from '../src/server/db/schema.js';
 
 let handle: Awaited<ReturnType<typeof createDb>>;
 let db: Database;
@@ -117,10 +119,19 @@ describe('bearer tokens', () => {
     expect(first.token).toMatch(new RegExp(`^${prefix}[A-Za-z0-9_-]{43}$`));
     expect(Buffer.from(first.token.slice(prefix.length), 'base64url')).toHaveLength(LIMITS.bearerTokenBytes);
     expect(first.hash).toBe(createHmac('sha256', Buffer.from(SECRET, 'hex')).update(first.token).digest('hex'));
-    expect(first.displayPrefix).toBe(first.token.slice(0, 12));
+    expect(first.displayPrefix).toBe(first.token.slice(0, prefix.length + 6));
     expect(hashBearerToken(first.token, SECRET)).toBe(first.hash);
     expect(hashBearerToken(first.token, hex(32))).not.toBe(first.hash);
     expect(newBearerToken(prefix, SECRET).token).not.toBe(first.token);
+  });
+
+  it.each<BearerTokenPrefix>([SESSION_TOKEN_PREFIX, AGENT_TOKEN_PREFIX])('gives %s keys display prefixes that tell them apart and fit the column', (prefix) => {
+    const shown = Array.from({ length: 50 }, () => newBearerToken(prefix, SECRET).displayPrefix);
+    for (const displayPrefix of shown) {
+      expect(displayPrefix).toMatch(new RegExp(`^${prefix}[A-Za-z0-9_-]{6}$`));
+      expect(displayPrefix.length).toBeLessThanOrEqual(TEXT_CAPS.tokenPrefix);
+    }
+    expect(new Set(shown).size).toBe(shown.length);
   });
 
   it('hashes only the exact token shape and refuses a malformed secret', () => {
@@ -419,7 +430,7 @@ describe('agents', () => {
     const { ownerId } = await signIn();
     const agent = await createAgent(ownerId, '  Travel agent  ');
     expect(isBearerToken(agent.token, AGENT_TOKEN_PREFIX)).toBe(true);
-    expect(agent.displayPrefix).toBe(agent.token.slice(0, 12));
+    expect(agent.displayPrefix).toBe(agent.token.slice(0, AGENT_TOKEN_PREFIX.length + 6));
     expect(agent.token).not.toContain(agent.agentId);
     const row = one(await db.select().from(agents).where(eq(agents.id, agent.agentId)));
     expect(row).toMatchObject({ ownerId, label: 'Travel agent', kind: 'external', tokenHash: hashBearerToken(agent.token, SECRET), tokenPrefix: agent.displayPrefix, revokedAt: null });
@@ -468,6 +479,26 @@ describe('agents', () => {
     await expect(createAgent('not-a-uuid')).rejects.toMatchObject({ code: 'BAD_INPUT' });
     await expect(createAgent('00000000-0000-4000-8000-000000000000')).rejects.toThrow(new AgentError('NOT_FOUND', 'there is no such owner'));
     expect(await listAgents({ db, ownerId })).toEqual([]);
+  });
+
+  it('refuses the 21st live agent of either kind, even in a race, and makes room when one is revoked', async () => {
+    const { ownerId } = await signIn();
+    expect(LIMITS.agentsPerOwnerMax).toBe(20);
+    const tooMany = new AgentError('TOO_MANY_AGENTS', 'an owner may hold at most 20 agents at once; revoke one first');
+    const made = [await createAgentToken({ db, ownerId, label: 'Demo agent', kind: 'builtin', sessionSecretHex: SECRET, now: NOW })];
+    for (let i = 2; i <= 19; i += 1) made.push(await createAgent(ownerId, `Agent ${i}`));
+
+    const raced = await Promise.allSettled([createAgent(ownerId, 'Racer 1'), createAgent(ownerId, 'Racer 2'), createAgent(ownerId, 'Racer 3')]);
+    expect(raced.filter((outcome) => outcome.status === 'fulfilled')).toHaveLength(1);
+    for (const lost of raced.filter((outcome) => outcome.status === 'rejected')) expect(lost.reason).toEqual(tooMany);
+    await expect(createAgent(ownerId, 'Agent 21')).rejects.toThrow(tooMany);
+    expect(await listAgents({ db, ownerId })).toHaveLength(20);
+
+    await revokeAgent({ db, ownerId, agentId: made[1]?.agentId ?? '', now: later(1_000) });
+    await expect(createAgent(ownerId, 'Agent 21')).resolves.toMatchObject({ agentId: expect.any(String) });
+    await expect(createAgent(ownerId, 'Agent 22')).rejects.toMatchObject({ name: 'AgentError', code: 'TOO_MANY_AGENTS' });
+    expect(await listAgents({ db, ownerId })).toHaveLength(21);
+    await expect(createAgent((await signIn()).ownerId, 'Someone else')).resolves.toBeDefined();
   });
 });
 

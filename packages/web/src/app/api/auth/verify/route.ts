@@ -19,8 +19,11 @@ const body = z.strictObject({ message: z.string().max(1_024), signature: z.strin
  * Finishes a wallet sign-in: { message, signature } in, { ownerId } out, with the session
  * cookie set HttpOnly, SameSite=Strict and Secure on https (C14). The session token goes only
  * into the cookie, never the body. Same origin only, and rate-limited like the nonce step.
- * 403 cross_origin, 429 rate_limited, 400 for a bad body or message, 401 for a signature or
- * nonce that does not hold up.
+ * A zkLogin proof can only be checked by Sui itself, so a zkLogin signature, alone or as a
+ * multisig member, is checked through the context chain's gRPC client: one Tatum read for each
+ * zkLogin signature, within that client's timeout (C21). Every other kind is checked offline
+ * and reads nothing. 403 cross_origin, 429 rate_limited, 400 for a bad body or message, 401
+ * for a signature or nonce that does not hold up.
  */
 export async function POST(request: Request): Promise<Response> {
   return respond(() =>
@@ -37,6 +40,7 @@ export async function POST(request: Request): Promise<Response> {
         masterSecretHex: ctx.env.ELLAI_MASTER_SECRET,
         sessionSecretHex: ctx.env.SESSION_SECRET,
         now,
+        zkLoginClient: ctx.chain.grpc,
       });
       const cookie = sessionCookie(signedIn.sessionToken, signedIn.expiresAt, cookieIsSecure(ctx.env.APP_ORIGIN));
       return jsonResponse({ ownerId: signedIn.ownerId }, { headers: { 'set-cookie': cookie } });

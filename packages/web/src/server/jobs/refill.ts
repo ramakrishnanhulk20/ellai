@@ -4,6 +4,7 @@ import { type AllowanceState, type Chain, ChainError, type ExecutionResult, type
 import { canonicalSuiAddress, derivePurseKeypair } from '@ellai/core/keys';
 import { LIMITS } from '@ellai/core/limits';
 import { USDC_TYPE_MAINNET } from '@ellai/core/usdc';
+import { bcs } from '@mysten/sui/bcs';
 import type { Ed25519Keypair } from '@mysten/sui/keypairs/ed25519';
 import { TransactionDataBuilder } from '@mysten/sui/transactions';
 import { SUI_TYPE_ARG, normalizeStructTag } from '@mysten/sui/utils';
@@ -20,6 +21,8 @@ export interface RefillJobArgs {
   /** The gas wallet, which sponsors the refill's gas from its SUI address balance. */
   gasKeypair: Ed25519Keypair;
   now: Date;
+  /** Waits between the reads that confirm a lost refill. A real timer when not given. */
+  sleep?: (ms: number) => Promise<void>;
 }
 
 export type RefillOutcome = 'refilled' | 'not_needed' | 'skipped_pending' | 'refused';
@@ -41,6 +44,8 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const DAY_MS = 86_400_000;
 const U32_LIMIT = 2 ** 32;
 const SUI_TYPE = normalizeStructTag(SUI_TYPE_ARG);
+
+const timerSleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
 interface OwnerFacts {
   suiAddress: string;
@@ -160,23 +165,64 @@ async function recordLanded(db: Database, refill: { id: string; amountAtomic: bi
   return 'verified';
 }
 
-/** Reads the oldest pending refill's digest and records the outcome. True when the chain does not have it yet. */
-async function resolvePending(db: Database, chain: Chain, ownerId: string, parties: Parties, now: Date): Promise<boolean> {
+/** What the chain has for a digest, or null when it does not have it. Any other failure throws. */
+async function readLanded(chain: Chain, digest: string): Promise<TransactionResult | null> {
+  try {
+    return await chain.getTransactionResult(digest);
+  } catch (error) {
+    if (error instanceof ChainError && error.code === 'NOT_FOUND') return null;
+    throw error;
+  }
+}
+
+// The window is read from the bytes that were signed, the one place it cannot differ from what
+// the chain enforces; assertRefill has already held it to the window the refill was built for.
+function maxEpochOf(txBytes: Uint8Array): bigint {
+  const expiration = bcs.TransactionData.parse(txBytes).V1?.expiration;
+  if (expiration?.$kind !== 'ValidDuring' || expiration.ValidDuring.maxEpoch === null) throw new Error('the refill has no epoch window');
+  return BigInt(expiration.ValidDuring.maxEpoch);
+}
+
+/**
+ * Reads the oldest pending refill's digest and records the outcome. True while it still blocks
+ * the next refill: the chain does not have it and cannot yet be shown never to.
+ *
+ * A refill missing once the chain's epoch is past its valid_until_epoch can no longer land, but
+ * one lagging node must not release a refill that landed in the last moments of its window, so,
+ * as C4 releases a payment, LIMITS.paymentReleaseReads further reads LIMITS.settlementPollIntervalMs
+ * apart must all miss it too. Then it is 'failed' and no longer blocks; it still counts toward the
+ * day's refills. A row with no valid_until_epoch, written before it was kept, waits as before.
+ */
+async function resolvePending(
+  db: Database,
+  chain: Chain,
+  ownerId: string,
+  parties: Parties,
+  now: Date,
+  sleep: (ms: number) => Promise<void>,
+): Promise<boolean> {
   const [pending] = await db
-    .select({ id: refills.id, digest: refills.digest, amountAtomic: refills.amountAtomic })
+    .select({ id: refills.id, digest: refills.digest, amountAtomic: refills.amountAtomic, validUntilEpoch: refills.validUntilEpoch })
     .from(refills)
     .where(and(eq(refills.ownerId, ownerId), eq(refills.status, 'pending')))
     .orderBy(asc(refills.sentAt), asc(refills.id))
     .limit(1);
   if (pending === undefined) return false;
-  let result: TransactionResult;
-  try {
-    result = await chain.getTransactionResult(pending.digest);
-  } catch (error) {
-    if (error instanceof ChainError && error.code === 'NOT_FOUND') return true;
-    throw error;
+  const landed = await readLanded(chain, pending.digest);
+  if (landed !== null) {
+    await recordLanded(db, pending, landed, parties, now);
+    return false;
   }
-  await recordLanded(db, pending, result, parties, now);
+  if (pending.validUntilEpoch === null || (await chain.getCurrentEpoch()) <= pending.validUntilEpoch) return true;
+  for (let read = 0; read < LIMITS.paymentReleaseReads; read++) {
+    await sleep(LIMITS.settlementPollIntervalMs);
+    const late = await readLanded(chain, pending.digest);
+    if (late !== null) {
+      await recordLanded(db, pending, late, parties, now);
+      return false;
+    }
+  }
+  await markFailed(db, pending.id);
   return false;
 }
 
@@ -186,7 +232,10 @@ async function resolvePending(db: Database, chain: Chain, ownerId: string, parti
  *
  * 1. A refill still pending from an earlier call is read by its stored digest first, before
  *    anything else is read or built: landed and exact is 'verified', failed is 'failed', not
- *    on chain yet is 'skipped_pending'.
+ *    on chain yet is 'skipped_pending', unless the chain's epoch is past the refill's
+ *    valid_until_epoch and LIMITS.paymentReleaseReads more reads, `sleep`ing
+ *    LIMITS.settlementPollIntervalMs before each, still miss it: then it is 'failed', the same
+ *    release rule as a payment's (C4), and this call goes on as if nothing were pending.
  * 2. The owner's recorded purse must be the purse derived from the master secret, and the
  *    allowance at the owner's stored allowance_id, read from chain now, must pass C7 (funder
  *    is the owner, spender is the purse, USDC, not expired, room for one refill under the
@@ -198,7 +247,7 @@ async function resolvePending(db: Database, chain: Chain, ownerId: string, parti
  *    hours is counted and core's refillDecision decides ('not_needed' when it says no). The
  *    refill is built with buildRefill, checked with assertRefill, signed by the derived purse
  *    and by the gas wallet as sponsor, and its row is written with the digest of the signed
- *    bytes, status 'pending', before anything is sent.
+ *    bytes, their maxEpoch as valid_until_epoch, status 'pending', before anything is sent.
  * 5. After commit the bytes are sent. A failure the chain reports is 'failed' and throws
  *    RefillError FAILED. A success is read back by its digest: exactly the refill is
  *    'verified'; not readable yet stays 'pending' for the next call. Either way 'refilled'.
@@ -212,6 +261,7 @@ export async function refillIfNeeded(args: RefillJobArgs): Promise<RefillOutcome
   if (typeof args.ownerId !== 'string' || !UUID.test(args.ownerId)) throw new Error('the owner id is not a uuid');
   if (!(args.now instanceof Date) || Number.isNaN(args.now.getTime())) throw new Error('the current time is not a date');
   const { db, chain, gasKeypair, now } = args;
+  const sleep = args.sleep ?? timerSleep;
   const ownerId = args.ownerId.toLowerCase();
 
   const owner = await readOwner(db, ownerId, false);
@@ -222,7 +272,7 @@ export async function refillIfNeeded(args: RefillJobArgs): Promise<RefillOutcome
     funder: canonicalSuiAddress(owner.suiAddress),
     gasOwner: canonicalSuiAddress(gasKeypair.toSuiAddress()),
   };
-  if (await resolvePending(db, chain, ownerId, parties, now)) return 'skipped_pending';
+  if (await resolvePending(db, chain, ownerId, parties, now, sleep)) return 'skipped_pending';
 
   const purse = derivePurseKeypair(args.masterSecretHex, owner.suiAddress);
   if (!sameAddress(purse.toSuiAddress(), owner.purseAddress)) return 'refused';
@@ -278,7 +328,7 @@ export async function refillIfNeeded(args: RefillJobArgs): Promise<RefillOutcome
     const digest = TransactionDataBuilder.getDigestFromBytes(txBytes);
     const [row] = await tx
       .insert(refills)
-      .values({ ownerId, allowanceId, amountAtomic: decision.amountAtomic, digest, sentAt: now, status: 'pending' })
+      .values({ ownerId, allowanceId, amountAtomic: decision.amountAtomic, digest, sentAt: now, validUntilEpoch: maxEpochOf(txBytes), status: 'pending' })
       .returning({ id: refills.id, amountAtomic: refills.amountAtomic });
     if (row === undefined) throw new Error('the refill insert returned no row');
     return { row, digest, txBytes, signatures };

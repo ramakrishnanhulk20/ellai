@@ -6,7 +6,8 @@
 // (open, or signed and still able to land, up to the edge of that window), a twin decision
 // opened once the first was paid and refused under the signing lock, the same request
 // decided again once its payment was released, an x402 v2 price refused before decide, a seller
-// that fails after payment, a settlement mismatch pausing the owner, the release of a payment
+// that fails after payment, a status write, settlement read or outcome memory that fails after
+// payment and still leaves 'paid', a settlement mismatch pausing the owner, the release of a payment
 // that never landed, six-decimal amounts in reasons, and reasons that never carry agent or
 // seller text.
 // Does NOT cover: a real seller, the real Sui chain or Tatum (npm run prove:flow does those
@@ -31,9 +32,20 @@ import { agents, decisions, memories, owners, payments } from '../src/server/db/
 import { type Recall, decide } from '../src/server/decide/decide.js';
 import { ownerDelegate } from '../src/server/memory/delegate.js';
 import { MEMORY_NAMESPACE } from '../src/server/memory/namespace.js';
+import { recordOutcome } from '../src/server/memory/outcome.js';
 import { type PaidFetchArgs, paidFetch } from '../src/server/pay/flow.js';
 import { SETTLEMENT_MISMATCH, settlePayment } from '../src/server/pay/settle.js';
 import { PURSE_KEY_MISMATCH, signForDecision } from '../src/server/pay/sign.js';
+
+// Both run as written unless a test makes one fail once, to show a failure after payment.
+vi.mock('../src/server/memory/outcome.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../src/server/memory/outcome.js')>();
+  return { ...actual, recordOutcome: vi.fn(actual.recordOutcome) };
+});
+vi.mock('../src/server/pay/settle.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../src/server/pay/settle.js')>();
+  return { ...actual, settlePayment: vi.fn(actual.settlePayment) };
+});
 
 let handle: Awaited<ReturnType<typeof createDb>>;
 let db: Database;
@@ -200,11 +212,11 @@ function onSigning(w: World, change: Partial<typeof owners.$inferInsert>) {
   return { ...base, chain };
 }
 
-type RunOptions = Partial<Omit<PaidFetchArgs, 'db' | 'deps' | 'secrets'> & PaidFetchArgs['deps']>;
+type RunOptions = Partial<Omit<PaidFetchArgs, 'deps' | 'secrets'> & PaidFetchArgs['deps']>;
 
 function run(w: World, options: RunOptions = {}) {
   return paidFetch({
-    db,
+    db: options.db ?? db,
     ownerId: options.ownerId ?? w.ownerId,
     agentId: options.agentId ?? w.agentId,
     url: options.url ?? SELLER_URL,
@@ -588,6 +600,56 @@ describe('paidFetch', () => {
     const next = await run(w, { fetch, recallFor, purpose: 'search hotels in Porto' });
     expect(next).toMatchObject({ outcome: 'asked', rule: 'bad_outcome', citedMemories: [{ memoryId: outcome.id, blobId: null }] });
     expect(paidCalls(fetch)).toHaveLength(1);
+  });
+
+  it('still reports paid with its payment when a status write, the settlement read or the outcome memory fails after payment', async () => {
+    const error = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    const failure = () => new Error(`the database went away ${hex(4)}`);
+
+    // The first write to payments outside the signing transaction is the seller's status.
+    const statusWriteFails = await world();
+    let failed = false;
+    const flaky = new Proxy(db, {
+      get(target, property) {
+        if (property === 'update') {
+          return (table: typeof payments) => {
+            if (table === payments && !failed) {
+              failed = true;
+              throw failure();
+            }
+            return target.update(table);
+          };
+        }
+        const value = Reflect.get(target, property);
+        return typeof value === 'function' ? value.bind(target) : value;
+      },
+    });
+    const statusResult = await run(statusWriteFails, { db: flaky, recallFor: (await approvals(statusWriteFails)).recallFor });
+    expect(statusResult).toMatchObject({ outcome: 'paid', reason: 'Paid 0.010000 USDC to hotels.example.', seller: { status: 200 }, payment: { settlement: 'verified' } });
+    expect(one(await paymentRows(statusWriteFails.ownerId))).toMatchObject({ sellerStatus: null, settlement: 'verified' });
+
+    const settleFails = await world();
+    vi.mocked(settlePayment).mockRejectedValueOnce(failure());
+    const settleResult = await run(settleFails, { recallFor: (await approvals(settleFails)).recallFor });
+    const settleRow = one(await paymentRows(settleFails.ownerId));
+    expect(settleResult).toMatchObject({ outcome: 'paid', payment: { digest: settleRow.digest, amountAtomic: '10000', recipient: RECIPIENT, settlement: 'pending' } });
+    expect(settleRow).toMatchObject({ sellerStatus: 200, delivered: true, settlement: 'pending' });
+
+    const outcomeFails = await world();
+    vi.mocked(recordOutcome).mockRejectedValueOnce(failure());
+    const fetch = seller((url) => response(url, 500, 'internal error'));
+    const outcomeResult = await run(outcomeFails, { fetch, recallFor: (await approvals(outcomeFails)).recallFor });
+    expect(outcomeResult).toMatchObject({ outcome: 'paid', reason: 'Paid 0.010000 USDC to hotels.example; the seller returned no answer.', payment: { settlement: 'verified' } });
+    expect(vi.mocked(recordOutcome)).toHaveBeenLastCalledWith(expect.objectContaining({ ownerId: outcomeFails.ownerId, decisionId: outcomeResult.decisionId, delivered: false }));
+    expect(await db.select().from(memories).where(and(eq(memories.ownerId, outcomeFails.ownerId), eq(memories.kind, 'outcome')))).toHaveLength(0);
+
+    for (const result of [statusResult, settleResult, outcomeResult]) expect(result.decisionId).not.toBeNull();
+    expect(error.mock.calls.map((call) => call.join(' '))).toEqual([
+      '[ellai pay] after_payment_failed seller_status',
+      '[ellai pay] after_payment_failed settlement',
+      '[ellai pay] after_payment_failed outcome',
+    ]);
+    error.mockRestore();
   });
 
   it('pauses the owner when a payment lands but is not the approved one, and the next decide refuses paused', async () => {

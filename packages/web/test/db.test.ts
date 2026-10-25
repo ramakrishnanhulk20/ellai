@@ -1,9 +1,11 @@
 // Covers: the rules the database itself enforces, proven on PGlite in memory. One payment
 // per decision and per digest, one live decision per identical request, one use per grant
-// and one grant per deciding decision, unique refill digests and seller challenges, owners
-// never deleted from under their records, no row linking one owner's records to another
-// owner's, the answer and memory shape checks, the text caps, a row lock inside a
-// transaction, and the refusal of an in-process database in production.
+// and one grant per deciding decision, one live built-in agent per owner, unique refill
+// digests and seller challenges, owners never deleted from under their records, no row
+// linking one owner's records to another owner's, the answer and memory shape checks, the
+// text caps, a row lock inside a transaction, the history indexes the owner pages read
+// through, migration 0001 applied after 0000 both to an empty database and to one already
+// holding rows, and the refusal of an in-process database in production.
 // Does NOT cover: Neon (nothing here opens a network connection); two connections racing
 // for one row (PGlite serves a single connection, so no lock is ever waited on); the
 // queries later modules write. The owner keys prove a row agrees with the records it links
@@ -11,10 +13,17 @@
 // owner's name is consistent and is accepted. Nor do they check that a grant's use matches
 // the grant's recipient, amount or seller request.
 import { randomBytes } from 'node:crypto';
+import { copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { type SQL, eq, sql } from 'drizzle-orm';
+import type { PgliteDatabase } from 'drizzle-orm/pglite';
+import { migrate as migratePglite } from 'drizzle-orm/pglite/migrator';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { type Database, createDb, migrate } from '../src/server/db/client.js';
 import {
+  TEXT_CAPS,
   agents,
   decisionCitations,
   decisions,
@@ -180,6 +189,57 @@ function useGrant(grant: Grant, decision: Decision, ownerId: string = grant.owne
   return db.insert(grantUses).values({ grantId: grant.id, decisionId: decision.id, ownerId }).returning();
 }
 
+const MIGRATIONS_FOLDER = fileURLToPath(new URL('../src/server/db/migrations', import.meta.url));
+const ADDED_IN_0001 = ['agents_one_live_builtin_per_owner', 'decisions_owner_created_at_idx', 'memories_owner_created_at_idx'];
+
+/**
+ * A fresh database migrated through 0000 alone, from a copy of the folder whose journal stops
+ * there, so it is exactly what a database migrated before 0001 existed looks like.
+ */
+async function databaseAtFirstMigration(): Promise<Awaited<ReturnType<typeof createDb>>> {
+  const folder = await mkdtemp(join(tmpdir(), 'ellai-migrations-'));
+  try {
+    const journal = JSON.parse(await readFile(join(MIGRATIONS_FOLDER, 'meta', '_journal.json'), 'utf8')) as { entries: Array<{ tag: string }> };
+    const [first] = journal.entries;
+    if (first === undefined) throw new Error('the journal lists no migration');
+    await mkdir(join(folder, 'meta'));
+    await writeFile(join(folder, 'meta', '_journal.json'), JSON.stringify({ ...journal, entries: [first] }));
+    await copyFile(join(MIGRATIONS_FOLDER, `${first.tag}.sql`), join(folder, `${first.tag}.sql`));
+    const opened = await createDb('pglite:memory');
+    await migratePglite(opened.db as unknown as PgliteDatabase, { migrationsFolder: folder });
+    return opened;
+  } finally {
+    await rm(folder, { recursive: true, force: true });
+  }
+}
+
+async function rowsOn<T>(database: Database, query: SQL): Promise<T[]> {
+  return ((await database.execute(query)) as unknown as { rows: T[] }).rows;
+}
+
+/** What 0001 changes, read from the catalogue, so two databases can be compared as wholes. */
+async function migrationFacts(database: Database) {
+  const [applied] = await rowsOn<{ n: number }>(database, sql`select count(*)::int as n from drizzle.__drizzle_migrations`);
+  return {
+    applied: applied?.n,
+    refillEpoch: await rowsOn(
+      database,
+      sql`select data_type, is_nullable from information_schema.columns where table_name = 'refills' and column_name = 'valid_until_epoch'`,
+    ),
+    indexes: await rowsOn<{ indexname: string; indexdef: string }>(
+      database,
+      sql`select indexname, indexdef from pg_indexes where schemaname = 'public' and indexname in (${sql.join(ADDED_IN_0001.map((name) => sql`${name}`), sql`, `)}) order by 1`,
+    ),
+    prefixCheck: await rowsOn<{ def: string }>(database, sql`select pg_get_constraintdef(oid) as def from pg_constraint where conname = 'agents_token_prefix_length'`),
+  };
+}
+
+// Each row as JSON text without the column 0001 adds, so rows from before and after it compare equal.
+async function everyRow(database: Database, table: string): Promise<string[]> {
+  const read = await rowsOn<{ row: string }>(database, sql`select (to_jsonb(t) - 'valid_until_epoch')::text as row from ${sql.identifier(table)} t order by 1`);
+  return read.map((entry) => entry.row);
+}
+
 describe('migrations', () => {
   it('create every table, and running them again changes nothing', async () => {
     await migrate(db);
@@ -213,6 +273,113 @@ describe('migrations', () => {
     expect(keys.filter((key) => key.on_delete !== 'r')).toEqual([]);
     const pointingAtOwners = keys.filter((key) => key.target === 'owners').map((key) => key.source).sort();
     expect(pointingAtOwners).toEqual(['agents', 'decisions', 'grants', 'memories', 'payments', 'questions', 'refills', 'sessions']);
+  });
+
+  it('take a database from 0000 to 0001 to exactly what migrating in one go makes', async () => {
+    const stepped = await databaseAtFirstMigration();
+    try {
+      const before = await migrationFacts(stepped.db);
+      expect(before).toMatchObject({ applied: 1, refillEpoch: [], indexes: [] });
+      expect(before.prefixCheck.map((check) => check.def)).toEqual(['CHECK ((char_length(token_prefix) <= 12))']);
+
+      await migrate(stepped.db);
+      const after = await migrationFacts(stepped.db);
+      expect(after).toEqual(await migrationFacts(db));
+      expect(after.applied).toBe(2);
+      expect(after.refillEpoch).toEqual([{ data_type: 'bigint', is_nullable: 'YES' }]);
+      expect(after.indexes.map((index) => index.indexname)).toEqual(ADDED_IN_0001);
+      expect(after.indexes.map((index) => index.indexdef)).toEqual([
+        "CREATE UNIQUE INDEX agents_one_live_builtin_per_owner ON public.agents USING btree (owner_id) WHERE ((kind = 'builtin'::text) AND (revoked_at IS NULL))",
+        'CREATE INDEX decisions_owner_created_at_idx ON public.decisions USING btree (owner_id, created_at)',
+        'CREATE INDEX memories_owner_created_at_idx ON public.memories USING btree (owner_id, created_at)',
+      ]);
+      expect(after.prefixCheck.map((check) => check.def)).toEqual(['CHECK ((char_length(token_prefix) <= 24))']);
+    } finally {
+      await stepped.close();
+    }
+  });
+
+  it('apply 0001 over a database that already holds 0000 and rows, keeping every row as it was', async () => {
+    const stepped = await databaseAtFirstMigration();
+    try {
+      const on = stepped.db;
+      // Written as plain SQL: the schema in code already names the column 0001 adds, which this
+      // database does not have yet.
+      const [owner] = await rowsOn<{ id: string }>(on, sql`insert into owners (sui_address, purse_address) values (${suiAddress()}, ${suiAddress()}) returning id`);
+      const ownerId = owner?.id ?? '';
+      const [external] = await rowsOn<{ id: string }>(
+        on,
+        sql`insert into agents (owner_id, label, kind, token_hash, token_prefix) values (${ownerId}, 'Old agent', 'external', ${hex(32)}, 'ellai_agent_') returning id`,
+      );
+      await on.execute(sql`insert into agents (owner_id, label, kind, token_hash, token_prefix) values (${ownerId}, 'Ellai demo agent', 'builtin', ${hex(32)}, 'ellai_agent_')`);
+      await on.execute(sql`
+        insert into decisions (owner_id, agent_id, request_key, seller_url, seller_method, seller_host, body_hash, purpose, recipient, amount_atomic, asset, network, expires_at, outcome, rule, reason, status)
+        values (${ownerId}, ${external?.id ?? ''}, ${hex(16)}, 'https://seller.example/v1/check', 'GET', 'seller.example', ${hex(32)}, 'Check a wallet', ${suiAddress()}, 10000, ${USDC}, 'sui:mainnet', ${minutesFromNow(1)}, 'approved', 'learned', 'Two of your own approvals match', 'paid')`);
+      await on.execute(sql`
+        insert into memories (owner_id, kind, recipient, amount_atomic, verdict, sentence, namespace, writer_public_key)
+        values (${ownerId}, 'owner_decision', ${suiAddress()}, 10000, 'approve', 'The owner approved 0.01 USDC.', 'ellai-test-v1', ${hex(32)})`);
+      await on.execute(sql`insert into refills (owner_id, allowance_id, amount_atomic, digest, sent_at) values (${ownerId}, ${suiAddress()}, 100000, ${digest()}, ${new Date()})`);
+      await on.execute(sql`insert into rate_counters (key, window_start, count) values ('http:old', ${new Date()}, 3)`);
+
+      const tables = ['owners', 'agents', 'decisions', 'memories', 'refills', 'rate_counters'];
+      const before = await Promise.all(tables.map((table) => everyRow(on, table)));
+      expect(before.map((rowsOfTable) => rowsOfTable.length)).toEqual([1, 2, 1, 1, 1, 1]);
+
+      await migrate(on);
+      expect((await migrationFacts(on)).applied).toBe(2);
+      expect(await Promise.all(tables.map((table) => everyRow(on, table)))).toEqual(before);
+      expect(await on.select({ validUntilEpoch: refills.validUntilEpoch, status: refills.status }).from(refills)).toEqual([{ validUntilEpoch: null, status: 'pending' }]);
+
+      const builtin = () => on.insert(agents).values({ ownerId, label: 'Second demo agent', kind: 'builtin', tokenHash: hex(32), tokenPrefix: 'ellai_agent_' });
+      expect((await refusal(builtin())).constraint).toBe('agents_one_live_builtin_per_owner');
+      const longest = 'x'.repeat(TEXT_CAPS.tokenPrefix);
+      expect(one(await on.update(agents).set({ tokenPrefix: longest }).where(eq(agents.id, external?.id ?? '')).returning()).tokenPrefix).toBe(longest);
+    } finally {
+      await stepped.close();
+    }
+  });
+});
+
+describe('agents', () => {
+  it('allow one live built-in agent per owner, a new one once it is revoked, and any number of external ones', async () => {
+    const owner = await newOwner();
+    const builtin = (ownerId: string) =>
+      db.insert(agents).values({ ownerId, label: 'Ellai demo agent', kind: 'builtin', tokenHash: hex(32), tokenPrefix: 'ellai_agent_' }).returning();
+    const first = one(await builtin(owner.id));
+    await expectRefusedBy(builtin(owner.id), 'agents_one_live_builtin_per_owner');
+    const external = await newAgent(owner);
+    await newAgent(owner);
+    await expectRefusedBy(db.update(agents).set({ kind: 'builtin' }).where(eq(agents.id, external.id)), 'agents_one_live_builtin_per_owner');
+
+    await db.update(agents).set({ revokedAt: new Date() }).where(eq(agents.id, first.id));
+    const second = one(await builtin(owner.id));
+    expect(second.id).not.toBe(first.id);
+    await expectRefusedBy(db.update(agents).set({ revokedAt: null }).where(eq(agents.id, first.id)), 'agents_one_live_builtin_per_owner');
+    expect(one(await builtin((await newOwner()).id)).kind).toBe('builtin');
+  });
+});
+
+describe('owner history', () => {
+  it('reads a page of a long history of decisions or memories through the owner and time index', async () => {
+    const { owner, agent } = await ownerWithAgent();
+    const long = Array.from({ length: 300 }, (_, i) => new Date(Date.now() - i * 1_000));
+    await db.insert(decisions).values(long.map((createdAt) => decisionValues(owner, agent, { status: 'paid', createdAt })));
+    await db.insert(memories).values(long.map((createdAt) => ownerDecisionMemory(owner, { createdAt })));
+    await db.execute(sql`analyze decisions, memories`);
+    const plans = await db.transaction(async (tx) => {
+      // The whole test database is small enough that a full scan would still be cheapest, so it
+      // is switched off to see which index the planner picks among the ones there are.
+      await tx.execute(sql`set local enable_seqscan = off`);
+      const plan = async (table: 'decisions' | 'memories') => {
+        const lines = (await tx.execute(
+          sql`explain select id from ${sql.identifier(table)} where owner_id = ${sql.raw(`'${owner.id}'::uuid`)} and created_at < now() order by created_at desc, id desc limit 51`,
+        )) as unknown as { rows: Array<{ 'QUERY PLAN': string }> };
+        return lines.rows.map((line) => line['QUERY PLAN']).join('\n');
+      };
+      return { decisions: await plan('decisions'), memories: await plan('memories') };
+    });
+    expect(plans.decisions).toContain('Index Scan Backward using decisions_owner_created_at_idx on decisions');
+    expect(plans.memories).toContain('Index Scan Backward using memories_owner_created_at_idx on memories');
   });
 });
 
@@ -373,10 +540,12 @@ describe('decisions', () => {
         'agents_label_length',
       );
     }
+    expect(TEXT_CAPS.tokenPrefix).toBe(24);
     await expectRefusedBy(
-      db.update(agents).set({ tokenPrefix: 'x'.repeat(13) }).where(eq(agents.id, agent.id)),
+      db.update(agents).set({ tokenPrefix: 'x'.repeat(TEXT_CAPS.tokenPrefix + 1) }).where(eq(agents.id, agent.id)),
       'agents_token_prefix_length',
     );
+    await db.update(agents).set({ tokenPrefix: 'x'.repeat(TEXT_CAPS.tokenPrefix) }).where(eq(agents.id, agent.id));
     await expectRefusedBy(
       db.update(owners).set({ autoPausedReason: 'x'.repeat(201) }).where(eq(owners.id, owner.id)),
       'owners_auto_paused_reason_length',

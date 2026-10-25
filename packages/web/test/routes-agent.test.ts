@@ -1,10 +1,11 @@
 // Covers: the agent API and MCP routes called as Next would call them, with Request objects, on
 // PGlite with a stub chain and a stub seller in place of safeFetch: the bearer token as the
 // only way in (no token, a session token or cookie, another scheme, two values, junk and a
-// revoked agent are all 401); the owner taken from the token alone; the PaidFetchResult with
-// the seller's answer marked untrusted and nothing of Ellai's sent to the seller; a question,
-// the owner's yes, retryAllowed, one paid retry, and the grant spent or expired; the per-agent
-// rate limit, shared by HTTP and MCP; bodies the route does not take; one agent never reading
+// revoked agent are all 401, with a Bearer challenge); the owner taken from the token alone; the
+// PaidFetchResult with the seller's answer marked untrusted and nothing of Ellai's sent to the
+// seller; a question, the owner's yes, retryAllowed, one paid retry, and the grant spent or
+// expired; the per-agent and per-owner pay limits and the per-agent decision read limit, each
+// shared by HTTP and MCP; the routes' time ceilings; bodies the route does not take; one agent never reading
 // another's decision; an unexpected failure as a bare 500; and the MCP handshake, tool list,
 // both tools running the same flow as the HTTP routes, tool failures as fixed JSON, and 405 on
 // GET and DELETE.
@@ -24,6 +25,7 @@ import { eq } from 'drizzle-orm';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import * as decisionRoute from '../src/app/api/agent/decisions/[id]/route.js';
 import * as fetchRoute from '../src/app/api/agent/fetch/route.js';
+import * as jobsRoute from '../src/app/api/jobs/tick/route.js';
 import * as mcpRoute from '../src/app/api/mcp/route.js';
 import { createAgentToken, revokeAgent } from '../src/server/auth/agents.js';
 import { completeSignIn, issueSignIn } from '../src/server/auth/signin.js';
@@ -236,6 +238,7 @@ async function approve(w: World, decisionId: string): Promise<void> {
 }
 
 const UNAUTHORIZED = { error: 'agent_unauthorized', message: 'Send a valid Ellai agent token as Authorization: Bearer <token>.' };
+const TOO_MANY = { error: 'too_many_requests', message: 'Too many requests. Try again in a minute.' };
 
 describe('route files', () => {
   it.each([
@@ -244,6 +247,11 @@ describe('route files', () => {
   ])('%s runs on Node and is never cached or prerendered', (_name, route) => {
     expect(route.runtime).toBe('nodejs');
     expect(route.dynamic).toBe('force-dynamic');
+  });
+
+  it('gives the routes that can wait on a paid call or a tick a 60 second ceiling of their own', () => {
+    expect([fetchRoute.maxDuration, mcpRoute.maxDuration, jobsRoute.maxDuration]).toEqual([60, 60, 60]);
+    expect(LIMITS.netPaidTimeoutMaxMs).toBeLessThanOrEqual(60_000);
   });
 });
 
@@ -268,11 +276,18 @@ describe('the agent token', () => {
     for (const headers of refused) {
       for (const response of [await agentFetch(fetchInput(), headers), await readDecision(someDecision, headers)]) {
         expect(response.status).toBe(401);
+        expect(response.headers.get('www-authenticate')).toBe('Bearer realm="ellai"');
+        expect(response.headers.get('cache-control')).toBe('no-store');
         expect(await response.json()).toEqual(UNAUTHORIZED);
       }
     }
     expect(seller).not.toHaveBeenCalled();
-    expect((await agentFetch(fetchInput(), { authorization: `bearer  ${w.token}` })).status).toBe(200);
+    const allowed = await agentFetch(fetchInput(), { authorization: `bearer  ${w.token}` });
+    expect(allowed.status).toBe(200);
+    expect(allowed.headers.get('www-authenticate')).toBeNull();
+    const missing = await readDecision(someDecision, bearer(w.token));
+    expect(missing.status).toBe(404);
+    expect(missing.headers.get('www-authenticate')).toBeNull();
   });
 
   it('names the owner itself: a body naming another owner is refused, and the decision is recorded for the token\'s owner', async () => {
@@ -359,11 +374,40 @@ describe('POST /api/agent/fetch', () => {
     for (let call = 0; call < LIMITS.agentCallsPerMinute; call += 1) expect((await agentFetch(fetchInput(), bearer(w.token))).status).toBe(200);
     const over = await agentFetch(fetchInput(), bearer(w.token));
     expect(over.status).toBe(429);
-    expect(await over.json()).toMatchObject({ error: 'rate_limited' });
+    expect(await over.json()).toEqual(TOO_MANY);
     expect(seller).toHaveBeenCalledTimes(LIMITS.agentCallsPerMinute);
     expect((await agentFetch(fetchInput(), bearer(sibling.token))).status).toBe(200);
     clock = new Date(clock.getTime() + 60_000);
     expect((await agentFetch(fetchInput(), bearer(w.token))).status).toBe(200);
+  });
+
+  it(`refuses call ${LIMITS.ownerPayRequestsPerMinute + 1} in a minute across one owner's agents with 429, though the agent making it is under its own limit`, async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    const w = await world();
+    const sibling = await anotherAgent(w.ownerId);
+    // Two agents at their own limit of 30 make 60; a 61st from either of them would also be
+    // its own 31st, so the call that shows the owner's limit comes from a third agent.
+    const third = await anotherAgent(w.ownerId);
+    const stranger = await world();
+    freeSeller('{}');
+    expect(LIMITS.ownerPayRequestsPerMinute).toBe(2 * LIMITS.agentCallsPerMinute);
+    for (let call = 0; call < LIMITS.agentCallsPerMinute; call += 1) {
+      for (const agent of [w, sibling]) expect((await agentFetch(fetchInput(), bearer(agent.token))).status).toBe(200);
+    }
+    expect(seller).toHaveBeenCalledTimes(LIMITS.ownerPayRequestsPerMinute);
+    expect(warn).not.toHaveBeenCalled();
+
+    const over = await agentFetch(fetchInput(), bearer(third.token));
+    expect(over.status).toBe(429);
+    expect(await over.json()).toEqual(TOO_MANY);
+    const overMcp = await callTool(third, 'paid_fetch', fetchInput());
+    expect(overMcp).toEqual({ isError: true, text: JSON.stringify(TOO_MANY) });
+    expect(seller).toHaveBeenCalledTimes(LIMITS.ownerPayRequestsPerMinute);
+    expect(warn.mock.calls.map((call) => call.join(' '))).toEqual(['[ellai http] owner_pay too_many_requests', '[ellai http] owner_pay too_many_requests']);
+
+    expect((await agentFetch(fetchInput(), bearer(stranger.token))).status).toBe(200);
+    clock = new Date(clock.getTime() + 60_000);
+    expect((await agentFetch(fetchInput(), bearer(third.token))).status).toBe(200);
   });
 
   it('refuses a body it does not take with 400, before any seller is called', async () => {
@@ -422,6 +466,31 @@ describe('GET /api/agent/decisions/[id]', () => {
     expect(new Set(answers).size).toBe(1);
     expect(await decision(w, askedId.toUpperCase())).toMatchObject({ decisionId: askedId, status: 'asked' });
   });
+
+  it(`refuses read ${LIMITS.agentDecisionReadsPerMinute + 1} in a minute with 429, counting HTTP and check_decision together and each agent apart`, async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    const w = await world();
+    const sibling = await anotherAgent(w.ownerId);
+    chain = stubChain(w);
+    payingSeller();
+    const askedId = (await fetched(w)).decisionId ?? '';
+    for (let read = 1; read < LIMITS.agentDecisionReadsPerMinute; read += 1) expect((await readDecision(askedId, bearer(w.token))).status).toBe(200);
+    expect((await callTool(w, 'check_decision', { decisionId: askedId })).isError).toBe(false);
+    expect(warn).not.toHaveBeenCalled();
+
+    const over = await readDecision(askedId, bearer(w.token));
+    expect(over.status).toBe(429);
+    expect(await over.json()).toEqual(TOO_MANY);
+    expect(await callTool(w, 'check_decision', { decisionId: askedId })).toEqual({ isError: true, text: JSON.stringify(TOO_MANY) });
+    expect(await callTool(w, 'check_decision', { decisionId: 'not-a-uuid' })).toEqual({ isError: true, text: JSON.stringify(TOO_MANY) });
+    expect(warn.mock.calls.map((call) => call.join(' '))).toEqual(Array(3).fill('[ellai http] decision_reads too_many_requests'));
+
+    // Another agent's reads, and this agent's paid fetches, have counts of their own.
+    expect((await readDecision(askedId, bearer(sibling.token))).status).toBe(404);
+    expect((await agentFetch(fetchInput(), bearer(w.token))).status).toBe(200);
+    clock = new Date(clock.getTime() + 60_000);
+    expect(await decision(w, askedId)).toMatchObject({ decisionId: askedId, status: 'asked' });
+  });
 });
 
 interface RpcAnswer {
@@ -479,6 +548,7 @@ describe('POST /api/mcp', () => {
     for (const headers of refused) {
       const response = await mcpPost(call, headers);
       expect(response.status).toBe(401);
+      expect(response.headers.get('www-authenticate')).toBe('Bearer realm="ellai"');
       expect(await response.json()).toEqual(UNAUTHORIZED);
     }
     expect(seller).not.toHaveBeenCalled();
@@ -547,7 +617,7 @@ describe('POST /api/mcp', () => {
     for (let call = 0; call < LIMITS.agentCallsPerMinute; call += 1) expect((await agentFetch(fetchInput(), bearer(w.token))).status).toBe(200);
     const over = await callTool(w, 'paid_fetch', fetchInput());
     expect(over.isError).toBe(true);
-    expect(JSON.parse(over.text)).toEqual({ error: 'rate_limited', message: 'Too many requests. Try again in a minute.' });
+    expect(JSON.parse(over.text)).toEqual(TOO_MANY);
     expect(seller).toHaveBeenCalledTimes(LIMITS.agentCallsPerMinute);
   });
 

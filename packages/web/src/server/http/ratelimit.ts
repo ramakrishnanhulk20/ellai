@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { LIMITS } from '@ellai/core/limits';
 import { lt, sql } from 'drizzle-orm';
 import type { Database } from '../db/client.js';
 import { rateCounters } from '../db/schema.js';
@@ -17,17 +18,22 @@ export const SIGN_IN_RATE_LIMITS = {
 } as const;
 
 /**
- * Counts one request against `key` in the fixed minute that holds `now`, and says whether it
- * is within `perMinute`. The count is one atomic upsert, so concurrent requests can never
+ * Counts one request against `key` in the fixed window of `windowMs` that holds `now`, and says
+ * whether it is within `limit`. The count is one atomic upsert, so concurrent requests can never
  * both read the old count. A request over the limit is still counted, so hammering does not
- * reset anything. Throws Error for an empty key, a limit that is not a positive integer, or
- * a `now` that is not a date.
+ * reset anything. Throws Error for an empty key, a limit that is not a positive integer, a
+ * `now` that is not a date, or a window that is not a whole number of milliseconds shorter
+ * than LIMITS.rateCounterRetentionMs, since pruneRateCounters could delete a longer window
+ * while it is still counting.
  */
-export async function consume(db: Database, key: string, perMinute: number, now: Date): Promise<boolean> {
+export async function consumeWindow(db: Database, key: string, limit: number, windowMs: number, now: Date): Promise<boolean> {
   if (typeof key !== 'string' || key === '') throw new Error('the rate key is missing');
-  if (!Number.isInteger(perMinute) || perMinute < 1) throw new Error('the rate limit must be a positive integer');
+  if (!Number.isInteger(limit) || limit < 1) throw new Error('the rate limit must be a positive integer');
+  if (!Number.isInteger(windowMs) || windowMs < 1 || windowMs >= LIMITS.rateCounterRetentionMs) {
+    throw new Error('the rate window must be a whole number of milliseconds shorter than the counter retention');
+  }
   if (!(now instanceof Date) || Number.isNaN(now.getTime())) throw new Error('The current time is not a date');
-  const windowStart = new Date(Math.floor(now.getTime() / MINUTE_MS) * MINUTE_MS);
+  const windowStart = new Date(Math.floor(now.getTime() / windowMs) * windowMs);
   const stored = `${STORED_KEY_PREFIX}${createHash('sha256').update(key, 'utf8').digest('hex')}`;
   const [counter] = await db
     .insert(rateCounters)
@@ -35,18 +41,27 @@ export async function consume(db: Database, key: string, perMinute: number, now:
     .onConflictDoUpdate({ target: [rateCounters.key, rateCounters.windowStart], set: { count: sql`${rateCounters.count} + 1` } })
     .returning({ count: rateCounters.count });
   if (counter === undefined) throw new Error('the rate counter returned no row');
-  return counter.count <= perMinute;
+  return counter.count <= limit;
+}
+
+/** consumeWindow over the fixed minute that holds `now`, with the same refusals. */
+export async function consume(db: Database, key: string, perMinute: number, now: Date): Promise<boolean> {
+  return consumeWindow(db, key, perMinute, MINUTE_MS, now);
 }
 
 /**
- * Deletes every rate counter, the seller's included, whose window started before `before`, and
- * returns how many it deleted. Every limit counts one fixed minute, so a window that old can no
- * longer turn anyone away; this only keeps the table from growing. Throws Error for a `before`
- * that is not a date.
+ * Deletes every rate counter, the seller's and the built-in agent's included, whose window
+ * started more than LIMITS.rateCounterRetentionMs before `now`, and returns how many it deleted.
+ * The retention is longer than the longest window any counter is read over (the agent run's
+ * day), so a window that can still turn anyone away is never deleted; this only keeps the table
+ * from growing. `now` is the current time: the cut-off is always worked out here from the
+ * retention, and a caller passing an earlier time, as an older cut-off, only keeps rows longer.
+ * Throws Error for a `now` that is not a date.
  */
-export async function pruneRateCounters(db: Database, before: Date): Promise<number> {
-  if (!(before instanceof Date) || Number.isNaN(before.getTime())) throw new Error('The cut-off time is not a date');
-  const deleted = await db.delete(rateCounters).where(lt(rateCounters.windowStart, before)).returning({ key: rateCounters.key });
+export async function pruneRateCounters(db: Database, now: Date): Promise<number> {
+  if (!(now instanceof Date) || Number.isNaN(now.getTime())) throw new Error('The current time is not a date');
+  const cutoff = new Date(now.getTime() - LIMITS.rateCounterRetentionMs);
+  const deleted = await db.delete(rateCounters).where(lt(rateCounters.windowStart, cutoff)).returning({ key: rateCounters.key });
   return deleted.length;
 }
 

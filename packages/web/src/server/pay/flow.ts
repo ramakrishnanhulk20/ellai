@@ -157,6 +157,18 @@ async function citations(db: Database, ownerId: string, ids: string[]): Promise<
   return ids.flatMap((id) => (blobs.has(id) ? [{ memoryId: id, blobId: blobs.get(id) ?? null }] : []));
 }
 
+// The seller may already hold a payment once its header has left, so a failure in a step after
+// that is no reason to tell the agent anything but 'paid'. The step is left undone, and only its
+// name is logged, since an error's text can carry SQL and bound values (C19).
+async function afterPayment<T>(step: 'seller_status' | 'settlement' | 'outcome', run: () => Promise<T>): Promise<T | undefined> {
+  try {
+    return await run();
+  } catch {
+    console.error(`[ellai pay] after_payment_failed ${step}`);
+    return undefined;
+  }
+}
+
 async function closeDecision(db: Database, ownerId: string, decisionId: string, status: 'failed' | 'refused'): Promise<void> {
   await db
     .update(decisions)
@@ -194,10 +206,14 @@ async function closeDecision(db: Database, ownerId: string, decisionId: string, 
  *    patience. Its status, or null when it never answered, is stored with the payment.
  * 9. settlePayment reads the chain by Ellai's digest, LIMITS.settlementInlineTries times (C8).
  * 10. A verified payment the seller answered with anything but 2xx becomes an outcome memory.
- *    Once signed material has left, the result is 'paid' whatever the seller did.
+ *    Once signed material has left, the result is 'paid' with its payment block whatever the
+ *    seller did, and whatever fails after it: a failed status write, settlement read or outcome
+ *    memory is logged by step name and left undone, and a settlement that was not read is
+ *    reported as 'pending'.
  *
  * Every reason is Ellai's own fixed text (C17). Throws only for failures that are not about
- * this request: a database error, a master secret that is not 64 hex characters.
+ * this request, and only before the payment header leaves: a database error, a master secret
+ * that is not 64 hex characters.
  */
 export async function paidFetch(args: PaidFetchArgs): Promise<PaidFetchResult> {
   const { db, deps } = args;
@@ -290,24 +306,32 @@ export async function paidFetch(args: PaidFetchArgs): Promise<PaidFetchResult> {
     // failure here is "no answer" and the flow still goes on to read the chain.
   }
   const delivered = answer !== null && answer.status >= 200 && answer.status < 300;
-  await db
-    .update(payments)
-    .set({ sellerStatus: answer?.status ?? null, delivered })
-    .where(and(eq(payments.id, paymentRow.id), eq(payments.ownerId, ownerId)));
+  await afterPayment('seller_status', () =>
+    db
+      .update(payments)
+      .set({ sellerStatus: answer?.status ?? null, delivered })
+      .where(and(eq(payments.id, paymentRow.id), eq(payments.ownerId, ownerId))),
+  );
 
-  const settlement = await settlePayment({
-    db,
-    ownerId,
-    paymentId: paymentRow.id,
-    chain: deps.chain,
-    tries: LIMITS.settlementInlineTries,
-    intervalMs: LIMITS.settlementInlineIntervalMs,
-    sleep: deps.sleep,
-  });
+  // A settlement that could not be read stays 'pending' in payments, which the jobs tick reads again.
+  const settlement =
+    (await afterPayment('settlement', () =>
+      settlePayment({
+        db,
+        ownerId,
+        paymentId: paymentRow.id,
+        chain: deps.chain,
+        tries: LIMITS.settlementInlineTries,
+        intervalMs: LIMITS.settlementInlineIntervalMs,
+        sleep: deps.sleep,
+      }),
+    )) ?? 'pending';
   // A normal paid call is already on chain and in payments; only a bad one becomes a memory,
   // so outcomes never crowd the owner's own answers out of recall.
   if (settlement === 'verified' && !delivered) {
-    await recordOutcome({ db, ownerId, decisionId, delivered: false, delegatePublicKeyHex: delegate.publicKeyHex, now: deps.now() });
+    await afterPayment('outcome', () =>
+      recordOutcome({ db, ownerId, decisionId, delivered: false, delegatePublicKeyHex: delegate.publicKeyHex, now: deps.now() }),
+    );
   }
 
   const paidText = `Paid ${formatUsdc(payment.amount)} USDC to ${hostLabel(payment.sellerHost)}`;

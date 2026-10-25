@@ -50,7 +50,8 @@ export const SALE_STATUSES = ['issued', 'settled', 'rejected'] as const;
 export const TEXT_CAPS = {
   autoPausedReason: 200,
   agentLabel: 60,
-  tokenPrefix: 12,
+  /** The longer token prefix (14 characters) and 6 characters of the random part, with room. */
+  tokenPrefix: 24,
   sellerUrl: 2_048,
   sellerHost: 253,
   purpose: 500,
@@ -170,6 +171,11 @@ export const agents = pgTable(
   },
   (t) => [
     unique('agents_id_owner_id_unique').on(t.id, t.ownerId),
+    // The built-in agent is found by kind, not by id, so a second live one for an owner would
+    // leave which agent acts to row order. A revoked one no longer counts.
+    uniqueIndex('agents_one_live_builtin_per_owner')
+      .on(t.ownerId)
+      .where(sql`${t.kind} = 'builtin' and ${t.revokedAt} is null`),
     check('agents_label_length', sql`char_length(${t.label}) between 1 and ${sql.raw(String(TEXT_CAPS.agentLabel))}`),
     oneOf('agents_kind_known', t.kind, AGENT_KINDS),
     maxLength('agents_token_prefix_length', t.tokenPrefix, TEXT_CAPS.tokenPrefix),
@@ -208,6 +214,9 @@ export const decisions = pgTable(
   (t) => [
     unique('decisions_id_owner_id_unique').on(t.id, t.ownerId),
     sameOwner('decisions_agent_same_owner_fk', [t.agentId, t.ownerId], [agents.id, agents.ownerId]),
+    // The owner's history pages read newest first from a time, so a page costs an index range,
+    // not a pass over every decision the owner ever had.
+    index('decisions_owner_created_at_idx').on(t.ownerId, t.createdAt),
     // A retry of a request that is still open or asked must find the first decision,
     // never start a second one that could be paid as well (C5). Once the first has
     // reached any other status, the same request may be decided afresh.
@@ -265,6 +274,7 @@ export const memories = pgTable(
       sql`${t.kind} <> 'owner_decision' or (${t.verdict} is not null and ${t.recipient} is not null and ${t.amountAtomic} is not null)`,
     ),
     index('memories_refusal_lookup_idx').on(t.ownerId, t.recipient, t.verdict),
+    index('memories_owner_created_at_idx').on(t.ownerId, t.createdAt),
     oneOf('memories_kind_known', t.kind, MEMORY_KINDS),
     oneOf('memories_verdict_known', t.verdict, VERDICTS),
     oneOf('memories_status_known', t.status, MEMORY_STATUSES),
@@ -399,6 +409,9 @@ export const refills = pgTable(
     amountAtomic: atomic('amount_atomic').notNull(),
     digest: text('digest').notNull().unique(),
     sentAt: at('sent_at').notNull(),
+    // The signed bytes' maxEpoch. Null only on rows written before it was kept, which go on
+    // waiting for their digest as they always did.
+    validUntilEpoch: bigint('valid_until_epoch', { mode: 'bigint' }),
     status: text('status', { enum: REFILL_STATUSES }).notNull().default('pending'),
     verifiedAt: at('verified_at'),
   },

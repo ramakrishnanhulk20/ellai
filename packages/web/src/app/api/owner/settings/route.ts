@@ -120,7 +120,7 @@ export async function PATCH(request: Request): Promise<Response> {
         return { settings: updated };
       });
 
-      if ('problem' in outcome) return jsonResponse({ error: 'out_of_bounds', message: outcome.problem }, { status: 400 });
+      if (outcome.problem !== undefined) throw new HttpError(400, 'out_of_bounds', outcome.problem);
       return jsonResponse(outcome.settings);
     }),
   );

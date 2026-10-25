@@ -1,9 +1,9 @@
 import { and, asc, desc, eq, inArray, lt } from 'drizzle-orm';
 import { agents, decisionCitations, decisions, memories, payments } from '../../../../server/db/schema.js';
 import { withServerContext } from '../../../../server/http/context.js';
-import { respond } from '../../../../server/http/errors.js';
+import { HttpError, respond } from '../../../../server/http/errors.js';
 import { jsonResponse } from '../../../../server/http/json.js';
-import { PAGE_READ, badQueryResponse, cutPage, readPageQuery } from '../../../../server/http/owner-limits.js';
+import { PAGE_READ, cutPage, readPageQuery } from '../../../../server/http/owner-limits.js';
 import { requireOwner } from '../../../../server/http/session.js';
 
 export const runtime = 'nodejs';
@@ -31,7 +31,7 @@ export async function GET(request: Request): Promise<Response> {
     withServerContext(async (ctx) => {
       const { ownerId } = await requireOwner(request, ctx);
       const query = readPageQuery(request);
-      if (query === null) return badQueryResponse();
+      if (query === null) throw new HttpError(400, 'bad_query');
 
       const ownRows = eq(decisions.ownerId, ownerId);
       const read = await ctx.db

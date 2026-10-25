@@ -32,9 +32,15 @@ function isJsonContentType(header: string | null): boolean {
   return true;
 }
 
-// Content-Length is only a fast early refusal. The count that decides is the bytes actually
-// read, because the header can be absent or lie.
-async function readCapped(request: Request, maxBytes: number): Promise<Uint8Array> {
+/**
+ * A request's body as bytes, read only up to `maxBytes`. Content-Length is only a fast early
+ * refusal; the count that decides is the bytes actually read, because the header can be absent
+ * or lie, and reading stops as soon as the cap is passed. A request with no body is zero bytes.
+ * Throws HttpError 400 body_too_large past the cap, and 400 bad_json for a body that fails to
+ * arrive. Throws Error when `maxBytes` is not a positive integer, which is a server bug.
+ */
+export async function readCappedBody(request: Request, maxBytes: number): Promise<Uint8Array> {
+  if (!Number.isInteger(maxBytes) || maxBytes < 1) throw new Error('the body cap must be a positive integer');
   const declared = request.headers.get('content-length');
   if (declared !== null && /^[0-9]+$/.test(declared) && Number(declared) > maxBytes) throw new HttpError(400, 'body_too_large');
   if (request.body === null) return new Uint8Array(0);
@@ -81,7 +87,7 @@ async function readCapped(request: Request, maxBytes: number): Promise<Uint8Arra
 export async function readJson<Schema extends z.ZodType>(request: Request, schema: Schema, maxBytes: number): Promise<z.output<Schema>> {
   if (!Number.isInteger(maxBytes) || maxBytes < 1) throw new Error('the body cap must be a positive integer');
   if (!isJsonContentType(request.headers.get('content-type'))) throw new HttpError(400, 'bad_content_type');
-  const bytes = await readCapped(request, maxBytes);
+  const bytes = await readCappedBody(request, maxBytes);
 
   let parsed: unknown;
   try {

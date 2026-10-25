@@ -6,12 +6,18 @@ import { z } from 'zod';
 import { createAgentToken } from '../auth/agents.js';
 import type { Database } from '../db/client.js';
 import { agents, owners, rateCounters } from '../db/schema.js';
+import { AgentLimitError } from '../http/agent-auth.js';
 import type { PaidFetchResult } from '../pay/result.js';
 import { type CatalogEntry, agentCatalog } from './catalog.js';
 import { AGENT_SYSTEM_PROMPT } from './prompt.js';
 
 /** The cheapest model that does the job (6n). */
 export const AGENT_MODEL = 'claude-haiku-5-5';
+/**
+ * Retries the model client makes after a failed request. One, not the SDK's two: the owner is
+ * waiting on the page, and a second failure in a row is reported rather than waited out.
+ */
+export const AGENT_MODEL_RETRIES = 1;
 export const BUILTIN_AGENT_LABEL = 'Built-in agent';
 
 export type AgentRunStatus = 'done' | 'needs_key' | 'stopped' | 'limit' | 'refused';
@@ -52,7 +58,11 @@ export const AGENT_ANSWERS = {
   noAnswer: 'The built-in agent finished without writing an answer.',
   asked: 'Ellai asked you before paying, so the built-in agent stopped. Answer the question in Ellai, then run the task again.',
   refusedPayment: 'Ellai refused this payment, so the built-in agent stopped.',
+  payLimit: "Your agents reached Ellai's limit on paid calls for this minute, so the built-in agent stopped. Try again in a minute.",
 } as const;
+
+/** The reason on a step Ellai did not run because a per-minute pay limit was reached (C22). */
+export const PAY_LIMIT_REASON = 'Ellai did not make this call: the limit on paid calls for this minute was reached.';
 
 /** Tool results the run writes for a call it will not run. */
 export const TOOL_ERRORS = {
@@ -217,6 +227,8 @@ function modelFailure(error: InstanceType<typeof Anthropic.AnthropicError>): str
 interface ToolOutcome {
   block: Anthropic.ToolResultBlockParam;
   fetched?: { sellerId: string; result: PaidFetchResult };
+  /** The seller id of a call the gate turned away for a per-minute pay limit. */
+  limited?: string;
 }
 
 async function runTool(
@@ -244,7 +256,13 @@ async function runTool(
   if (body !== null && Buffer.byteLength(body, 'utf8') > LIMITS.challengeMaxBytes) return { block: errorResult(call.id, TOOL_ERRORS.body) };
 
   // The URL, method and content type are the catalog's, whatever the model asked for (C7, C20).
-  const result = await pay({ url: entry.url, method: entry.method, body, contentType: entry.contentType, purpose: parsed.data.purpose });
+  let result: PaidFetchResult;
+  try {
+    result = await pay({ url: entry.url, method: entry.method, body, contentType: entry.contentType, purpose: parsed.data.purpose });
+  } catch (error) {
+    if (error instanceof AgentLimitError) return { block: errorResult(call.id, PAY_LIMIT_REASON), limited: entry.id };
+    throw error;
+  }
   return { block: { type: 'tool_result', tool_use_id: call.id, content: paidFetchContent(result) }, fetched: { sellerId: entry.id, result } };
 }
 
@@ -266,8 +284,11 @@ async function runTool(
  * fetch. Every result of one turn goes back in one message. A turn that would take the run
  * past LIMITS.agentMaxToolCalls is not run and the run ends 'stopped'. A paid_fetch answered
  * 'asked' or 'refused' ends the run 'stopped' on the model's next reply, or at once if that
- * reply calls a tool. A 'refusal' stop ends it 'refused'; any other stop but end_turn and
- * tool_use, and any SDK error, end it 'stopped' with fixed text (C19).
+ * reply calls a tool. `paidFetchFor` throws AgentLimitError when this agent or its owner is past
+ * a per-minute pay limit (C22): that call becomes a 'failed' step with PAY_LIMIT_REASON,
+ * nothing more of the turn runs, and the run ends 'stopped' at once with AGENT_ANSWERS.payLimit.
+ * A 'refusal' stop ends it 'refused'; any other stop but end_turn and tool_use, and any SDK
+ * error, end it 'stopped' with fixed text (C19).
  *
  * `steps` lists every call that reached the gate, with Ellai's outcome, reason and digest.
  * Throws for failures that are not about the run: a database error, a bad owner id or clock,
@@ -341,6 +362,12 @@ export async function runAgentTask(args: {
         continue;
       }
       const outcome = await runTool(call, catalog, byId, pay);
+      // Every later call this minute would be turned away too, so the run ends here, with no
+      // further model request spent on it.
+      if (outcome.limited !== undefined) {
+        steps.push({ sellerId: outcome.limited, outcome: 'failed', reason: PAY_LIMIT_REASON, digest: null });
+        return finish('stopped', AGENT_ANSWERS.payLimit);
+      }
       results.push(outcome.block);
       if (outcome.fetched === undefined) continue;
       const { sellerId, result } = outcome.fetched;

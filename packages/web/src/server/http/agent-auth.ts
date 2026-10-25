@@ -2,13 +2,38 @@ import { LIMITS } from '@ellai/core/limits';
 import { authenticateAgent } from '../auth/agents.js';
 import type { Database } from '../db/client.js';
 import type { ServerContext } from './context.js';
-import { HttpError } from './errors.js';
+import { HttpError, toErrorResponse } from './errors.js';
+import { jsonResponse } from './json.js';
 import { consume } from './ratelimit.js';
 
 // RFC 6750's credentials: the scheme, which RFC 9110 makes case-insensitive, one or more
 // spaces, then one token with no spaces in it. Two Authorization headers arrive joined by a
 // comma and a space, so they never match and the request is refused.
 const BEARER = /^bearer +(\S+)$/i;
+
+// RFC 6750 section 3: a 401 from a resource behind a bearer token names the scheme it wants.
+const BEARER_CHALLENGE = 'Bearer realm="ellai"';
+
+// errors.ts names no code for this, so the body is fixed here, in the words owner-limits.ts
+// gives its own 429. Nothing in it comes from the caller (C19).
+const TOO_MANY_REQUESTS = { error: 'too_many_requests', message: 'Too many requests. Try again in a minute.' } as const;
+
+/**
+ * An agent, or the owner it acts for, is past one of its per-minute limits (C22). The message
+ * is fixed text. respondToAgent answers it with agentLimitResponse; the MCP tools and the
+ * built-in agent catch it themselves.
+ */
+export class AgentLimitError extends Error {
+  constructor() {
+    super(TOO_MANY_REQUESTS.message);
+    this.name = 'AgentLimitError';
+  }
+}
+
+/** The 429 { error: 'too_many_requests', message } answer to an AgentLimitError. */
+export function agentLimitResponse(): Response {
+  return jsonResponse(TOO_MANY_REQUESTS, { status: 429 });
+}
 
 /**
  * The credential in a request's `Authorization: Bearer <value>` header, or undefined when the
@@ -31,11 +56,48 @@ export async function requireAgent(request: Request, ctx: ServerContext): Promis
   return agent;
 }
 
+// A request over the limit still counts, so hammering does not reset anything.
+async function withinLimit(db: Database, key: string, perMinute: number, now: Date, logName: string): Promise<void> {
+  if (await consume(db, key, perMinute, now)) return;
+  console.warn(`[ellai http] ${logName} too_many_requests`);
+  throw new AgentLimitError();
+}
+
 /**
- * Counts one paid fetch for this agent in the fixed minute that holds `now`, over HTTP and MCP
- * together, keyed on the authenticated agent id, which the caller cannot choose (C22).
- * Throws HttpError 429 rate_limited past LIMITS.agentCallsPerMinute.
+ * Counts one paid fetch for this agent and for its owner in the fixed minute that holds `now`,
+ * keyed on the ids authentication gave, which the caller cannot choose (C22). Every agent of
+ * the owner shares the owner's count, whether it calls over HTTP, MCP or is the built-in agent
+ * (C16). The agent's own LIMITS.agentCallsPerMinute is counted first, so an agent already past
+ * it cannot spend the LIMITS.ownerPayRequestsPerMinute its siblings share.
+ * Throws AgentLimitError past either.
  */
-export async function limitAgentFetch(db: Database, agentId: string, now: Date): Promise<void> {
-  if (!(await consume(db, `agent:paid-fetch:${agentId}`, LIMITS.agentCallsPerMinute, now))) throw new HttpError(429, 'rate_limited');
+export async function limitAgentFetch(db: Database, agent: { ownerId: string; agentId: string }, now: Date): Promise<void> {
+  await withinLimit(db, `agent:paid-fetch:${agent.agentId.toLowerCase()}`, LIMITS.agentCallsPerMinute, now, 'agent_pay');
+  await withinLimit(db, `owner-pay:${agent.ownerId.toLowerCase()}`, LIMITS.ownerPayRequestsPerMinute, now, 'owner_pay');
+}
+
+/**
+ * Counts one decision read for this agent in the fixed minute that holds `now`, over HTTP and
+ * MCP together, keyed on the authenticated agent id (C22). Throws AgentLimitError past
+ * LIMITS.agentDecisionReadsPerMinute.
+ */
+export async function limitDecisionRead(db: Database, agentId: string, now: Date): Promise<void> {
+  await withinLimit(db, `agent:decision-read:${agentId.toLowerCase()}`, LIMITS.agentDecisionReadsPerMinute, now, 'decision_reads');
+}
+
+/**
+ * respond, for the routes an agent calls with its token: an AgentLimitError is the fixed 429
+ * too_many_requests, and the 401 agent_unauthorized also carries
+ * `WWW-Authenticate: Bearer realm="ellai"`. Anything else is toErrorResponse's answer.
+ * Never throws.
+ */
+export async function respondToAgent(run: () => Promise<Response>): Promise<Response> {
+  try {
+    return await run();
+  } catch (error) {
+    if (error instanceof AgentLimitError) return agentLimitResponse();
+    const response = toErrorResponse(error);
+    if (error instanceof HttpError && error.code === 'agent_unauthorized') response.headers.set('www-authenticate', BEARER_CHALLENGE);
+    return response;
+  }
 }
