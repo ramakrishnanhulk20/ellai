@@ -4,15 +4,18 @@
 // unknown, expired, already-claimed or other-resource challenge, and for a header that is not
 // the t2000 shape; bytes paying another recipient or amount or carrying an extra command, and a
 // signature that is not the sender's, are refused after the claim and never executed; a
-// settlement mismatch is refused and recorded; a challenge pays once and one payment never pays
-// two challenges; the unpaid rate limit; the wallet check summary and its blob cap; the pay-to
+// settlement mismatch or failure is refused and closed; an unknown execution outcome is read
+// back by its digest and settled if it landed, and otherwise left open to the same bytes alone,
+// so a retry delivers; a challenge pays once and one payment never pays
+// two challenges; the unpaid rate limit per caller and for every caller together; one epoch
+// read per cache window; the wallet check summary and its blob cap; the pay-to
 // fallback; and no response ever carries the payment header, its bytes or its signature.
 // Does NOT cover: the live chain or Tatum (`npm run prove:seller` pays one 0.01 USDC live),
 // core's own challenge, payment and settlement rules (core's tests), zkLogin or multisig payers,
 // two connections racing on one claim (PGlite serves one connection at a time), or the HTTP
 // route that will call this handler.
 import { randomBytes } from 'node:crypto';
-import { type BalanceChange, type Chain, ChainError, type ExecutionResult, type WalrusBlob } from '@ellai/core/chain';
+import { type BalanceChange, type Chain, ChainError, type ExecutionResult, type TransactionResult, type WalrusBlob } from '@ellai/core/chain';
 import { type CanonicalPayment, parseChallenge } from '@ellai/core/challenge';
 import { canonicalSuiAddress } from '@ellai/core/keys';
 import { LIMITS } from '@ellai/core/limits';
@@ -29,7 +32,7 @@ import { type Database, createDb, migrate } from '../src/server/db/client.js';
 import { sellerSales } from '../src/server/db/schema.js';
 import { SellerError, issueWalletCheckChallenge, readSellerChallengeId, sellerChallengeId } from '../src/server/seller/challenge.js';
 import { HANDLER_MESSAGES, type SellerResponse, handleWalletCheck, sellerPayTo } from '../src/server/seller/handler.js';
-import { SETTLE_REASONS, settleWalletCheckPayment } from '../src/server/seller/settle.js';
+import { SETTLE_REASONS, type SettleOutcome, settleWalletCheckPayment } from '../src/server/seller/settle.js';
 import { walletCheck } from '../src/server/seller/walletcheck.js';
 
 vi.mock('@ellai/core/memory', async (importOriginal) => ({
@@ -93,23 +96,33 @@ function landed(txBytes: Uint8Array, changes?: (payer: string) => BalanceChange[
 }
 
 interface ChainState {
-  epoch: bigint;
+  /** An Error is thrown by the epoch read instead. */
+  epoch: bigint | Error;
   execute: (txBytes: Uint8Array) => ExecutionResult;
+  /** What a read of a digest finds; null is a chain that does not have it (NOT_FOUND). */
+  read: (digest: string) => TransactionResult | null;
   blobs: number | 'too many';
 }
 
 function stubChain(overrides: Partial<ChainState> = {}) {
-  const state: ChainState = { epoch: EPOCH, execute: (txBytes) => landed(txBytes), blobs: 0, ...overrides };
-  const calls = { epochs: 0, executions: [] as string[], balances: [] as string[], blobs: [] as string[] };
+  const state: ChainState = { epoch: EPOCH, execute: (txBytes) => landed(txBytes), read: () => null, blobs: 0, ...overrides };
+  const calls = { epochs: 0, executions: [] as string[], reads: [] as string[], balances: [] as string[], blobs: [] as string[] };
   const chain = {
     usesApiKey: false,
     getCurrentEpoch: async () => {
       calls.epochs += 1;
+      if (state.epoch instanceof Error) throw state.epoch;
       return state.epoch;
     },
     executeTransaction: async (txBytes: Uint8Array) => {
       calls.executions.push(TransactionDataBuilder.getDigestFromBytes(txBytes));
       return state.execute(txBytes);
+    },
+    getTransactionResult: async (digest: string) => {
+      calls.reads.push(digest);
+      const found = state.read(digest);
+      if (found === null) throw new ChainError('NOT_FOUND', 'Transaction was not found on Sui mainnet');
+      return found;
     },
     getBalances: async (address: string) => {
       calls.balances.push(address);
@@ -188,8 +201,14 @@ async function handBuilt(payment: CanonicalPayment, tamper: Tamper = {}): Promis
   return tx.build();
 }
 
+// Counts the waits between chain reads instead of waiting them out.
+const waits: number[] = [];
+const noWait = async (ms: number) => {
+  waits.push(ms);
+};
+
 function settle(chain: Chain, paymentHeaderValue: string, options: { resourceUrl?: string; now?: Date } = {}) {
-  return settleWalletCheckPayment({ db, chain, paymentHeader: paymentHeaderValue, resourceUrl: options.resourceUrl ?? RESOURCE, now: options.now ?? NOW });
+  return settleWalletCheckPayment({ db, chain, paymentHeader: paymentHeaderValue, resourceUrl: options.resourceUrl ?? RESOURCE, now: options.now ?? NOW, sleep: noWait });
 }
 
 function call(chain: Chain, options: { method?: string; headers?: Record<string, string>; body?: string; callerKey?: string; now?: Date } = {}) {
@@ -203,6 +222,7 @@ function call(chain: Chain, options: { method?: string; headers?: Record<string,
     payTo: PAY_TO,
     callerKey: options.callerKey ?? `caller-${randomBytes(8).toString('hex')}`,
     now: options.now ?? NOW,
+    sleep: noWait,
   });
 }
 
@@ -260,6 +280,35 @@ describe('issueWalletCheckChallenge', () => {
     }
     await expect(issue(stubChain({ epoch: 2n ** 32n }).chain)).rejects.toThrow(SellerError);
     expect(await saleCount()).toBe(before);
+  });
+
+  it('reads the epoch once per LIMITS.epochCacheMs, and issues nothing from a failed read or one lower than an epoch already read (C22)', async () => {
+    const { chain, state, calls } = stubChain();
+    const at = (ms: number) => new Date(NOW.getTime() + ms);
+    const epochOf = async (now: Date) => readSellerChallengeId((await issue(chain, RESOURCE, now)).challengeId, BINDING)?.minEpoch;
+
+    expect(await epochOf(at(0))).toBe(EPOCH);
+    state.epoch = EPOCH + 1n;
+    expect(await epochOf(at(LIMITS.epochCacheMs - 1))).toBe(EPOCH);
+    expect(calls.epochs).toBe(1);
+    expect(await epochOf(at(LIMITS.epochCacheMs))).toBe(EPOCH + 1n);
+    expect(calls.epochs).toBe(2);
+
+    // A node still short of the boundary the last read passed, then a read that fails: the
+    // expired reading is not fallen back on, and nothing is stored.
+    const before = await saleCount();
+    state.epoch = EPOCH;
+    await expect(issue(chain, RESOURCE, at(2 * LIMITS.epochCacheMs))).rejects.toThrow(SellerError);
+    state.epoch = new ChainError('TIMEOUT', 'timed out', true);
+    await expect(issue(chain, RESOURCE, at(2 * LIMITS.epochCacheMs + 1))).rejects.toThrow(ChainError);
+    expect(await saleCount()).toBe(before);
+    expect(calls.epochs).toBe(4);
+
+    state.epoch = EPOCH + 1n;
+    expect(await epochOf(at(2 * LIMITS.epochCacheMs + 2))).toBe(EPOCH + 1n);
+    // A clock that reads earlier than the cached read cannot make that read look younger.
+    expect(await epochOf(at(LIMITS.epochCacheMs))).toBe(EPOCH + 1n);
+    expect(calls.epochs).toBe(6);
   });
 });
 
@@ -341,27 +390,94 @@ describe('settleWalletCheckPayment', () => {
     expect(calls.executions).toEqual([]);
   });
 
-  it('refuses a settlement that is not the exact payment, a failed one and an unknown outcome, and records each against its digest', async () => {
+  const mismatched = (txBytes: Uint8Array) =>
+    landed(txBytes, (payer) => [
+      { address: payer, coinType: USDC_TYPE_MAINNET, amount: -PRICE },
+      { address: PAY_TO, coinType: USDC_TYPE_MAINNET, amount: PRICE - 1n },
+      { address: OTHER, coinType: USDC_TYPE_MAINNET, amount: 1n },
+    ]);
+  const failedOnChain = (txBytes: Uint8Array): ExecutionResult => ({ ...landed(txBytes, () => []), status: 'failure', errorCode: 'INSUFFICIENT_ADDRESS_BALANCE' });
+
+  it('rejects only on a definite answer: a settlement that is not the exact payment, a failed one, or bytes core refused to send, each closed against its digest', async () => {
     const outcomes: Array<[ChainState['execute'], string]> = [
-      [(txBytes) => landed(txBytes, (payer) => [
-        { address: payer, coinType: USDC_TYPE_MAINNET, amount: -PRICE },
-        { address: PAY_TO, coinType: USDC_TYPE_MAINNET, amount: PRICE - 1n },
-        { address: OTHER, coinType: USDC_TYPE_MAINNET, amount: 1n },
-      ]), SETTLE_REASONS.mismatch],
-      [(txBytes) => ({ ...landed(txBytes, () => []), status: 'failure', errorCode: 'INSUFFICIENT_ADDRESS_BALANCE' }), SETTLE_REASONS.failed],
+      [mismatched, SETTLE_REASONS.mismatch],
+      [failedOnChain, SETTLE_REASONS.failed],
       [() => {
-        throw new ChainError('TIMEOUT', 'timed out', true);
-      }, SETTLE_REASONS.unconfirmed],
+        throw new ChainError('INVALID_INPUT', 'a signature is not base64');
+      }, SETTLE_REASONS.failed],
     ];
     for (const [execute, reason] of outcomes) {
       const { chain, calls } = stubChain({ execute });
       const issued = await issue(chain);
       const { signed, header } = await pay(asBuyer(issued));
       expect(await settle(chain, header)).toEqual({ ok: false, status: 402, reason });
-      expect(await saleOf(issued.challengeId)).toMatchObject({ status: 'rejected', digest: signed.digest, payer: BUYER, settledAt: null });
-      expect(calls.executions).toEqual([signed.digest]);
+      expect(await saleOf(issued.challengeId)).toMatchObject({ status: 'rejected', digest: signed.digest, payer: BUYER, settledAt: NOW });
       expect(await settle(chain, header)).toEqual({ ok: false, status: 409, reason: SETTLE_REASONS.used });
+      expect(calls.executions).toEqual([signed.digest]);
+      expect(calls.reads).toEqual([]);
     }
+  });
+
+  it('reads the digest after an unknown execution outcome, settling a payment that landed and closing on a failed or mismatched one (A1-7)', async () => {
+    const reads: Array<[(txBytes: Uint8Array) => TransactionResult, SettleOutcome | null, string]> = [
+      [landed, null, 'settled'],
+      [failedOnChain, { ok: false, status: 402, reason: SETTLE_REASONS.failed }, 'rejected'],
+      [mismatched, { ok: false, status: 402, reason: SETTLE_REASONS.mismatch }, 'rejected'],
+    ];
+    for (const [found, outcome, status] of reads) {
+      const { chain, state, calls } = stubChain({
+        execute: () => {
+          throw new ChainError('TIMEOUT', 'Tatum executeTransaction: timed out; the transaction may have landed', true);
+        },
+      });
+      const issued = await issue(chain);
+      const { signed, header } = await pay(asBuyer(issued));
+      // A lagging node misses it twice before the third read finds it.
+      state.read = () => (calls.reads.length < 3 ? null : found(Buffer.from(signed.txBytesBase64, 'base64')));
+      waits.length = 0;
+      expect(await settle(chain, header)).toEqual(outcome ?? { ok: true, digest: signed.digest, payer: BUYER });
+      expect(await saleOf(issued.challengeId)).toMatchObject({ status, digest: signed.digest, payer: BUYER, settledAt: NOW });
+      expect(calls.reads).toEqual([signed.digest, signed.digest, signed.digest]);
+      expect(waits).toEqual([LIMITS.chainReadAfterWriteDelayMs, LIMITS.chainReadAfterWriteDelayMs]);
+      expect(calls.executions).toEqual([signed.digest]);
+    }
+  });
+
+  it('keeps a sale whose outcome stays unknown open to the same bytes alone, and a retry with the same header after the challenge expired re-checks the chain and delivers (A1-7)', async () => {
+    const { chain, state, calls } = stubChain({
+      execute: () => {
+        throw new ChainError('UPSTREAM', 'Tatum executeTransaction: gateway error; the transaction may have landed', true);
+      },
+    });
+    const unpaid = await call(chain);
+    const payment = asBuyer(unpaid);
+    const { signed, header } = await pay(payment);
+    const paidCall = (now: Date) => call(chain, { headers: { 'content-type': 'application/json', 'X-PAYMENT': header }, now });
+
+    const unknown = await paidCall(NOW);
+    expect(unknown.status).toBe(402);
+    expect(JSON.parse(unknown.body)).toEqual({ error: SETTLE_REASONS.unconfirmed });
+    expect(calls.reads).toEqual(Array<string>(LIMITS.chainReadAfterWriteTries).fill(signed.digest));
+    expect(await saleOf(payment.challengeId ?? '')).toMatchObject({ status: 'rejected', digest: signed.digest, payer: BUYER, settledAt: null });
+
+    // Other bytes for the same challenge, even well formed and signed, cannot pick the sale up.
+    const other = await pay(payment, Ed25519Keypair.generate());
+    expect(await settle(chain, other.header)).toEqual({ ok: false, status: 409, reason: SETTLE_REASONS.used });
+
+    const tenMinutesLater = new Date(NOW.getTime() + 600_000);
+    expect((await paidCall(tenMinutesLater)).status).toBe(402);
+    expect(calls.reads).toHaveLength(2 * LIMITS.chainReadAfterWriteTries);
+
+    state.read = (digest) => (digest === signed.digest ? landed(Buffer.from(signed.txBytesBase64, 'base64')) : null);
+    const delivered = await paidCall(tenMinutesLater);
+    expect(delivered.status).toBe(200);
+    expect(JSON.parse(delivered.body)).toMatchObject({ address: CHECKED });
+    const receipt = JSON.parse(Buffer.from(delivered.headers['X-PAYMENT-RESPONSE'] ?? '', 'base64').toString('utf8'));
+    expect(receipt).toEqual({ success: true, network: 'sui:mainnet', transaction: signed.digest, payer: BUYER });
+    expect(await saleOf(payment.challengeId ?? '')).toMatchObject({ status: 'settled', digest: signed.digest, settledAt: tenMinutesLater });
+
+    expect((await paidCall(tenMinutesLater)).status).toBe(409);
+    expect(calls.executions).toEqual([signed.digest]);
   });
 
   it('lets exactly one of two payments racing for one challenge claim it', async () => {
@@ -474,10 +590,35 @@ describe('handleWalletCheck', () => {
     const limited = await call(chain, { callerKey, now: new Date(NOW.getTime() + 30_000) });
     expect(limited).toMatchObject({ status: 429, headers: { 'Retry-After': '30' } });
     expect(JSON.parse(limited.body)).toEqual({ error: HANDLER_MESSAGES.rate });
-    expect(calls.epochs).toBe(LIMITS.sellerChallengesPerMinute);
+    expect(calls.epochs).toBe(1);
 
     expect((await call(chain, { callerKey: '203.0.113.8', now: new Date(NOW.getTime() + 30_000) })).status).toBe(402);
     expect((await call(chain, { callerKey, now: new Date(NOW.getTime() + 60_000) })).status).toBe(402);
+  });
+
+  it('serves 100 callers in a minute from one epoch read, and holds every caller together to LIMITS.sellerChallengesPerMinuteGlobal (C22)', async () => {
+    const { chain, calls } = stubChain();
+    // Two hours after NOW, a minute no other test counts in.
+    const minute = NOW.getTime() + 7_200_000;
+    const at = (ms: number) => new Date(minute + ms);
+    const before = await saleCount();
+
+    const burst = await Promise.all(Array.from({ length: 100 }, (_, i) => call(chain, { callerKey: `198.51.100.${i}`, now: at(0) })));
+    expect(burst.map((answer) => answer.status)).toEqual(Array<number>(100).fill(402));
+    expect(calls.epochs).toBe(1);
+
+    for (let i = 100; i < LIMITS.sellerChallengesPerMinuteGlobal; i++) {
+      expect((await call(chain, { callerKey: `caller-${i}`, now: at(i * 10) })).status).toBe(402);
+    }
+    const busy = await call(chain, { callerKey: 'caller-never-seen', now: at(30_000) });
+    expect(busy).toMatchObject({ status: 429, headers: { 'Retry-After': '30' } });
+    expect(JSON.parse(busy.body)).toEqual({ error: HANDLER_MESSAGES.busy });
+    expect(calls.epochs).toBe(1);
+    expect(await saleCount()).toBe(before + LIMITS.sellerChallengesPerMinuteGlobal);
+
+    // The next minute is a new shared window, and by then the cached epoch is a minute old.
+    expect((await call(chain, { callerKey: 'caller-never-seen', now: at(60_000) })).status).toBe(402);
+    expect(calls.epochs).toBe(2);
   });
 
   it('never puts the payment header, its bytes or its signature in any response, whatever the outcome (C19)', async () => {

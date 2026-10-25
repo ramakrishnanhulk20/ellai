@@ -1,8 +1,10 @@
 // Covers: the HTTP plumbing under every route: error responses and their log lines, the one
 // table of HTTP error codes, the same-origin check, the client key, the rate counter over a
-// minute or a longer window, pruning old counters while keeping every window still read, the
+// minute or a longer window, the shared quota every caller counts against, pruning old
+// counters while keeping every window still read, the
 // capped body and JSON readers and the
-// seller route reading with the capped one, bigint-safe responses, the session requirement, and
+// seller route reading with the capped one, bigint-safe responses, the session requirement with
+// its cookie read under the one name the app's origin gives, and
 // how request contexts are opened and closed, including the default PGlite path and the
 // per-request Neon pool.
 // Does NOT cover: the routes themselves (routes-auth and routes-owner do), a real Postgres
@@ -33,7 +35,7 @@ import { HttpError, httpErrorResponse, toErrorResponse } from '../src/server/htt
 import { jsonResponse, readCappedBody, readJson } from '../src/server/http/json.js';
 import { HANDLER_MESSAGES } from '../src/server/seller/handler.js';
 import { requireSameOrigin } from '../src/server/http/origin.js';
-import { consume, consumeWindow, pruneRateCounters } from '../src/server/http/ratelimit.js';
+import { consume, consumeShared, consumeWindow, pruneRateCounters } from '../src/server/http/ratelimit.js';
 import { requireOwner } from '../src/server/http/session.js';
 import { OnboardingError } from '../src/server/onboarding/state.js';
 import { SellerError } from '../src/server/seller/challenge.js';
@@ -327,6 +329,21 @@ describe('consumeWindow', () => {
   });
 });
 
+describe('consumeShared', () => {
+  const minute = new Date('2026-10-25T09:40:00.000Z');
+
+  it('counts one quota for every caller, apart from any per-client key of the same text, with the seconds left in its window', async () => {
+    const name = `test-shared-${hex(4)}`;
+    expect(await consumeShared(db, name, 2, 60_000, minute)).toEqual({ allowed: true, retryAfterSeconds: 60 });
+    expect(await consumeShared(db, name, 2, 60_000, new Date(minute.getTime() + 15_500))).toEqual({ allowed: true, retryAfterSeconds: 45 });
+    expect(await consumeShared(db, name, 2, 60_000, new Date(minute.getTime() + 59_999))).toEqual({ allowed: false, retryAfterSeconds: 1 });
+    expect(await consume(db, name, 1, minute)).toBe(true);
+    expect((await consumeShared(db, name, 1, DAY_MS, minute)).retryAfterSeconds).toBe(DAY_MS / 1_000 - 9 * 3_600 - 40 * 60);
+    await expect(consumeShared(untouchable, '', 1, 60_000, minute)).rejects.toThrow('the quota name is missing');
+    await expect(consumeShared(untouchable, name, 0, 60_000, minute)).rejects.toThrow('positive integer');
+  });
+});
+
 describe('pruneRateCounters', () => {
   it('keeps every window newer than the retention, a day window at its oldest included, whatever earlier time it is given', async () => {
     expect(LIMITS.rateCounterRetentionMs).toBe(25 * HOUR_MS);
@@ -524,14 +541,14 @@ describe('requireOwner', () => {
   it('returns the owner and session the cookie belongs to', async () => {
     const { ownerId, token } = await session();
     const [row] = await db.select().from(sessions).where(eq(sessions.ownerId, ownerId));
-    expect(await requireOwner(withCookie(`theme=dark; ellai_session=${token}`), ctx(db))).toEqual({ ownerId, sessionId: row?.id });
+    expect(await requireOwner(withCookie(`theme=dark; __Host-ellai_session=${token}`), ctx(db))).toEqual({ ownerId, sessionId: row?.id });
   });
 
   it.each([
     ['no cookie', undefined],
-    ['an empty cookie', 'ellai_session='],
-    ['junk', `ellai_session=${MARKER}`],
-    ['a record id', 'ellai_session=00000000-0000-4000-8000-000000000000'],
+    ['an empty cookie', '__Host-ellai_session='],
+    ['junk', `__Host-ellai_session=${MARKER}`],
+    ['a record id', '__Host-ellai_session=00000000-0000-4000-8000-000000000000'],
   ])('refuses %s with 401 signed_out without touching the database', async (_label, cookie) => {
     expect(await httpError(() => requireOwner(withCookie(cookie), ctx(untouchable)))).toMatchObject({ status: 401, code: 'signed_out' });
   });
@@ -539,9 +556,17 @@ describe('requireOwner', () => {
   it('refuses an ended session, and two session cookies even when one is real', async () => {
     const { token } = await session();
     const other = await session();
-    expect(await httpError(() => requireOwner(withCookie(`ellai_session=${token}; ellai_session=${other.token}`), ctx(db)))).toMatchObject({ status: 401 });
+    expect(await httpError(() => requireOwner(withCookie(`__Host-ellai_session=${token}; __Host-ellai_session=${other.token}`), ctx(db)))).toMatchObject({ status: 401 });
     await endSession({ db, token, sessionSecretHex: SECRET, now: new Date() });
-    expect(await httpError(() => requireOwner(withCookie(`ellai_session=${token}`), ctx(db)))).toMatchObject({ status: 401, code: 'signed_out' });
+    expect(await httpError(() => requireOwner(withCookie(`__Host-ellai_session=${token}`), ctx(db)))).toMatchObject({ status: 401, code: 'signed_out' });
+  });
+
+  it('reads a live session only under the name its origin gives: __Host- on https, the plain name on http localhost', async () => {
+    const { ownerId, token } = await session();
+    const local = (database: Database): ServerContext => ({ ...ctx(database), env: { ...ENV, APP_ORIGIN: 'http://localhost:3000' } });
+    expect(await httpError(() => requireOwner(withCookie(`ellai_session=${token}`), ctx(untouchable)))).toMatchObject({ status: 401, code: 'signed_out' });
+    expect(await httpError(() => requireOwner(withCookie(`__Host-ellai_session=${token}`), local(untouchable)))).toMatchObject({ status: 401, code: 'signed_out' });
+    expect(await requireOwner(withCookie(`ellai_session=${token}`), local(db))).toMatchObject({ ownerId });
   });
 });
 

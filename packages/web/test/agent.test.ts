@@ -103,7 +103,7 @@ async function signedIn(): Promise<{ ownerId: string; cookie: string }> {
   const { message } = await issueSignIn({ db, address: signer.toSuiAddress(), appOrigin: APP_ORIGIN, now: clock });
   const { signature } = await signer.signPersonalMessage(new TextEncoder().encode(message));
   const done = await completeSignIn({ db, message, signature, appOrigin: APP_ORIGIN, masterSecretHex: MASTER, sessionSecretHex: SECRET, now: clock });
-  return { ownerId: done.ownerId, cookie: `ellai_session=${done.sessionToken}` };
+  return { ownerId: done.ownerId, cookie: `__Host-ellai_session=${done.sessionToken}` };
 }
 
 const newOwner = async () => (await signedIn()).ownerId;
@@ -618,7 +618,7 @@ describe('POST /api/owner/agent/run', () => {
   it('is 401 signed_out without a session, whatever the body names', async () => {
     quiet();
     const { ownerId } = await signedIn();
-    for (const cookie of [undefined, `ellai_session=${MARKER}`]) {
+    for (const cookie of [undefined, `__Host-ellai_session=${MARKER}`]) {
       const response = await post({ task: 'Check a wallet', ownerId }, cookie === undefined ? {} : { cookie });
       expect(response.status).toBe(401);
       expect(await response.json()).toEqual({ error: 'signed_out', message: 'Sign in to Ellai to continue.' });

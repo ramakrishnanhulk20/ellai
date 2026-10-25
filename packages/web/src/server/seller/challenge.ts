@@ -65,6 +65,68 @@ const COMMITMENT_DOMAIN = 'ellai/seller-challenge/v1';
 
 const mask = (bits: bigint) => (1n << bits) - 1n;
 
+interface EpochReading {
+  epoch: bigint;
+  /** The caller's clock when the read started, so the age is never counted short. */
+  readAtMs: number;
+}
+
+interface EpochCache {
+  latest: EpochReading | null;
+  reading: Promise<EpochReading> | null;
+}
+
+// Kept on globalThis, as the server context keeps its chain, because the Next server can load
+// this module more than once and each copy would otherwise read the epoch for itself.
+const EPOCH_CACHES_KEY = '__ellaiSellerEpochCaches';
+
+function epochCacheOf(chain: Chain): EpochCache {
+  const holder = globalThis as unknown as Record<string, WeakMap<Chain, EpochCache> | undefined>;
+  holder[EPOCH_CACHES_KEY] ??= new WeakMap();
+  const caches = holder[EPOCH_CACHES_KEY];
+  let cache = caches.get(chain);
+  if (cache === undefined) {
+    cache = { latest: null, reading: null };
+    caches.set(chain, cache);
+  }
+  return cache;
+}
+
+async function readEpoch(chain: Chain, cache: EpochCache, startedAtMs: number): Promise<EpochReading> {
+  const epoch = await chain.getCurrentEpoch();
+  if (typeof epoch !== 'bigint' || epoch < 0n || epoch > EPOCH_MAX) throw new SellerError('the current epoch does not fit a challenge id');
+  // Epochs only go up, so a lower answer comes from a node still short of a boundary that an
+  // earlier read had already passed. A window started there may have closed, and the older
+  // reading is past its age limit, so neither is used.
+  if (cache.latest !== null && epoch < cache.latest.epoch) throw new SellerError('the chain answered an epoch older than one already read');
+  const reading = { epoch, readAtMs: startedAtMs };
+  cache.latest = reading;
+  return reading;
+}
+
+/**
+ * The epoch a new challenge starts at, read through Tatum at most once per
+ * LIMITS.epochCacheMs for each chain, with callers that arrive during a read sharing it (C22).
+ * A reading is reused only while `nowMs` is no earlier than the read and less than
+ * LIMITS.epochCacheMs after it. The window [epoch, epoch + 1] stays open through the whole of
+ * the next epoch, and a Sui Mainnet epoch lasts about a day, so a reading that young always
+ * names the epoch the chain is in or the one just before, and the window is open when issued.
+ * Throws ChainError when the read fails and SellerError when it answers an epoch that does
+ * not fit or that is lower than one already read; an expired reading is never fallen back on.
+ */
+async function challengeEpoch(chain: Chain, nowMs: number): Promise<bigint> {
+  const cache = epochCacheOf(chain);
+  const latest = cache.latest;
+  if (latest !== null && nowMs >= latest.readAtMs && nowMs - latest.readAtMs < LIMITS.epochCacheMs) return latest.epoch;
+  if (cache.reading === null) {
+    const reading = readEpoch(chain, cache, nowMs).finally(() => {
+      if (cache.reading === reading) cache.reading = null;
+    });
+    cache.reading = reading;
+  }
+  return (await cache.reading).epoch;
+}
+
 const Commitment = bcs.struct('EllaiSellerChallenge', {
   domain: bcs.string(),
   nonce: bcs.u32(),
@@ -184,12 +246,14 @@ function payableAddress(value: string): string {
  * reads and core's signPayment pays: a JSON body with one accepts entry asking for exactly
  * LIMITS.sellerPriceAtomic of Sui Mainnet USDC to `payTo`, valid for
  * LIMITS.sellerChallengeTtlMs, with a fresh challenge id, a random u32 nonce and the window
- * [current epoch, current epoch + 1] read through Tatum, mirrored in a WWW-Authenticate
- * "Payment" header whose recipient, currency and amount agree with the body under
- * parseChallenge. Stores the sale as 'issued' before returning, so only stored challenges pay.
- * Reads the chain once. Throws SellerError for a resource URL sellerResource refuses, a
- * pay-to address that is not a payable Sui address, an invalid `now`, an epoch past 2^32 - 1,
- * or an id that is already stored; throws ChainError when the epoch cannot be read.
+ * [current epoch, current epoch + 1], mirrored in a WWW-Authenticate "Payment" header whose
+ * recipient, currency and amount agree with the body under parseChallenge. Stores the sale as
+ * 'issued' before returning, so only stored challenges pay.
+ * The current epoch comes from challengeEpoch's cache, so the chain is read at most once per
+ * LIMITS.epochCacheMs however many challenges are issued. Throws SellerError for a resource
+ * URL sellerResource refuses, a pay-to address that is not a payable Sui address, an invalid
+ * `now`, an epoch past 2^32 - 1 or lower than one already read, or an id that is already
+ * stored; throws ChainError when the epoch cannot be read.
  */
 export async function issueWalletCheckChallenge(args: {
   db: Database;
@@ -204,8 +268,7 @@ export async function issueWalletCheckChallenge(args: {
   const payTo = payableAddress(args.payTo);
   const amount = BigInt(LIMITS.sellerPriceAtomic);
 
-  const minEpoch = await args.chain.getCurrentEpoch();
-  if (typeof minEpoch !== 'bigint' || minEpoch < 0n || minEpoch > EPOCH_MAX) throw new SellerError('the current epoch does not fit a challenge id');
+  const minEpoch = await challengeEpoch(args.chain, nowMs);
   const parts: IdParts = {
     nonce: randomBytes(4).readUInt32BE(0),
     minEpoch,

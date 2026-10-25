@@ -9,6 +9,7 @@ import { z } from 'zod';
 import type { Database } from '../db/client.js';
 import { rateCounters } from '../db/schema.js';
 import type { ServerEnv } from '../env.js';
+import { consumeShared } from '../http/ratelimit.js';
 import { SellerError, issueWalletCheckChallenge, timestampOf } from './challenge.js';
 import { settleWalletCheckPayment } from './settle.js';
 import { walletCheck } from './walletcheck.js';
@@ -25,6 +26,7 @@ export const HANDLER_MESSAGES = {
   headers: 'The request headers could not be read.',
   body: 'Send a JSON body {"address": "<Sui address>"} naming the Sui address to check.',
   rate: 'Too many unpaid requests from this caller. Try again in a minute.',
+  busy: 'This seller is issuing too many payment challenges right now. Try again in a minute.',
   unavailable: 'The seller cannot issue a payment challenge right now. Try again shortly.',
   undelivered: 'Your payment settled, but the wallet check could not be read. The receipt is in X-PAYMENT-RESPONSE.',
   internal: 'The seller hit an unexpected error.',
@@ -37,6 +39,7 @@ const PAYMENT_RESPONSE_HEADER = 'X-PAYMENT-RESPONSE';
 // The caller key is hashed, so the counter row has a fixed length under the column cap and
 // never stores a client address in the clear.
 const RATE_KEY_PREFIX = 'seller-challenge:';
+const SHARED_QUOTA = 'seller-challenges';
 
 const requestSchema = z.strictObject({ address: z.string() });
 
@@ -112,6 +115,10 @@ async function handle(args: Parameters<typeof handleWalletCheck>[0]): Promise<Se
   if (payment.value === undefined) {
     const limit = await countUnpaid(db, args.callerKey, nowMs);
     if (!limit.allowed) return json(429, { error: HANDLER_MESSAGES.rate }, { 'Retry-After': String(limit.retryAfterSeconds) });
+    // Client keys cost nothing to vary, so the per-caller count alone never bounds the rows
+    // stored or the chain reads.
+    const shared = await consumeShared(db, SHARED_QUOTA, LIMITS.sellerChallengesPerMinuteGlobal, MINUTE_MS, args.now);
+    if (!shared.allowed) return json(429, { error: HANDLER_MESSAGES.busy }, { 'Retry-After': String(shared.retryAfterSeconds) });
     try {
       const challenge = await issueWalletCheckChallenge({ db, chain, resourceUrl: args.url, payTo: args.payTo, now: args.now });
       return { status: challenge.status, headers: challenge.headers, body: challenge.body };
@@ -120,7 +127,7 @@ async function handle(args: Parameters<typeof handleWalletCheck>[0]): Promise<Se
     }
   }
 
-  const settled = await settleWalletCheckPayment({ db, chain, paymentHeader: payment.value, resourceUrl: args.url, now: args.now });
+  const settled = await settleWalletCheckPayment({ db, chain, paymentHeader: payment.value, resourceUrl: args.url, now: args.now, sleep: args.sleep });
   if (!settled.ok) return json(settled.status, { error: settled.reason });
   const paid = receipt(settled.digest, settled.payer);
   try {
@@ -137,12 +144,15 @@ async function handle(args: Parameters<typeof handleWalletCheck>[0]): Promise<Se
  * otherwise, also for headers that are not plain text or that name X-PAYMENT twice). With no
  * X-PAYMENT header, the unpaid request is counted against `callerKey`, which must be the
  * platform's verified client address and never a header the client sets: past
- * LIMITS.sellerChallengesPerMinute in one minute the answer is 429 with Retry-After, else a
- * fresh 402 challenge from issueWalletCheckChallenge (503 when one cannot be issued). With
+ * LIMITS.sellerChallengesPerMinute in one minute the answer is 429 with Retry-After. A request
+ * within its caller's limit is then counted against every caller together: past
+ * LIMITS.sellerChallengesPerMinuteGlobal in one minute it is 429 with Retry-After too (C22).
+ * Otherwise it is a fresh 402 challenge from issueWalletCheckChallenge (503 when one cannot be
+ * issued). With
  * X-PAYMENT, settleWalletCheckPayment must take the payment (its 402 or 409 otherwise) before
- * the wallet check is read; the 200 carries the check as JSON and X-PAYMENT-RESPONSE with the
- * digest. If the check cannot be read after the payment settled, the answer is 502 with the
- * same receipt.
+ * the wallet check is read, waiting with `sleep` between its chain reads when an outcome is
+ * unknown; the 200 carries the check as JSON and X-PAYMENT-RESPONSE with the digest. If the
+ * check cannot be read after the payment settled, the answer is 502 with the same receipt.
  *
  * No response ever carries the X-PAYMENT value, its bytes or its signature, and every error
  * body is fixed text (C19). Never throws: anything unexpected is a 500 with fixed text.
@@ -157,6 +167,7 @@ export async function handleWalletCheck(args: {
   payTo: string;
   callerKey: string;
   now: Date;
+  sleep?: (ms: number) => Promise<void>;
 }): Promise<SellerResponse> {
   try {
     return await handle(args);

@@ -104,6 +104,10 @@ export async function createAgentToken(args: {
  * Revokes one of this owner's agents by setting its revoked_at to `now`. From that moment
  * authenticateAgent refuses its token. Revoking an agent that is already revoked keeps the
  * first time and succeeds.
+ * The revoke runs in one transaction holding the owner row FOR UPDATE, the lock
+ * signForDecision holds while it reads the agent and signs, so a revoke and a signature for
+ * this owner run one after the other and never interleave (C13): a signature that took the
+ * lock first finishes before the revoke lands, and one that comes after reads the agent revoked.
  * Throws AgentError: BAD_INPUT, NOT_FOUND, which is also what another owner's agent gives,
  * so the answer never reveals that an id exists elsewhere. Throws Error if `now` is not a
  * date.
@@ -112,15 +116,20 @@ export async function revokeAgent(args: { db: Database; ownerId: string; agentId
   const ownerId = checkUuid(args.ownerId, 'the owner id is not a uuid');
   const agentId = checkUuid(args.agentId, 'the agent id is not a uuid');
   const now = checkNow(args.now);
+  const notFound = () => new AgentError('NOT_FOUND', 'there is no such agent for this owner');
   const thisOwnersAgent = and(eq(agents.id, agentId), eq(agents.ownerId, ownerId));
-  const revoked = await args.db
-    .update(agents)
-    .set({ revokedAt: now })
-    .where(and(thisOwnersAgent, isNull(agents.revokedAt)))
-    .returning({ id: agents.id });
-  if (revoked.length === 1) return;
-  const [existing] = await args.db.select({ id: agents.id }).from(agents).where(thisOwnersAgent);
-  if (existing === undefined) throw new AgentError('NOT_FOUND', 'there is no such agent for this owner');
+  await args.db.transaction(async (tx) => {
+    const [owner] = await tx.select({ id: owners.id }).from(owners).where(eq(owners.id, ownerId)).for('update');
+    if (owner === undefined) throw notFound();
+    const revoked = await tx
+      .update(agents)
+      .set({ revokedAt: now })
+      .where(and(thisOwnersAgent, isNull(agents.revokedAt)))
+      .returning({ id: agents.id });
+    if (revoked.length === 1) return;
+    const [existing] = await tx.select({ id: agents.id }).from(agents).where(thisOwnersAgent);
+    if (existing === undefined) throw notFound();
+  });
 }
 
 /**

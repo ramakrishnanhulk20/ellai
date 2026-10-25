@@ -7,9 +7,19 @@ import { clientKey } from './client.js';
 import { HttpError } from './errors.js';
 
 const MINUTE_MS = 60_000;
+const MS_PER_SECOND = 1_000;
 // Every key is stored as this prefix and a SHA-256, so a row never holds a client address
 // in clear, always fits the column cap, and cannot collide with the seller's own counters.
 const STORED_KEY_PREFIX = 'http:';
+// A quota every caller shares is named under this prefix before hashing, so no per-client key
+// can ever land on the same counter.
+const SHARED_KEY_PREFIX = 'shared:';
+
+export interface SharedTurn {
+  allowed: boolean;
+  /** Whole seconds, at least 1, until the window that was counted ends. */
+  retryAfterSeconds: number;
+}
 
 /** Sign-in requests allowed in one fixed minute, for each step (nonce and verify) separately. */
 export const SIGN_IN_RATE_LIMITS = {
@@ -47,6 +57,21 @@ export async function consumeWindow(db: Database, key: string, limit: number, wi
 /** consumeWindow over the fixed minute that holds `now`, with the same refusals. */
 export async function consume(db: Database, key: string, perMinute: number, now: Date): Promise<boolean> {
   return consumeWindow(db, key, perMinute, MINUTE_MS, now);
+}
+
+/**
+ * Counts one use of the quota `name` that every caller shares, the global cap that stands
+ * behind a per-client one (C22), in the fixed window of `windowMs` that holds `now`. The count
+ * is consumeWindow's, with its refusals, under a key no per-client key can equal. Count the
+ * caller's own limit first, so a caller already over it never spends the shared one.
+ * Returns whether this use is within `limit` and how long until the window ends.
+ * Throws Error for an empty name, or for anything consumeWindow refuses.
+ */
+export async function consumeShared(db: Database, name: string, limit: number, windowMs: number, now: Date): Promise<SharedTurn> {
+  if (typeof name !== 'string' || name === '') throw new Error('the quota name is missing');
+  const allowed = await consumeWindow(db, `${SHARED_KEY_PREFIX}${name}`, limit, windowMs, now);
+  const windowEndMs = (Math.floor(now.getTime() / windowMs) + 1) * windowMs;
+  return { allowed, retryAfterSeconds: Math.max(1, Math.ceil((windowEndMs - now.getTime()) / MS_PER_SECOND)) };
 }
 
 /**

@@ -1,10 +1,13 @@
 // Covers: wallet sign-in end to end on PGlite with real Ed25519, Secp256k1, Secp256r1 and
 // multisig keys; the message shape and every refusal of a message, a signature or a nonce, the
-// site and nonce checked before any chain read; zkLogin through a stub client, including a chain
-// that cannot be read answering CHAIN_UNAVAILABLE (503) with the nonce left unused;
-// the owner row and its derived purse; sessions, their cookie and their end; agent tokens,
+// site and nonce checked before any chain read; a refused signature using up its nonce, so ten
+// tries of one zkLogin message reach the chain once; zkLogin through a stub client, including a
+// chain that cannot be read answering CHAIN_UNAVAILABLE (503); the shared zkLogin quotas per
+// minute and per day refusing before any chain call, one check counted for each zkLogin member;
+// the owner row and its derived purse; sessions, their cookie (named __Host-ellai_session
+// whenever it is Secure, and read under that name only) and their end; agent tokens,
 // their display prefixes, the cap on live external agents per owner (never counting the one
-// built-in agent), and their revocation; that one
+// built-in agent), and their revocation behind the owner's row lock; that one
 // kind of token never works as the other or as a record id;
 // that malformed tokens never reach the database; and that no refusal repeats a token, a
 // signature or the message.
@@ -12,9 +15,12 @@
 // made; routes-auth also runs one through the route), passkey or
 // ML-DSA signatures, real wallet software, two database connections racing for one nonce or
 // for an owner's last agent place (PGlite serves one connection, so each race is run with
-// Promise.all on that one connection), or the routes that will call these functions with
-// their same-origin check and rate limits.
+// Promise.all on that one connection), a row lock blocking a second connection (the revoke test
+// shows the lock statement and that the revoke waits, but on PGlite the wait comes from its one
+// connection), or the routes that will call these functions with their same-origin check and
+// rate limits.
 import { createHmac, randomBytes } from 'node:crypto';
+import type { PGlite } from '@electric-sql/pglite';
 import { canonicalSuiAddress, derivePurseKeypair } from '@ellai/core/keys';
 import { LIMITS } from '@ellai/core/limits';
 import { bcs } from '@mysten/sui/bcs';
@@ -27,14 +33,17 @@ import { MultiSigPublicKey, MultiSigSigner } from '@mysten/sui/multisig';
 import { fromBase64, toBase64 } from '@mysten/sui/utils';
 import { computeZkLoginAddressFromSeed, getZkLoginSignature } from '@mysten/sui/zklogin';
 import { eq } from 'drizzle-orm';
+import { drizzle as drizzlePglite } from 'drizzle-orm/pglite';
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import { AgentError, authenticateAgent, createAgentToken, listAgents, revokeAgent } from '../src/server/auth/agents.js';
 import { endSession, readSessionCookie, resolveSession, sessionCookie } from '../src/server/auth/sessions.js';
-import { SignInError, type SignInErrorCode, completeSignIn, issueSignIn } from '../src/server/auth/signin.js';
+import { SignInError, type SignInErrorCode, ZKLOGIN_CHECK_QUOTAS, completeSignIn, issueSignIn } from '../src/server/auth/signin.js';
 import { AGENT_TOKEN_PREFIX, type BearerTokenPrefix, SESSION_TOKEN_PREFIX, hashBearerToken, isBearerToken, newBearerToken } from '../src/server/auth/tokens.js';
 import { type Database, createDb, migrate } from '../src/server/db/client.js';
+import * as schema from '../src/server/db/schema.js';
 import { TEXT_CAPS, agents, owners, sessions, signinNonces } from '../src/server/db/schema.js';
 import { toErrorResponse } from '../src/server/http/errors.js';
+import { consumeShared } from '../src/server/http/ratelimit.js';
 
 let handle: Awaited<ReturnType<typeof createDb>>;
 let db: Database;
@@ -252,7 +261,8 @@ describe('completeSignIn', () => {
     const belowThreshold = multisig.combinePartialSignatures([await sign(first, message)]);
     await refused(complete(message, belowThreshold), 'BAD_SIGNATURE');
 
-    const result = await complete(message, await sign(new MultiSigSigner(multisig, [first, second]), message));
+    const { message: next } = await issue(address);
+    const result = await complete(next, await sign(new MultiSigSigner(multisig, [first, second]), next));
     expect(one(await db.select().from(owners).where(eq(owners.id, result.ownerId))).suiAddress).toBe(address);
   });
 
@@ -344,18 +354,29 @@ describe('completeSignIn', () => {
     const someoneElse = Ed25519Keypair.generate().toSuiAddress();
     const swapped = withLine(message, 1, someoneElse);
     await refused(complete(swapped, await sign(keypair, message)), 'BAD_SIGNATURE');
-    await refused(complete(swapped, await sign(keypair, swapped)), 'BAD_SIGNATURE');
+    const nextSwapped = withLine((await issue(address)).message, 1, someoneElse);
+    await refused(complete(nextSwapped, await sign(keypair, nextSwapped)), 'BAD_SIGNATURE');
     expect(await db.select().from(owners).where(eq(owners.suiAddress, someoneElse))).toEqual([]);
   });
 
-  it('refuses a signature by a different key than the address, without using up the nonce', async () => {
+  it('refuses a signature by a different key than the address, using up the nonce, so even the right signature on it is then refused', async () => {
     const owner = Ed25519Keypair.generate();
-    const { message } = await issue(owner.toSuiAddress());
-    await refused(complete(message, await sign(Ed25519Keypair.generate(), message)), 'BAD_SIGNATURE');
-    await refused(complete(message, await sign(Secp256k1Keypair.generate(), message)), 'BAD_SIGNATURE');
-    for (const junk of ['', 'not base64 at all!', toBase64(new Uint8Array([9, 1, 2, 3]))]) {
-      await refused(complete(message, junk), 'BAD_SIGNATURE');
+    const address = owner.toSuiAddress();
+    const wrong = [
+      async (message: string) => sign(Ed25519Keypair.generate(), message),
+      async (message: string) => sign(Secp256k1Keypair.generate(), message),
+      async () => '',
+      async () => 'not base64 at all!',
+      async () => toBase64(new Uint8Array([9, 1, 2, 3])),
+    ];
+    for (const signWrong of wrong) {
+      const { nonce, message } = await issue(address);
+      await refused(complete(message, await signWrong(message)), 'BAD_SIGNATURE');
+      expect(one(await db.select().from(signinNonces).where(eq(signinNonces.nonce, nonce))).usedAt).toEqual(NOW);
+      await refused(complete(message, await sign(owner, message)), 'NONCE_USED');
     }
+    expect(await db.select().from(owners).where(eq(owners.suiAddress, address))).toEqual([]);
+    const { message } = await issue(address);
     await expect(complete(message, await sign(owner, message))).resolves.toBeDefined();
   });
 
@@ -364,6 +385,7 @@ describe('completeSignIn', () => {
     const { message } = await issue(member.toSuiAddress());
     const zkLogin = await zkLoginSignature(message);
     await refused(complete(message, zkLogin), 'ZKLOGIN_UNAVAILABLE');
+    const { message: next } = await issue(member.toSuiAddress());
 
     const multisig = bcs.MultiSig.serialize(
       {
@@ -374,7 +396,7 @@ describe('completeSignIn', () => {
       { maxSize: 65_536 },
     ).toBytes();
     const zkLoginInsideMultisig = toBase64(new Uint8Array([SIGNATURE_SCHEME_TO_FLAG.MultiSig, ...multisig]));
-    await refused(complete(message, zkLoginInsideMultisig), 'ZKLOGIN_UNAVAILABLE');
+    await refused(complete(next, zkLoginInsideMultisig), 'ZKLOGIN_UNAVAILABLE');
   });
 
   it('checks the site and the nonce before the signature, so a zkLogin signature on a bad one makes no chain call', async () => {
@@ -393,7 +415,7 @@ describe('completeSignIn', () => {
     expect(verifyZkLoginSignature).toHaveBeenCalledTimes(1);
   });
 
-  it('refuses a zkLogin signature Sui could not be read for as CHAIN_UNAVAILABLE, a 503 chain_unavailable, and leaves the nonce for a retry', async () => {
+  it('refuses a zkLogin signature Sui could not be read for as CHAIN_UNAVAILABLE, a 503 chain_unavailable, with the nonce used up', async () => {
     const error = vi.spyOn(console, 'error').mockImplementation(() => undefined);
     const { client, verifyZkLoginSignature } = zkLoginClient(async () => {
       throw new Error('UNAVAILABLE: the gateway did not answer');
@@ -404,14 +426,86 @@ describe('completeSignIn', () => {
     const response = toErrorResponse(unavailable);
     expect(response.status).toBe(503);
     expect(await response.json()).toEqual({ error: 'chain_unavailable', message: 'Ellai could not read Sui just now. Try again in a minute.' });
-    expect(one(await db.select().from(signinNonces).where(eq(signinNonces.nonce, nonce))).usedAt).toBeNull();
+    expect(one(await db.select().from(signinNonces).where(eq(signinNonces.nonce, nonce))).usedAt).toEqual(NOW);
 
-    verifyZkLoginSignature.mockResolvedValueOnce({ success: false, errors: ['the proof does not verify'] });
-    await refused(complete(message, signature, { zkLoginClient: client }), 'BAD_SIGNATURE');
-    verifyZkLoginSignature.mockResolvedValueOnce({ success: true, errors: [] });
-    await expect(complete(message, signature, { zkLoginClient: client })).resolves.toMatchObject({ ownerId: expect.any(String) });
-    expect(verifyZkLoginSignature).toHaveBeenCalledTimes(3);
+    verifyZkLoginSignature.mockResolvedValue({ success: true, errors: [] });
+    await refused(complete(message, signature, { zkLoginClient: client }), 'NONCE_USED');
+    const { message: next } = await issue(ZKLOGIN_ADDRESS);
+    await expect(complete(next, await zkLoginSignature(next), { zkLoginClient: client })).resolves.toMatchObject({ ownerId: expect.any(String) });
+    expect(verifyZkLoginSignature).toHaveBeenCalledTimes(2);
     error.mockRestore();
+  });
+
+  it('uses up the nonce before asking Sui, so ten tries of one fake zkLogin signature, in turn or all at once, reach Sui once each (C14, C22)', async () => {
+    const { client, verifyZkLoginSignature } = zkLoginClient(async () => ({ success: false, errors: ['the proof does not verify'] }));
+    const sessionsBefore = (await db.select().from(sessions)).length;
+
+    const inTurn = await issue(ZKLOGIN_ADDRESS);
+    const inTurnSignature = await zkLoginSignature(inTurn.message);
+    const codes: string[] = [];
+    for (let attempt = 0; attempt < 10; attempt += 1) {
+      codes.push(((await refusal(complete(inTurn.message, inTurnSignature, { zkLoginClient: client }))) as SignInError).code);
+    }
+    expect(codes).toEqual(['BAD_SIGNATURE', ...Array<string>(9).fill('NONCE_USED')]);
+    expect(verifyZkLoginSignature).toHaveBeenCalledTimes(1);
+
+    const atOnce = await issue(ZKLOGIN_ADDRESS);
+    const atOnceSignature = await zkLoginSignature(atOnce.message);
+    const raced = await Promise.allSettled(Array.from({ length: 10 }, () => complete(atOnce.message, atOnceSignature, { zkLoginClient: client })));
+    const racedCodes = raced.map((outcome) => (outcome.status === 'rejected' ? (outcome.reason as SignInError).code : 'SIGNED_IN')).sort();
+    expect(racedCodes).toEqual(['BAD_SIGNATURE', ...Array<string>(9).fill('NONCE_USED')]);
+    expect(verifyZkLoginSignature).toHaveBeenCalledTimes(2);
+    expect(await db.select().from(sessions)).toHaveLength(sessionsBefore);
+  });
+
+  it('refuses zkLogin checks past the shared minute or day quota with CHAIN_UNAVAILABLE before any chain call, leaving the nonce, and counts each zkLogin member of a multisig (C22)', { timeout: 60_000 }, async () => {
+    const [perMinute, perDay] = ZKLOGIN_CHECK_QUOTAS;
+    expect([perMinute.limit, perDay.limit]).toEqual([LIMITS.zkLoginChecksPerMinute, LIMITS.zkLoginChecksPerDay]);
+    const { client, verifyZkLoginSignature } = zkLoginClient(async () => ({ success: true, errors: [] }));
+    // A day of its own, so these counters start at zero and no other test counts in them.
+    const day = Date.parse('2026-12-01T00:00:00.000Z');
+    const at = (ms: number) => new Date(day + ms);
+    const attempt = async (now: Date, signature?: (message: string) => Promise<string>) => {
+      const issued = await issueSignIn({ db, address: ZKLOGIN_ADDRESS, appOrigin: APP_ORIGIN, now });
+      const signed = await (signature ?? zkLoginSignature)(issued.message);
+      return { issued, signed, run: (when: Date) => complete(issued.message, signed, { zkLoginClient: client, now: when }) };
+    };
+    const fill = async (quota: (typeof ZKLOGIN_CHECK_QUOTAS)[number], uses: number, now: Date) => {
+      for (let use = 0; use < uses; use += 1) await consumeShared(db, quota.name, quota.limit, quota.windowMs, now);
+    };
+
+    await fill(perMinute, perMinute.limit, at(1_000));
+    const overMinute = await attempt(at(2_000));
+    const unavailable = await refused(overMinute.run(at(2_000)), 'CHAIN_UNAVAILABLE');
+    expect(toErrorResponse(unavailable).status).toBe(503);
+    expect(verifyZkLoginSignature).not.toHaveBeenCalled();
+    expect(one(await db.select().from(signinNonces).where(eq(signinNonces.nonce, overMinute.issued.nonce))).usedAt).toBeNull();
+    await expect(overMinute.run(at(60_000))).resolves.toMatchObject({ ownerId: expect.any(String) });
+    expect(verifyZkLoginSignature).toHaveBeenCalledTimes(1);
+
+    // Two zkLogin members are two checks, so one place left in the minute is not enough.
+    const zkLoginPair = async (message: string) => {
+      const member = fromBase64(await zkLoginSignature(message)).slice(1);
+      const pair = bcs.MultiSig.serialize(
+        {
+          sigs: [{ ZkLogin: member }, { ZkLogin: member }],
+          bitmap: 3,
+          multisig_pk: { pk_map: [{ pubKey: { ED25519: Ed25519Keypair.generate().getPublicKey().toRawBytes() }, weight: 1 }], threshold: 1 },
+        },
+        { maxSize: 65_536 },
+      ).toBytes();
+      return toBase64(new Uint8Array([SIGNATURE_SCHEME_TO_FLAG.MultiSig, ...pair]));
+    };
+    await fill(perMinute, perMinute.limit - 1, at(120_000));
+    const pair = await attempt(at(120_000), zkLoginPair);
+    await refused(pair.run(at(120_000)), 'CHAIN_UNAVAILABLE');
+    expect(verifyZkLoginSignature).toHaveBeenCalledTimes(1);
+
+    await fill(perDay, perDay.limit, at(180_000));
+    const overDay = await attempt(at(240_000));
+    await refused(overDay.run(at(240_000)), 'CHAIN_UNAVAILABLE');
+    expect(verifyZkLoginSignature).toHaveBeenCalledTimes(1);
+    expect(one(await db.select().from(signinNonces).where(eq(signinNonces.nonce, overDay.issued.nonce))).usedAt).toBeNull();
   });
 });
 
@@ -458,27 +552,41 @@ describe('sessions', () => {
     await expect(authenticateAgent({ db: untouchable, token: agent, sessionSecretHex: SECRET })).rejects.toThrow('the database was touched');
   });
 
-  it('writes the session cookie with its attributes, and refuses anything but a session token', () => {
+  it('writes the session cookie with its attributes, named __Host-ellai_session whenever it is Secure, and refuses anything but a session token', () => {
     vi.useFakeTimers();
     vi.setSystemTime(NOW);
     const { token } = newBearerToken(SESSION_TOKEN_PREFIX, SECRET);
-    expect(sessionCookie(token, later(LIMITS.sessionTtlMs), true)).toBe(`ellai_session=${token}; HttpOnly; SameSite=Strict; Path=/; Max-Age=604800; Secure`);
+    expect(sessionCookie(token, later(LIMITS.sessionTtlMs), true)).toBe(`__Host-ellai_session=${token}; HttpOnly; SameSite=Strict; Path=/; Max-Age=604800; Secure`);
     expect(sessionCookie(token, later(90_500), false)).toBe(`ellai_session=${token}; HttpOnly; SameSite=Strict; Path=/; Max-Age=90`);
     expect(sessionCookie(token, later(-1_000), true)).toContain('Max-Age=0;');
+    expect(sessionCookie(token, later(1_000), true)).not.toContain('Domain');
     for (const value of [newBearerToken(AGENT_TOKEN_PREFIX, SECRET).token, `${token}; Domain=evil.example`, '']) {
       expect(() => sessionCookie(value, later(1_000), true)).toThrow('Only a session token can be set as the session cookie');
     }
   });
 
-  it('reads exactly one session cookie from the request header', () => {
+  it('reads exactly one session cookie, under the one name the Secure rule gives and never the other', () => {
     const { token } = newBearerToken(SESSION_TOKEN_PREFIX, SECRET);
-    expect(readSessionCookie(null)).toBeUndefined();
-    expect(readSessionCookie('')).toBeUndefined();
-    expect(readSessionCookie('theme=dark; other=1')).toBeUndefined();
-    expect(readSessionCookie(`theme=dark; ellai_session=${token}; other=1`)).toBe(token);
-    expect(readSessionCookie(`ellai_session=${token}`)).toBe(token);
-    expect(readSessionCookie(`Ellai_session=${token}`)).toBeUndefined();
-    expect(readSessionCookie(`ellai_session=${token}; ellai_session=${newBearerToken(SESSION_TOKEN_PREFIX, SECRET).token}`)).toBeUndefined();
+    const other = newBearerToken(SESSION_TOKEN_PREFIX, SECRET).token;
+    for (const secure of [true, false]) {
+      expect(readSessionCookie(null, secure)).toBeUndefined();
+      expect(readSessionCookie('', secure)).toBeUndefined();
+      expect(readSessionCookie('theme=dark; other=1', secure)).toBeUndefined();
+    }
+    expect(readSessionCookie(`theme=dark; __Host-ellai_session=${token}; other=1`, true)).toBe(token);
+    expect(readSessionCookie(`__Host-ellai_session=${token}`, true)).toBe(token);
+    expect(readSessionCookie(`__host-ellai_session=${token}`, true)).toBeUndefined();
+    expect(readSessionCookie(`__Host-ellai_session=${token}; __Host-ellai_session=${other}`, true)).toBeUndefined();
+    // A plain-named cookie can be set by a sibling site on a shared parent domain, so once the
+    // cookie is Secure it is never read, not even beside the real one or in its absence.
+    expect(readSessionCookie(`ellai_session=${token}`, true)).toBeUndefined();
+    expect(readSessionCookie(`ellai_session=${other}; __Host-ellai_session=${token}`, true)).toBe(token);
+    expect(readSessionCookie(`__Secure-ellai_session=${token}`, true)).toBeUndefined();
+
+    expect(readSessionCookie(`theme=dark; ellai_session=${token}; other=1`, false)).toBe(token);
+    expect(readSessionCookie(`Ellai_session=${token}`, false)).toBeUndefined();
+    expect(readSessionCookie(`__Host-ellai_session=${token}`, false)).toBeUndefined();
+    expect(readSessionCookie(`ellai_session=${token}; ellai_session=${other}`, false)).toBeUndefined();
   });
 });
 
@@ -565,6 +673,64 @@ describe('agents', () => {
     expect(await listAgents({ db, ownerId })).toHaveLength(23);
     await expect(createAgent((await signIn()).ownerId, 'Someone else')).resolves.toBeDefined();
   });
+
+  it('revokes under the owner row lock a signature holds, so it waits for a signer already holding it (C13)', async () => {
+    const { ownerId } = await signIn();
+    const first = await createAgent(ownerId, 'First');
+    const second = await createAgent(ownerId, 'Second');
+
+    // Every statement revokeAgent sends, with its transaction's start and end marked.
+    const client = (db as unknown as { $client: PGlite }).$client;
+    const sent: string[] = [];
+    const logged = drizzlePglite({ client, schema, logger: { logQuery: (query) => sent.push(query) } }) as unknown as Database;
+    const transaction = client.transaction.bind(client);
+    client.transaction = (async (callback: Parameters<PGlite['transaction']>[0]) => {
+      sent.push('begin');
+      try {
+        return await transaction(callback);
+      } finally {
+        sent.push('end');
+      }
+    }) as PGlite['transaction'];
+    try {
+      await revokeAgent({ db: logged, ownerId, agentId: first.agentId, now: later(1_000) });
+    } finally {
+      Reflect.deleteProperty(client, 'transaction');
+    }
+    expect(sent).toEqual([
+      'begin',
+      expect.stringMatching(/^select "id" from "owners" where "owners"\."id" = \$1 for update$/),
+      expect.stringMatching(/^update "agents" set "revoked_at" = \$1 where/),
+      'end',
+    ]);
+
+    // A signer holding the lock reads the agent live and finishes before the revoke lands.
+    const events: string[] = [];
+    let release = () => {};
+    const released = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let held = () => {};
+    const lockHeld = new Promise<void>((resolve) => {
+      held = resolve;
+    });
+    const signer = db.transaction(async (tx) => {
+      await tx.select({ id: owners.id }).from(owners).where(eq(owners.id, ownerId)).for('update');
+      events.push('lock taken');
+      held();
+      await released;
+      const [agent] = await tx.select({ revokedAt: agents.revokedAt }).from(agents).where(eq(agents.id, second.agentId));
+      events.push(agent?.revokedAt === null ? 'agent live under the lock' : 'agent revoked under the lock');
+    });
+    await lockHeld;
+    const revoking = revokeAgent({ db, ownerId, agentId: second.agentId, now: later(2_000) }).then(() => events.push('revoked'));
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(events).toEqual(['lock taken']);
+    release();
+    await Promise.all([signer, revoking]);
+    expect(events).toEqual(['lock taken', 'agent live under the lock', 'revoked']);
+    expect(await authenticateAgent({ db, token: second.token, sessionSecretHex: SECRET })).toBeNull();
+  });
 });
 
 describe('error messages', () => {
@@ -575,12 +741,15 @@ describe('error messages', () => {
     const signature = await sign(owner, message);
     const markedMessage = `${message}\n${marker}`;
     const markedHost = withLine(message, 0, `${marker} wants you to sign in to Ellai with your Sui account:`);
+    // A refused signature uses up its nonce, so each signature refusal and the sign-in get their own.
+    const second = await issue(owner.toSuiAddress());
+    const third = await issue(owner.toSuiAddress());
     const errors = [
       await refusal(issue(marker)),
       await refusal(complete(markedMessage, await sign(owner, markedMessage))),
       await refusal(complete(markedHost, await sign(owner, markedHost))),
-      await refusal(complete(message, marker)),
-      await refusal(complete(message, toBase64(new TextEncoder().encode(marker)))),
+      await refusal(complete(second.message, marker)),
+      await refusal(complete(third.message, toBase64(new TextEncoder().encode(marker)))),
     ];
     const result = await complete(message, signature);
     errors.push(await refusal(complete(message, signature)));
@@ -595,7 +764,7 @@ describe('error messages', () => {
     expect(errors).toHaveLength(10);
     for (const error of errors) {
       const text = `${error.message}\n${error.stack ?? ''}`;
-      for (const secret of [marker, message, signature, result.sessionToken, agent.token]) {
+      for (const secret of [marker, message, second.message, third.message, signature, result.sessionToken, agent.token]) {
         expect(text).not.toContain(secret);
       }
       expect(error.cause).toBeUndefined();

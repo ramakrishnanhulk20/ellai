@@ -289,6 +289,7 @@ describe('the agent token', () => {
     const refused: Array<Record<string, string>> = [
       {},
       { cookie: `ellai_session=${w.sessionToken}` },
+      { cookie: `__Host-ellai_session=${w.sessionToken}` },
       bearer(w.sessionToken),
       { authorization: `Basic ${w.token}` },
       { authorization: w.token },
@@ -589,7 +590,13 @@ describe('POST /api/mcp', () => {
     const revoked = await anotherAgent(w.ownerId);
     await revokeAgent({ db, ownerId: w.ownerId, agentId: revoked.agentId, now: clock });
     const call = { jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'paid_fetch', arguments: fetchInput() } };
-    const refused: Array<Record<string, string>> = [{}, bearer(w.sessionToken), { cookie: `ellai_session=${w.sessionToken}` }, bearer(revoked.token)];
+    const refused: Array<Record<string, string>> = [
+      {},
+      bearer(w.sessionToken),
+      { cookie: `ellai_session=${w.sessionToken}` },
+      { cookie: `__Host-ellai_session=${w.sessionToken}` },
+      bearer(revoked.token),
+    ];
     for (const headers of refused) {
       const response = await mcpPost(call, headers);
       expect(response.status).toBe(401);

@@ -3,7 +3,19 @@ import type { Database } from '../db/client.js';
 import { sessions } from '../db/schema.js';
 import { SESSION_TOKEN_PREFIX, hashBearerToken, isBearerToken } from './tokens.js';
 
+/** The session cookie's name on plain-http localhost, the one place it is not Secure. */
 export const SESSION_COOKIE_NAME = 'ellai_session';
+/**
+ * Its name whenever it is Secure. A browser keeps a __Host- cookie only when it was set Secure,
+ * with Path=/ and no Domain, by this exact host, so a sibling site on a shared parent domain or
+ * a plain-http response cannot plant or overwrite one.
+ */
+export const SECURE_SESSION_COOKIE_NAME = '__Host-ellai_session';
+
+/** The one rule for the cookie's name, shared by the cookie written, the one read and the one cleared. */
+export function sessionCookieName(secure: boolean): string {
+  return secure ? SECURE_SESSION_COOKIE_NAME : SESSION_COOKIE_NAME;
+}
 
 function checkNow(now: Date): Date {
   if (!(now instanceof Date) || Number.isNaN(now.getTime())) throw new Error('The current time is not a date');
@@ -56,9 +68,10 @@ export async function endSession(args: { db: Database; token: string | undefined
 }
 
 /**
- * The Set-Cookie value that carries a session token: HttpOnly, SameSite=Strict, Path=/,
- * Max-Age counted from the current clock to `expiresAt` (0 once it has passed), and Secure
- * unless `secure` is exactly false, which only local plain-http development should pass.
+ * The Set-Cookie value that carries a session token: HttpOnly, SameSite=Strict, Path=/, no
+ * Domain, Max-Age counted from the current clock to `expiresAt` (0 once it has passed), and
+ * Secure under the name SECURE_SESSION_COOKIE_NAME unless `secure` is exactly false, which only
+ * local plain-http development should pass and which keeps the name SESSION_COOKIE_NAME.
  * Throws Error, without repeating the value, for anything that is not exactly a session
  * token, because the value is written into the header as it is and could otherwise add
  * cookie attributes of its own. Throws Error if `expiresAt` is not a date.
@@ -66,23 +79,28 @@ export async function endSession(args: { db: Database; token: string | undefined
 export function sessionCookie(token: string, expiresAt: Date, secure: boolean): string {
   if (!isBearerToken(token, SESSION_TOKEN_PREFIX)) throw new Error('Only a session token can be set as the session cookie');
   if (!(expiresAt instanceof Date) || Number.isNaN(expiresAt.getTime())) throw new Error('The session expiry is not a date');
+  const isSecure = secure !== false;
   const maxAgeSeconds = Math.max(0, Math.floor((expiresAt.getTime() - Date.now()) / 1000));
-  const attributes = [`${SESSION_COOKIE_NAME}=${token}`, 'HttpOnly', 'SameSite=Strict', 'Path=/', `Max-Age=${maxAgeSeconds}`];
-  if (secure !== false) attributes.push('Secure');
+  const attributes = [`${sessionCookieName(isSecure)}=${token}`, 'HttpOnly', 'SameSite=Strict', 'Path=/', `Max-Age=${maxAgeSeconds}`];
+  if (isSecure) attributes.push('Secure');
   return attributes.join('; ');
 }
 
 /**
  * The session cookie's value from a Cookie request header, or undefined when the header
- * is missing, holds no session cookie, or holds more than one. The value is returned as
- * sent; resolveSession is what decides whether it is a session.
+ * is missing, holds no session cookie, or holds more than one. Only the name
+ * sessionCookieName gives for `secure` is read, so when the cookie is Secure a plain
+ * ellai_session, which anyone on a shared parent domain could set, is never taken in its place.
+ * As in sessionCookie, a `secure` that is anything but exactly false counts as Secure. The
+ * value is returned as sent; resolveSession is what decides whether it is a session.
  */
-export function readSessionCookie(cookieHeader: string | null): string | undefined {
+export function readSessionCookie(cookieHeader: string | null, secure: boolean): string | undefined {
   if (typeof cookieHeader !== 'string') return undefined;
+  const name = sessionCookieName(secure !== false);
   let found: string | undefined;
   for (const pair of cookieHeader.split(';')) {
     const equals = pair.indexOf('=');
-    if (equals === -1 || pair.slice(0, equals).trim() !== SESSION_COOKIE_NAME) continue;
+    if (equals === -1 || pair.slice(0, equals).trim() !== name) continue;
     // Ellai sets exactly one, so a second was set by someone else, for example a sibling
     // site on a shared parent domain. Which one the browser lists first proves nothing.
     if (found !== undefined) return undefined;

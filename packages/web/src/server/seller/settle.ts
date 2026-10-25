@@ -1,4 +1,4 @@
-import type { Chain, ExecutionResult } from '@ellai/core/chain';
+import { type Chain, ChainError, type ExecutionResult, type TransactionResult } from '@ellai/core/chain';
 import type { CanonicalPayment } from '@ellai/core/challenge';
 import { canonicalSuiAddress } from '@ellai/core/keys';
 import { LIMITS } from '@ellai/core/limits';
@@ -13,7 +13,7 @@ import { alias } from 'drizzle-orm/pg-core';
 import { z } from 'zod';
 import type { Database } from '../db/client.js';
 import { sellerSales } from '../db/schema.js';
-import { readSellerChallengeId, sellerResource, timestampOf } from './challenge.js';
+import { type ChallengeTerms, readSellerChallengeId, sellerResource, timestampOf } from './challenge.js';
 
 export type SettleOutcome = { ok: true; digest: string; payer: string } | { ok: false; status: 402 | 409; reason: string };
 
@@ -29,11 +29,15 @@ export const SETTLE_REASONS = {
   bytes: 'the payment bytes are not exactly the payment this challenge asks for',
   signature: 'the payment signature does not verify for its sender',
   presented: 'these payment bytes were already presented for another challenge',
-  unconfirmed: 'the payment could not be confirmed on chain, and this challenge cannot be paid again',
+  unconfirmed: 'the payment could not be confirmed on chain yet; send the same payment again to have it checked',
   failed: 'the payment did not succeed on chain',
   mismatch: 'the payment that landed is not the payment this challenge asks for',
 } as const;
 
+type Sale = typeof sellerSales.$inferSelect;
+type Sleep = (ms: number) => Promise<void>;
+
+const timerSleep: Sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const STRICT_BASE64 = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
 const base64Text = z.string().min(1).regex(STRICT_BASE64);
 
@@ -92,64 +96,17 @@ async function signedBy(txBytes: Uint8Array, signature: string, sender: string):
   }
 }
 
-/**
- * Takes one payment for a wallet check challenge this seller issued, or refuses it.
- *
- * In order: decodes the X-PAYMENT header (decodePaymentHeader); finds the sale by its
- * challenge id and refuses an unknown one (402), one no longer 'issued' (409) and an expired one
- * (402); reads the nonce and epoch window back out of the id, which also proves the id was
- * issued for this resource, recipient and amount (402 otherwise); then claims the sale with one
- * UPDATE from 'issued' to 'rejected' that must touch exactly one row, so a challenge is paid at
- * most once whatever runs at the same time (409 if another request claimed it first). From the
- * claim on, nothing releases it: a refusal before execution leaves it 'rejected', so it can
- * never be retried with other bytes.
- *
- * After the claim: core's assertPlainUsdcSend proves the bytes are byte for byte the plain
- * gasless USDC send of the stored amount to the stored recipient with this challenge's nonce
- * and window, from the sender; verifyTransactionSignature proves the sender signed them; the
- * digest of the bytes is recorded, unique across all sales, so one payment can never pay two
- * challenges; the bytes are executed once through Tatum; core's verifySettlement must find
- * exactly the sender minus the amount and the recipient plus it. Only then is the sale
- * 'settled' with its settled_at. A failed or mismatched settlement stays 'rejected' with its
- * digest and payer recorded.
- *
- * Returns fixed-text reasons only (SETTLE_REASONS). Throws only for database failures or an
- * invalid `now`.
- */
-export async function settleWalletCheckPayment(args: {
-  db: Database;
-  chain: Chain;
-  paymentHeader: string;
-  resourceUrl: string;
-  now: Date;
-}): Promise<SettleOutcome> {
-  const { db, chain } = args;
-  const nowMs = timestampOf(args.now);
-  const now = new Date(nowMs);
-  const refuse = (status: 402 | 409, reason: string): SettleOutcome => ({ ok: false, status, reason });
+const refusal = (status: 402 | 409, reason: string): SettleOutcome => ({ ok: false, status, reason });
 
-  const target = sellerResource(args.resourceUrl);
-  if (target === null) return refuse(402, SETTLE_REASONS.resource);
-  const payment = decodePaymentHeader(args.paymentHeader);
-  if (payment === null) return refuse(402, SETTLE_REASONS.header);
+/** A sale whose bytes were sent and whose outcome is not yet known. Only those same bytes can pick it up again. */
+function awaitingChain(sale: Sale): sale is Sale & { digest: string } {
+  return sale.status === 'rejected' && sale.digest !== null && sale.settledAt === null;
+}
 
-  const [sale] = await db.select().from(sellerSales).where(eq(sellerSales.challengeId, payment.challengeId));
-  if (sale === undefined) return refuse(402, SETTLE_REASONS.unknown);
-  if (sale.status !== 'issued') return refuse(409, SETTLE_REASONS.used);
-  if (nowMs >= sale.expiresAt.getTime()) return refuse(402, SETTLE_REASONS.expired);
-  const terms = readSellerChallengeId(sale.challengeId, { resource: target.resource, recipient: sale.recipient, amount: sale.amountAtomic });
-  if (terms === null) return refuse(402, SETTLE_REASONS.otherResource);
-
-  const claimed = await db
-    .update(sellerSales)
-    .set({ status: 'rejected', payer: payment.sender })
-    .where(and(eq(sellerSales.challengeId, sale.challengeId), eq(sellerSales.status, 'issued'), gt(sellerSales.expiresAt, now)))
-    .returning({ id: sellerSales.id });
-  if (claimed.length !== 1) return refuse(409, SETTLE_REASONS.used);
-
-  // Built field by field from the stored sale and the id, never from the header, so the
-  // bytes are checked against what this seller issued and nothing the buyer said.
-  const expected: CanonicalPayment = {
+// Built field by field from the stored sale and the id, never from the header, so the bytes
+// are checked against what this seller issued and nothing the buyer said.
+function expectedPayment(sale: Sale, target: { resource: string; host: string }, terms: ChallengeTerms): CanonicalPayment {
+  return {
     dialect: 'x402-v1-t2000',
     sellerUrl: target.resource,
     sellerHost: target.host,
@@ -164,14 +121,157 @@ export async function settleWalletCheckPayment(args: {
     maxEpoch: terms.maxEpoch,
     resource: target.resource,
   };
+}
+
+/** Null when the bytes are exactly the payment `expected` describes and the sender signed them, otherwise the reason. */
+async function paymentRefusal(payment: DecodedPayment, expected: CanonicalPayment): Promise<string | null> {
   try {
     await assertPlainUsdcSend(payment.txBytes, expected, payment.sender);
   } catch {
-    return refuse(402, SETTLE_REASONS.bytes);
+    return SETTLE_REASONS.bytes;
   }
-  if (!(await signedBy(payment.txBytes, payment.signature, payment.sender))) return refuse(402, SETTLE_REASONS.signature);
+  return (await signedBy(payment.txBytes, payment.signature, payment.sender)) ? null : SETTLE_REASONS.signature;
+}
 
+/**
+ * What the chain did with `digest`, read up to LIMITS.chainReadAfterWriteTries times,
+ * LIMITS.chainReadAfterWriteDelayMs apart, or null when every read missed or failed. A node
+ * that has not caught up with the write and a read that failed both leave the outcome unknown;
+ * neither ever means the payment did not land.
+ */
+async function readOutcome(chain: Chain, digest: string, sleep: Sleep): Promise<TransactionResult | null> {
+  for (let attempt = 0; attempt < LIMITS.chainReadAfterWriteTries; attempt += 1) {
+    if (attempt > 0) await sleep(LIMITS.chainReadAfterWriteDelayMs);
+    try {
+      return await chain.getTransactionResult(digest);
+    } catch {
+      // Not found yet, or not readable: unknown either way, so read again.
+    }
+  }
+  return null;
+}
+
+interface Closing {
+  db: Database;
+  chain: Chain;
+  sale: Sale;
+  digest: string;
+  expected: CanonicalPayment;
+  payer: string;
+  now: Date;
+  sleep: Sleep;
+}
+
+/**
+ * Ends the wait on the sale with the chain's answer for its digest: 'settled' when
+ * verifySettlement finds exactly this payment, otherwise left 'rejected' with settled_at set,
+ * which records that the chain's answer is in and that the sale can no longer be picked up again.
+ */
+async function closeOn(result: Pick<TransactionResult, 'status' | 'balanceChanges'>, closing: Closing): Promise<SettleOutcome> {
+  const thisWait = and(
+    eq(sellerSales.challengeId, closing.sale.challengeId),
+    eq(sellerSales.status, 'rejected'),
+    eq(sellerSales.digest, closing.digest),
+    isNull(sellerSales.settledAt),
+  );
+  const verdict = verifySettlement({ status: result.status, balanceChanges: result.balanceChanges }, closing.expected, closing.payer);
+  if (!verdict.verified) {
+    await closing.db.update(sellerSales).set({ settledAt: closing.now }).where(thisWait);
+    return refusal(402, result.status === 'success' ? SETTLE_REASONS.mismatch : SETTLE_REASONS.failed);
+  }
+  const settled = await closing.db.update(sellerSales).set({ status: 'settled', settledAt: closing.now }).where(thisWait).returning({ id: sellerSales.id });
+  if (settled.length !== 1) return refusal(409, SETTLE_REASONS.used);
+  return { ok: true, digest: closing.digest, payer: closing.payer };
+}
+
+/** Reads the digest (readOutcome) and closes on what it finds; while it finds nothing, the sale keeps waiting. */
+async function confirmOnChain(closing: Closing): Promise<SettleOutcome> {
+  const landed = await readOutcome(closing.chain, closing.digest, closing.sleep);
+  return landed === null ? refusal(402, SETTLE_REASONS.unconfirmed) : closeOn(landed, closing);
+}
+
+/**
+ * Takes one payment for a wallet check challenge this seller issued, or refuses it, and never
+ * keeps a payment that landed without settling its sale.
+ *
+ * In order: decodes the X-PAYMENT header (decodePaymentHeader) and finds the sale by its
+ * challenge id (402 for an unknown one). A sale still waiting on the chain (its bytes were sent,
+ * no outcome is recorded) is picked up again only by a header carrying those same bytes, whose
+ * digest it holds (409 for any other), whatever the challenge's expiry, since the payment was
+ * taken in time: the bytes and signature are checked again as below, then the digest is read as
+ * after an unknown outcome. Otherwise the sale must still be 'issued' (409) and unexpired
+ * (402); the nonce and epoch window are read back out of the id, which also proves the id was
+ * issued for this resource, recipient and amount (402 otherwise); then the sale is claimed with
+ * one UPDATE from 'issued' to 'rejected' that must touch exactly one row, so a challenge is paid
+ * at most once whatever runs at the same time (409 if another request claimed it first). From
+ * the claim on, nothing releases it: a refusal before execution leaves it 'rejected' with no
+ * digest, so it can never be retried with other bytes.
+ *
+ * After the claim: core's assertPlainUsdcSend proves the bytes are byte for byte the plain
+ * gasless USDC send of the stored amount to the stored recipient with this challenge's nonce
+ * and window, from the sender; verifyTransactionSignature proves the sender signed them; the
+ * digest of the bytes is recorded, unique across all sales, so one payment can never pay two
+ * challenges; the bytes are executed once through Tatum. Only a definite answer closes the sale:
+ * core's verifySettlement finding exactly the sender minus the amount and the recipient plus it
+ * makes it 'settled'; a transaction that ran and failed, bytes the network refused, or one that
+ * landed as anything but this payment leaves it 'rejected' with settled_at set. When the outcome
+ * is unknown (any ChainError but core's own INVALID_INPUT refusal, which sends nothing), the
+ * digest is read up to LIMITS.chainReadAfterWriteTries times and the sale closed on what is
+ * found; if nothing is found the answer is 402 unconfirmed and the sale keeps waiting for the
+ * same bytes. The bytes are never sent again.
+ *
+ * `sleep` waits between those reads; tests pass one that does not wait. Returns fixed-text
+ * reasons only (SETTLE_REASONS). Throws only for database failures or an invalid `now`.
+ */
+export async function settleWalletCheckPayment(args: {
+  db: Database;
+  chain: Chain;
+  paymentHeader: string;
+  resourceUrl: string;
+  now: Date;
+  sleep?: Sleep;
+}): Promise<SettleOutcome> {
+  const { db, chain } = args;
+  const sleep = args.sleep ?? timerSleep;
+  const nowMs = timestampOf(args.now);
+  const now = new Date(nowMs);
+
+  const target = sellerResource(args.resourceUrl);
+  if (target === null) return refusal(402, SETTLE_REASONS.resource);
+  const payment = decodePaymentHeader(args.paymentHeader);
+  if (payment === null) return refusal(402, SETTLE_REASONS.header);
+
+  const [sale] = await db.select().from(sellerSales).where(eq(sellerSales.challengeId, payment.challengeId));
+  if (sale === undefined) return refusal(402, SETTLE_REASONS.unknown);
   const digest = TransactionDataBuilder.getDigestFromBytes(payment.txBytes);
+  const binding = { resource: target.resource, recipient: sale.recipient, amount: sale.amountAtomic };
+
+  if (awaitingChain(sale)) {
+    if (sale.digest !== digest) return refusal(409, SETTLE_REASONS.used);
+    const terms = readSellerChallengeId(sale.challengeId, binding);
+    if (terms === null) return refusal(402, SETTLE_REASONS.otherResource);
+    const expected = expectedPayment(sale, target, terms);
+    const refused = await paymentRefusal(payment, expected);
+    if (refused !== null) return refusal(402, refused);
+    return confirmOnChain({ db, chain, sale, digest, expected, payer: payment.sender, now, sleep });
+  }
+
+  if (sale.status !== 'issued') return refusal(409, SETTLE_REASONS.used);
+  if (nowMs >= sale.expiresAt.getTime()) return refusal(402, SETTLE_REASONS.expired);
+  const terms = readSellerChallengeId(sale.challengeId, binding);
+  if (terms === null) return refusal(402, SETTLE_REASONS.otherResource);
+
+  const claimed = await db
+    .update(sellerSales)
+    .set({ status: 'rejected', payer: payment.sender })
+    .where(and(eq(sellerSales.challengeId, sale.challengeId), eq(sellerSales.status, 'issued'), gt(sellerSales.expiresAt, now)))
+    .returning({ id: sellerSales.id });
+  if (claimed.length !== 1) return refusal(409, SETTLE_REASONS.used);
+
+  const expected = expectedPayment(sale, target, terms);
+  const refused = await paymentRefusal(payment, expected);
+  if (refused !== null) return refusal(402, refused);
+
   const otherSale = alias(sellerSales, 'other_sale');
   const recorded = await db
     .update(sellerSales)
@@ -185,22 +285,15 @@ export async function settleWalletCheckPayment(args: {
       ),
     )
     .returning({ id: sellerSales.id });
-  if (recorded.length !== 1) return refuse(409, SETTLE_REASONS.presented);
+  if (recorded.length !== 1) return refusal(409, SETTLE_REASONS.presented);
 
+  const closing: Closing = { db, chain, sale, digest, expected, payer: payment.sender, now, sleep };
   let executed: ExecutionResult;
   try {
     executed = await chain.executeTransaction(payment.txBytes, [payment.signature]);
-  } catch {
-    return refuse(402, SETTLE_REASONS.unconfirmed);
+  } catch (error) {
+    if (error instanceof ChainError && error.code === 'INVALID_INPUT') return closeOn({ status: 'failure', balanceChanges: [] }, closing);
+    return confirmOnChain(closing);
   }
-  const verdict = verifySettlement({ status: executed.status, balanceChanges: executed.balanceChanges }, expected, payment.sender);
-  if (!verdict.verified) return refuse(402, executed.status === 'success' ? SETTLE_REASONS.mismatch : SETTLE_REASONS.failed);
-
-  const settled = await db
-    .update(sellerSales)
-    .set({ status: 'settled', settledAt: now })
-    .where(and(eq(sellerSales.challengeId, sale.challengeId), eq(sellerSales.status, 'rejected'), eq(sellerSales.digest, digest)))
-    .returning({ id: sellerSales.id });
-  if (settled.length !== 1) return refuse(409, SETTLE_REASONS.used);
-  return { ok: true, digest, payer: payment.sender };
+  return closeOn(executed, closing);
 }

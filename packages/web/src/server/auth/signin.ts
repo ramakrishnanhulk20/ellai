@@ -8,6 +8,7 @@ import { verifyPersonalMessageSignature } from '@mysten/sui/verify';
 import { and, eq, gt, isNull } from 'drizzle-orm';
 import type { Database } from '../db/client.js';
 import { owners, sessions, signinNonces } from '../db/schema.js';
+import { consumeShared } from '../http/ratelimit.js';
 import { SESSION_TOKEN_PREFIX, newBearerToken } from './tokens.js';
 
 export type SignInErrorCode =
@@ -55,10 +56,24 @@ const NONCE_BYTES = 16;
 const NONCE_PATTERN = new RegExp(`^[0-9a-f]{${NONCE_BYTES * 2}}$`);
 const ZKLOGIN_FLAG = SIGNATURE_SCHEME_TO_FLAG.ZkLogin;
 const MULTISIG_FLAG = SIGNATURE_SCHEME_TO_FLAG.MultiSig;
+const MINUTE_MS = 60_000;
+const DAY_MS = 86_400_000;
+
+/** The checks against Sui that every zkLogin sign-in shares, whoever sends it (C22). */
+export const ZKLOGIN_CHECK_QUOTAS = [
+  { name: 'zklogin-checks:minute', limit: LIMITS.zkLoginChecksPerMinute, windowMs: MINUTE_MS },
+  { name: 'zklogin-checks:day', limit: LIMITS.zkLoginChecksPerDay, windowMs: DAY_MS },
+] as const;
 
 interface Site {
   host: string;
   origin: string;
+}
+
+interface SignedIn {
+  ownerId: string;
+  sessionToken: string;
+  expiresAt: Date;
 }
 
 interface SignInFields extends Site {
@@ -139,14 +154,30 @@ function parseSignInMessage(message: string, site: Site): SignInFields {
   return fields;
 }
 
-// A zkLogin proof can only be checked against the chain, whether it signs alone or as one
-// member of a multisig. A multisig whose zkLogin member did not sign is checked offline.
-function signatureNeedsChain(signature: string): boolean {
+// A zkLogin proof can only be checked against the chain, whether it signs alone or as a member
+// of a multisig, and the SDK checks each zkLogin member that signed with a call of its own. A
+// multisig whose zkLogin members did not sign is checked offline. Throws for a signature that
+// does not parse.
+function chainChecksOf(signature: string): number {
   const flag = fromBase64(signature)[0];
-  if (flag === ZKLOGIN_FLAG) return true;
-  if (flag !== MULTISIG_FLAG) return false;
+  if (flag === ZKLOGIN_FLAG) return 1;
+  if (flag !== MULTISIG_FLAG) return 0;
   const parsed = parseSerializedSignature(signature);
-  return parsed.signatureScheme === 'MultiSig' && parsed.multisig.sigs.some((sig) => 'ZkLogin' in sig);
+  return parsed.signatureScheme === 'MultiSig' ? parsed.multisig.sigs.filter((sig) => 'ZkLogin' in sig).length : 0;
+}
+
+/**
+ * Counts `checks` uses of each zkLogin quota, the minute's first, and refuses with
+ * CHAIN_UNAVAILABLE once either is spent, before anything is sent to Sui (C22). The caller is
+ * over no limit of its own: Ellai's shared budget for asking Sui is spent, which is what a
+ * 503 chain_unavailable tells it, and its "try again in a minute" fits the minute's quota.
+ */
+async function holdZkLoginQuotas(db: Database, checks: number, now: Date): Promise<void> {
+  for (const quota of ZKLOGIN_CHECK_QUOTAS) {
+    for (let check = 0; check < checks; check += 1) {
+      if (!(await consumeShared(db, quota.name, quota.limit, quota.windowMs, now)).allowed) refuse('CHAIN_UNAVAILABLE');
+    }
+  }
 }
 
 /**
@@ -175,7 +206,7 @@ async function recoveredAddress(message: string, signature: unknown, claimed: st
   if (typeof signature !== 'string' || signature === '') refuse('BAD_SIGNATURE');
   let needsChain: boolean;
   try {
-    needsChain = signatureNeedsChain(signature);
+    needsChain = chainChecksOf(signature) > 0;
   } catch {
     refuse('BAD_SIGNATURE');
   }
@@ -188,6 +219,16 @@ async function recoveredAddress(message: string, signature: unknown, claimed: st
     return canonicalSuiAddress(publicKey.toSuiAddress());
   } catch {
     refuse(watched?.chainFailed() === true ? 'CHAIN_UNAVAILABLE' : 'BAD_SIGNATURE');
+  }
+}
+
+/** Why the signature does not sign this message in for `claimed`, or null when it does. */
+async function signatureRefusal(message: string, signature: unknown, claimed: string, client: ClientWithCoreApi | undefined): Promise<SignInErrorCode | null> {
+  try {
+    return (await recoveredAddress(message, signature, claimed, client)) === claimed ? null : 'BAD_SIGNATURE';
+  } catch (error) {
+    if (error instanceof SignInError) return error.code;
+    throw error;
   }
 }
 
@@ -227,25 +268,33 @@ export async function issueSignIn(args: { db: Database; address: string; appOrig
 }
 
 /**
- * Finishes a wallet sign-in (C14), cheapest check first. The message must be exactly one that
- * issueSignIn writes for this app's host and origin. Its nonce must be one this server issued
- * with the message's times, unused and unexpired; that is read before any signature is
- * checked, so a bad nonce never costs a chain read. Then the signature, checked as a Sui
- * personal message, must recover to the address the message names. Ed25519, Secp256k1,
- * Secp256r1 and multisig signatures are checked offline; a zkLogin signature is checked
- * only through `zkLoginClient` and is refused when none is given. When Sui cannot be read for
- * that check, the refusal is CHAIN_UNAVAILABLE, not BAD_SIGNATURE, and the nonce is left for a retry.
+ * Finishes a wallet sign-in (C14), in the order nonce, claim, signature, session.
+ *
+ * The message must be exactly one that issueSignIn writes for this app's host and origin. Its
+ * nonce must be one this server issued with the message's times, unused and unexpired; that is
+ * read first, so a bad nonce never costs a chain read. A signature that needs Sui (zkLogin,
+ * alone or as multisig members, one check for each member that signed) is then counted against
+ * ZKLOGIN_CHECK_QUOTAS, which every caller shares; past either, the refusal is
+ * CHAIN_UNAVAILABLE, nothing is sent to Sui, and the nonce is left as it was (C22).
+ *
  * Then, in one transaction: the nonce is marked used by a conditional update that only an
- * unused, unexpired nonce issued with these exact times can pass, so a second use fails
- * even under a race; the owner row is created on first sign-in with its derived purse
- * address and reused after that; and a session is created whose token hash alone is
- * stored, expiring LIMITS.sessionTtlMs after `now`.
+ * unused, unexpired nonce issued with these exact times can pass, so a second use fails even
+ * under a race. Only after that claim is the signature checked, as a Sui personal message that
+ * must recover to the address the message names: Ed25519, Secp256k1, Secp256r1 and multisig
+ * offline, zkLogin only through `zkLoginClient` (ZKLOGIN_UNAVAILABLE when none is given), and
+ * CHAIN_UNAVAILABLE rather than BAD_SIGNATURE when Sui cannot be read for it. A refused
+ * signature commits the claim and creates nothing, so every check against Sui has spent its
+ * nonce and a replay of the same message never reaches Sui again (C14). A signature that holds
+ * creates the owner row on first sign-in, with its derived purse address, and a session whose
+ * token hash alone is stored, expiring LIMITS.sessionTtlMs after `now`. The transaction stays
+ * open through the zkLogin check, which `zkLoginClient`'s own timeout bounds.
+ *
  * Returns the owner id, the session token (to be set as the cookie, never stored), and its
  * expiry.
  * Throws SignInError: BAD_MESSAGE, WRONG_SITE, BAD_SIGNATURE, ZKLOGIN_UNAVAILABLE,
- * CHAIN_UNAVAILABLE, NONCE_UNKNOWN, NONCE_USED, NONCE_EXPIRED. A refused signature or message
- * never uses up the nonce. Throws Error for server faults: a bad time, origin, master secret or session
- * secret.
+ * CHAIN_UNAVAILABLE, NONCE_UNKNOWN, NONCE_USED, NONCE_EXPIRED. A refused message never uses up
+ * the nonce; a refused signature always does. Throws Error for server faults: a bad time,
+ * origin, master secret or session secret.
  */
 export async function completeSignIn(args: {
   db: Database;
@@ -256,7 +305,7 @@ export async function completeSignIn(args: {
   sessionSecretHex: string;
   now: Date;
   zkLoginClient?: ClientWithCoreApi;
-}): Promise<{ ownerId: string; sessionToken: string; expiresAt: Date }> {
+}): Promise<SignedIn> {
   const now = checkNow(args.now);
   const site = siteOf(args.appOrigin);
   if (typeof args.message !== 'string') refuse('BAD_MESSAGE');
@@ -266,20 +315,31 @@ export async function completeSignIn(args: {
   if (args.message.length > issuedLength) refuse('BAD_MESSAGE');
   const fields = parseSignInMessage(args.message, site);
   const thisNonce = eq(signinNonces.nonce, fields.nonce);
-  // Read before any signature is checked, so a junk signature on a nonce that cannot sign in
-  // costs one indexed read and never a chain read. The claim below decides; this only refuses early.
+  // Read before anything else, so a junk signature on a nonce that cannot sign in costs one
+  // indexed read and never a quota or a chain read. The claim below decides; this only refuses early.
   const [issued] = await args.db.select().from(signinNonces).where(thisNonce);
   const early = nonceRefusal(issued, fields, now);
   if (early !== null) refuse(early);
 
-  const recovered = await recoveredAddress(args.message, args.signature, fields.address, args.zkLoginClient);
-  if (recovered !== fields.address) refuse('BAD_SIGNATURE');
-  const address = recovered;
+  // Counted outside the transaction: a counter row updated inside it would stay locked through
+  // the zkLogin check and line every zkLogin sign-in up behind the slowest one.
+  if (args.zkLoginClient !== undefined) {
+    let checks = 0;
+    try {
+      checks = typeof args.signature === 'string' ? chainChecksOf(args.signature) : 0;
+    } catch {
+      // Unreadable, so it is refused as BAD_SIGNATURE after the claim and never reaches Sui.
+    }
+    if (checks > 0) await holdZkLoginQuotas(args.db, checks, now);
+  }
+
+  // Only a signature that recovers to fields.address creates anything, so both come from it.
+  const address = fields.address;
   const purseAddress = canonicalSuiAddress(derivePurseKeypair(args.masterSecretHex, address).toSuiAddress());
   const session = newBearerToken(SESSION_TOKEN_PREFIX, args.sessionSecretHex);
   const sessionExpiresAt = new Date(now.getTime() + LIMITS.sessionTtlMs);
 
-  return args.db.transaction(async (tx) => {
+  const outcome = await args.db.transaction(async (tx): Promise<{ refused: SignInErrorCode } | { signedIn: SignedIn }> => {
     const claimed = await tx
       .update(signinNonces)
       .set({ usedAt: now })
@@ -299,11 +359,17 @@ export async function completeSignIn(args: {
       refuse(nonceRefusal(row, fields, now) ?? 'NONCE_EXPIRED');
     }
 
+    // Returned rather than thrown, so the transaction commits and the nonce stays used.
+    const refusal = await signatureRefusal(args.message, args.signature, address, args.zkLoginClient);
+    if (refusal !== null) return { refused: refusal };
+
     await tx.insert(owners).values({ suiAddress: address, purseAddress, createdAt: now }).onConflictDoNothing({ target: owners.suiAddress });
     const [owner] = await tx.select({ id: owners.id }).from(owners).where(eq(owners.suiAddress, address));
     if (owner === undefined) throw new Error('The owner row is missing after it was created');
 
     await tx.insert(sessions).values({ ownerId: owner.id, tokenHash: session.hash, createdAt: now, expiresAt: sessionExpiresAt });
-    return { ownerId: owner.id, sessionToken: session.token, expiresAt: sessionExpiresAt };
+    return { signedIn: { ownerId: owner.id, sessionToken: session.token, expiresAt: sessionExpiresAt } };
   });
+  if ('refused' in outcome) refuse(outcome.refused);
+  return outcome.signedIn;
 }

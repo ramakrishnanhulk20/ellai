@@ -1,8 +1,10 @@
 // Covers: the sign-in routes called as Next would call them, with Request objects, on PGlite:
 // nonce, verify and logout end to end with a real Ed25519 key; a zkLogin sign-in whose proof
-// verify sends, once, to the chain client it was given (a 503 when that chain cannot answer),
-// and nothing read for any other key;
-// the session cookie and its flags; the same-origin check on all three; the per-client and
+// verify sends, once, to the chain client it was given (a 503 when that chain cannot answer,
+// with the nonce spent either way), and nothing read for any other key;
+// the session cookie, its flags and its name (__Host-ellai_session on https, read and cleared
+// under that name only, the plain name on http localhost); the same-origin check on all three;
+// the per-client and
 // overall rate limits, keyed on the platform's client address; and the fixed 400s for a bad
 // body.
 // Does NOT cover: the owner routes (routes-owner does, including a cookie from this verify
@@ -162,9 +164,9 @@ describe('sign-in', () => {
     expect(Object.keys(JSON.parse(text))).toEqual(['ownerId']);
 
     const setCookie = response.headers.get('set-cookie');
-    expect(setCookie).toMatch(/^ellai_session=ellai_session_[A-Za-z0-9_-]{43}; HttpOnly; SameSite=Strict; Path=\/; Max-Age=\d+; Secure$/);
+    expect(setCookie).toMatch(/^__Host-ellai_session=ellai_session_[A-Za-z0-9_-]{43}; HttpOnly; SameSite=Strict; Path=\/; Max-Age=\d+; Secure$/);
     const cookie = cookieValue(setCookie);
-    expect(text).not.toContain(cookie.slice('ellai_session='.length));
+    expect(text).not.toContain(cookie.slice('__Host-ellai_session='.length));
 
     const session = await requireOwner(new Request(`${APP_ORIGIN}/`, { headers: { cookie } }), ownerContext());
     expect(session.ownerId).toBe(ownerId);
@@ -173,12 +175,12 @@ describe('sign-in', () => {
     expect(verifyZkLoginSignature).not.toHaveBeenCalled();
   });
 
-  it('leaves Secure off only when the app runs on plain-http localhost', async () => {
+  it('leaves Secure and the __Host- name off only when the app runs on plain-http localhost', async () => {
     env = { ...HTTPS_ENV, APP_ORIGIN: 'http://localhost:3000' };
     const { message, signature } = await signedMessage();
     const response = await verify({ message, signature });
     expect(response.status).toBe(200);
-    expect(response.headers.get('set-cookie')).toMatch(/; HttpOnly; SameSite=Strict; Path=\/; Max-Age=\d+$/);
+    expect(response.headers.get('set-cookie')).toMatch(/^ellai_session=ellai_session_[A-Za-z0-9_-]{43}; HttpOnly; SameSite=Strict; Path=\/; Max-Age=\d+$/);
   });
 
   it('refuses a verify from another site or with no Origin with 403, leaving the nonce for the real app', async () => {
@@ -268,7 +270,7 @@ describe('zkLogin sign-in', () => {
     expect(response.status).toBe(200);
     const { ownerId } = (await response.json()) as { ownerId: string };
     expect(verifyZkLoginSignature.mock.calls).toEqual([[{ bytes: toBase64(new TextEncoder().encode(message)), signature, intentScope: 'PersonalMessage', address: zkLoginAddress }]]);
-    expect(response.headers.get('set-cookie')).toMatch(/^ellai_session=ellai_session_/);
+    expect(response.headers.get('set-cookie')).toMatch(/^__Host-ellai_session=ellai_session_/);
     const [owner] = await db.select().from(owners).where(eq(owners.id, ownerId));
     expect(owner?.suiAddress).toBe(zkLoginAddress);
   });
@@ -283,8 +285,9 @@ describe('zkLogin sign-in', () => {
     expect(verifyZkLoginSignature).toHaveBeenCalledTimes(1);
   });
 
-  it('answers 503 chain_unavailable and no session when the chain cannot check a zkLogin proof, and the same sign-in works once it can', async () => {
+  it('answers 503 chain_unavailable and no session when the chain cannot check a zkLogin proof; the nonce is spent, and a fresh sign-in works once it can', async () => {
     vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    vi.spyOn(console, 'warn').mockImplementation(() => undefined);
     verifyZkLoginSignature.mockRejectedValueOnce(new Error('UNAVAILABLE: the gateway did not answer'));
     const { message, signature } = await zkLoginSigned();
     const response = await verify({ message, signature });
@@ -292,8 +295,13 @@ describe('zkLogin sign-in', () => {
     expect(await response.json()).toEqual({ error: 'chain_unavailable', message: 'Ellai could not read Sui just now. Try again in a minute.' });
     expect(response.headers.get('set-cookie')).toBeNull();
 
-    verifyZkLoginSignature.mockResolvedValueOnce({ success: true, errors: [] });
-    expect((await verify({ message, signature })).status).toBe(200);
+    verifyZkLoginSignature.mockResolvedValue({ success: true, errors: [] });
+    const replay = await verify({ message, signature });
+    expect(replay.status).toBe(401);
+    expect(await replay.json()).toMatchObject({ error: 'nonce_used' });
+    expect(verifyZkLoginSignature).toHaveBeenCalledTimes(1);
+    const fresh = await zkLoginSigned();
+    expect((await verify(fresh)).status).toBe(200);
     expect(verifyZkLoginSignature).toHaveBeenCalledTimes(2);
   });
 });
@@ -359,7 +367,7 @@ describe('logout', () => {
     const response = await logout({ cookie });
     expect(response.status).toBe(200);
     expect(await response.json()).toEqual({ signedOut: true });
-    expect(response.headers.get('set-cookie')).toBe('ellai_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0; Secure');
+    expect(response.headers.get('set-cookie')).toBe('__Host-ellai_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0; Secure');
 
     const [row] = await db.select().from(sessions).where(eq(sessions.id, sessionId));
     expect(row?.revokedAt).toEqual(clock);
@@ -375,8 +383,27 @@ describe('logout', () => {
   });
 
   it('still clears the cookie when there is no session to end', async () => {
-    const response = await logout({ cookie: 'ellai_session=junk' });
+    const response = await logout({ cookie: '__Host-ellai_session=junk' });
     expect(response.status).toBe(200);
     expect(response.headers.get('set-cookie')).toContain('Max-Age=0');
+  });
+
+  it('on https never reads a plain-named cookie, even one carrying a real session token', async () => {
+    const cookie = await signedInCookie();
+    const plain = `ellai_session=${cookie.slice('__Host-ellai_session='.length)}`;
+    const response = await logout({ cookie: plain });
+    expect(response.status).toBe(200);
+    await expect(requireOwner(new Request(`${APP_ORIGIN}/`, { headers: { cookie } }), ownerContext())).resolves.toMatchObject({});
+  });
+
+  it('on plain-http localhost reads and clears the plain-named cookie, and ends its session', async () => {
+    env = { ...HTTPS_ENV, APP_ORIGIN: 'http://localhost:3000' };
+    const cookie = await signedInCookie();
+    expect(cookie.startsWith('ellai_session=ellai_session_')).toBe(true);
+    const { sessionId } = await requireOwner(new Request(`${env.APP_ORIGIN}/`, { headers: { cookie } }), ownerContext());
+    const response = await logout({ cookie });
+    expect(response.headers.get('set-cookie')).toBe('ellai_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0');
+    const [row] = await db.select().from(sessions).where(eq(sessions.id, sessionId));
+    expect(row?.revokedAt).toEqual(clock);
   });
 });

@@ -106,7 +106,7 @@ async function signedInOwner(): Promise<Owner> {
   const signer = Ed25519Keypair.generate();
   const { message } = await issueSignIn({ db, address: signer.toSuiAddress(), appOrigin: APP_ORIGIN, now: clock });
   const done = await completeSignIn({ db, message, signature: await sign(signer, message), appOrigin: APP_ORIGIN, masterSecretHex: MASTER, sessionSecretHex: SECRET, now: clock });
-  return { ownerId: done.ownerId, address: canonicalSuiAddress(signer.toSuiAddress()), cookie: `ellai_session=${done.sessionToken}` };
+  return { ownerId: done.ownerId, address: canonicalSuiAddress(signer.toSuiAddress()), cookie: `__Host-ellai_session=${done.sessionToken}` };
 }
 
 async function agentFor(ownerId: string, label = 'Travel agent'): Promise<string> {
@@ -261,8 +261,8 @@ describe('the session requirement', () => {
   it.each(routes)('%s is 401 signed_out with no cookie, a junk cookie, or a session that has ended', async (_name, run) => {
     quiet();
     const owner = await signedInOwner();
-    await endSession({ db, token: owner.cookie.slice('ellai_session='.length), sessionSecretHex: SECRET, now: clock });
-    for (const cookie of [undefined, `ellai_session=${MARKER}`, 'ellai_session=', owner.cookie]) {
+    await endSession({ db, token: owner.cookie.slice('__Host-ellai_session='.length), sessionSecretHex: SECRET, now: clock });
+    for (const cookie of [undefined, `__Host-ellai_session=${MARKER}`, '__Host-ellai_session=', owner.cookie]) {
       const response = await run(cookie);
       expect(response.status).toBe(401);
       expect(await response.json()).toEqual({ error: 'signed_out', message: 'Sign in to Ellai to continue.' });
@@ -519,7 +519,7 @@ describe('POST /api/owner/questions/[id]/answer', () => {
 });
 
 describe('unexpected failures', () => {
-  const sessionCookie = () => `ellai_session=${newBearerToken(SESSION_TOKEN_PREFIX, SECRET).token}`;
+  const sessionCookie = () => `__Host-ellai_session=${newBearerToken(SESSION_TOKEN_PREFIX, SECRET).token}`;
 
   it('turns an unknown error inside a handler into 500 { error: internal } with no message text anywhere', async () => {
     const logged = vi.spyOn(console, 'error').mockImplementation(() => undefined);
