@@ -247,4 +247,8 @@ export const LIMITS = {
   agentCreatesPerHour: 10,
   /** Rate counter rows are kept this long, longer than the longest window that reads them (a day). */
   rateCounterRetentionMs: 90_000_000,
+  /** A paid call stops waiting for settlement after this long and answers 'paid', settlement pending; under Vercel's 300 s function limit. */
+  paidFetchDeadlineMs: 240_000,
+  /** Function duration requested by the slow routes, Vercel's maximum on every plan with Fluid compute. */
+  slowRouteMaxDurationS: 300,
 } as const;
