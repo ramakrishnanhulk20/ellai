@@ -235,4 +235,16 @@ export const LIMITS = {
   agentMaxTokens: 4_000,
   /** Longest task text an owner may give the built-in agent, in characters. */
   agentTaskMaxChars: 1_000,
+  /** Longest wait for one model request from the built-in agent, retries included. */
+  agentModelTimeoutMs: 60_000,
+  /** Paid-fetch calls one owner's agents together may make per minute (C22). */
+  ownerPayRequestsPerMinute: 60,
+  /** Decision status reads one agent may make per minute (C22). */
+  agentDecisionReadsPerMinute: 120,
+  /** Agent keys one owner may hold at once, revoked ones not counted. */
+  agentsPerOwnerMax: 20,
+  /** Agent keys one owner may create per hour. */
+  agentCreatesPerHour: 10,
+  /** Rate counter rows are kept this long, longer than the longest window that reads them (a day). */
+  rateCounterRetentionMs: 90_000_000,
 } as const;
