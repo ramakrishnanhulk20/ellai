@@ -219,4 +219,20 @@ export const LIMITS = {
   questionTtlMs: 86_400_000,
   /** Gas wallet SUI below which the jobs tick warns: 0.1 SUI in MIST. */
   gasWalletLowMist: 100_000_000,
+  /** Paid-fetch calls one agent may make per minute through the agent API or MCP (C22). */
+  agentCallsPerMinute: 30,
+  /** Reads one owner may make per minute on owner routes that touch Tatum (C22). */
+  ownerChainReadsPerMinute: 30,
+  /** How long the public proof page's answer is reused before it is read again (C22). */
+  publicProofCacheMs: 60_000,
+  /** Built-in agent runs one owner may start per hour, so a public demo cannot burn the Claude credit. */
+  agentRunsPerOwnerPerHour: 10,
+  /** Built-in agent runs across all owners per day. */
+  agentRunsPerDay: 200,
+  /** Tool calls the built-in agent may make in one run. */
+  agentMaxToolCalls: 6,
+  /** Output token ceiling for one built-in agent request. */
+  agentMaxTokens: 4_000,
+  /** Longest task text an owner may give the built-in agent, in characters. */
+  agentTaskMaxChars: 1_000,
 } as const;
