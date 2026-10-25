@@ -1,6 +1,6 @@
 import type { CanonicalPayment } from '@ellai/core/challenge';
 import { LIMITS } from '@ellai/core/limits';
-import { and, count, desc, eq, gt, gte, inArray, isNull, sql } from 'drizzle-orm';
+import { and, count, desc, eq, gt, gte, inArray, isNull, or, sql } from 'drizzle-orm';
 import type { Database } from '../db/client.js';
 import {
   LIVE_DECISION_STATUSES,
@@ -206,10 +206,13 @@ async function reuse(q: Queryable, row: typeof decisions.$inferSelect, r: Reques
 const ownedHere = (r: Request) => and(eq(memories.ownerId, r.ownerId), eq(memories.namespace, r.namespace));
 
 async function badOutcomes(q: Queryable, r: Request): Promise<BadOutcome[]> {
-  // The window restarts only at an approval that would itself count toward learning.
-  const [lastApproval] = await q
-    .select({ at: memories.createdAt })
+  // The window restarts only at a yes that would itself count toward learning, and it restarts
+  // at the time that yes's question was asked, not answered: a question asked before a bad
+  // payment never showed it to the owner, so a late yes to it clears nothing.
+  const [lastAskedYes] = await q
+    .select({ at: decisions.createdAt })
     .from(memories)
+    .innerJoin(decisions, and(eq(decisions.id, memories.decisionId), eq(decisions.ownerId, memories.ownerId)))
     .where(
       and(
         ownedHere(r),
@@ -219,18 +222,30 @@ async function badOutcomes(q: Queryable, r: Request): Promise<BadOutcome[]> {
         eq(memories.writerPublicKey, r.delegate),
       ),
     )
-    .orderBy(desc(memories.createdAt))
+    .orderBy(desc(decisions.createdAt))
     .limit(1);
+  // From the moment it is signed until the seller is known to have delivered, a payment counts:
+  // a pending settlement and an unknown delivery are not good news. A released or 'not_landed'
+  // payment moved no money. A mismatch counts whatever the seller said.
   const bad = await q
-    .select({ id: payments.id, decisionId: payments.decisionId, amountAtomic: payments.amountAtomic, signedAt: payments.signedAt })
+    .select({
+      id: payments.id,
+      decisionId: payments.decisionId,
+      amountAtomic: payments.amountAtomic,
+      signedAt: payments.signedAt,
+      delivered: payments.delivered,
+      settlement: payments.settlement,
+    })
     .from(payments)
     .where(
       and(
         eq(payments.ownerId, r.ownerId),
         eq(payments.recipient, r.payment.recipient),
-        eq(payments.settlement, 'verified'),
-        eq(payments.delivered, false),
-        lastApproval === undefined ? undefined : gt(payments.signedAt, lastApproval.at),
+        or(
+          eq(payments.settlement, 'mismatch'),
+          and(inArray(payments.settlement, ['verified', 'pending']), isNull(payments.releasedAt), sql`${payments.delivered} is not true`),
+        ),
+        lastAskedYes === undefined ? undefined : gte(payments.signedAt, lastAskedYes.at),
       ),
     )
     .orderBy(desc(payments.signedAt))
@@ -241,12 +256,20 @@ async function badOutcomes(q: Queryable, r: Request): Promise<BadOutcome[]> {
     .from(memories)
     .where(and(ownedHere(r), eq(memories.kind, 'outcome'), inArray(memories.decisionId, bad.map((p) => p.decisionId))))
     .limit(LIMITS.decideMaxCitedMemories);
-  return bad.map((p) => ({
-    paymentId: p.id,
-    amountAtomic: p.amountAtomic,
-    signedAt: p.signedAt,
-    outcomeMemoryIds: outcomes.filter((o) => o.decisionId === p.decisionId).map((o) => o.id),
-  }));
+  return bad.flatMap((p) =>
+    p.settlement === 'not_landed'
+      ? []
+      : [
+          {
+            paymentId: p.id,
+            amountAtomic: p.amountAtomic,
+            signedAt: p.signedAt,
+            delivered: p.delivered,
+            settlement: p.settlement,
+            outcomeMemoryIds: outcomes.filter((o) => o.decisionId === p.decisionId).map((o) => o.id),
+          },
+        ],
+  );
 }
 
 async function gatherFacts(q: Queryable, r: Request, settings: OwnerSettings, maxPending: number): Promise<Omit<DecideFacts, 'recall'>> {
@@ -343,7 +366,8 @@ async function recallFacts(db: Database, r: Request, recall: Recall): Promise<Re
     if (typeof blobId !== 'string' || typeof distance !== 'number' || !Number.isFinite(distance)) return FAILED;
     parsed.push({ blobId, distance });
   }
-  const limitReached = parsed.length >= LIMITS.decideRecallLimit;
+  // Taken over every hit, Ellai's or not, because the limit cut the namespace as a whole.
+  const cutOffAt = parsed.length >= LIMITS.decideRecallLimit ? parsed.reduce((far, hit) => Math.max(far, hit.distance), Number.NEGATIVE_INFINITY) : null;
   const blobIds = [...new Set(parsed.map((hit) => hit.blobId))].filter((id) => id.length > 0 && id.length <= TEXT_CAPS.relayerId);
   const rows =
     blobIds.length === 0
@@ -374,7 +398,7 @@ async function recallFacts(db: Database, r: Request, recall: Recall): Promise<Re
       countsAsOwnerDecision: row.kind === 'owner_decision' && row.writerPublicKey === r.delegate,
     });
   }
-  return { kind: 'hits', limitReached, hits };
+  return { kind: 'hits', cutOffAt, hits };
 }
 
 const STATUS_FOR = { approved: 'open', refused: 'refused', asked: 'asked' } as const;
@@ -388,6 +412,8 @@ const STATUS_FOR = { approved: 'open', refused: 'refused', asked: 'asked' } as c
  * - Otherwise the facts are read and rules 1 to 6 run. Recall is called only when they
  *   decide nothing, outside any lock, with LIMITS.decideRecallTimeoutMs; a throw, a
  *   timeout, a malformed answer or a hit without a finite distance counts as failed (C12).
+ *   A result of LIMITS.decideRecallLimit hits asks only while its farthest hit is inside the
+ *   owner's distance cutoff, since only then could the limit have hidden a closer approval.
  * - Then, in one transaction that first locks the owner row FOR UPDATE, every fact is read
  *   again and the rules run again, so two decides for one owner can never both spend one
  *   grant or both fit under the daily budget. If that pass needs a recall the first did not

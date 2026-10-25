@@ -1,14 +1,17 @@
 // Covers: the memory service on PGlite against a stand-in relayer client. submitPendingMemories
 // claims only this owner's pending, unsent rows written by the derived delegate in Ellai's
-// namespace, sends them once, never resubmits a row with a job id, leaves rows untouched when
-// the relayer refuses, marks them failed when the write may have been stored, and holds back a
-// repeated sentence; confirmMemoryJobs maps done, failed and pending; both refuse an owner
-// without an account; makeRecall rejects for such an owner so decide asks (C12) and returns no
-// sentence text; recordOutcome is idempotent per decision and owner-scoped; ownerDelegate's key form.
+// namespace, sends them once, never resubmits a row with a job id, counts every attempt, sends a
+// row from a refused write alone so another row still goes, fails a row at the attempt ceiling,
+// marks rows failed when the write may have been stored, counts and fails nothing on a refused
+// delegate key, and holds back a repeated sentence; confirmMemoryJobs maps done, failed and
+// pending, fails one malformed or clashing job alone, fails a job past the age ceiling, and
+// changes nothing on a refused delegate key; both refuse an owner without an account;
+// makeRecall rejects for such an owner so decide asks (C12) and returns no sentence text;
+// recordOutcome is idempotent per decision and owner-scoped; ownerDelegate's key form.
 // Does NOT cover: the live relayer, its job timing or its search ranking (proven only by
-// `npm run prove:loop`), the real SDK's HTTP layer (core's tests cover the client), or two
-// connections racing for one row: PGlite serves one connection, so SKIP LOCKED is issued but
-// never skips anything here.
+// `npm run prove:loop`), the real SDK's HTTP layer (core's tests cover the client), the jobs
+// tick's own handling of what is thrown (jobs.test), or two connections racing for one row:
+// PGlite serves one connection, so SKIP LOCKED is issued but never skips anything here.
 import { randomBytes } from 'node:crypto';
 import type { CanonicalPayment } from '@ellai/core/challenge';
 import { deriveMemwalDelegateKeypair } from '@ellai/core/keys';
@@ -204,7 +207,7 @@ describe('submitPendingMemories', () => {
     const jobIds = [(await row(first)).jobId, (await row(second)).jobId];
     expect(jobIds[0]).toMatch(/^job-/);
     expect(new Set(jobIds).size).toBe(2);
-    for (const id of [first, second]) expect((await row(id)).status).toBe('pending');
+    for (const id of [first, second]) expect(await row(id)).toMatchObject({ status: 'pending', submitAttempts: 1, submittedAt: NOW });
     for (const id of [otherWriter, otherNamespace, elsewhere]) expect((await row(id)).jobId).toBeNull();
 
     expect(await submitPendingMemories(writer(owner))).toEqual({ submitted: 0 });
@@ -221,17 +224,69 @@ describe('submitPendingMemories', () => {
     expect(client.rememberBulk).toHaveBeenCalledTimes(2);
   });
 
-  it('leaves rows pending with no job id when the relayer refuses the write, so a later pass sends them', async () => {
-    const owner = await newOwner();
-    const ids = [await pendingMemory(owner), await pendingMemory(owner)];
-    for (const status of [429, 400, 401, 503]) {
+  it('counts a refused write against its rows and leaves them pending with no job id, so a later pass sends them', async () => {
+    for (const [status, code] of [
+      [429, 'RATE_LIMITED'],
+      [400, 'WRITE'],
+      [503, 'UPSTREAM'],
+    ] as const) {
+      const owner = await newOwner();
+      const ids = [await pendingMemory(owner), await pendingMemory(owner)];
       const client = relayer({ rememberBulk: () => Promise.reject(Object.assign(new Error('refused'), { status })) });
-      await expect(submitPendingMemories(writer(owner))).rejects.toMatchObject({ name: 'MemoryError' });
+      await expect(submitPendingMemories(writer(owner))).rejects.toMatchObject({ name: 'MemoryError', code });
       expect(client.rememberBulk).toHaveBeenCalledTimes(1);
-      for (const id of ids) expect(await row(id)).toMatchObject({ status: 'pending', jobId: null });
+      for (const id of ids) expect(await row(id)).toMatchObject({ status: 'pending', jobId: null, submitAttempts: 1, submittedAt: NOW });
+      relayer({ rememberBulk: accepted });
+      expect(await submitPendingMemories(writer(owner))).toEqual({ submitted: 2 });
+      for (const id of ids) expect(await row(id)).toMatchObject({ status: 'pending', jobId: expect.stringMatching(/^job-/), submitAttempts: 2 });
     }
-    relayer({ rememberBulk: accepted });
+  });
+
+  it('sends each row of a refused write alone on the next pass, so row B is written while row A is refused again', async () => {
+    const owner = await newOwner();
+    const a = await pendingMemory(owner);
+    const b = await pendingMemory(owner);
+    const bad = (await row(a)).sentence;
+    const refusesA = async (items: Array<{ text: string }>) =>
+      items.some((item) => item.text === bad) ? Promise.reject(Object.assign(new Error('bad item'), { status: 400 })) : accepted(items);
+
+    relayer({ rememberBulk: refusesA as Method });
+    await expect(submitPendingMemories(writer(owner))).rejects.toMatchObject({ name: 'MemoryError', code: 'WRITE' });
+    for (const id of [a, b]) expect(await row(id)).toMatchObject({ status: 'pending', jobId: null, submitAttempts: 1 });
+
+    const c = await pendingMemory(owner);
+    const client = relayer({ rememberBulk: refusesA as Method });
     expect(await submitPendingMemories(writer(owner))).toEqual({ submitted: 2 });
+    const texts = client.rememberBulk.mock.calls.map((call) => (call[0] as unknown as Array<{ text: string }>).map((item) => item.text));
+    expect(texts).toEqual([[bad], [(await row(b)).sentence], [(await row(c)).sentence]]);
+    expect(await row(a)).toMatchObject({ status: 'pending', jobId: null, submitAttempts: 2 });
+    expect(await row(b)).toMatchObject({ status: 'pending', jobId: expect.stringMatching(/^job-/), submitAttempts: 2 });
+    expect(await row(c)).toMatchObject({ status: 'pending', jobId: expect.stringMatching(/^job-/), submitAttempts: 1 });
+  });
+
+  it('marks a row failed once it reaches LIMITS.memoryWriteMaxAttempts, and never sends it again', async () => {
+    const owner = await newOwner();
+    const id = await pendingMemory(owner);
+    const client = relayer({ rememberBulk: () => Promise.reject(Object.assign(new Error('bad item'), { status: 422 })) });
+    for (let attempt = 1; attempt <= LIMITS.memoryWriteMaxAttempts; attempt++) {
+      await expect(submitPendingMemories(writer(owner))).rejects.toMatchObject({ name: 'MemoryError', code: 'WRITE' });
+      expect(await row(id)).toMatchObject({ status: attempt < LIMITS.memoryWriteMaxAttempts ? 'pending' : 'failed', submitAttempts: attempt });
+    }
+    expect(await submitPendingMemories(writer(owner))).toEqual({ submitted: 0 });
+    expect(client.rememberBulk).toHaveBeenCalledTimes(LIMITS.memoryWriteMaxAttempts);
+  });
+
+  it('counts and fails nothing when the relayer refuses the delegate key, ends the pass, and throws DELEGATE', async () => {
+    const owner = await newOwner();
+    const retried = await pendingMemory(owner, { submitAttempts: LIMITS.memoryWriteMaxAttempts - 1 });
+    const fresh = [await pendingMemory(owner), await pendingMemory(owner)];
+    const client = relayer({ rememberBulk: () => Promise.reject(Object.assign(new Error('unauthorized'), { status: 401 })) });
+    for (let pass = 0; pass <= LIMITS.memoryWriteMaxAttempts; pass++) {
+      await expect(submitPendingMemories(writer(owner))).rejects.toMatchObject({ name: 'MemoryError', code: 'DELEGATE' });
+    }
+    expect(client.rememberBulk).toHaveBeenCalledTimes(LIMITS.memoryWriteMaxAttempts + 1);
+    expect(await row(retried)).toMatchObject({ status: 'pending', jobId: null, submitAttempts: LIMITS.memoryWriteMaxAttempts - 1, submittedAt: null });
+    for (const id of fresh) expect(await row(id)).toMatchObject({ status: 'pending', jobId: null, submitAttempts: 0, submittedAt: null });
   });
 
   it('marks rows failed, and never sends them again, when the write may have reached the relayer', async () => {
@@ -249,7 +304,7 @@ describe('submitPendingMemories', () => {
       const error = await submitPendingMemories(writer(owner)).catch((reason: unknown) => reason);
       expect(error).toBeInstanceOf(MemoryServiceError);
       expect((error as MemoryServiceError).code).toBe('SEND_UNCERTAIN');
-      for (const id of ids) expect(await row(id)).toMatchObject({ status: 'failed', jobId: null });
+      for (const id of ids) expect(await row(id)).toMatchObject({ status: 'failed', jobId: null, submitAttempts: 1, submittedAt: NOW });
       const again = relayer({ rememberBulk: accepted });
       expect(await submitPendingMemories(writer(owner))).toEqual({ submitted: 0 });
       expect(again.rememberBulk).not.toHaveBeenCalled();
@@ -301,14 +356,74 @@ describe('confirmMemoryJobs', () => {
     expect(client.destroy).toHaveBeenCalledTimes(1);
   });
 
-  it('changes nothing when the status answer is malformed, and checks no more than the relayer allows per call', async () => {
+  it('fails only the job whose answer fails its checks, reading each job alone, and asks about no more than the relayer allows per call', async () => {
     const owner = await newOwner();
     const ids: string[] = [];
     for (let i = 0; i < LIMITS.memwalBulkMaxItems + 2; i++) ids.push(await pendingMemory(owner, { jobId: `job-many-${i}` }));
-    const bad = relayer({ getRememberBulkStatus: async () => ({ results: [{ job_id: 'job-many-0', status: 'done' }] }) });
-    await expect(confirmMemoryJobs(writer(owner))).rejects.toMatchObject({ name: 'MemoryError', code: 'WRITE' });
-    for (const id of ids) expect((await row(id)).status).toBe('pending');
-    expect((bad.getRememberBulkStatus.mock.calls[0]?.[0] as unknown as string[]).length).toBe(LIMITS.memwalBulkMaxItems);
+    const client = relayer({
+      getRememberBulkStatus: async (asked: string[]) => ({
+        results: asked.map((id) => (id === 'job-many-3' ? { job_id: id, status: 'done' } : { job_id: id, status: 'running' })),
+      }),
+    });
+    expect(await confirmMemoryJobs(writer(owner))).toEqual({ confirmed: 0, failed: 1, pending: LIMITS.memwalBulkMaxItems - 1 });
+    const asked = client.getRememberBulkStatus.mock.calls.map((call) => call[0] as unknown as string[]);
+    expect(asked[0]).toHaveLength(LIMITS.memwalBulkMaxItems);
+    expect(asked.slice(1)).toEqual(ids.slice(0, LIMITS.memwalBulkMaxItems).map((_, i) => [`job-many-${i}`]));
+    for (const [i, id] of ids.entries()) {
+      expect(await row(id)).toMatchObject({ status: i === 3 ? 'failed' : 'pending', blobId: null, jobId: `job-many-${i}` });
+    }
+  });
+
+  it('fails a done job whose blob id is already stored, or that another job in the answer also reports, and confirms the rest', async () => {
+    const owner = await newOwner();
+    await pendingMemory(await newOwner(), { status: 'confirmed', blobId: 'blob-held', jobId: 'job-held' });
+    const held = await pendingMemory(owner, { jobId: 'job-a' });
+    const twinOne = await pendingMemory(owner, { jobId: 'job-b' });
+    const twinTwo = await pendingMemory(owner, { jobId: 'job-c' });
+    const fine = await pendingMemory(owner, { jobId: 'job-d' });
+    relayer({
+      getRememberBulkStatus: async () => ({
+        results: [
+          { job_id: 'job-a', status: 'done', blob_id: 'blob-held' },
+          { job_id: 'job-b', status: 'done', blob_id: 'blob-twin' },
+          { job_id: 'job-c', status: 'done', blob_id: 'blob-twin' },
+          { job_id: 'job-d', status: 'done', blob_id: 'blob-fine' },
+        ],
+      }),
+    });
+    expect(await confirmMemoryJobs(writer(owner))).toEqual({ confirmed: 1, failed: 3, pending: 0 });
+    for (const id of [held, twinOne, twinTwo]) expect(await row(id)).toMatchObject({ status: 'failed', blobId: null });
+    expect(await row(fine)).toMatchObject({ status: 'confirmed', blobId: 'blob-fine', confirmedAt: NOW });
+  });
+
+  it('fails a job still not done LIMITS.memoryJobMaxAgeMs after it was sent, read or not, and keeps a younger one', async () => {
+    const ago = (ms: number) => new Date(NOW.getTime() - ms);
+    const sentAt = (owner: Owner, submittedAt: Date | null, jobId: string, createdAt = ago(LIMITS.memoryJobMaxAgeMs + 60_000)) =>
+      pendingMemory(owner, { jobId, submittedAt, createdAt });
+
+    const owner = await newOwner();
+    const old = await sentAt(owner, ago(LIMITS.memoryJobMaxAgeMs), 'job-old');
+    const young = await sentAt(owner, ago(LIMITS.memoryJobMaxAgeMs - 1), 'job-young');
+    const legacy = await sentAt(owner, null, 'job-legacy');
+    relayer({ getRememberBulkStatus: async (asked: string[]) => ({ results: asked.map((id) => ({ job_id: id, status: 'running' })) }) });
+    expect(await confirmMemoryJobs(writer(owner))).toEqual({ confirmed: 0, failed: 2, pending: 1 });
+    expect([(await row(old)).status, (await row(young)).status, (await row(legacy)).status]).toEqual(['failed', 'pending', 'failed']);
+
+    const unread = await newOwner();
+    const unreadOld = await sentAt(unread, ago(LIMITS.memoryJobMaxAgeMs), 'job-unread-old');
+    const unreadYoung = await sentAt(unread, ago(60_000), 'job-unread-young');
+    relayer({ getRememberBulkStatus: () => Promise.reject(Object.assign(new Error('bad gateway'), { status: 502 })) });
+    await expect(confirmMemoryJobs(writer(unread))).rejects.toMatchObject({ name: 'MemoryError', code: 'UPSTREAM' });
+    expect([(await row(unreadOld)).status, (await row(unreadYoung)).status]).toEqual(['failed', 'pending']);
+  });
+
+  it('changes nothing, even past the age ceiling, when the relayer refuses the delegate key, and throws DELEGATE', async () => {
+    const owner = await newOwner();
+    const old = await pendingMemory(owner, { jobId: 'job-key-old', submittedAt: new Date(NOW.getTime() - LIMITS.memoryJobMaxAgeMs - 1) });
+    const done = await pendingMemory(owner, { jobId: 'job-key-done', submittedAt: NOW });
+    relayer({ getRememberBulkStatus: () => Promise.reject(Object.assign(new Error('unauthorized'), { status: 401 })) });
+    await expect(confirmMemoryJobs(writer(owner))).rejects.toMatchObject({ name: 'MemoryError', code: 'DELEGATE' });
+    for (const id of [old, done]) expect(await row(id)).toMatchObject({ status: 'pending', blobId: null });
   });
 });
 

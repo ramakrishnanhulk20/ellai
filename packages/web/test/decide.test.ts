@@ -19,7 +19,7 @@ import { type Database, createDb, migrate } from '../src/server/db/client.js';
 import { agents, decisionCitations, decisions, grantUses, memories, owners, payments, questions } from '../src/server/db/schema.js';
 import { answerQuestion } from '../src/server/decide/answer.js';
 import { type DecideArgs, DecideError, type Recall, decide } from '../src/server/decide/decide.js';
-import { type DecideFacts, type RecallHit, type RecallResult, applyRules } from '../src/server/decide/rules.js';
+import { type BadOutcome, type DecideFacts, type RecallHit, type RecallResult, applyRules } from '../src/server/decide/rules.js';
 import { querySentence } from '../src/server/decide/sentences.js';
 
 const RECIPIENT = `0x${'11'.repeat(32)}`;
@@ -37,8 +37,8 @@ function approval(overrides: Partial<RecallHit> = {}): RecallHit {
   };
 }
 
-function hits(list: RecallHit[], limitReached = false): RecallResult {
-  return { kind: 'hits', limitReached, hits: list };
+function hits(list: RecallHit[], cutOffAt: number | null = null): RecallResult {
+  return { kind: 'hits', cutOffAt, hits: list };
 }
 
 function facts(overrides: Partial<DecideFacts> = {}, settings: Partial<DecideFacts['settings']> = {}): DecideFacts {
@@ -65,10 +65,16 @@ function facts(overrides: Partial<DecideFacts> = {}, settings: Partial<DecideFac
   };
 }
 
-const badOutcome = (outcomeMemoryIds: string[] = [], amountAtomic = 10_000n, signedAt = new Date('2026-10-24T08:00:00Z')) => ({
+const badOutcome = (
+  outcomeMemoryIds: string[] = [],
+  amountAtomic = 10_000n,
+  signedAt = new Date('2026-10-24T08:00:00Z'),
+  record: Pick<BadOutcome, 'delivered' | 'settlement'> = { delivered: false, settlement: 'verified' },
+): BadOutcome => ({
   paymentId: randomUUID(),
   amountAtomic,
   signedAt,
+  ...record,
   outcomeMemoryIds,
 });
 
@@ -157,12 +163,20 @@ describe('applyRules', () => {
     expect(applyRules(facts({ recall: hits([first, { ...first }]) })).rule).toBe('no_match');
   });
 
-  it('asks when recall failed, and when it reached its limit even with enough approvals', () => {
+  it('asks when recall failed, and when a full result ends inside the cutoff even with enough approvals', () => {
     expect(applyRules(facts({ recall: { kind: 'failed' } }))).toMatchObject({ outcome: 'asked', rule: 'recall_unavailable' });
-    expect(applyRules(facts({ recall: hits([approval(), approval(), approval()], true) }))).toMatchObject({
-      outcome: 'asked',
-      rule: 'recall_unavailable',
-    });
+    const three = [approval(), approval(), approval()];
+    for (const cutOffAt of [0.1, 0.4999]) {
+      expect(applyRules(facts({ recall: hits(three, cutOffAt) }))).toMatchObject({ outcome: 'asked', rule: 'recall_unavailable' });
+    }
+    expect(applyRules(facts({ recall: hits(three, 1.2) }, { distanceCutoff: Number.NaN })).rule).toBe('recall_unavailable');
+  });
+
+  it('runs the rules on a full result whose farthest hit is at or past the cutoff, since every hidden hit is farther still', () => {
+    for (const cutOffAt of [0.5, 1.2, 2]) {
+      expect(applyRules(facts({ recall: hits([approval(), approval()], cutOffAt) }))).toMatchObject({ outcome: 'approved', rule: 'learned' });
+      expect(applyRules(facts({ recall: hits([approval()], cutOffAt) })).rule).toBe('no_match');
+    }
   });
 
   it('asks on a bad outcome with no outcome memory yet, and cites the outcome memories that exist', () => {
@@ -172,6 +186,17 @@ describe('applyRules', () => {
     expect(decided).toMatchObject({ outcome: 'asked', rule: 'bad_outcome', citedMemoryIds: [memory] });
     expect(decided.reason).toBe('hotels.example took 0.010000 USDC last time and returned nothing.');
     expect(applyRules(facts({ badOutcomes: [badOutcome()] }))).toMatchObject({ rule: 'bad_outcome', citedMemoryIds: [] });
+  });
+
+  it("words a bad outcome from the latest payment's record, never claiming nothing came back while the answer is unknown", () => {
+    const reasonFor = (record: Pick<BadOutcome, 'delivered' | 'settlement'>) =>
+      applyRules(facts({ badOutcomes: [badOutcome([], 10_000n, undefined, record)], recall: hits([approval(), approval()]) })).reason;
+    expect(reasonFor({ delivered: null, settlement: 'pending' })).toBe('hotels.example took 0.010000 USDC last time and Ellai has not seen it deliver yet.');
+    expect(reasonFor({ delivered: null, settlement: 'verified' })).toBe('hotels.example took 0.010000 USDC last time and Ellai has not seen it deliver yet.');
+    expect(reasonFor({ delivered: false, settlement: 'pending' })).toBe('hotels.example took 0.010000 USDC last time and returned nothing.');
+    expect(reasonFor({ delivered: true, settlement: 'mismatch' })).toBe(
+      'hotels.example was paid 0.010000 USDC last time and the payment did not match what was agreed.',
+    );
   });
 
   it('refuses an ask when the queue is full, and never blocks an approval or a refusal', () => {
@@ -213,7 +238,7 @@ describe('applyRules properties', () => {
   });
   const recall: fc.Arbitrary<RecallResult> = fc.oneof(
     fc.constant({ kind: 'failed' as const }),
-    fc.record({ kind: fc.constant('hits' as const), limitReached: fc.boolean(), hits: fc.array(hit, { maxLength: 25 }) }),
+    fc.record({ kind: fc.constant('hits' as const), cutOffAt: fc.option(fc.double({ min: -1, max: 3 }), { nil: null }), hits: fc.array(hit, { maxLength: 25 }) }),
   );
   const anyFacts: fc.Arbitrary<DecideFacts> = fc.record({
     settings: fc.record({
@@ -230,7 +255,14 @@ describe('applyRules properties', () => {
     sellerHost: fc.string(),
     refusalMemoryIds: fc.array(fc.uuid(), { maxLength: 4 }),
     badOutcomes: fc.array(
-      fc.record({ paymentId: fc.uuid(), amountAtomic: amount, signedAt: fc.date({ noInvalidDate: true }), outcomeMemoryIds: fc.array(fc.uuid(), { maxLength: 3 }) }),
+      fc.record({
+        paymentId: fc.uuid(),
+        amountAtomic: amount,
+        signedAt: fc.date({ noInvalidDate: true }),
+        delivered: fc.constantFrom(false, null, true),
+        settlement: fc.constantFrom('pending' as const, 'verified' as const, 'mismatch' as const),
+        outcomeMemoryIds: fc.array(fc.uuid(), { maxLength: 3 }),
+      }),
       { maxLength: 3 },
     ),
     grantId: fc.option(fc.uuid(), { nil: undefined }),
@@ -253,9 +285,19 @@ describe('applyRules properties', () => {
 
   it('never approves, without a grant, when no recalled approval is for this recipient', () => {
     fc.assert(
-      fc.property(anyFacts, fc.array(hit, { maxLength: 25 }), fc.boolean(), (f, list, limitReached) => {
+      fc.property(anyFacts, fc.array(hit, { maxLength: 25 }), fc.option(fc.double({ min: -1, max: 3 }), { nil: null }), (f, list, cutOffAt) => {
         const elsewhere = list.map((h) => ({ ...h, recipient: OTHER_RECIPIENT }));
-        return applyRules({ ...f, grantId: undefined, recall: hits(elsewhere, limitReached) }).outcome !== 'approved';
+        return applyRules({ ...f, grantId: undefined, recall: hits(elsewhere, cutOffAt) }).outcome !== 'approved';
+      }),
+      runs,
+    );
+  });
+
+  it('never learns from a full result whose farthest hit is inside the cutoff', () => {
+    fc.assert(
+      fc.property(anyFacts, fc.array(hit, { maxLength: 25 }), fc.double({ min: 1e-6, max: 4, noNaN: true }), (f, list, gap) => {
+        const cutOffAt = f.settings.distanceCutoff - gap;
+        return applyRules({ ...f, grantId: undefined, recall: hits(list, cutOffAt) }).rule !== 'learned';
       }),
       runs,
     );
@@ -378,6 +420,9 @@ describe('decide', () => {
     } satisfies typeof decisions.$inferInsert;
     return one(await db.insert(decisions).values(values).returning());
   }
+
+  // A question Ellai asked at `at` that the owner has since answered.
+  const questionAt = (w: World, at: Date) => pastDecision(w, { outcome: 'asked', rule: 'no_match', status: 'answered', createdAt: at });
 
   async function signedPayment(w: World, amountAtomic: bigint, signedAt: Date, overrides: Partial<typeof payments.$inferInsert> = {}) {
     const decision = await pastDecision(w, { amountAtomic });
@@ -564,7 +609,25 @@ describe('decide', () => {
     }
   });
 
-  it('asks when recall throws, returns a hit without a finite distance, reaches its limit, or times out', async () => {
+  it('keeps learning for an owner with 20 memories when the full result ends past the cutoff (A2-1)', async () => {
+    const w = await world();
+    const pair = [await approvalMemory(w), await approvalMemory(w)];
+    const others: Array<typeof memories.$inferSelect> = [];
+    for (let i = 0; i < LIMITS.decideRecallLimit - 2; i++) {
+      others.push(await approvalMemory(w, { recipient: OTHER_RECIPIENT, verdict: i % 2 === 0 ? 'approve' : 'refuse' }));
+    }
+    expect(await db.select().from(memories).where(eq(memories.ownerId, w.ownerId))).toHaveLength(LIMITS.decideRecallLimit);
+    const at = (rows: Array<{ blobId: string | null }>, distance: number) => rows.map((row) => ({ blobId: row.blobId ?? '', distance }));
+
+    const learned = await run(w, { recall: async () => [...at(pair, 0.1), ...at(others, 1.2)] });
+    expect(learned).toMatchObject({ outcome: 'approved', rule: 'learned' });
+    expect(learned.citedMemoryIds.sort()).toEqual(pair.map((m) => m.id).sort());
+
+    const inside = await run(w, { recall: async () => [...at(pair, 0.1), ...at(others, 0.45)], purpose: `${PURPOSE} inside` });
+    expect(inside).toMatchObject({ outcome: 'asked', rule: 'recall_unavailable' });
+  });
+
+  it('asks when recall throws, returns a hit without a finite distance, comes back full inside the cutoff, or times out', async () => {
     const w = await world();
     const pair = [await approvalMemory(w), await approvalMemory(w)];
     const full = [...pair, ...Array.from({ length: LIMITS.decideRecallLimit - 2 }, () => ({ blobId: hex(16) }))];
@@ -616,18 +679,68 @@ describe('decide', () => {
     );
     expect(await run(w, { recall: recallOf(pair), purpose: `${PURPOSE} 2` })).toMatchObject({ rule: 'bad_outcome', citedMemoryIds: [outcome.id] });
 
-    await approvalMemory(w, { writerPublicKey: hex(32), createdAt: new Date(NOW.getTime() - 60_000) });
+    const askedAfter = await questionAt(w, new Date(NOW.getTime() - 1_800_000));
+    await approvalMemory(w, { decisionId: askedAfter.id, writerPublicKey: hex(32), createdAt: new Date(NOW.getTime() - 60_000) });
     expect((await run(w, { recall: recallOf(pair), purpose: `${PURPOSE} 3` })).rule).toBe('bad_outcome');
-    await approvalMemory(w, { createdAt: new Date(NOW.getTime() - 60_000) });
+    await approvalMemory(w, { decisionId: askedAfter.id, createdAt: new Date(NOW.getTime() - 60_000) });
     expect((await run(w, { recall: recallOf(pair), purpose: `${PURPOSE} 4` })).rule).toBe('learned');
+  });
+
+  it('asks from the moment a payment is signed until the seller is known to have delivered (A2-4)', async () => {
+    const hourAgo = new Date(NOW.getTime() - 3_600_000);
+    const earlier = new Date(NOW.getTime() - 7_200_000);
+    const withPayment = async (record: Partial<typeof payments.$inferInsert>) => {
+      const w = await world();
+      const pair = [
+        await approvalMemory(w, { decisionId: (await questionAt(w, earlier)).id, createdAt: earlier }),
+        await approvalMemory(w, { decisionId: (await questionAt(w, earlier)).id, createdAt: earlier }),
+      ];
+      await signedPayment(w, 10_000n, hourAgo, record);
+      return run(w, { recall: recallOf(pair) });
+    };
+
+    expect(await withPayment({ settlement: 'pending', delivered: false })).toMatchObject({ outcome: 'asked', rule: 'bad_outcome' });
+    expect(await withPayment({ settlement: 'pending' })).toMatchObject({
+      outcome: 'asked',
+      rule: 'bad_outcome',
+      reason: 'hotels.example took 0.010000 USDC last time and Ellai has not seen it deliver yet.',
+    });
+    expect((await withPayment({ settlement: 'verified' })).rule).toBe('bad_outcome');
+    expect((await withPayment({ settlement: 'mismatch', delivered: true })).rule).toBe('bad_outcome');
+
+    const movedNothingOrDelivered: Array<Partial<typeof payments.$inferInsert>> = [
+      { settlement: 'pending', delivered: true },
+      { settlement: 'verified', delivered: true },
+      { settlement: 'not_landed' },
+      { settlement: 'pending', releasedAt: new Date(NOW.getTime() - 1_800_000) },
+    ];
+    for (const record of movedNothingOrDelivered) expect((await withPayment(record)).rule).toBe('learned');
+  });
+
+  it('keeps asking when the only yes since a bad payment answered a question asked before it (A2-5)', async () => {
+    const w = await world();
+    const ago = (ms: number) => new Date(NOW.getTime() - ms);
+    const old = await run(w, { now: ago(7_200_000), purpose: `${PURPOSE} old` });
+    expect(old.outcome).toBe('asked');
+    await signedPayment(w, 10_000n, ago(3_600_000), { settlement: 'verified', delivered: false });
+    await ownerAnswer(w, old.decisionId, 'approve', ago(600_000));
+    const pair = [await approvalMemory(w, { createdAt: ago(10_800_000) }), await approvalMemory(w, { createdAt: ago(10_800_000) })];
+
+    const stale = await run(w, { recall: recallOf(pair) });
+    expect(stale).toMatchObject({ outcome: 'asked', rule: 'bad_outcome' });
+
+    // A yes to the question that showed the bad outcome is what restarts the window.
+    await ownerAnswer(w, stale.decisionId, 'approve', NOW);
+    expect((await run(w, { recall: recallOf(pair), now: new Date(NOW.getTime() + 60_000) })).rule).toBe('grant');
   });
 
   it('counts every signed, unreleased payment of the last 24 hours against the daily budget', async () => {
     const w = await world({ dailyBudgetAtomic: 30_000n });
     const hoursAgo = (hours: number) => new Date(NOW.getTime() - hours * 3_600_000);
-    await signedPayment(w, 15_000n, hoursAgo(1));
-    await signedPayment(w, 40_000n, hoursAgo(2), { releasedAt: hoursAgo(1) });
-    await signedPayment(w, 40_000n, hoursAgo(25));
+    // Delivered, so the only rule these payments can trip is the budget.
+    await signedPayment(w, 15_000n, hoursAgo(1), { delivered: true });
+    await signedPayment(w, 40_000n, hoursAgo(2), { releasedAt: hoursAgo(1), delivered: true });
+    await signedPayment(w, 40_000n, hoursAgo(25), { delivered: true });
 
     expect((await run(w, { payment: payment(NOW, { amount: 15_000n }), purpose: `${PURPOSE} fits` })).rule).toBe('no_match');
     expect(await run(w, { payment: payment(NOW, { amount: 15_001n }), purpose: `${PURPOSE} over` })).toMatchObject({

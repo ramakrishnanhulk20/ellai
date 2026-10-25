@@ -24,13 +24,25 @@ export interface RecallHit {
   countsAsOwnerDecision: boolean;
 }
 
-export type RecallResult = { kind: 'failed' } | { kind: 'hits'; limitReached: boolean; hits: RecallHit[] };
+/**
+ * A search that answered. `cutOffAt` is null when it returned fewer hits than it asked for.
+ * When it came back full, it is the largest distance among every hit returned, whether or not
+ * Ellai knows the hit's blob: the relayer returns the nearest memories, so everything the
+ * limit cut off is at least that far.
+ */
+export type RecallResult = { kind: 'failed' } | { kind: 'hits'; cutOffAt: number | null; hits: RecallHit[] };
 
-/** A verified payment to this recipient that delivered nothing, signed after the owner last approved the recipient. */
+/**
+ * A payment to this recipient with no delivery on record, or one that did not match on chain,
+ * signed no earlier than the last question about this recipient that the owner said yes to.
+ */
 export interface BadOutcome {
   paymentId: string;
   amountAtomic: bigint;
   signedAt: Date;
+  /** Null while the seller's answer is unknown. */
+  delivered: boolean | null;
+  settlement: 'pending' | 'verified' | 'mismatch';
   /** The outcome memories written for it so far, possibly none: the payment alone is enough to ask. */
   outcomeMemoryIds: string[];
 }
@@ -74,6 +86,16 @@ function result(outcome: RuleResult['outcome'], rule: DecisionRule, reason: stri
   return { outcome, rule, reason, citedMemoryIds: cite(citedMemoryIds) };
 }
 
+// Worded from the latest payment's own record, so the owner is never told a seller returned
+// nothing while its answer is still unknown.
+function badOutcomeReason(sellerHost: string, latest: BadOutcome): string {
+  const seller = hostLabel(sellerHost, true);
+  const paid = formatUsdc(latest.amountAtomic);
+  if (latest.settlement === 'mismatch') return `${seller} was paid ${paid} USDC last time and the payment did not match what was agreed.`;
+  if (latest.delivered === false) return `${seller} took ${paid} USDC last time and returned nothing.`;
+  return `${seller} took ${paid} USDC last time and Ellai has not seen it deliver yet.`;
+}
+
 // The queue cap turns an ask into a refusal and leaves approvals and refusals alone (C22).
 // A count that is not below the cap, including one that is not a number, refuses.
 function capAsk(facts: Omit<DecideFacts, 'recall'>, decided: RuleResult): RuleResult {
@@ -83,7 +105,7 @@ function capAsk(facts: Omit<DecideFacts, 'recall'>, decided: RuleResult): RuleRe
 
 /**
  * Rules 1 to 6, the ones that need no recall: paused, the per-payment maximum, the daily
- * budget, a past refusal of this recipient, a bad outcome since the owner last approved it,
+ * budget, a past refusal of this recipient, a bad outcome the owner has not said yes past,
  * and a matching grant. Returns null when none of them decides, which is the only case in
  * which recall is worth calling.
  */
@@ -118,7 +140,7 @@ export function rulesBeforeRecall(facts: Omit<DecideFacts, 'recall'>): RuleResul
       result(
         'asked',
         'bad_outcome',
-        `${hostLabel(facts.sellerHost, true)} took ${formatUsdc(latest.amountAtomic)} USDC last time and returned nothing.`,
+        badOutcomeReason(facts.sellerHost, latest),
         facts.badOutcomes.flatMap((bad) => bad.outcomeMemoryIds),
       ),
     );
@@ -132,7 +154,10 @@ export function rulesBeforeRecall(facts: Omit<DecideFacts, 'recall'>): RuleResul
 function rulesAfterRecall(facts: DecideFacts): RuleResult {
   const { settings, recall } = facts;
   const host = hostLabel(facts.sellerHost);
-  if (recall.kind === 'failed' || recall.limitReached) {
+  // A full result can hide a closer approval only while its farthest hit is still inside the
+  // owner's cutoff; past it, the hidden hits are farther still and never count (C12). Written
+  // as "not at or past" so a cutoff that is not a number asks.
+  if (recall.kind === 'failed' || (recall.cutOffAt !== null && !(recall.cutOffAt >= settings.distanceCutoff))) {
     return result('asked', 'recall_unavailable', 'Ellai could not check your past answers just now, so it is asking you.');
   }
   // Keyed by memory id, so a hit the relayer repeats counts once.
@@ -169,8 +194,9 @@ function rulesAfterRecall(facts: DecideFacts): RuleResult {
 /**
  * Decides one payment with fixed rules, first match wins:
  * 1 paused, 2 over the per-payment maximum, 3 over the daily budget, 4 a past refusal of
- * this recipient (refuse); 5 a bad outcome since the last approval (ask); 6 a matching grant
- * (approve); 7 recall failed or hit its limit (ask); 8 enough close owner approvals for this
+ * this recipient (refuse); 5 a bad outcome the owner has not yet said yes past (ask); 6 a matching grant
+ * (approve); 7 recall failed, or came back full with its farthest hit inside the cutoff
+ * (ask); 8 enough close owner approvals for this
  * recipient at or above this amount (approve); 9 otherwise ask. An ask from rules 5 to 9 is
  * refused instead when the agent's question queue is full. Pure: no database, no network.
  */
