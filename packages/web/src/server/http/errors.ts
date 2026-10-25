@@ -1,10 +1,16 @@
+import { ChainError, type ChainErrorCode } from '@ellai/core/chain';
+import { ChallengeError, type ChallengeErrorCode } from '@ellai/core/challenge';
+import { MemoryError, type MemoryErrorCode } from '@ellai/core/memory';
+import { NetError, type NetErrorCode } from '@ellai/core/net';
 import { PaymentError, type PaymentErrorCode } from '@ellai/core/payment';
 import { DrizzleQueryError } from 'drizzle-orm/errors';
 import { AgentError, type AgentErrorCode } from '../auth/agents.js';
 import { SignInError, type SignInErrorCode } from '../auth/signin.js';
 import { AnswerError, type AnswerErrorCode } from '../decide/answer.js';
 import { DecideError, type DecideErrorCode } from '../decide/decide.js';
+import { MemoryServiceError, type MemoryServiceErrorCode } from '../memory/delegate.js';
 import { OnboardingError, type OnboardingErrorCode } from '../onboarding/state.js';
+import { ProofUnavailableError } from '../public/proof.js';
 import { SellerError } from '../seller/challenge.js';
 
 /**
@@ -24,7 +30,9 @@ export type HttpErrorCode =
   | 'bad_content_type'
   | 'body_too_large'
   | 'bad_json'
-  | 'bad_body';
+  | 'bad_body'
+  | 'agent_unauthorized'
+  | 'jobs_unauthorized';
 
 const HTTP_ERROR_MESSAGES: Readonly<Record<HttpErrorCode, string>> = {
   cross_origin: 'This request did not come from the Ellai app.',
@@ -35,6 +43,8 @@ const HTTP_ERROR_MESSAGES: Readonly<Record<HttpErrorCode, string>> = {
   body_too_large: 'The request body is too large.',
   bad_json: 'The request body could not be read as JSON.',
   bad_body: 'The request body does not have the fields this endpoint takes.',
+  agent_unauthorized: 'Send a valid Ellai agent token as Authorization: Bearer <token>.',
+  jobs_unauthorized: 'This endpoint needs the jobs secret.',
 };
 
 /**
@@ -108,6 +118,76 @@ const PAYMENT_STATUS: Readonly<Record<PaymentErrorCode, number>> = {
 // business of the caller's, so it gets fixed wording of its own.
 const SELLER_UNAVAILABLE = { status: 503, code: 'seller_unavailable', message: 'Ellai cannot serve this request right now.' } as const;
 
+const PROOF_UNAVAILABLE = { status: 503, code: 'proof_unavailable', message: 'The public proof cannot be read right now. Try again in a minute.' } as const;
+
+// These classes write their messages from fixed text plus values they checked, such as a
+// digest, a status code or a count. That is fine in a log line but not owed to the caller, so
+// each class answers with one fixed sentence and its code names the failure. Each table is a
+// complete record, like the ones above, so a new code fails the typecheck instead of a 500.
+const CHAIN_STATUS: Readonly<Record<ChainErrorCode, number>> = {
+  INVALID_INPUT: 502,
+  NOT_FOUND: 502,
+  TIMEOUT: 504,
+  RATE_LIMITED: 503,
+  UNAUTHORIZED: 503,
+  UPSTREAM: 502,
+  BAD_RESPONSE: 502,
+  LIMIT_EXCEEDED: 502,
+};
+
+// Every one of these is a seller answer Ellai would not act on, so each is a bad gateway.
+const CHALLENGE_STATUS: Readonly<Record<ChallengeErrorCode, number>> = {
+  NOT_402: 502,
+  NO_DIALECT: 502,
+  TWO_DIALECTS: 502,
+  MALFORMED: 502,
+  NO_PAYABLE_OPTION: 502,
+  MANY_PAYABLE_OPTIONS: 502,
+  COPIES_DISAGREE: 502,
+  BAD_AMOUNT: 502,
+  BAD_ASSET: 502,
+  BAD_NETWORK: 502,
+  EXPIRED: 502,
+  TOO_LARGE: 502,
+  UNSUPPORTED: 502,
+};
+
+// A URL that is malformed or names a private address is the caller's to fix; the rest is the far side.
+const NET_STATUS: Readonly<Record<NetErrorCode, number>> = {
+  BAD_URL: 400,
+  NOT_PUBLIC: 400,
+  REDIRECT: 502,
+  TIMEOUT: 504,
+  TOO_LARGE: 502,
+  NETWORK: 502,
+};
+
+const MEMORY_STATUS: Readonly<Record<MemoryErrorCode, number>> = {
+  ACCOUNT: 502,
+  DELEGATE: 502,
+  WRITE: 502,
+  RECALL: 502,
+  TIMEOUT: 504,
+  RATE_LIMITED: 503,
+  UPSTREAM: 502,
+};
+
+const MEMORY_SERVICE_STATUS: Readonly<Record<MemoryServiceErrorCode, number>> = {
+  BAD_INPUT: 400,
+  OWNER: 404,
+  NO_ACCOUNT: 409,
+  DECISION: 404,
+  SEND_UNCERTAIN: 503,
+};
+
+const FIXED_MESSAGES = {
+  chain: 'Ellai could not read Sui just now. Try again shortly.',
+  challenge: "Ellai could not read this seller's price safely.",
+  net: 'Ellai could not reach this address safely.',
+  memory: 'Walrus Memory could not be reached just now. Try again shortly.',
+  memory_service: 'Ellai could not finish this memory step.',
+} as const;
+
 const FALLBACK_MESSAGE = 'The request was refused.';
 // The known classes promise fixed text plus values Ellai checked itself. This holds them to
 // it on the way out, since the next reader may be a page or an agent (C17).
@@ -126,6 +206,15 @@ function coded(status: number, code: string, message: string): Mapped {
   return { status, code: code.toLowerCase(), message: SAFE_MESSAGE.test(message) ? message : FALLBACK_MESSAGE, logCode: code };
 }
 
+// A code outside its class's closed set means the object did not come from that class's own
+// code paths, so it gets no status from the table and is answered as unknown.
+function fixed(table: Readonly<Record<string, number>>, kind: keyof typeof FIXED_MESSAGES, code: unknown): Mapped | null {
+  if (typeof code !== 'string' || !Object.hasOwn(table, code)) return null;
+  const status = table[code];
+  if (status === undefined) return null;
+  return { status, code: `${kind}_${code.toLowerCase()}`, message: FIXED_MESSAGES[kind], logCode: code };
+}
+
 function mapKnown(error: unknown): Mapped | null {
   if (error instanceof HttpError) return coded(error.status, error.code, error.message);
   if (error instanceof SignInError) return coded(SIGN_IN_STATUS[error.code], error.code, error.message);
@@ -135,6 +224,12 @@ function mapKnown(error: unknown): Mapped | null {
   if (error instanceof OnboardingError) return coded(ONBOARDING_STATUS[error.code], error.code, error.message);
   if (error instanceof PaymentError) return coded(PAYMENT_STATUS[error.code], error.code, error.message);
   if (error instanceof SellerError) return { ...SELLER_UNAVAILABLE, logCode: 'SELLER' };
+  if (error instanceof ProofUnavailableError) return { ...PROOF_UNAVAILABLE, logCode: 'PROOF' };
+  if (error instanceof ChainError) return fixed(CHAIN_STATUS, 'chain', error.code);
+  if (error instanceof ChallengeError) return fixed(CHALLENGE_STATUS, 'challenge', error.code);
+  if (error instanceof NetError) return fixed(NET_STATUS, 'net', error.code);
+  if (error instanceof MemoryError) return fixed(MEMORY_STATUS, 'memory', error.code);
+  if (error instanceof MemoryServiceError) return fixed(MEMORY_SERVICE_STATUS, 'memory_service', error.code);
   return null;
 }
 
@@ -164,8 +259,11 @@ function codeOf(error: unknown): string | null {
 /**
  * The JSON response for anything a route handler threw. A class from this codebase becomes
  * its status with { error: code in lower case, message }, the message being that class's
- * fixed text. Anything else, including a database error whose text carries SQL and
- * parameters, becomes 500 { error: 'internal' } with nothing taken from the error (C19).
+ * fixed text; for ChainError, ChallengeError, NetError, MemoryError and MemoryServiceError the
+ * code is prefixed with the kind (chain_timeout) and the message is one fixed sentence per
+ * class, whatever the error itself says. Anything else, including a database error whose
+ * text carries SQL and parameters, becomes 500 { error: 'internal' } with nothing taken from
+ * the error (C19).
  * The log line holds only the class name and its code. Never throws.
  */
 export function toErrorResponse(error: unknown): Response {

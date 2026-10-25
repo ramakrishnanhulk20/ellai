@@ -1,0 +1,25 @@
+name: Jobs tick
+
+on:
+  schedule:
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  tick:
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    steps:
+      # The secret and the origin reach curl as environment variables rather than being pasted
+      # into the script text. Only the status code is printed: run logs of a public repository
+      # are public, and the summary names owner ids.
+      - name: Run one jobs tick
+        env:
+          ELLAI_JOBS_SECRET: ${{ secrets.ELLAI_JOBS_SECRET }}
+          ELLAI_ORIGIN: ${{ vars.ELLAI_ORIGIN }}
+        run: |
+          curl -fsS --max-time 300 -o /dev/null -w '%{http_code}\n' -X POST \
+            -H "Authorization: Bearer ${ELLAI_JOBS_SECRET}" \
+            "${ELLAI_ORIGIN}/api/jobs/tick"

@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { sql } from 'drizzle-orm';
+import { lt, sql } from 'drizzle-orm';
 import type { Database } from '../db/client.js';
 import { rateCounters } from '../db/schema.js';
 import { clientKey } from './client.js';
@@ -36,6 +36,18 @@ export async function consume(db: Database, key: string, perMinute: number, now:
     .returning({ count: rateCounters.count });
   if (counter === undefined) throw new Error('the rate counter returned no row');
   return counter.count <= perMinute;
+}
+
+/**
+ * Deletes every rate counter, the seller's included, whose window started before `before`, and
+ * returns how many it deleted. Every limit counts one fixed minute, so a window that old can no
+ * longer turn anyone away; this only keeps the table from growing. Throws Error for a `before`
+ * that is not a date.
+ */
+export async function pruneRateCounters(db: Database, before: Date): Promise<number> {
+  if (!(before instanceof Date) || Number.isNaN(before.getTime())) throw new Error('The cut-off time is not a date');
+  const deleted = await db.delete(rateCounters).where(lt(rateCounters.windowStart, before)).returning({ key: rateCounters.key });
+  return deleted.length;
 }
 
 /**
