@@ -3,12 +3,14 @@
 // copy is broken) and on adversarial challenges. Each adversarial fixture is a live 402
 // with one thing changed, named in its "note": ambiguity, disagreeing copies, bad
 // amounts, assets, networks and ids, expiry, size and depth caps, mixed dialects,
-// __proto__ keys, a key named twice in the body or the header copy, and a t2000 escrow
-// job entry.
+// __proto__ keys, a key named twice in the body or the header copy, a t2000 escrow
+// job entry, and a recipient Sui reserves for itself (every address below 0x10 and the
+// named system ids above it).
 // Does NOT cover: whether the seller is honest, whether the recipient belongs to the
 // host (trust is keyed on the recipient elsewhere), the epoch window against the live
 // chain, or the network fetch itself (net.test.ts covers that).
 import { readdirSync, readFileSync } from 'node:fs';
+import { MOCKED_GAS_OBJECT_ID, normalizeSuiAddress } from '@mysten/sui/utils';
 import { describe, expect, it } from 'vitest';
 import { type CanonicalPayment, ChallengeError, parseChallenge } from '../src/challenge.js';
 import { LIMITS } from '../src/limits.js';
@@ -144,9 +146,25 @@ describe('parseChallenge on adversarial challenges', () => {
       'escrow-terms',
       'duplicate-key-body',
       'duplicate-key-header',
+      'recipient-system',
     ]) {
       expect(names).toContain(required);
     }
+  });
+
+  it('refuses every address Sui reserves for itself, the whole range below 0x10 and the named ids above it, and pays 0x10', () => {
+    const fixture = load('adversarial', 'recipient-system');
+    const header = fixture.headers['www-authenticate'] ?? '';
+    const payingTo = (address: string): Fixture => ({
+      ...fixture,
+      body: fixture.body.replace('"payTo":"0x2"', `"payTo":"${address}"`),
+      headers: { ...fixture.headers, 'www-authenticate': header.replace(`0x${'0'.repeat(63)}2`, normalizeSuiAddress(address)) },
+    });
+    const reserved = [...Array.from({ length: 16 }, (_, n) => `0x${n.toString(16)}`), '0x403', '0xACC', '0xdee9', MOCKED_GAS_OBJECT_ID];
+    for (const address of reserved) {
+      expect(refusalOf(payingTo(address)), address).toMatchObject({ code: 'MALFORMED', message: 'payTo is an address Sui reserves for itself' });
+    }
+    expect(parseChallenge(responseOf(payingTo('0x10')), NOW).recipient).toBe(normalizeSuiAddress('0x10'));
   });
 
   it.each(names)('%s', (name) => {

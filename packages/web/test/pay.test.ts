@@ -16,14 +16,22 @@
 // leaves 'paid', a settlement mismatch pausing the owner, a settlement checked against the purse
 // that signed it, reads that keep failing after the window closed marking the payment
 // unverifiable and pausing the owner however many days apart they come, outcome_at stamped by
-// every writer on its own clock and a yes to a question asked before an outcome was recorded
-// clearing nothing, the release of a payment that never landed, the call's
+// every writer on its own clock, each read inside the transaction that holds the owner lock, and a
+// yes to a question asked before an outcome was recorded clearing nothing, the release of a payment
+// that never landed only on a second tick pass LIMITS.paymentReleaseGapMs after the first saw it
+// missing (never from the paid call's own pass), a lagging miss followed by a found transaction
+// keeping the payment counted (a window [E, E] signed during E among them), a settlement read
+// the Tatum budget refused never counted, a transaction that ran and
+// failed released without a pause, auto_paused_at stamped with each pause and a purse key
+// mismatch never replaced, the purse checked under the lock against other pending payments, a
+// refusal recorded between decide and signing refusing the payment, the call's
 // deadline (the paid request's wait cut to it, nothing signed when too little time is left,
 // settlement reads stopped at it), six-decimal amounts in reasons, and reasons that never carry
 // agent or seller text.
 // Does NOT cover: a real seller, the real Sui chain or Tatum (npm run prove:flow does those
 // live), safeFetch's own network checks (core's net tests), two connections racing on the owner
-// lock (PGlite serves one connection, so racing calls here run one transaction at a time),
+// lock (PGlite serves one connection, so racing calls here run one transaction at a time, and
+// "read under the lock" is shown as "read inside a transaction that locked the owner first"),
 // two identical requests whose in-flight check and decide interleave on separate connections,
 // a revocation racing the signing lock on another connection, or the jobs tick that settles
 // payments the inline reads left pending.
@@ -46,9 +54,10 @@ import { type Recall, decide } from '../src/server/decide/decide.js';
 import { ownerDelegate } from '../src/server/memory/delegate.js';
 import { MEMORY_NAMESPACE } from '../src/server/memory/namespace.js';
 import { recordOutcome } from '../src/server/memory/outcome.js';
+import { ledgerBalanceAtomic } from '../src/server/jobs/refill.js';
 import { type PaidFetchArgs, paidFetch } from '../src/server/pay/flow.js';
 import { heldOrSpentAtomic } from '../src/server/pay/liability.js';
-import { SETTLEMENT_MISMATCH, SETTLEMENT_UNVERIFIABLE, UNVERIFIABLE, settlePayment } from '../src/server/pay/settle.js';
+import { FAILED_ON_CHAIN, SETTLEMENT_MISMATCH, SETTLEMENT_UNVERIFIABLE, UNVERIFIABLE, settlePayment } from '../src/server/pay/settle.js';
 import { PURSE_KEY_MISMATCH, signForDecision } from '../src/server/pay/sign.js';
 
 // Both run as written unless a test makes one fail once, to show a failure after payment.
@@ -150,8 +159,9 @@ function response(url: string, status: number, bodyText: string, headers: Record
 }
 
 /** A t2000 x402 v1 challenge in the shape live sellers send, with a fresh id and nonce each time. */
-function challenge(url: string, overrides: { payTo?: string; note?: string; minEpoch?: bigint } = {}): SafeResponse {
+function challenge(url: string, overrides: { payTo?: string; note?: string; minEpoch?: bigint; maxEpoch?: bigint } = {}): SafeResponse {
   const minEpoch = overrides.minEpoch ?? 100n;
+  const maxEpoch = overrides.maxEpoch ?? minEpoch + 1n;
   const body = {
     x402Version: 1,
     error: overrides.note ?? 'Payment required',
@@ -165,7 +175,7 @@ function challenge(url: string, overrides: { payTo?: string; note?: string; minE
         resource: url,
         maxTimeoutSeconds: 60,
         extra: {
-          suimpp: { challengeId: randomUUID(), nonce: randomBytes(4).readUInt32BE(), chain: SUI_MAINNET_CHAIN_ID, minEpoch: String(minEpoch), maxEpoch: String(minEpoch + 1n) },
+          suimpp: { challengeId: randomUUID(), nonce: randomBytes(4).readUInt32BE(), chain: SUI_MAINNET_CHAIN_ID, minEpoch: String(minEpoch), maxEpoch: String(maxEpoch) },
         },
       },
     ],
@@ -252,24 +262,68 @@ function run(w: World, options: RunOptions = {}) {
   });
 }
 
-/** The database, except that the first write to payments outside the signing transaction, the seller's status, throws. */
+/**
+ * The database, except that the first update of payments, the seller's status (signing only
+ * inserts one), throws, whether it is made on the database or inside a transaction.
+ */
 function statusWriteFails(failure: () => Error): Database {
   let failed = false;
-  return new Proxy(db, {
+  const failingFirstUpdate = <T extends object>(handle: T): T =>
+    new Proxy(handle, {
+      get(target, property) {
+        if (property === 'update') {
+          return (table: typeof payments) => {
+            if (table === payments && !failed) {
+              failed = true;
+              throw failure();
+            }
+            return (target as unknown as Database).update(table);
+          };
+        }
+        if (property === 'transaction') {
+          return (run: (tx: unknown) => Promise<unknown>, config?: unknown) =>
+            (target as unknown as Database).transaction((tx) => run(failingFirstUpdate(tx)), config as never);
+        }
+        const value = Reflect.get(target, property);
+        return typeof value === 'function' ? value.bind(target) : value;
+      },
+    });
+  return failingFirstUpdate(db);
+}
+
+/**
+ * The database, and a clock that says, for each time it handed out, whether a transaction was
+ * open on that database when it was read. Every transaction that stamps a payment or a decision
+ * locks the owner row first, so a time read inside one was read under that lock (C26).
+ */
+function clockWatch(start: Date) {
+  let open = 0;
+  let at = start.getTime();
+  const insideTransaction = new Map<number, boolean>();
+  const watched = new Proxy(db, {
     get(target, property) {
-      if (property === 'update') {
-        return (table: typeof payments) => {
-          if (table === payments && !failed) {
-            failed = true;
-            throw failure();
-          }
-          return target.update(table);
-        };
+      if (property === 'transaction') {
+        return (run: (tx: unknown) => Promise<unknown>, config?: unknown) =>
+          target.transaction(async (tx) => {
+            open += 1;
+            try {
+              return await run(tx);
+            } finally {
+              open -= 1;
+            }
+          }, config as never);
       }
       const value = Reflect.get(target, property);
       return typeof value === 'function' ? value.bind(target) : value;
     },
   });
+  const now = () => {
+    at += 1;
+    insideTransaction.set(at, open > 0);
+    return new Date(at);
+  };
+  const readInside = (stamp: Date | null) => (stamp === null ? undefined : insideTransaction.get(stamp.getTime()));
+  return { db: watched, now, readInside };
 }
 
 const paymentRows = (ownerId: string) => db.select().from(payments).where(eq(payments.ownerId, ownerId));
@@ -427,7 +481,11 @@ describe('paidFetch', () => {
     expect(await sign(second)).toEqual({ refusal: 'over_daily_budget' });
     expect(await paymentRows(w.ownerId)).toHaveLength(1);
 
+    // Verified only now, so it holds a full day from verification, whenever it was signed (A-F2).
     await db.update(payments).set({ settlement: 'verified', verifiedAt: NOW }).where(eq(payments.id, old.id));
+    expect(await heldOrSpentAtomic(db, w.ownerId, NOW)).toBe(PRICE);
+    expect(await sign(second)).toEqual({ refusal: 'over_daily_budget' });
+    await db.update(payments).set({ verifiedAt: new Date(NOW.getTime() - LIMITS.dailyBudgetWindowMs - 1) }).where(eq(payments.id, old.id));
     expect(await heldOrSpentAtomic(db, w.ownerId, NOW)).toBe(0n);
     expect(await sign(second)).toHaveProperty('signed');
   });
@@ -617,7 +675,7 @@ describe('paidFetch', () => {
     const { recallFor } = await approvals(w);
     const result = await run(w, { recallFor });
     expect(result).toMatchObject({ outcome: 'failed', reason: 'This decision can no longer be paid.' });
-    expect((await ownerRow(w.ownerId)).autoPausedReason).toBe(PURSE_KEY_MISMATCH);
+    expect(await ownerRow(w.ownerId)).toMatchObject({ autoPausedReason: PURSE_KEY_MISMATCH, autoPausedAt: NOW });
     expect(await run(w, { recallFor, purpose: 'try again' })).toMatchObject({ outcome: 'refused', rule: 'paused' });
     expect(await paymentRows(w.ownerId)).toHaveLength(0);
   });
@@ -699,17 +757,20 @@ describe('paidFetch', () => {
     for (const at of [new Date(NOW.getTime() + windowMs - 1), new Date(NOW.getTime() + windowMs), dayLater]) {
       expect(await run(w, { fetch, chain, recallFor, now: () => at })).toEqual(inProgress);
     }
-    const settle = () => settlePayment({ db, ownerId: w.ownerId, paymentId: row.id, chain, tries: 1, intervalMs: 5, sleep: noSleep });
+    const settle = (at: Date) => settlePayment({ db, ownerId: w.ownerId, paymentId: row.id, chain, tries: 1, intervalMs: 5, sleep: noSleep, now: () => at });
     state.epoch = 101n;
-    expect(await settle()).toBe('pending');
+    expect(await settle(dayLater)).toBe('pending');
     expect(await run(w, { fetch, chain, recallFor, now: () => dayLater })).toEqual(inProgress);
     // Only signing reads the purse balance, so one read is one signature.
     expect(calls.balances).toEqual([w.purse]);
     expect(paidCalls(fetch)).toHaveLength(1);
     expect(await decisionRows(w.ownerId)).toHaveLength(1);
 
+    // The first pass that sees the window closed only marks it missing; the release takes a second.
     state.epoch = 102n;
-    expect(await settle()).toBe('not_landed');
+    expect(await settle(dayLater)).toBe('pending');
+    expect(await run(w, { fetch, chain, recallFor, now: () => dayLater })).toEqual(inProgress);
+    expect(await settle(new Date(dayLater.getTime() + LIMITS.paymentReleaseGapMs))).toBe('not_landed');
     state.landed = () => settled(w.purse, RECIPIENT, PRICE);
     const after = seller(ok, (url) => challenge(url, { minEpoch: 102n }));
     expect(await run(w, { fetch: after, chain, recallFor, now: () => dayLater })).toMatchObject({ outcome: 'paid', payment: { settlement: 'verified' } });
@@ -737,7 +798,9 @@ describe('paidFetch', () => {
     expect(first.payment?.settlement).toBe('pending');
     const row = one(await paymentRows(w.ownerId));
     state.epoch = 102n;
-    expect(await settlePayment({ db, ownerId: w.ownerId, paymentId: row.id, chain, tries: 1, intervalMs: 5, sleep: noSleep })).toBe('not_landed');
+    const settleAt = (at: Date) => settlePayment({ db, ownerId: w.ownerId, paymentId: row.id, chain, tries: 1, intervalMs: 5, sleep: noSleep, now: () => at });
+    expect(await settleAt(NOW)).toBe('pending');
+    expect(await settleAt(new Date(NOW.getTime() + LIMITS.paymentReleaseGapMs))).toBe('not_landed');
 
     state.landed = () => settled(w.purse, RECIPIENT, PRICE);
     const fetch = seller(ok, (url) => challenge(url, { minEpoch: 102n }));
@@ -884,8 +947,11 @@ describe('paidFetch', () => {
     expect(one(await paymentRows(mismatched.w.ownerId))).toMatchObject({ outcomeAt: at(120_000) });
 
     const lost = await signedOnly((w) => stubChain(w, { epoch: 102n, landed: () => null }).chain);
-    expect(await lost.settle(at(180_000))).toBe('not_landed');
-    expect(one(await paymentRows(lost.w.ownerId))).toMatchObject({ outcomeAt: at(180_000), releasedAt: at(180_000) });
+    expect(await lost.settle(at(180_000))).toBe('pending');
+    expect(one(await paymentRows(lost.w.ownerId))).toMatchObject({ missingSince: at(180_000), outcomeAt: at(1_000), releasedAt: null });
+    const releasedAt = at(180_000 + LIMITS.paymentReleaseGapMs);
+    expect(await lost.settle(releasedAt)).toBe('not_landed');
+    expect(one(await paymentRows(lost.w.ownerId))).toMatchObject({ outcomeAt: releasedAt, releasedAt });
 
     // The paid answer comes a second after signing, and the settlement stays pending, so only the status write stamps it.
     const w = await world();
@@ -969,7 +1035,7 @@ describe('paidFetch', () => {
     expect(await paymentRows(w.ownerId)).toHaveLength(1);
   });
 
-  it('releases a payment that never landed only after its window closes, and then stops counting it', async () => {
+  it('releases a payment that never landed only on a second pass at least LIMITS.paymentReleaseGapMs after the first saw its window closed, and then stops counting it (C4, C27)', async () => {
     const w = await world({ dailyBudgetAtomic: PRICE });
     const { recallFor } = await approvals(w);
     const { chain, state, calls } = stubChain(w, { landed: () => null });
@@ -979,35 +1045,239 @@ describe('paidFetch', () => {
     expect(calls.reads).toHaveLength(LIMITS.settlementInlineTries);
     expect(sleep.mock.calls).toEqual(Array.from({ length: LIMITS.settlementInlineTries - 1 }, () => [LIMITS.settlementInlineIntervalMs]));
     const row = one(await paymentRows(w.ownerId));
+    const stored = async () => one(await db.select().from(payments).where(eq(payments.id, row.id)));
 
     expect(await run(w, { chain, recallFor, purpose: 'while it can still land' })).toMatchObject({ outcome: 'refused', rule: 'over_daily_budget' });
-    const settle = () => settlePayment({ db, ownerId: w.ownerId, paymentId: row.id, chain, tries: 1, intervalMs: 5, sleep: noSleep });
-    expect(await settle()).toBe('pending');
+    const settle = (at: Date) => settlePayment({ db, ownerId: w.ownerId, paymentId: row.id, chain, tries: 1, intervalMs: 5, sleep: noSleep, now: () => at });
+    expect(await settle(NOW)).toBe('pending');
+    expect((await stored()).missingSince).toBeNull();
 
     state.epoch = 102n;
-    const readsBefore = calls.reads.length;
-    expect(await settle()).toBe('not_landed');
-    expect(calls.reads.length - readsBefore).toBe(1 + LIMITS.paymentReleaseReads);
-    expect(one(await db.select().from(payments).where(eq(payments.id, row.id))).releasedAt).not.toBeNull();
-    expect(await settle()).toBe('not_landed');
+    const firstSeen = new Date(NOW.getTime() + 60_000);
+    let readsBefore = calls.reads.length;
+    expect(await settle(firstSeen)).toBe('pending');
+    expect(calls.reads.length - readsBefore).toBe(1);
+    expect(await stored()).toMatchObject({ settlement: 'pending', missingSince: firstSeen, releasedAt: null });
+    expect(await heldOrSpentAtomic(db, w.ownerId, firstSeen)).toBe(PRICE);
+    const releaseAt = new Date(firstSeen.getTime() + LIMITS.paymentReleaseGapMs);
+    expect(await settle(new Date(releaseAt.getTime() - 1))).toBe('pending');
+    expect(await stored()).toMatchObject({ missingSince: firstSeen, releasedAt: null });
+
+    readsBefore = calls.reads.length;
+    expect(await settle(releaseAt)).toBe('not_landed');
+    expect(calls.reads.length - readsBefore).toBe(1);
+    expect(await stored()).toMatchObject({ settlement: 'not_landed', releasedAt: releaseAt, outcomeAt: releaseAt });
+    expect(await heldOrSpentAtomic(db, w.ownerId, releaseAt)).toBe(0n);
+    expect(await settle(releaseAt)).toBe('not_landed');
 
     state.landed = () => settled(w.purse, RECIPIENT, PRICE);
     const later = seller(ok, (url) => challenge(url, { minEpoch: 102n }));
     expect(await run(w, { fetch: later, chain, recallFor, purpose: 'after the release' })).toMatchObject({ outcome: 'paid', payment: { settlement: 'verified' } });
   });
 
-  it('does not release a payment that shows up on the last read after its window', async () => {
+  it('keeps a payment counted when a lagging read misses it after its window, and verifies it when a later pass finds it (A-F1)', async () => {
+    const w = await world({ dailyBudgetAtomic: PRICE });
+    const { recallFor } = await approvals(w);
+    const { chain, state } = stubChain(w, { landed: () => null });
+    expect((await run(w, { chain, recallFor })).payment?.settlement).toBe('pending');
+    const row = one(await paymentRows(w.ownerId));
+    const settle = (at: Date) => settlePayment({ db, ownerId: w.ownerId, paymentId: row.id, chain, tries: 1, intervalMs: 5, sleep: noSleep, now: () => at });
+
+    // A node behind the epoch boundary misses bytes that landed at the very end of the window.
+    state.epoch = 102n;
+    const lagging = new Date(NOW.getTime() + 60_000);
+    expect(await settle(lagging)).toBe('pending');
+    expect(one(await paymentRows(w.ownerId))).toMatchObject({ missingSince: lagging, releasedAt: null });
+    expect(await heldOrSpentAtomic(db, w.ownerId, lagging)).toBe(PRICE);
+    expect(await run(w, { chain, recallFor, purpose: 'while the first is missing', now: () => lagging })).toMatchObject({ outcome: 'refused', rule: 'over_daily_budget' });
+
+    state.landed = () => settled(w.purse, RECIPIENT, PRICE);
+    const found = new Date(lagging.getTime() + LIMITS.paymentReleaseGapMs);
+    expect(await settle(found)).toBe('verified');
+    expect(one(await paymentRows(w.ownerId))).toMatchObject({ settlement: 'verified', verifiedAt: found, releasedAt: null });
+    expect(await heldOrSpentAtomic(db, w.ownerId, found)).toBe(PRICE);
+  });
+
+  it("never releases, marks missing or reads the epoch from the paid call's own pass, even with the window already closed", async () => {
     const w = await world();
     const { recallFor } = await approvals(w);
-    let misses: number = LIMITS.settlementInlineTries;
-    const { chain } = stubChain(w, { epoch: 100n, landed: () => (misses-- > 0 ? null : settled(w.purse, RECIPIENT, PRICE)) });
-    const result = await run(w, { chain, recallFor });
+    const { chain, state, calls } = stubChain(w, { landed: () => null });
+    // The epoch turns twice while the seller answers, so the window is closed before the first settlement read.
+    const fetch = seller((url, init) => {
+      state.epoch = 102n;
+      return ok(url, init);
+    });
+    const result = await run(w, { fetch, chain, recallFor });
     expect(result.payment?.settlement).toBe('pending');
+    expect(calls.epochs).toBe(1);
+    expect(one(await paymentRows(w.ownerId))).toMatchObject({ settlement: 'pending', missingSince: null, releasedAt: null, settlementFailedReads: 0 });
+  });
+
+  it('signs a window [E, E] during E, and never releases it on one lagging read once E has ended (A-F1)', async () => {
+    const w = await world({ dailyBudgetAtomic: PRICE });
+    const { recallFor } = await approvals(w);
+    const { chain, state } = stubChain(w, { landed: () => null });
+    const fetch = seller(ok, (url) => challenge(url, { minEpoch: 100n, maxEpoch: 100n }));
+    expect((await run(w, { fetch, chain, recallFor })).payment?.settlement).toBe('pending');
     const row = one(await paymentRows(w.ownerId));
-    const late = { ...chain, getCurrentEpoch: async () => 102n } as Chain;
-    // One read inside the tries, then every release read but the last one misses.
-    misses = LIMITS.paymentReleaseReads;
-    expect(await settlePayment({ db, ownerId: w.ownerId, paymentId: row.id, chain: late, tries: 1, intervalMs: 5, sleep: noSleep })).toBe('verified');
+    expect(row.validUntilEpoch).toBe(100n);
+    const settle = (at: Date) => settlePayment({ db, ownerId: w.ownerId, paymentId: row.id, chain, tries: 1, intervalMs: 5, sleep: noSleep, now: () => at });
+
+    // The seller held the bytes and broadcast them at the end of E; the node read first is behind.
+    state.epoch = 101n;
+    const lagging = new Date(NOW.getTime() + 60_000);
+    expect(await settle(lagging)).toBe('pending');
+    expect(one(await paymentRows(w.ownerId))).toMatchObject({ settlement: 'pending', missingSince: lagging, releasedAt: null });
+    expect(await heldOrSpentAtomic(db, w.ownerId, lagging)).toBe(PRICE);
+    expect(await settle(new Date(lagging.getTime() + LIMITS.paymentReleaseGapMs - 1))).toBe('pending');
+
+    state.landed = () => settled(w.purse, RECIPIENT, PRICE);
+    const found = new Date(lagging.getTime() + LIMITS.paymentReleaseGapMs);
+    expect(await settle(found)).toBe('verified');
+    expect(one(await paymentRows(w.ownerId))).toMatchObject({ settlement: 'verified', verifiedAt: found, releasedAt: null });
+    expect(await heldOrSpentAtomic(db, w.ownerId, found)).toBe(PRICE);
+  });
+
+  it('treats a settlement read the request budget refused as never made: pending, never counted and never a miss (D-1)', async () => {
+    const w = await world();
+    const { recallFor } = await approvals(w);
+    const { chain, state } = stubChain(w, { landed: () => null });
+    expect((await run(w, { chain, recallFor })).payment?.settlement).toBe('pending');
+    const row = one(await paymentRows(w.ownerId));
+    state.epoch = 102n;
+    const refused = {
+      ...chain,
+      getTransactionResult: async () => {
+        throw new ChainError('BUDGET', 'Tatum getTransactionResult: GetTransaction refused by the request budget, nothing was sent');
+      },
+    } as Chain;
+    for (let pass = 0; pass <= LIMITS.settlementUnverifiableReads; pass++) {
+      const at = new Date(NOW.getTime() + pass * LIMITS.paymentReleaseGapMs);
+      expect(await settlePayment({ db, ownerId: w.ownerId, paymentId: row.id, chain: refused, tries: 1, intervalMs: 5, sleep: noSleep, now: () => at })).toBe('pending');
+    }
+    expect(one(await paymentRows(w.ownerId))).toMatchObject({ settlement: 'pending', settlementFailedReads: 0, missingSince: null, releasedAt: null });
+    expect((await ownerRow(w.ownerId)).autoPausedReason).toBeNull();
+  });
+
+  it('releases a payment whose transaction ran and failed as not_landed, failed_on_chain, without pausing the owner, so the ledger keeps the money (A-F3)', async () => {
+    const w = await world({ allowanceId: null, allowanceCheckedAt: null });
+    await db.insert(refills).values({ ownerId: w.ownerId, allowanceId: canonicalSuiAddress(`0x${hex(32)}`), amountAtomic: 100_000n, digest: hex(32), sentAt: NOW, status: 'verified', verifiedAt: NOW });
+    const { recallFor } = await approvals(w);
+    const failedRun: TransactionResult = { status: 'failure', balanceChanges: [] };
+    const result = await run(w, { chain: stubChain(w, { balance: 100_000n, landed: () => failedRun }).chain, recallFor });
+    expect(result).toMatchObject({ outcome: 'paid', payment: { settlement: 'not_landed' } });
+    const row = one(await paymentRows(w.ownerId));
+    expect(row).toMatchObject({ settlement: 'not_landed', mismatchReason: FAILED_ON_CHAIN, releasedAt: NOW, outcomeAt: NOW });
+    expect(await ownerRow(w.ownerId)).toMatchObject({ autoPausedReason: null, autoPausedAt: null });
+    expect(await ledgerBalanceAtomic(db, w.ownerId)).toBe(100_000n);
+    expect(await heldOrSpentAtomic(db, w.ownerId, NOW)).toBe(0n);
+
+    // A failed transaction that still shows a USDC change is not taken on trust: it is a mismatch.
+    const odd = await world();
+    const oddRecall = (await approvals(odd)).recallFor;
+    const failedWithUsdc: TransactionResult = { ...settled(odd.purse, RECIPIENT, PRICE), status: 'failure' };
+    expect((await run(odd, { chain: stubChain(odd, { landed: () => failedWithUsdc }).chain, recallFor: oddRecall })).payment?.settlement).toBe('mismatch');
+    expect((await ownerRow(odd.ownerId)).autoPausedReason).toBe(SETTLEMENT_MISMATCH);
+  });
+
+  it('stamps auto_paused_at with each pause it sets, at the settlement clock, and never replaces a purse key mismatch (A-F4)', async () => {
+    const at = (ms: number) => new Date(NOW.getTime() + ms);
+    const pendingPayment = async () => {
+      const w = await world();
+      const { recall } = await approvals(w);
+      expect(await signForDecision({ db, ownerId: w.ownerId, ...(await approvedDecision(w, recall, 'signed directly')), masterSecretHex: MASTER, chain: stubChain(w).chain, now: () => NOW })).toHaveProperty('signed');
+      return { w, row: one(await paymentRows(w.ownerId)) };
+    };
+    const wrongRecipient = (w: World) => stubChain(w, { landed: () => settled(w.purse, OTHER_RECIPIENT, PRICE) }).chain;
+    const settleAt = (w: World, paymentId: string, chain: Chain, when: Date) =>
+      settlePayment({ db, ownerId: w.ownerId, paymentId, chain, tries: 1, intervalMs: 5, sleep: noSleep, now: () => when });
+
+    const mismatched = await pendingPayment();
+    expect(await settleAt(mismatched.w, mismatched.row.id, wrongRecipient(mismatched.w), at(60_000))).toBe('mismatch');
+    expect(await ownerRow(mismatched.w.ownerId)).toMatchObject({ autoPausedReason: SETTLEMENT_MISMATCH, autoPausedAt: at(60_000) });
+
+    const unreadable = await pendingPayment();
+    const failing = { ...stubChain(unreadable.w, { epoch: 102n }).chain, getTransactionResult: async () => Promise.reject(new ChainError('UPSTREAM', 'gateway error', true)) } as Chain;
+    for (let pass = 1; pass <= LIMITS.settlementUnverifiableReads; pass++) await settleAt(unreadable.w, unreadable.row.id, failing, at(pass * 60_000));
+    expect(await ownerRow(unreadable.w.ownerId)).toMatchObject({ autoPausedReason: SETTLEMENT_UNVERIFIABLE, autoPausedAt: at(LIMITS.settlementUnverifiableReads * 60_000) });
+
+    // The master secret changed after this payment was signed; a mismatch found later still records the payment but keeps that pause.
+    const keyed = await pendingPayment();
+    await db.update(owners).set({ autoPausedReason: PURSE_KEY_MISMATCH, autoPausedAt: at(10_000) }).where(eq(owners.id, keyed.w.ownerId));
+    expect(await settleAt(keyed.w, keyed.row.id, wrongRecipient(keyed.w), at(60_000))).toBe('mismatch');
+    expect(one(await paymentRows(keyed.w.ownerId))).toMatchObject({ settlement: 'mismatch', outcomeAt: at(60_000) });
+    expect(await ownerRow(keyed.w.ownerId)).toMatchObject({ autoPausedReason: PURSE_KEY_MISMATCH, autoPausedAt: at(10_000) });
+  });
+
+  it('reads every clock that dates a decision, a question, a delivery or a settlement inside the transaction that holds the owner lock (C26)', async () => {
+    const paidOnce = async (landed: (w: World) => TransactionResult | null, purpose: string) => {
+      const w = await world();
+      const { recallFor } = await approvals(w);
+      const watch = clockWatch(NOW);
+      const result = await run(w, { db: watch.db, chain: stubChain(w, { landed: () => landed(w) }).chain, recallFor, now: watch.now, purpose });
+      expect(result.outcome).toBe('paid');
+      return { w, watch, decision: one(await decisionRows(w.ownerId)), payment: one(await paymentRows(w.ownerId)) };
+    };
+
+    const verified = await paidOnce((w) => settled(w.purse, RECIPIENT, PRICE), 'verified this time');
+    expect(verified.payment.settlement).toBe('verified');
+    expect([verified.decision.createdAt, verified.payment.signedAt, verified.payment.verifiedAt, verified.payment.outcomeAt].map(verified.watch.readInside)).toEqual([true, true, true, true]);
+
+    // Still pending, so outcome_at is the delivery's own stamp.
+    const delivered = await paidOnce(() => null, 'not on chain yet');
+    expect(delivered.payment).toMatchObject({ settlement: 'pending', delivered: true });
+    expect(delivered.watch.readInside(delivered.payment.outcomeAt)).toBe(true);
+
+    const asking = await world();
+    const watch = clockWatch(NOW);
+    const asked = await run(asking, { db: watch.db, now: watch.now });
+    expect(asked.outcome).toBe('asked');
+    const question = one(await db.select().from(questions).where(eq(questions.ownerId, asking.ownerId)));
+    expect([one(await decisionRows(asking.ownerId)).createdAt, question.createdAt].map(watch.readInside)).toEqual([true, true]);
+  });
+
+  it('refuses purse_short under the lock when the read, less every other payment still pending, cannot cover this one (A-F7)', async () => {
+    const w = await world();
+    const { recall } = await approvals(w);
+    // One read that two calls both pass before either takes the lock.
+    const { chain } = stubChain(w, { balance: PRICE + PRICE / 2n });
+    const sign = (d: { decisionId: string; payment: CanonicalPayment }) => signForDecision({ db, ownerId: w.ownerId, ...d, masterSecretHex: MASTER, chain, now: () => NOW });
+    const first = await approvedDecision(w, recall, 'first search');
+    const second = await approvedDecision(w, recall, 'second search');
+    expect(await sign(first)).toHaveProperty('signed');
+    expect(await sign(second)).toEqual({ refusal: 'purse_short' });
+    expect(await paymentRows(w.ownerId)).toHaveLength(1);
+
+    await storeDelivered(w.ownerId);
+    await db.update(payments).set({ settlement: 'verified', verifiedAt: NOW }).where(eq(payments.ownerId, w.ownerId));
+    expect(await sign(second)).toHaveProperty('signed');
+  });
+
+  it('refuses at signing, with no payment, a recipient the owner refused after decide approved it (B-N1)', async () => {
+    const w = await world();
+    const { recallFor } = await approvals(w);
+    const base = stubChain(w);
+    const refusing = {
+      ...base.chain,
+      getCurrentEpoch: async () => {
+        await approvals(w, 'refuse', 1);
+        return base.state.epoch;
+      },
+    } as Chain;
+    const fetch = seller();
+    const result = await run(w, { fetch, chain: refusing, recallFor });
+    expect(result).toMatchObject({ outcome: 'refused', rule: 'learned', reason: 'You refused payments to hotels.example before.', payment: null });
+    expect(one(await decisionRows(w.ownerId)).status).toBe('refused');
+    expect(await paymentRows(w.ownerId)).toHaveLength(0);
+    expect(paidCalls(fetch)).toHaveLength(0);
+
+    // A refusal still waiting for its Walrus write, under another namespace label, binds as well.
+    const direct = await world();
+    const approved = await approvedDecision(direct, (await approvals(direct)).recall, 'signed directly');
+    await db.insert(memories).values({ ownerId: direct.ownerId, kind: 'owner_decision', recipient: RECIPIENT, amountAtomic: PRICE, verdict: 'refuse', sentence: 'The owner refused.', namespace: 'ellai-demo-v1', writerPublicKey: direct.delegate, status: 'pending' });
+    expect(await signForDecision({ db, ownerId: direct.ownerId, ...approved, masterSecretHex: MASTER, chain: stubChain(direct).chain, now: () => NOW })).toEqual({ refusal: 'refused_recipient' });
+    expect(one(await decisionRows(direct.ownerId)).status).toBe('refused');
+    expect(await paymentRows(direct.ownerId)).toHaveLength(0);
   });
 
   it('verifies a settlement against the purse that signed it, even after the purse on record changed', async () => {

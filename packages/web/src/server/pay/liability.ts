@@ -9,10 +9,12 @@ import { payments } from '../db/schema.js';
  * left.
  *
  * The sum, in atomic USDC, of every payment of this owner that has not been released and that
- * either is still settlement 'pending', however long ago it was signed, or was signed in the
- * LIMITS.dailyBudgetWindowMs before `now`, whatever its settlement. A pending payment's signed bytes can
- * land until its epoch window (valid_until_epoch) closes, which on Sui Mainnet can be close to
- * 48 hours after signing, so age alone never frees its share (A1-1). Only settlePayment's
+ * either is still settlement 'pending', however long ago it was signed, or was signed or
+ * verified in the LIMITS.dailyBudgetWindowMs before `now`, whatever its settlement. A pending
+ * payment's signed bytes can land until its epoch window (valid_until_epoch) closes, which on Sui
+ * Mainnet can be close to 48 hours after signing, so age alone never frees its share (A1-1). A
+ * settled payment counts from the later of signed_at and verified_at, so one that landed late
+ * still holds a full day of budget from the moment the money moved (C25). Only settlePayment's
  * release, made once that window has closed and the chain shows the bytes did not land, takes a
  * payment out of the sum.
  *
@@ -28,7 +30,12 @@ export async function heldOrSpentAtomic(db: Pick<Database, 'select'>, ownerId: s
       and(
         eq(payments.ownerId, ownerId),
         isNull(payments.releasedAt),
-        or(eq(payments.settlement, 'pending'), gte(payments.signedAt, new Date(now.getTime() - LIMITS.dailyBudgetWindowMs))),
+        or(
+          eq(payments.settlement, 'pending'),
+          // The later of the two is inside the window exactly when either is; a null verified_at matches nothing.
+          gte(payments.signedAt, new Date(now.getTime() - LIMITS.dailyBudgetWindowMs)),
+          gte(payments.verifiedAt, new Date(now.getTime() - LIMITS.dailyBudgetWindowMs)),
+        ),
       ),
     );
   return BigInt(row?.total ?? '0');

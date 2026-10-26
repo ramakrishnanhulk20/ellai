@@ -8,7 +8,7 @@ import { bcs } from '@mysten/sui/bcs';
 import type { Ed25519Keypair } from '@mysten/sui/keypairs/ed25519';
 import { TransactionDataBuilder } from '@mysten/sui/transactions';
 import { SUI_TYPE_ARG, normalizeStructTag } from '@mysten/sui/utils';
-import { and, asc, count, eq, gte, isNull, sql } from 'drizzle-orm';
+import { and, asc, count, eq, gte, isNull, lte, sql } from 'drizzle-orm';
 import type { Database } from '../db/client.js';
 import { owners, payments, refills } from '../db/schema.js';
 import type { DbHandle } from '../pay/sign.js';
@@ -21,7 +21,16 @@ export interface RefillJobArgs {
   /** The gas wallet, which sponsors the refill's gas from its SUI address balance. */
   gasKeypair: Ed25519Keypair;
   now: Date;
-  /** Waits between the reads that confirm a lost refill. A real timer when not given. */
+  /**
+   * The clock read after the reads it follows: under the owner lock for the day's
+   * refill count and the row's sent_at, and for every later stamp, so time the pending refill's
+   * reads took is counted (C26). Returns `now` when left out.
+   */
+  clock?: () => Date;
+  /**
+   * Not used: a lost refill is now released over two calls, not by reads with waits between them
+   * in one. Accepted so callers that still pass it keep compiling.
+   */
   sleep?: (ms: number) => Promise<void>;
   /**
    * Asked before each chain read up to the moment the refill row is written: false once the jobs
@@ -55,7 +64,6 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const U32_LIMIT = 2 ** 32;
 const SUI_TYPE = normalizeStructTag(SUI_TYPE_ARG);
 
-const timerSleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
 interface OwnerFacts {
   suiAddress: string;
@@ -186,21 +194,25 @@ const LAST_DATE_MS = 8_640_000_000_000_000n;
 
 /**
  * C7: whether the allowance as the chain holds it now can pay one whole refill. 'serves' when it
- * debits this owner, pays only this owner's purse, is over Sui Mainnet USDC, has not expired, and
- * has room for the refill under its lifetime cap and in its current rate window, since a spend
- * past either aborts on chain and the gas wallet pays for nothing.
+ * debits this owner, pays only this owner's purse, is over Sui Mainnet USDC, does not expire
+ * within LIMITS.allowanceExpiryMarginMs of `now`, and has room for the refill under its lifetime
+ * cap and in its current rate window, since a spend past any of those aborts on chain and the gas
+ * wallet pays for nothing. The margin covers the dry run, the send and its retries, so a refill
+ * whose dry run passed cannot reach the chain after the allowance has expired (C30).
  *
  * 'never' when no later reading can change that (C22): another funder or spender, another coin,
- * expired, a lifetime cap with less than a refill left, or a rate limit smaller than one refill.
- * Each of those is fixed when the allowance is made or only moves the wrong way. Otherwise only
- * the current window is short, and the answer is the time it ends: one period from `now` when the
- * reading cannot place the window, and 'never' when the allowance expires before that time.
+ * expiring within the margin, a lifetime cap with less than a refill left, or a rate limit
+ * smaller than one refill. Each of those is fixed when the allowance is made or only moves the
+ * wrong way. Otherwise only the current window is short, and the answer is the time it ends: one
+ * period from `now` when the reading cannot place the window, and 'never' when the allowance
+ * expires within the margin of that time.
  */
 function allowanceVerdict(allowance: AllowanceReading, owner: OwnerFacts, now: Date): 'serves' | 'never' | Date {
   if (!sameAddress(allowance.funder, owner.suiAddress) || !sameAddress(allowance.spender, owner.purseAddress)) return 'never';
   if (coinOrNull(allowance.coinType) !== USDC_TYPE_MAINNET) return 'never';
   const nowMs = BigInt(now.getTime());
-  if (allowance.expirationMs !== null && allowance.expirationMs <= nowMs) return 'never';
+  const margin = BigInt(LIMITS.allowanceExpiryMarginMs);
+  if (allowance.expirationMs !== null && allowance.expirationMs < nowMs + margin) return 'never';
   const refill = BigInt(LIMITS.purseRefillAtomic);
   if (allowance.lifetimeCap !== null && allowance.lifetimeCap - allowance.spentTotal < refill) return 'never';
   if (allowance.periodLimit !== null && allowance.periodLimit < refill) return 'never';
@@ -211,7 +223,7 @@ function allowanceVerdict(allowance: AllowanceReading, owner: OwnerFacts, now: D
   if (typeof allowance.periodSpent === 'bigint' && typeof periodEndMs === 'bigint' && periodEndMs > nowMs) endMs = periodEndMs;
   else if (typeof periodMs === 'bigint' && periodMs > 0n) endMs = nowMs + periodMs;
   if (endMs === null || endMs > LAST_DATE_MS) return 'never';
-  if (allowance.expirationMs !== null && allowance.expirationMs <= endMs) return 'never';
+  if (allowance.expirationMs !== null && allowance.expirationMs < endMs + margin) return 'never';
   return new Date(Number(endMs));
 }
 
@@ -308,22 +320,31 @@ function maxEpochOf(txBytes: Uint8Array): bigint {
  * is now 'failed'.
  *
  * A refill missing once the chain's epoch is past its valid_until_epoch can no longer land, but
- * one lagging node must not release a refill that landed in the last moments of its window, so,
- * as C4 releases a payment, LIMITS.paymentReleaseReads further reads LIMITS.settlementPollIntervalMs
- * apart must all miss it too. Then it is 'failed' and no longer blocks; it still counts toward the
- * day's refills. A row with no valid_until_epoch, written before it was kept, waits as before.
+ * one lagging node must not release a refill that landed in the last moments of its window, so
+ * a refill is released as a payment is (C4, C27): the first call that sees the window closed and
+ * the digest missing only stamps missing_since, and a call at least LIMITS.paymentReleaseGapMs
+ * later whose read misses too marks it 'failed', when it no longer blocks; it still counts
+ * toward the day's refills. That later read comes after missing_since, which was stamped after
+ * an epoch reading showed the window closed, so it is a read made after the window. A refill
+ * found at any call is recorded as it landed. A row with no valid_until_epoch, written before it
+ * was kept, waits as before.
  */
 async function resolvePending(
   db: Database,
   chain: Chain,
   ownerId: string,
   parties: Parties,
-  now: Date,
-  sleep: (ms: number) => Promise<void>,
+  clock: () => Date,
   canStart: () => boolean,
 ): Promise<'blocked' | 'verified' | 'clear' | 'deferred'> {
   const [pending] = await db
-    .select({ id: refills.id, digest: refills.digest, amountAtomic: refills.amountAtomic, validUntilEpoch: refills.validUntilEpoch })
+    .select({
+      id: refills.id,
+      digest: refills.digest,
+      amountAtomic: refills.amountAtomic,
+      validUntilEpoch: refills.validUntilEpoch,
+      missingSince: refills.missingSince,
+    })
     .from(refills)
     .where(and(eq(refills.ownerId, ownerId), eq(refills.status, 'pending')))
     .orderBy(asc(refills.sentAt), asc(refills.id))
@@ -331,18 +352,25 @@ async function resolvePending(
   if (pending === undefined) return 'clear';
   if (!canStart()) return 'deferred';
   const landed = await readLanded(chain, pending.digest);
-  if (landed !== null) return (await recordLanded(db, pending, landed, parties, now)) === 'verified' ? 'verified' : 'clear';
+  if (landed !== null) return (await recordLanded(db, pending, landed, parties, clock())) === 'verified' ? 'verified' : 'clear';
   if (pending.validUntilEpoch === null) return 'blocked';
   if (!canStart()) return 'deferred';
   if ((await chain.getCurrentEpoch()) <= pending.validUntilEpoch) return 'blocked';
-  for (let read = 0; read < LIMITS.paymentReleaseReads; read++) {
-    if (!canStart()) return 'deferred';
-    await sleep(LIMITS.settlementPollIntervalMs);
-    const late = await readLanded(chain, pending.digest);
-    if (late !== null) return (await recordLanded(db, pending, late, parties, now)) === 'verified' ? 'verified' : 'clear';
+
+  const at = clock();
+  const stillPending = and(eq(refills.id, pending.id), eq(refills.status, 'pending'));
+  if (pending.missingSince === null) {
+    await db.update(refills).set({ missingSince: at }).where(and(stillPending, isNull(refills.missingSince)));
+    return 'blocked';
   }
-  await markFailed(db, pending.id);
-  return 'clear';
+  const releaseFrom = new Date(at.getTime() - LIMITS.paymentReleaseGapMs);
+  if (pending.missingSince.getTime() > releaseFrom.getTime()) return 'blocked';
+  const failed = await db
+    .update(refills)
+    .set({ status: 'failed' })
+    .where(and(stillPending, lte(refills.missingSince, releaseFrom)))
+    .returning({ id: refills.id });
+  return failed.length > 0 ? 'clear' : 'blocked';
 }
 
 /**
@@ -352,10 +380,10 @@ async function resolvePending(
  * 1. A refill still pending from an earlier call is read by its stored digest first, before
  *    anything else is read or built: landed and exact is 'verified' and this call returns
  *    'resolved_pending' without refilling again; failed is 'failed'; not on chain yet is
- *    'skipped_pending', unless the chain's epoch is past the refill's valid_until_epoch and
- *    LIMITS.paymentReleaseReads more reads, `sleep`ing LIMITS.settlementPollIntervalMs before
- *    each, still miss it: then it is 'failed', the same release rule as a payment's (C4), and
- *    this call goes on as if nothing were pending.
+ *    'skipped_pending'. Once the chain's epoch is past the refill's valid_until_epoch, the first
+ *    call that misses it stamps missing_since and is still 'skipped_pending'; a call at least
+ *    LIMITS.paymentReleaseGapMs after that stamp that misses it too makes it 'failed', the same
+ *    release rule as a payment's (C4, C27), and goes on as if nothing were pending.
  * 2. The owner's recorded purse must be the purse derived from the master secret; otherwise
  *    'refused' and nothing is read.
  * 3. Ellai's ledger comes before any other chain read (C22, C23): with a refill still pending the
@@ -376,15 +404,19 @@ async function resolvePending(
  *    allowance id. Then the chain facts (epoch, gas price, the allowance's initial shared
  *    version, a random nonce) are read, all before any lock.
  * 6. In one transaction holding the owner row FOR UPDATE: any refill still pending is
- *    'skipped_pending', so two calls can never refill twice; every refill sent in the last
- *    LIMITS.purseRefillWindowMs is counted, and core's refillDecision decides again on the larger of the balance read and
- *    Ellai's ledger (purseForDecision), 'not_needed' when it says no (C23). The refill is
+ *    'skipped_pending', so two calls can never refill twice; `clock` is read, every refill sent
+ *    in the LIMITS.purseRefillWindowMs before that reading is counted, and core's refillDecision
+ *    decides again on the larger of the balance read and Ellai's ledger (purseForDecision),
+ *    'not_needed' when it says no (C23, C26). The refill is
  *    built with buildRefill, checked with assertRefill, signed by the derived purse and by the
  *    gas wallet as sponsor, and its row is written with the digest of the signed bytes, their
- *    maxEpoch as valid_until_epoch, status 'pending', before anything leaves Ellai.
+ *    maxEpoch as valid_until_epoch, that same reading as sent_at, status 'pending', before
+ *    anything leaves Ellai.
  * 7. After commit the signed bytes are dry-run with chain.simulate. Unless the dry run
  *    succeeds and moves exactly the refill, the row is 'failed', nothing is sent, and the
- *    call throws: RefillError DRY_RUN_FAILED, or the dry run's own ChainError (C6).
+ *    call throws: RefillError DRY_RUN_FAILED, or the dry run's own ChainError (C6). A dry run
+ *    that gave its verdict and failed also sets refill_not_before one LIMITS.purseRefillWindowMs
+ *    ahead, while the owner still holds this allowance, so the tick does not try again sooner (C22).
  * 8. Then the bytes are sent. A failure the chain reports is 'failed' and throws RefillError
  *    FAILED. A success is read back by its digest: exactly the refill is 'verified'; not
  *    readable yet stays 'pending' for the next call. Either way 'refilled'. An unknown send
@@ -411,7 +443,12 @@ export async function refillIfNeeded(args: RefillJobArgs): Promise<RefillOutcome
   if (typeof args.ownerId !== 'string' || !UUID.test(args.ownerId)) throw new Error('the owner id is not a uuid');
   if (!(args.now instanceof Date) || Number.isNaN(args.now.getTime())) throw new Error('the current time is not a date');
   const { db, chain, gasKeypair, now } = args;
-  const sleep = args.sleep ?? timerSleep;
+  const readClock = args.clock ?? (() => now);
+  const clock = (): Date => {
+    const at = readClock();
+    if (!(at instanceof Date) || Number.isNaN(at.getTime())) throw new Error('the current time is not a date');
+    return at;
+  };
   const canStart = args.canStart ?? (() => true);
   const ownerId = args.ownerId.toLowerCase();
 
@@ -423,7 +460,7 @@ export async function refillIfNeeded(args: RefillJobArgs): Promise<RefillOutcome
     funder: canonicalSuiAddress(owner.suiAddress),
     gasOwner: canonicalSuiAddress(gasKeypair.toSuiAddress()),
   };
-  const earlier = await resolvePending(db, chain, ownerId, parties, now, sleep, canStart);
+  const earlier = await resolvePending(db, chain, ownerId, parties, clock, canStart);
   if (earlier === 'deferred') return 'deferred';
   if (earlier === 'blocked') return 'skipped_pending';
   // Tatum's nodes can still report the purse without a refill that just landed, so the next
@@ -435,7 +472,7 @@ export async function refillIfNeeded(args: RefillJobArgs): Promise<RefillOutcome
   // The same checks run again under the lock below. These only spare the chain reads when no
   // refill can happen now; a payment signed before the lock can only lower the ledger, and the
   // next call sees that.
-  const early = await refillLedger(db, ownerId, now);
+  const early = await refillLedger(db, ownerId, clock());
   if (early.pending) return 'skipped_pending';
   if (ledgerRulesOut(early)) return 'not_needed';
 
@@ -455,7 +492,8 @@ export async function refillIfNeeded(args: RefillJobArgs): Promise<RefillOutcome
     }
     throw error;
   }
-  const verdict = allowanceVerdict(allowance, owner, now);
+  // Read after the allowance itself, so its expiry and window are judged at a time no earlier than the reading (C26).
+  const verdict = allowanceVerdict(allowance, owner, clock());
   if (verdict === 'never') {
     await forgetAllowance(db, ownerId, allowanceId);
     return 'refused';
@@ -486,7 +524,10 @@ export async function refillIfNeeded(args: RefillJobArgs): Promise<RefillOutcome
     ) {
       return 'refused' as const;
     }
-    const ledger = await refillLedger(tx, ownerId, now);
+    // Read under the lock, after every chain read above, so the day's count and the new row's
+    // sent_at both stand at the moment the refill is decided (C26).
+    const lockedAt = clock();
+    const ledger = await refillLedger(tx, ownerId, lockedAt);
     if (ledger.pending) return 'skipped_pending' as const;
     const decision = refillDecision({ purseUsdcAtomic: purseForDecision(purseReadAtomic, ledger), refillsInWindow: ledger.inWindow });
     if (!decision.refill) return 'not_needed' as const;
@@ -504,7 +545,7 @@ export async function refillIfNeeded(args: RefillJobArgs): Promise<RefillOutcome
     const digest = TransactionDataBuilder.getDigestFromBytes(txBytes);
     const [row] = await tx
       .insert(refills)
-      .values({ ownerId, allowanceId, amountAtomic: decision.amountAtomic, digest, sentAt: now, validUntilEpoch: maxEpochOf(txBytes), status: 'pending' })
+      .values({ ownerId, allowanceId, amountAtomic: decision.amountAtomic, digest, sentAt: lockedAt, validUntilEpoch: maxEpochOf(txBytes), status: 'pending' })
       .returning({ id: refills.id, amountAtomic: refills.amountAtomic });
     if (row === undefined) throw new Error('the refill insert returned no row');
     return { row, digest, txBytes, signatures };
@@ -522,6 +563,9 @@ export async function refillIfNeeded(args: RefillJobArgs): Promise<RefillOutcome
   }
   if (rehearsal.status !== 'success' || !movedExactly(rehearsal, parties, prepared.row.amountAtomic)) {
     await markFailed(db, prepared.row.id);
+    // An allowance whose funder holds no USDC passes every read but fails here, and would
+    // otherwise cost a full set of reads and a dry run on every tick (C22, D-1).
+    await waitForWindow(db, ownerId, allowanceId, new Date(clock().getTime() + LIMITS.purseRefillWindowMs));
     throw new RefillError('DRY_RUN_FAILED', 'the refill dry run did not move exactly the refill, so nothing was sent');
   }
 
@@ -546,6 +590,6 @@ export async function refillIfNeeded(args: RefillJobArgs): Promise<RefillOutcome
     // Tatum's nodes can lag a moment behind the one that ran it; the next call reads it again.
     return 'refilled';
   }
-  if ((await recordLanded(db, prepared.row, landed, parties, now)) === 'failed') throw new RefillError('FAILED', 'the refill did not land');
+  if ((await recordLanded(db, prepared.row, landed, parties, clock())) === 'failed') throw new RefillError('FAILED', 'the refill did not land');
   return 'refilled';
 }

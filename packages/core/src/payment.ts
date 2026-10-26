@@ -4,7 +4,7 @@ import type { Ed25519Keypair } from '@mysten/sui/keypairs/ed25519';
 import { Transaction, TransactionDataBuilder } from '@mysten/sui/transactions';
 import { SUI_ADDRESS_LENGTH, fromBase64, normalizeStructTag, normalizeSuiAddress, toBase64 } from '@mysten/sui/utils';
 import type { BalanceChange } from './chain.js';
-import type { CanonicalPayment } from './challenge.js';
+import { type CanonicalPayment, isReservedSuiAddress } from './challenge.js';
 import { canonicalSuiAddress } from './keys.js';
 import { LIMITS } from './limits.js';
 import { DEPLOYMENT_NETWORK, SUI_MAINNET_CHAIN_ID } from './network.js';
@@ -47,7 +47,6 @@ const SEND_FUNDS = '0x2::balance::send_funds';
 const U32_MAX = 0xffff_ffff;
 const U64_MAX = 2n ** 64n - 1n;
 const UNSIGNED_INTEGER = /^(0|[1-9][0-9]*)$/;
-const ZERO_ADDRESS = normalizeSuiAddress('0x0');
 
 /** The values a payment transaction is built from, each already checked. */
 interface SendTerms {
@@ -94,7 +93,7 @@ function payableTerms(payment: CanonicalPayment): Omit<SendTerms, 'payer'> {
     fail('BUILD_FAILED', 'the amount is outside the per-payment limits');
   }
   const recipient = addressOrFail(payment.recipient, 'the recipient');
-  if (recipient === ZERO_ADDRESS) fail('BUILD_FAILED', 'the recipient is the zero address');
+  if (isReservedSuiAddress(recipient)) fail('BUILD_FAILED', 'the recipient is an address Sui reserves for itself');
   if (typeof payment.challengeId !== 'string' || payment.challengeId === '') fail('BUILD_FAILED', 'the challenge id is missing');
   if (typeof payment.nonce !== 'string' || !UNSIGNED_INTEGER.test(payment.nonce) || Number(payment.nonce) > U32_MAX) {
     fail('BUILD_FAILED', 'the nonce is not a u32');
@@ -294,7 +293,11 @@ export async function assertPlainUsdcSend(txBytes: Uint8Array, payment: Canonica
  * builds them from the canonical payment, asserts them with assertPlainUsdcSend, then
  * signs with the payer's key. Nothing is sent anywhere.
  * Preconditions: nowMs is before payment.expiresAtMs, and currentEpoch, read from the
- * chain by the caller, is inside the challenge's [minEpoch, maxEpoch].
+ * chain by the caller, is inside the challenge's [minEpoch, maxEpoch], so a window that has
+ * already closed is refused. A window that ends in the current epoch ([E, E] or [E - 1, E])
+ * is signed: bytes a seller holds until the epoch turns are still never released on one
+ * lagging read, since a release takes two settlement passes LIMITS.paymentReleaseGapMs apart
+ * (C4, C27), and Ellai's own seller names [E, E + 1] from an epoch reading up to an hour old.
  * Throws PaymentError: UNSUPPORTED_DIALECT, BUILD_FAILED, EXPIRED (also for an unreadable
  * time), WRONG_EPOCH, or MISMATCH.
  */

@@ -4,7 +4,10 @@
 // Tatum minute: the current epoch, a real settled USDC payment read with its status,
 // a dry run of garbage bytes, and both response size caps. Offline: whether a chain says
 // it sends an API key and, against stand-in gateway answers, executeTransaction's retry
-// and refusal rules and getAllowance's shape checks and rate window. Then, after a third fresh minute: a
+// and refusal rules (a resend refused after a send lost in transit, or a lookup the gateway
+// refuses, is an unknown outcome, never a failure or a "never sent" code), an answer with no
+// transaction in it read as BAD_RESPONSE rather than not found, and getAllowance's
+// shape checks and rate window. Then, after a third fresh minute: a
 // real third-party USDC allowance read with its terms, an app-bound one refused, and a
 // wrongly signed transaction refused by the network.
 // Offline too, against stand-in GraphQL pages: scanOwnedWalrusBlobs reading one bounded stretch,
@@ -15,7 +18,8 @@
 // the Chain methods, and a hook that throws sending nothing and failing the call as BUDGET, never
 // retried, with streaming calls refused; executeTransaction reading a refused first send as not
 // sent, and a refusal of a lookup or a second send as an unknown outcome that never says BUDGET.
-// Does NOT cover: the hook against the live gateway (no live test passes one), a paid key's rate limits, the Walrus blob listing or scan against the live
+// Does NOT cover: the hook against the live gateway (no live test passes one), whether Tatum ever
+// answers a missing digest with an empty OK (the live made-up digest test fails if it does), a paid key's rate limits, the Walrus blob listing or scan against the live
 // gateway (the probe script and the scratch cross-check exercise the listing), an owner that
 // actually holds USDC, a failed transaction's status read from chain (none is pinned
 // here), a dry run that executes and fails (probe:pay shows the refusal path), or a
@@ -329,6 +333,52 @@ describe('executeTransaction retry and refusal rules, against stand-in gateway a
     } finally {
       refusedOnly.local.close();
       landedBefore.local.close();
+    }
+  });
+
+  it('calls a resend refused after a send lost in transit, with both lookups missing, an unknown outcome and never a failure', async () => {
+    const notFound = () => Promise.reject(rpcError('NOT_FOUND'));
+    const { local, send, lookup } = standIn([() => Promise.reject(rpcError('UNAVAILABLE')), () => Promise.reject(rpcError('INVALID_ARGUMENT'))], [notFound, notFound]);
+    try {
+      const failure = await failureOf(local.executeTransaction(SIGNED_BYTES, [SIGNATURE]));
+      expect(failure).toMatchObject({ code: 'UPSTREAM', retryable: false });
+      expect(failure.message).toContain(`transaction ${SIGNED_DIGEST} may have landed`);
+      expect(send).toHaveBeenCalledTimes(2);
+      expect(lookup).toHaveBeenCalledTimes(2);
+    } finally {
+      local.close();
+    }
+  });
+
+  it('reads an answer with no transaction in it as BAD_RESPONSE, never as not found, so a refusal it follows stays unknown', async () => {
+    const empty = async () => ({ response: {} });
+    const read = standIn([], [empty]);
+    const refused = standIn([() => Promise.reject(rpcError('INVALID_ARGUMENT'))], [empty]);
+    try {
+      expect(await failureOf(read.local.getTransactionResult(SIGNED_DIGEST))).toMatchObject({ code: 'BAD_RESPONSE', retryable: false });
+      const failure = await failureOf(refused.local.executeTransaction(SIGNED_BYTES, [SIGNATURE]));
+      expect(failure.code).toBe('BAD_RESPONSE');
+      expect(failure.message).toContain(`transaction ${SIGNED_DIGEST} may have landed`);
+    } finally {
+      read.local.close();
+      refused.local.close();
+    }
+  });
+
+  it('never reports a lookup the gateway refuses as INVALID_INPUT, which callers read as never sent', async () => {
+    const refusedLookup = () => Promise.reject(rpcError('INVALID_ARGUMENT'));
+    const afterRefusal = standIn([() => Promise.reject(rpcError('INVALID_ARGUMENT'))], [refusedLookup]);
+    const afterTransit = standIn([() => Promise.reject(rpcError('UNAVAILABLE'))], [refusedLookup]);
+    try {
+      for (const { local } of [afterRefusal, afterTransit]) {
+        const failure = await failureOf(local.executeTransaction(SIGNED_BYTES, [SIGNATURE]));
+        expect(failure).toMatchObject({ code: 'UPSTREAM', retryable: false });
+        expect(failure.message).toContain(`transaction ${SIGNED_DIGEST} may have landed`);
+      }
+      expect([afterRefusal.send, afterTransit.send].map((spy) => spy.mock.calls.length)).toEqual([1, 1]);
+    } finally {
+      afterRefusal.local.close();
+      afterTransit.local.close();
     }
   });
 

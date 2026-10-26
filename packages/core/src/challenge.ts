@@ -1,4 +1,4 @@
-import { normalizeStructTag } from '@mysten/sui/utils';
+import { MOCKED_GAS_OBJECT_ID, SUI_DENY_LIST_OBJECT_ID, normalizeStructTag } from '@mysten/sui/utils';
 import { canonicalSuiAddress } from './keys.js';
 import { LIMITS } from './limits.js';
 import type { SafeResponse } from './net.js';
@@ -305,8 +305,25 @@ function structTagOrNull(value: unknown): string | null {
   }
 }
 
-// Money sent to the zero address is gone for good; no real seller asks for it.
-const ZERO_ADDRESS = canonicalSuiAddress('0x0');
+// Sui keeps every address below 0x10 for itself: the zero address, its packages (0x1 the Move
+// standard library, 0x2 the framework, 0x3 the system) and its system objects (0x5 system state,
+// 0x6 the clock, 0x8 randomness, 0xc the coin registry, and the rest of the range as it grows).
+// The range is one rule rather than a list, so a new system object inside it is covered unseen.
+const SYSTEM_RANGE_END = 0x10n;
+// The reserved ids outside that range: the deny list (the SDK's SUI_DENY_LIST_OBJECT_ID), the
+// accumulator root (0xacc, the SDK's coin reservations), the DeepBook system package (0xdee9, a
+// Sui system package the SDK does not name), and the gas coin id a dry run invents.
+const SYSTEM_IDS_ABOVE_RANGE = new Set([SUI_DENY_LIST_OBJECT_ID, '0xacc', '0xdee9', MOCKED_GAS_OBJECT_ID].map((id) => canonicalSuiAddress(id)));
+
+/**
+ * True for an address Sui reserves for its own packages and objects, where nobody holds a key, so
+ * money sent there is gone for good and no real seller asks for it. Takes a canonicalSuiAddress
+ * result. Covers the range below 0x10 and the named ids above it; does not cover other package or
+ * object ids, which no rule can tell apart from an account.
+ */
+export function isReservedSuiAddress(canonical: string): boolean {
+  return BigInt(canonical) < SYSTEM_RANGE_END || SYSTEM_IDS_ABOVE_RANGE.has(canonical);
+}
 
 function recipientFrom(value: unknown, what: string): string {
   if (typeof value !== 'string') refuse('MALFORMED', `${what} is missing`);
@@ -316,7 +333,7 @@ function recipientFrom(value: unknown, what: string): string {
   } catch {
     return refuse('MALFORMED', `${what} is not a Sui address`);
   }
-  if (recipient === ZERO_ADDRESS) refuse('MALFORMED', `${what} is the zero address`);
+  if (isReservedSuiAddress(recipient)) refuse('MALFORMED', `${what} is an address Sui reserves for itself`);
   return recipient;
 }
 

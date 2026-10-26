@@ -1,7 +1,8 @@
 // Covers: building the t2000 gasless USDC send from a canonical payment parsed out of a
 // saved live 402, offline and deterministically; checkPayable refusing what the build
-// refuses, with the same code; assertPlainUsdcSend refusing every
-// hand-built variant the work order names; signPayment's expiry and epoch refusals and
+// refuses, with the same code, a reserved Sui address as recipient included; assertPlainUsdcSend
+// refusing every hand-built variant the work order names; signPayment's expiry and epoch
+// refusals (a window already closed, while one ending in the current epoch is still signed) and
 // what it signs; t2000's own seller verifier, run offline, accepting Ellai's header
 // (byte for byte the header t2000's payer makes) and rejecting tampered bytes; and
 // verifySettlement's rule on hand-made balance changes.
@@ -11,7 +12,7 @@
 import { readFileSync } from 'node:fs';
 import { Ed25519Keypair } from '@mysten/sui/keypairs/ed25519';
 import { Transaction, TransactionDataBuilder } from '@mysten/sui/transactions';
-import { fromBase64, normalizeStructTag, toBase58, toBase64 } from '@mysten/sui/utils';
+import { fromBase64, normalizeStructTag, normalizeSuiAddress, toBase58, toBase64 } from '@mysten/sui/utils';
 import { verifyTransactionSignature } from '@mysten/sui/verify';
 import {
   buildX402SignedPayment,
@@ -172,6 +173,14 @@ describe('checkPayable', () => {
     expect(() => checkPayable(payment)).not.toThrow();
   });
 
+  it('refuses a recipient Sui reserves for itself, as parseChallenge does, for a payment that did not come from it', async () => {
+    for (const recipient of ['0x0', '0x2', '0xf', '0x403', '0xacc']) {
+      const reserved = { ...payment, recipient: normalizeSuiAddress(recipient) };
+      expect(await codeOf(() => checkPayable(reserved))).toBe('BUILD_FAILED');
+      expect(await codeOf(() => buildPaymentBytes(reserved, payer.toSuiAddress()))).toBe('BUILD_FAILED');
+    }
+  });
+
   it('refuses, with the code buildPaymentBytes gives, a v2 payment and a v1 payment with no t2000 binding fields', async () => {
     const v2 = paymentFrom('adversarial', 'v2-mainnet');
     const plainV1 = withoutSuimpp();
@@ -229,6 +238,14 @@ describe('signPayment', () => {
   it("refuses when the chain is outside the challenge's epoch window", async () => {
     expect((await refusalOf(signPayment(payment, payer, NOW, EPOCH_AT_CAPTURE - 1n))).code).toBe('WRONG_EPOCH');
     expect((await refusalOf(signPayment(payment, payer, NOW, EPOCH_AT_CAPTURE + 2n))).code).toBe('WRONG_EPOCH');
+  });
+
+  it('signs a window that ends in the current epoch, [E, E] or [E - 1, E], and refuses one that has already closed', async () => {
+    const sameEpoch = { ...payment, maxEpoch: payment.minEpoch };
+    expect(payment.maxEpoch).toBe(EPOCH_AT_CAPTURE + 1n);
+    await expect(signPayment(sameEpoch, payer, NOW, EPOCH_AT_CAPTURE)).resolves.toHaveProperty('digest');
+    await expect(signPayment(payment, payer, NOW, EPOCH_AT_CAPTURE + 1n)).resolves.toHaveProperty('digest');
+    expect((await refusalOf(signPayment(sameEpoch, payer, NOW, EPOCH_AT_CAPTURE + 1n))).code).toBe('WRONG_EPOCH');
   });
 });
 

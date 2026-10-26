@@ -70,7 +70,7 @@ interface SignRefusalAnswer {
   reason: string;
 }
 
-const SIGN_REFUSALS: Record<Exclude<SignRefusal, 'over_payment_max'>, SignRefusalAnswer> = {
+const SIGN_REFUSALS: Record<Exclude<SignRefusal, 'over_payment_max' | 'refused_recipient'>, SignRefusalAnswer> = {
   // The same answer loadParty gives a revoked agent, so it learns nothing from when it was revoked (C13).
   agent_revoked: { outcome: 'refused', status: 'refused', reason: REASONS.notAllowed },
   // decide's own sentence for its paused rule, so the agent reads one reason whichever check caught it.
@@ -83,10 +83,14 @@ const SIGN_REFUSALS: Record<Exclude<SignRefusal, 'over_payment_max'>, SignRefusa
   in_flight: { outcome: 'failed', status: 'failed', reason: REASONS.inProgress },
 };
 
-function signRefusal(refused: Exclude<SignResult, { signed: unknown }>, amount: bigint): SignRefusalAnswer {
+function signRefusal(refused: Exclude<SignResult, { signed: unknown }>, payment: CanonicalPayment): SignRefusalAnswer {
+  // decide's own sentence for its refusal rule, naming the seller as decide names it.
+  if (refused.refusal === 'refused_recipient') {
+    return { outcome: 'refused', status: 'refused', reason: `You refused payments to ${hostLabel(payment.sellerHost)} before.` };
+  }
   if (refused.refusal !== 'over_payment_max') return SIGN_REFUSALS[refused.refusal];
   // decide's own sentence for its per-payment maximum rule, naming the maximum checked at signing.
-  const reason = `This payment of ${formatUsdc(amount)} USDC is over your limit of ${formatUsdc(refused.perPaymentMaxAtomic)} USDC per payment.`;
+  const reason = `This payment of ${formatUsdc(payment.amount)} USDC is over your limit of ${formatUsdc(refused.perPaymentMaxAtomic)} USDC per payment.`;
   return { outcome: 'refused', status: 'refused', reason };
 }
 
@@ -251,21 +255,25 @@ async function closeDecision(db: Database, ownerId: string, decisionId: string, 
  *    LIMITS.paidRequestMarginMs (10 s) before the deadline. When that leaves less than
  *    LIMITS.netTimeoutMinMs, the result is 'failed' with a fixed reason and the decision is
  *    closed as 'failed' before anything is signed or sent (C21).
- * 8. signForDecision checks the agent is still active, the pause, the per-payment maximum, a
- *    payment already under way for the same request (step 5's check again) and the budget under
- *    the owner lock and signs at that moment (C4, C5, C6, C7, C8, C13). A refusal there, or a
- *    chain or build failure, is 'refused' (a revoked agent, with step 1's reason; paused or over
- *    the maximum, with decide's own reasons for those rules; or over the daily budget) or
+ * 8. signForDecision checks the agent is still active, the pause, the per-payment maximum, an
+ *    owner refusal of the recipient, a payment already under way for the same request (step 5's
+ *    check again), the budget and the purse under the owner lock and signs at that moment (C4,
+ *    C5, C6, C7, C8, C11, C13). A refusal there, or a chain or build failure, is 'refused' (a
+ *    revoked agent, with step 1's reason; paused, over the maximum or a refused recipient, with
+ *    decide's own reasons for those rules; or over the daily budget) or
  *    'failed' (a payment already in progress gets step 5's reason), and the decision is closed
  *    as 'refused' or 'failed' so the request can be decided again.
  * 9. The paid request is the same request plus the payment header, with step 7's wait measured
  *    again after signing and never below LIMITS.netTimeoutMinMs. Its status, or null when it
  *    never answered, is stored with the payment, and so is delivered: true for a 2xx answer,
- *    false for any other answer or none, with outcome_at set to the time of that write (C32).
- *    delivered stays null only when that write fails.
+ *    false for any other answer or none, with outcome_at set to the time of that write, read
+ *    while the write holds the owner row FOR UPDATE (C26, C32). delivered stays null only when
+ *    that write fails.
  * 10. settlePayment reads the chain by Ellai's digest, up to LIMITS.settlementInlineTries times
- *    (C8). No read starts once the deadline has passed, and no wait runs past it; the payment
- *    is then reported 'pending', and the jobs tick reads it again.
+ *    (C8), as an inline pass: it verifies or records a mismatch, and never releases a payment,
+ *    which only the jobs tick's passes may do (C4, C27). No read starts once the deadline has
+ *    passed, and no wait runs past it; the payment is then reported 'pending', and the jobs tick
+ *    reads it again.
  * 11. A verified payment stored as delivered false becomes an outcome memory. One whose delivered
  *    could not be stored does not; the jobs tick redoes an outcome that failed here.
  *    Once signed material has left, the result is 'paid' with its payment block whatever the
@@ -333,6 +341,7 @@ export async function paidFetch(args: PaidFetchArgs): Promise<PaidFetchResult> {
       delegatePublicKeyHex: delegate.publicKeyHex,
       namespace: MEMORY_NAMESPACE,
       now: deps.now(),
+      clock: deps.now,
     });
   } catch (error) {
     const reason = error instanceof DecideError ? DECIDE_REFUSALS[error.code] : undefined;
@@ -362,7 +371,7 @@ export async function paidFetch(args: PaidFetchArgs): Promise<PaidFetchResult> {
     throw error;
   }
   if ('refusal' in signing) {
-    const refusal = signRefusal(signing, payment.amount);
+    const refusal = signRefusal(signing, payment);
     await closeDecision(db, ownerId, decisionId, refusal.status);
     return { ...bare(refusal.outcome, refusal.reason), ...recorded };
   }
@@ -385,11 +394,16 @@ export async function paidFetch(args: PaidFetchArgs): Promise<PaidFetchResult> {
   // undefined when the write failed, which leaves the column null: then Ellai does not know
   // what the seller did, and no outcome is made from it here or by the jobs tick.
   const storedDelivered = await afterPayment('seller_status', async () => {
-    const written = await db
-      .update(payments)
-      .set({ sellerStatus: answer?.status ?? null, delivered, outcomeAt: deps.now() })
-      .where(and(eq(payments.id, paymentRow.id), eq(payments.ownerId, ownerId)))
-      .returning({ id: payments.id });
+    const written = await db.transaction(async (tx) => {
+      // decide dates a question under this lock, so the two stamps are ordered by it: a question
+      // committed before this write is dated earlier, and one after it is dated later (C26, C32).
+      await tx.select({ id: owners.id }).from(owners).where(eq(owners.id, ownerId)).for('update');
+      return tx
+        .update(payments)
+        .set({ sellerStatus: answer?.status ?? null, delivered, outcomeAt: deps.now() })
+        .where(and(eq(payments.id, paymentRow.id), eq(payments.ownerId, ownerId)))
+        .returning({ id: payments.id });
+    });
     return written.length === 1 ? delivered : undefined;
   });
 
@@ -406,6 +420,7 @@ export async function paidFetch(args: PaidFetchArgs): Promise<PaidFetchResult> {
         intervalMs: LIMITS.settlementInlineIntervalMs,
         sleep: bounded.sleep,
         now: deps.now,
+        inline: true,
       }),
     )) ?? 'pending';
   // A normal paid call is already on chain and in payments; only a bad one becomes a memory,

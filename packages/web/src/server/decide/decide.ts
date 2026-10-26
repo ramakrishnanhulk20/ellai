@@ -58,7 +58,14 @@ export interface DecideArgs {
   delegatePublicKeyHex: string;
   /** The owner's namespace. Every memory read is scoped to it (C9). */
   namespace: string;
+  /** The time the first pass, before recall and the lock, reads its facts at. */
   now: Date;
+  /**
+   * Read once inside the transaction, under the owner lock: the time the grant expiry check and
+   * the budget window use there, and the time the decision, its question and its grant use are
+   * recorded at (C26, C32). Returns `now` when left out.
+   */
+  clock?: () => Date;
 }
 
 export interface DecideResult {
@@ -105,6 +112,7 @@ function checkRequest(args: DecideArgs): Request {
     bad('the namespace is missing or too long');
   }
   if (!(args.now instanceof Date) || Number.isNaN(args.now.getTime())) bad('the current time is not a date');
+  if (args.clock !== undefined && typeof args.clock !== 'function') bad('the clock is not a function');
   if (typeof args.recall !== 'function') bad('recall is missing');
   const { payment } = args;
   if (
@@ -270,22 +278,28 @@ async function badOutcomes(q: Queryable, r: Request): Promise<BadOutcome[]> {
   }));
 }
 
+/**
+ * The exact refusal lookup (C11): the ids of this owner's own refusals of `recipient`, newest
+ * first, at most LIMITS.decideMaxCitedMemories. Any status, since an answer binds from the moment
+ * it is recorded, before its Walrus write lands (C11, C12). Keyed on the owner and the recipient
+ * only: a namespace label is public and authenticates nothing (C19), so a refusal recorded under
+ * any label still refuses. Signing runs this same lookup again under the owner lock.
+ */
+export async function recipientRefusals(q: Pick<Database, 'select'>, ownerId: string, recipient: string): Promise<string[]> {
+  const rows = await q
+    .select({ id: memories.id })
+    .from(memories)
+    .where(and(eq(memories.ownerId, ownerId), eq(memories.kind, 'owner_decision'), eq(memories.verdict, 'refuse'), eq(memories.recipient, recipient)))
+    .orderBy(desc(memories.createdAt))
+    .limit(LIMITS.decideMaxCitedMemories);
+  return rows.map((row) => row.id);
+}
+
 async function gatherFacts(q: Queryable, r: Request, settings: OwnerSettings, maxPending: number): Promise<Omit<DecideFacts, 'recall'>> {
   const { payment } = r;
   // The same sum signing checks under the owner lock, so decide never approves what signing refuses (C4).
   const held = await heldOrSpentAtomic(q, r.ownerId, r.now);
-
-  // Any status: an answer binds from the moment it is recorded, before its Walrus write lands (C11, C12).
-  // Keyed on the owner and the recipient only: a namespace label is public and authenticates
-  // nothing (C19), so a refusal recorded under any label still refuses.
-  const refusals = await q
-    .select({ id: memories.id })
-    .from(memories)
-    .where(
-      and(eq(memories.ownerId, r.ownerId), eq(memories.kind, 'owner_decision'), eq(memories.verdict, 'refuse'), eq(memories.recipient, payment.recipient)),
-    )
-    .orderBy(desc(memories.createdAt))
-    .limit(LIMITS.decideMaxCitedMemories);
+  const refusals = await recipientRefusals(q, r.ownerId, payment.recipient);
 
   const [grant] = await q
     .select({ id: grants.id })
@@ -320,7 +334,7 @@ async function gatherFacts(q: Queryable, r: Request, settings: OwnerSettings, ma
     amountAtomic: payment.amount,
     recipient: payment.recipient,
     sellerHost: payment.sellerHost,
-    refusalMemoryIds: refusals.map((m) => m.id),
+    refusalMemoryIds: refusals,
     badOutcomes: await badOutcomes(q, r),
     ...(grant === undefined ? {} : { grantId: grant.id }),
     pendingQuestions: pending?.n ?? 0,
@@ -416,11 +430,13 @@ const STATUS_FOR = { approved: 'open', refused: 'refused', asked: 'asked' } as c
  *   cutoff approves only when the approvals it shows already reach approvalsNeeded, and
  *   otherwise asks, since the limit can have hidden closer approvals but never a refusal or a
  *   bad outcome, which are exact lookups (applyRules).
- * - Then, in one transaction that first locks the owner row FOR UPDATE, every fact is read
- *   again and the rules run again, so two decides for one owner can never both spend one
- *   grant or both fit under the daily budget. If that pass needs a recall the first did not
- *   take, the recall counts as failed and Ellai asks. The decision, its citations, its
- *   question (for an ask) and its grant use (for a grant approval) are written together.
+ * - Then, in one transaction that first locks the owner row FOR UPDATE, `clock` is read and
+ *   every fact is read again at that time and the rules run again, so two decides for one owner
+ *   can never both spend one grant or both fit under the daily budget, and a grant that expired
+ *   during recall or the lock wait authorises nothing (C26). If that pass needs a recall the
+ *   first did not take, the recall counts as failed and Ellai asks. The decision, its
+ *   citations, its question (for an ask) and its grant use (for a grant approval) are written
+ *   together, each stamped with that same reading.
  *
  * Statuses: approved is 'open', refused is 'refused', asked is 'asked'. expires_at is the
  * payment's own expiry. Throws DecideError: BAD_INPUT, BAD_PURPOSE (empty after trimming or
@@ -440,11 +456,16 @@ export async function decide(args: DecideArgs): Promise<DecideResult> {
 
   return db.transaction(async (tx) => {
     const settings = await ownerSettings(tx, r.ownerId, true);
-    const agent = await activeAgent(tx, r);
-    const live = await liveDecision(tx, r);
-    if (live !== undefined) return reuse(tx, live, r);
+    // After recall and the wait for the lock, so a grant that expired meanwhile authorises
+    // nothing, and the question is dated after any outcome a writer holding this lock recorded.
+    const at = (args.clock ?? (() => args.now))();
+    if (!(at instanceof Date) || Number.isNaN(at.getTime())) bad('the current time is not a date');
+    const locked: Request = { ...r, now: at };
+    const agent = await activeAgent(tx, locked);
+    const live = await liveDecision(tx, locked);
+    if (live !== undefined) return reuse(tx, live, locked);
 
-    const decided = applyRules({ ...(await gatherFacts(tx, r, settings, agent.maxPending)), recall });
+    const decided = applyRules({ ...(await gatherFacts(tx, locked, settings, agent.maxPending)), recall });
     const { payment } = r;
     const [row] = await tx
       .insert(decisions)
@@ -470,7 +491,7 @@ export async function decide(args: DecideArgs): Promise<DecideResult> {
         rule: decided.rule,
         reason: decided.reason,
         status: STATUS_FOR[decided.outcome],
-        createdAt: r.now,
+        createdAt: at,
       })
       .returning({ id: decisions.id });
     if (row === undefined) throw new Error('the decision insert returned no row');
@@ -481,10 +502,10 @@ export async function decide(args: DecideArgs): Promise<DecideResult> {
         .values(decided.citedMemoryIds.map((memoryId) => ({ decisionId: row.id, memoryId, ownerId: r.ownerId })));
     }
     if (decided.outcome === 'asked') {
-      await tx.insert(questions).values({ decisionId: row.id, ownerId: r.ownerId, createdAt: r.now });
+      await tx.insert(questions).values({ decisionId: row.id, ownerId: r.ownerId, createdAt: at });
     }
     if (decided.rule === 'grant' && decided.grantId !== undefined) {
-      await tx.insert(grantUses).values({ grantId: decided.grantId, ownerId: r.ownerId, decisionId: row.id, usedAt: r.now });
+      await tx.insert(grantUses).values({ grantId: decided.grantId, ownerId: r.ownerId, decisionId: row.id, usedAt: at });
     }
     return {
       decisionId: row.id,

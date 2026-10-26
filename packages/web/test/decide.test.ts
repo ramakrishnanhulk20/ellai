@@ -3,8 +3,9 @@
 // "approved"; then decide on PGlite: reuse of a live decision, pending refusals and refusals
 // under any namespace label, one-time grants, the agent and purpose checks, which recall hits
 // may count, bad outcomes (worded from the worst, cleared only by a yes to a question asked
-// after the outcome was recorded), the daily budget (the 24-hour window and pending payments
-// however old) and the question cap.
+// after the outcome was recorded), the daily budget (the 24-hour window, counted from the later
+// of signing and verification, and pending payments however old), the clock read inside the
+// transaction for the grant expiry and the decision's time, and the question cap.
 // Does NOT cover: the live Walrus relayer or its ranking (recall is a stub everywhere here),
 // the pay flow that moves an approved decision on, any HTTP or MCP route, or two connections
 // blocking on the owner row lock. PGlite serves one connection and runs one transaction at a
@@ -18,7 +19,7 @@ import { eq } from 'drizzle-orm';
 import fc from 'fast-check';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { type Database, createDb, migrate } from '../src/server/db/client.js';
-import { agents, decisionCitations, decisions, grantUses, memories, owners, payments, questions } from '../src/server/db/schema.js';
+import { agents, decisionCitations, decisions, grantUses, grants, memories, owners, payments, questions } from '../src/server/db/schema.js';
 import { answerQuestion } from '../src/server/decide/answer.js';
 import { type DecideArgs, DecideError, type Recall, decide } from '../src/server/decide/decide.js';
 import { type BadOutcome, type DecideFacts, type RecallHit, type RecallResult, applyRules } from '../src/server/decide/rules.js';
@@ -877,6 +878,41 @@ describe('decide', () => {
       outcome: 'refused',
       rule: 'over_daily_budget',
     });
+  });
+
+  it('counts a settled payment for a full day from the later of signing and verification, so one verified 47 hours after signing still holds the budget (A-F2)', async () => {
+    const w = await world({ dailyBudgetAtomic: 30_000n });
+    const { payment: late } = await signedPayment(w, 20_000n, hoursAgo(47), { settlement: 'verified', verifiedAt: hoursAgo(1), delivered: true });
+    // A mismatch is never verified, so it counts from signing alone.
+    await signedPayment(w, 5_000n, hoursAgo(25), { settlement: 'mismatch', mismatchReason: 'test', delivered: true, recipient: OTHER_RECIPIENT });
+    expect(await heldOrSpentAtomic(db, w.ownerId, NOW)).toBe(20_000n);
+    expect(await run(w, { payment: payment(NOW, { amount: 10_001n }), purpose: `${PURPOSE} over` })).toMatchObject({ outcome: 'refused', rule: 'over_daily_budget' });
+
+    await db.update(payments).set({ verifiedAt: hoursAgo(24.001) }).where(eq(payments.id, late.id));
+    expect(await heldOrSpentAtomic(db, w.ownerId, NOW)).toBe(0n);
+    expect((await run(w, { payment: payment(NOW, { amount: 30_000n }), purpose: `${PURPOSE} fits` })).rule).toBe('no_match');
+  });
+
+  it('reads its clock inside the transaction: a grant that expired during recall authorises nothing, and the decision and question carry that time (C26)', async () => {
+    const w = await world();
+    const asked = await run(w);
+    const { grantId } = await ownerAnswer(w, asked.decisionId, 'approve');
+    if (grantId === null) throw new Error('expected a grant');
+    const expiresAt = one(await db.select({ expiresAt: grants.expiresAt }).from(grants).where(eq(grants.id, grantId))).expiresAt;
+
+    // Valid when the first pass reads its facts, expired by the time the lock is held.
+    const locked = new Date(expiresAt.getTime());
+    const clock = vi.fn(() => locked);
+    const retry = await run(w, { now: new Date(expiresAt.getTime() - 1), clock });
+    expect(clock).toHaveBeenCalledTimes(1);
+    expect(retry).toMatchObject({ outcome: 'asked', rule: 'recall_unavailable' });
+    expect(await rowCounts(w.ownerId)).toMatchObject({ grantUses: 0 });
+    expect(one(await db.select().from(decisions).where(eq(decisions.id, retry.decisionId))).createdAt).toEqual(locked);
+    expect(one(await db.select().from(questions).where(eq(questions.decisionId, retry.decisionId))).createdAt).toEqual(locked);
+
+    const unreadable = await world();
+    await expect(run(unreadable, { clock: () => new Date(Number.NaN) })).rejects.toMatchObject({ name: 'DecideError', code: 'BAD_INPUT' });
+    expect(await rowCounts(unreadable.ownerId)).toMatchObject({ decisions: 0 });
   });
 
   it('refuses a new question once the agent has maxPending waiting, writing no question', async () => {

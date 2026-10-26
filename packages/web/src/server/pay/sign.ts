@@ -5,9 +5,10 @@ import { LIMITS } from '@ellai/core/limits';
 import { PaymentError, type SignedPayment, signPayment } from '@ellai/core/payment';
 import { KNOWN_SELLERS } from '@ellai/core/sellers';
 import { normalizeStructTag } from '@mysten/sui/utils';
-import { and, eq, gt, ne, or } from 'drizzle-orm';
+import { and, eq, gt, isNull, ne, or, sql } from 'drizzle-orm';
 import type { Database } from '../db/client.js';
 import { agents, decisions, owners, payments } from '../db/schema.js';
+import { recipientRefusals } from '../decide/decide.js';
 import { ledgerBalanceAtomic } from '../jobs/refill.js';
 import { heldOrSpentAtomic } from './liability.js';
 
@@ -21,6 +22,7 @@ export type SignRefusal =
   | 'paused'
   | 'over_payment_max'
   | 'over_daily_budget'
+  | 'refused_recipient'
   | 'purse_short'
   | 'not_open'
   | 'in_flight';
@@ -119,6 +121,15 @@ export async function paymentInFlight(db: DbHandle, ownerId: string, key: string
   return row !== undefined;
 }
 
+/** What this owner's signed payments still pending settlement and not released add up to, in atomic USDC. */
+async function unsettledAtomic(db: DbHandle, ownerId: string): Promise<bigint> {
+  const [row] = await db
+    .select({ total: sql<string>`coalesce(sum(${payments.amountAtomic}), 0)::text` })
+    .from(payments)
+    .where(and(eq(payments.ownerId, ownerId), eq(payments.settlement, 'pending'), isNull(payments.releasedAt)));
+  return BigInt(row?.total ?? '0');
+}
+
 function decidedThis(decision: typeof decisions.$inferSelect, payment: CanonicalPayment): boolean {
   return (
     sameAddress(decision.recipient, payment.recipient) &&
@@ -144,17 +155,21 @@ function decidedThis(decision: typeof decisions.$inferSelect, payment: Canonical
  * window, and the stored signed_at, so the time spent on the reads and the lock waits counts
  * against the price; an unreadable time is 'expired'. A decision whose agent has been revoked
  * (or is not this owner's) is 'agent_revoked', an owner that is paused or has an
- * auto_paused_reason is 'paused', and an amount over per_payment_max_atomic is
- * 'over_payment_max'; each way the decision becomes 'refused' in the same transaction.
+ * auto_paused_reason is 'paused', an amount over per_payment_max_atomic is 'over_payment_max',
+ * and a recipient this owner has refused, by decide's own exact lookup (recipientRefusals) read
+ * under the lock, is 'refused_recipient'; each way the decision becomes 'refused' in the same
+ * transaction (C11).
  * Another decision under the decision's own stored request key with a payment that may still
  * be under way (paymentInFlight, read under the lock) is 'in_flight', and the decision becomes
  * 'failed' in the same transaction (C5). What counts against the budget is heldOrSpentAtomic,
  * read under the lock: every unreleased payment still pending whatever its age, and everything
  * else signed in the last 24 hours and not released; going past daily_budget_atomic with this
- * payment is 'over_daily_budget'. The purse key is
+ * payment is 'over_daily_budget'. The balance read before the lock, less every one of this
+ * owner's payments still 'pending' and not released (read under the lock), must cover the
+ * amount, else 'purse_short' (A-F7). The purse key is
  * derived from the master secret and the owner's address, and must give the recorded purse
- * address: if it does not, the owner's auto_paused_reason is set to PURSE_KEY_MISMATCH, that
- * is committed, and the answer is 'not_open'. Then core's signPayment builds, checks and signs the plain USDC send (its
+ * address: if it does not, the owner's auto_paused_reason is set to PURSE_KEY_MISMATCH and
+ * auto_paused_at to `now` in one update, that is committed, and the answer is 'not_open'. Then core's signPayment builds, checks and signs the plain USDC send (its
  * EXPIRED and WRONG_EPOCH become 'expired' and 'wrong_epoch'), the payments row is written
  * with the digest of the signed bytes, the challenge's maxEpoch as valid_until_epoch and `now`
  * as both signed_at and outcome_at (C32), and the decision becomes 'paid'. Nothing is sent
@@ -229,6 +244,12 @@ export async function signForDecision(args: SignArgs): Promise<SignResult> {
       await close('refused');
       return { refusal: 'over_payment_max', perPaymentMaxAtomic: owner.perPaymentMaxAtomic };
     }
+    // decide looked for a refusal before its recall. Answering a question takes this lock too, so
+    // a no the owner gave since then is committed and seen here, and it always wins (C11).
+    if ((await recipientRefusals(tx, ownerId, decision.recipient)).length > 0) {
+      await close('refused');
+      return { refusal: 'refused_recipient' };
+    }
     // flow's early check can run while a twin request is still 'open'; once that twin is paid,
     // decide opens this decision afresh. Every signature for this owner takes this lock, so a
     // twin signed first is committed and seen here (C5).
@@ -239,10 +260,16 @@ export async function signForDecision(args: SignArgs): Promise<SignResult> {
 
     // Read under the owner lock, so a payment signed by a racing call is already counted here.
     if ((await heldOrSpentAtomic(tx, ownerId, now)) + payment.amount > owner.dailyBudgetAtomic) return { refusal: 'over_daily_budget' };
+    // The balance was read before the lock, so a payment a racing call signed since may not show
+    // in it yet. Every other unsettled payment is taken off the read, so parallel calls cannot sign
+    // more than the purse holds and land as a false mismatch (A-F7). One that already landed but
+    // is not yet verified is taken off twice, which can only refuse, never overspend.
+    if (usdcAddressBalance - (await unsettledAtomic(tx, ownerId)) < payment.amount) return { refusal: 'purse_short' };
 
     const purse = derivePurseKeypair(args.masterSecretHex, owner.suiAddress);
     if (!sameAddress(purse.toSuiAddress(), owner.purseAddress)) {
-      await tx.update(owners).set({ autoPausedReason: PURSE_KEY_MISMATCH }).where(eq(owners.id, ownerId));
+      // Reached only with no pause in place (checked above, under this lock), so nothing is replaced.
+      await tx.update(owners).set({ autoPausedReason: PURSE_KEY_MISMATCH, autoPausedAt: now }).where(eq(owners.id, ownerId));
       return { refusal: 'not_open' };
     }
 

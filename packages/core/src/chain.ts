@@ -873,7 +873,9 @@ export function createChain(opts: { apiKey?: string; beforeRequest?: BeforeTatum
       throw error instanceof ChainError && error.code === 'NOT_FOUND' ? notFound() : error;
     });
     const transaction = response.transaction;
-    if (!transaction) throw notFound();
+    // A gateway behind the chain can answer OK with nothing in it; only the node's own NOT_FOUND
+    // says the digest is missing, so an empty answer is not read as one (C27).
+    if (!transaction) throw badResponse('the transaction read answered with no transaction');
     if (transaction.digest !== digest) throw badResponse('transaction digest does not match the request');
     return transaction;
   }
@@ -886,8 +888,9 @@ export function createChain(opts: { apiKey?: string; beforeRequest?: BeforeTatum
   /**
    * Reads a settled transaction's execution status together with its balance changes,
    * so a caller can never take the changes of a failed transaction as a payment.
-   * Throws ChainError: INVALID_INPUT for a malformed digest, NOT_FOUND, BAD_RESPONSE when
-   * the status is missing or contradictory, or any transport code.
+   * Throws ChainError: INVALID_INPUT for a malformed digest, NOT_FOUND only when the node says
+   * so, BAD_RESPONSE when the answer holds no transaction or its status is missing or
+   * contradictory, or any transport code.
    */
   async function getTransactionResult(digest: string): Promise<TransactionResult> {
     const transaction = await fetchTransaction('getTransactionResult', digest, ['effects.status', 'balance_changes']);
@@ -1120,13 +1123,16 @@ export function createChain(opts: { apiKey?: string; beforeRequest?: BeforeTatum
     return contents.data.value.committee.epoch;
   }
 
-  /** One read of a digest's outcome, no retries. Null while the chain has no such transaction. */
+  /**
+   * One read of a digest's outcome, no retries. Null only on the node's NOT_FOUND; an answer with
+   * no transaction in it is BAD_RESPONSE, as in fetchTransaction.
+   */
   async function landedResult(digest: string): Promise<ExecutionResult | null> {
     try {
       const { response } = await attempt((abort) =>
         grpc.ledgerService.getTransaction({ digest, readMask: { paths: EXECUTED_PATHS } }, { abort }),
       );
-      return response.transaction ? executedResult(response.transaction, digest) : null;
+      return executedResult(response.transaction, digest);
     } catch (error) {
       const failure = classifyChainError(error);
       if (failure.code === 'NOT_FOUND') return null;
@@ -1148,13 +1154,16 @@ export function createChain(opts: { apiKey?: string; beforeRequest?: BeforeTatum
    * unknown outcome and nothing is sent again. At most LIMITS.tatumRetries further rounds,
    * each bounded by LIMITS.tatumTimeoutMs per request.
    *
-   * Returns status "failure" with a fixed code for a transaction that ran and failed, or
-   * that the network refused before running it. Throws, without sending anything, ChainError
-   * INVALID_INPUT for empty bytes or bad signatures, and ChainError BUDGET when the
-   * beforeRequest hook refuses the first send; from this function BUDGET always means the bytes
-   * never left. Any other ChainError means the outcome is unknown, and its message says so and
-   * names the digest to read later. That includes the hook refusing any request after the first
-   * send, a lookup or a second send, which is reported as RATE_LIMITED, not retryable.
+   * Returns status "failure" with a fixed code only for a definite failure: a transaction that
+   * ran and failed, or a first send the network refused whose lookup then missed. A refusal of a
+   * later send whose lookup misses is an unknown outcome, never a failure, since the earlier send
+   * that failed in transit may have landed and the lookup can lag behind it. Throws, without
+   * sending anything, ChainError INVALID_INPUT for empty bytes or bad signatures, and ChainError
+   * BUDGET when the beforeRequest hook refuses the first send; from this function those two codes
+   * always mean the bytes never left. Any other ChainError means the outcome is unknown, and its
+   * message says so and names the digest to read later. That includes the hook refusing a request
+   * after the first send, reported as RATE_LIMITED, and a lookup the gateway refuses, reported as
+   * UPSTREAM, neither retryable.
    */
   async function executeTransaction(txBytes: Uint8Array, signatures: string[]): Promise<ExecutionResult> {
     if (!(txBytes instanceof Uint8Array) || txBytes.length === 0) {
@@ -1163,14 +1172,15 @@ export function createChain(opts: { apiKey?: string; beforeRequest?: BeforeTatum
     const userSignatures = signatureInputs(signatures);
     const digest = TransactionDataBuilder.getDigestFromBytes(txBytes);
     const outcomeUnknown = (failure: ChainError) => {
-      // A caller reads BUDGET from here as "never sent", so a budget refusal after bytes went out
-      // must not carry that code.
+      // A caller reads BUDGET and INVALID_INPUT from here as "never sent", so neither code may
+      // describe a request made after bytes went out.
       const refusedByBudget = failure.code === 'BUDGET';
+      const refusedAsInput = failure.code === 'INVALID_INPUT';
       return scrub(
         new ChainError(
-          refusedByBudget ? 'RATE_LIMITED' : failure.code,
+          refusedByBudget ? 'RATE_LIMITED' : refusedAsInput ? 'UPSTREAM' : failure.code,
           `Tatum executeTransaction: ${refusedByBudget ? 'the request budget refused a request after the bytes were sent' : failure.message}; transaction ${digest} may have landed, read it before building another`,
-          refusedByBudget ? false : failure.retryable,
+          refusedByBudget || refusedAsInput ? false : failure.retryable,
         ),
       );
     };
@@ -1215,7 +1225,13 @@ export function createChain(opts: { apiKey?: string; beforeRequest?: BeforeTatum
           } catch (lookupError) {
             throw outcomeUnknown(classifyChainError(lookupError));
           }
-          return landed ?? { digest, status: 'failure', errorCode: refusal, balanceChanges: [], createdObjects: [] };
+          if (landed !== null) return landed;
+          // An earlier round's send failed in transit and may still land, which is also why this
+          // send can be refused, so a miss here says only that the lookup has not seen it yet.
+          if (round > 0) {
+            throw outcomeUnknown(new ChainError('UPSTREAM', `the bytes were refused when sent again (${refusal}) and the chain does not show them yet`));
+          }
+          return { digest, status: 'failure', errorCode: refusal, balanceChanges: [], createdObjects: [] };
         }
         if (!failure.retryable) throw outcomeUnknown(failure);
         lastFailure = failure;
