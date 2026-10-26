@@ -1,12 +1,13 @@
 // Covers: tatumMeter as a real core chain's beforeRequest hook, on PGlite, with stand-in GraphQL
-// answers counting what is actually sent and the six day budgets cut small (LIMITS is mocked,
+// answers counting what is actually sent and the seven day budgets cut small (LIMITS is mocked,
 // each to its own size) so each is reached in a few requests: a request outside any scope refused
 // with nothing sent; one client's day, one owner's day, the day every caller with no owner shares
 // and the day every person shares each refusing at exactly its own limit with no request sent past
 // it and nothing counted after the first refusal, so strangers spending theirs leave owners able to
 // sign; the jobs budget kept apart, whole after persons spend the shared day and spending none of
-// it, and one owner's jobs share spent leaving the jobs day for every other owner; each shared
-// budget logged once a day; and a new UTC day starting over.
+// it, and one owner's jobs share spent leaving the jobs day for every other owner; the refills pool
+// kept apart from the jobs day and every owner's jobs share, both ways; each shared budget logged
+// once a day; and a new UTC day starting over.
 // Does NOT cover: real Tatum or gRPC (core's chain.test.ts runs the hook on a stand-in gRPC
 // transport), several server instances counting at once (they share the one database, and PGlite
 // serves one connection), or which route enters which scope (routes-scope.test.ts).
@@ -19,13 +20,14 @@ import { type TatumScope, tatumMeter, withTatumScope } from '../src/server/http/
 // The shared day is larger than one client's and one owner's days together, so a test can show
 // that a request refused by one of those never reached the counts after it. The anonymous day sits
 // inside the persons' day, and one owner's jobs share inside the jobs day, as in LIMITS.
-const { CLIENT_DAY, OWNER_DAY, ANONYMOUS_DAY, PERSONS_DAY, JOBS_DAY, JOBS_OWNER_DAY } = vi.hoisted(() => ({
+const { CLIENT_DAY, OWNER_DAY, ANONYMOUS_DAY, PERSONS_DAY, JOBS_DAY, JOBS_OWNER_DAY, REFILLS_DAY } = vi.hoisted(() => ({
   CLIENT_DAY: 4,
   OWNER_DAY: 3,
   ANONYMOUS_DAY: 5,
   PERSONS_DAY: 8,
   JOBS_DAY: 5,
   JOBS_OWNER_DAY: 2,
+  REFILLS_DAY: 3,
 }));
 
 vi.mock('@ellai/core/limits', async (importOriginal) => {
@@ -39,6 +41,7 @@ vi.mock('@ellai/core/limits', async (importOriginal) => {
       tatumCallsPerDayGlobal: PERSONS_DAY,
       tatumCallsJobsPerDay: JOBS_DAY,
       tatumCallsJobsPerOwnerPerDay: JOBS_OWNER_DAY,
+      tatumCallsRefillsPerDay: REFILLS_DAY,
     },
   };
 });
@@ -102,6 +105,8 @@ async function request(scope: TatumScope | null): Promise<string> {
 const person = (clientKey: string, ownerId?: string): TatumScope => (ownerId === undefined ? { kind: 'person', clientKey } : { kind: 'person', clientKey, ownerId });
 const JOBS: TatumScope = { kind: 'jobs' };
 const jobsFor = (ownerId: string): TatumScope => ({ kind: 'jobs', ownerId });
+const REFILLS: TatumScope = { kind: 'refills' };
+const repeat = <T>(n: number, value: T): T[] => Array<T>(n).fill(value);
 const fresh = (label: string) => `${label}-${randomUUID()}`;
 /** A signed-in owner on a client of its own, so only the persons' day is shared with anyone. */
 const someOwner = (): TatumScope => person(fresh('client'), randomUUID());
@@ -194,5 +199,24 @@ describe('tatumMeter', () => {
     expect(sent).toBe(JOBS_DAY);
     expect(await request(jobsFor(randomUUID()))).toBe('BUDGET');
     expect(logs.at(-1)).toBe('[ellai tatum] quota_spent tatum-jobs-calls:day');
+  });
+
+  it("keeps refills in a pool of their own: the jobs day and every owner's jobs share spent leave it whole, and refills spend none of them (C23, C28)", async () => {
+    const owners = [randomUUID(), randomUUID()];
+    // Payment reads as the tick makes them: each owner past its share, and the jobs day spent between them.
+    for (const ownerId of owners) await requests(repeat(JOBS_OWNER_DAY + 1, jobsFor(ownerId)));
+    expect(await requests([JOBS, jobsFor(randomUUID())])).toEqual(['sent', 'BUDGET']);
+    expect(sent).toBe(JOBS_DAY);
+
+    expect(await requests(repeat(REFILLS_DAY + 1, REFILLS))).toEqual([...repeat(REFILLS_DAY, 'sent'), 'BUDGET']);
+    expect(sent).toBe(JOBS_DAY + REFILLS_DAY);
+    expect(logs.filter((line) => line.includes('quota_spent'))).toEqual(['[ellai tatum] quota_spent tatum-jobs-calls:day', '[ellai tatum] quota_spent tatum-refills-calls:day']);
+
+    // The next day, refills spending their whole pool leave the jobs day and an owner's share whole.
+    clock = new Date(clock.getTime() + DAY_MS);
+    sent = 0;
+    expect(await requests(repeat(REFILLS_DAY, REFILLS))).toEqual(repeat(REFILLS_DAY, 'sent'));
+    expect(await requests([...repeat(JOBS_OWNER_DAY, jobsFor(owners[0] ?? '')), ...repeat(JOBS_DAY - JOBS_OWNER_DAY, JOBS)])).toEqual(repeat(JOBS_DAY, 'sent'));
+    expect(sent).toBe(REFILLS_DAY + JOBS_DAY);
   });
 });

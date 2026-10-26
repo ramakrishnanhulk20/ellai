@@ -14,8 +14,9 @@
 // points; every relayer call ends at the call ceiling, and both refuse an owner without an account;
 // failAgedMemories fails every owner's pending memory past its age whatever its account, key or
 // namespace, but never a leased row or a sent one whose job may still finish;
-// makeRecall rejects for such an owner, and for a hit distance outside 0 to 2, so decide asks
-// (C12), and returns no sentence text;
+// makeRecall rejects for such an owner, for a hit distance outside 0 to 2, and at once with
+// nothing sent for a delegate key whose relayer points are spent, so decide asks (C12), and
+// returns no sentence text;
 // recordOutcome is idempotent per decision and owner-scoped; ownerDelegate's key form.
 // Does NOT cover: the live relayer, its job timing or its search ranking (proven only by
 // `npm run prove:loop`), the real SDK's HTTP layer (core's tests cover the client), the jobs
@@ -777,6 +778,22 @@ describe('makeRecall', () => {
     const failing = relayer({ recall: () => Promise.reject(Object.assign(new Error('busy'), { status: 502 })) });
     await expect(recall('Paying 0.010000 USDC for a room.', 5)).rejects.toMatchObject({ name: 'MemoryError', code: 'UPSTREAM' });
     expect(failing.destroy).toHaveBeenCalledTimes(1);
+  });
+
+  it("refuses at once, sending nothing, when the delegate key's relayer points are spent, instead of waiting, and decide then asks (C12, C21)", async () => {
+    const owner = await newOwner();
+    // One client object for every call, so core counts every point against one ledger.
+    const search = vi.fn(async () => ({ results: [], total: 0 }));
+    const shared = { recall: search, destroy: vi.fn() };
+    vi.mocked(createMemoryClient).mockImplementation(() => shared as never);
+    const recall = makeRecall({ owner, masterSecretHex: MASTER, namespace: MEMORY_NAMESPACE });
+    const searches = LIMITS.memwalPointsPerMinute / LIMITS.memwalRequestPoints;
+    for (let i = 0; i < searches; i++) expect(await recall('Paying 0.010000 USDC for a room.', LIMITS.decideRecallLimit)).toEqual([]);
+
+    // Waiting would have slept until points came back and then searched; the refusal is core's answer when told not to wait.
+    await expect(recall('Paying 0.010000 USDC for a room.', LIMITS.decideRecallLimit)).rejects.toMatchObject({ name: 'MemoryError', code: 'RATE_LIMITED' });
+    expect(await decideFor(owner, recall)).toMatchObject({ outcome: 'asked', rule: 'recall_unavailable' });
+    expect(search).toHaveBeenCalledTimes(searches);
   });
 
   it('rejects an answer with a distance outside 0 to LIMITS.recallDistanceMax, and decide then asks (C12)', async () => {

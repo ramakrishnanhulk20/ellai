@@ -977,6 +977,9 @@ describe('agents', () => {
     const ch = (...codePoints: number[]) => String.fromCodePoint(...codePoints);
     expect(checkLabel('  Trip   planner  two ')).toBe('Trip planner two');
     expect(checkLabel(checkLabel('  Trip   planner  two '))).toBe('Trip planner two');
+    // Two apostrophes side by side can read as the message's closing quote.
+    expect(checkLabel("Bot'' Daily budget")).toBe("Bot' Daily budget");
+    expect(checkLabel(`Bot${ch(0x2019)}'${ch(0x2019)}s`)).toBe(`Bot${ch(0x2019)}s`);
     for (const fine of ['Caf' + ch(0xe9) + ' bot', "Ram's bot", `Ram${ch(0x2019)}s bot`, ch(0x1f600).repeat(3), 'Agent-2 (travel)', ch(0x0928, 0x092e, 0x0938, 0x094d, 0x0924, 0x0947)]) {
       expect(checkLabel(fine)).toBe(fine);
     }

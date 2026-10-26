@@ -33,6 +33,12 @@ export interface SettleArgs {
    * Those belong to the jobs tick's passes (C4, C27).
    */
   inline?: boolean;
+  /**
+   * True for the jobs tick's passes: a payment whose window is still open, and which a paced pass
+   * read less than LIMITS.pendingPaymentReadIntervalMs ago, is not read again, and every digest
+   * read such a pass sends stamps payments.last_read_at (C22). Ignored for an inline pass.
+   */
+  paced?: boolean;
 }
 
 /** Set as the owner's auto_paused_reason when a payment landed and was not the approved one (C8). */
@@ -126,6 +132,16 @@ async function stored(db: Database, ownerId: string, paymentId: string): Promise
  * writes read that time while holding the owner row FOR UPDATE (C26). Either pause also sets the
  * owner's auto_paused_at to that same time, in the same update, and neither replaces a
  * PURSE_KEY_MISMATCH pause already in place (A-F4).
+ *
+ * A `paced` pass, the jobs tick's, first looks at payments.last_read_at: when a paced pass read
+ * this digest less than LIMITS.pendingPaymentReadIntervalMs ago, it reads the epoch through
+ * `readEpoch` before any digest read, and while the window is still open, or the epoch cannot be
+ * read, it answers 'pending' with nothing read, so a seller holding a payment back costs one read
+ * an hour rather than one a tick (C22). A window that has closed is read on every pass, so the
+ * release above keeps its timing; an older epoch reading can only hold a read back, since epochs
+ * only go up. Every digest read a paced pass sends that does not find the transaction stamps
+ * last_read_at with the time after it; a read the budget refused was never sent and stamps
+ * nothing. The epoch is read at most once a pass.
  *
  * A payment already past 'pending' is returned as it is. Writes only from 'pending', so two
  * passes never overwrite each other. Throws for an unknown payment or tries out of range.
@@ -246,20 +262,38 @@ export async function settlePayment(args: SettleArgs): Promise<Settlement> {
     return mismatch(UNVERIFIABLE, SETTLEMENT_UNVERIFIABLE);
   };
 
-  const { digest, validUntilEpoch, missingSince } = row.payment;
+  const { digest, validUntilEpoch, missingSince, lastReadAt } = row.payment;
+  const paced = args.paced === true && args.inline !== true;
+  let epochReading: Promise<bigint> | null = null;
+  const epochNow = (): Promise<bigint> => (epochReading ??= readEpoch());
+
+  if (paced && lastReadAt !== null && stamp().getTime() - lastReadAt.getTime() < LIMITS.pendingPaymentReadIntervalMs) {
+    let early: bigint;
+    try {
+      early = await epochNow();
+    } catch {
+      return 'pending';
+    }
+    if (early <= validUntilEpoch) return 'pending';
+  }
+
   let failed = false;
-  for (let attempt = 0; attempt < args.tries && !failed; attempt++) {
+  let refused = false;
+  let sent = false;
+  for (let attempt = 0; attempt < args.tries && !failed && !refused; attempt++) {
     if (attempt > 0) await sleep(args.intervalMs);
     const seen = await read(chain, digest);
     if (seen.kind === 'landed') return judge(seen.result);
-    if (seen.kind === 'not_read') return 'pending';
+    refused = seen.kind === 'not_read';
+    sent ||= !refused;
     failed = seen.kind === 'unknown';
   }
-  if (args.inline === true) return 'pending';
+  if (paced && sent) await db.update(payments).set({ lastReadAt: stamp() }).where(stillPending);
+  if (refused || args.inline === true) return 'pending';
 
   let epoch: bigint;
   try {
-    epoch = await readEpoch();
+    epoch = await epochNow();
   } catch {
     return 'pending';
   }

@@ -14,7 +14,9 @@ const NO_CUTOFF = LIMITS.recallDistanceMax;
  * counts as a failed recall and answers by asking (C12): no account (MemoryServiceError
  * NO_ACCOUNT, before any client exists), a bad master secret, and any MemoryError from
  * recallSentences, which refuses the whole answer when any hit's distance is missing or outside
- * 0 to LIMITS.recallDistanceMax. One client per call, destroyed after it.
+ * 0 to LIMITS.recallDistanceMax. A delegate key that has spent its relayer points for the
+ * minute is refused at once with MemoryError RATE_LIMITED and nothing sent, never waited for, so
+ * a paid request asks instead of stalling. One client per call, destroyed after it.
  */
 export function makeRecall(args: {
   owner: { suiAddress: string; memwalAccountId: string | null };
@@ -25,7 +27,8 @@ export function makeRecall(args: {
   return async (query, limit) => {
     const { client } = ownerMemoryClient(owner, masterSecretHex);
     try {
-      const hits = await recallSentences(client, namespace, query, { limit, maxDistance: NO_CUTOFF });
+      // A wait for points can outlast decide's own recall timeout and send the search after decide has already asked.
+      const hits = await recallSentences(client, namespace, query, { limit, maxDistance: NO_CUTOFF }, { waitForPoints: false });
       return hits.map(({ blobId, distance }) => ({ blobId, distance }));
     } finally {
       client.destroy();

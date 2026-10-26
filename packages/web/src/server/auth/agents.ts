@@ -2,7 +2,7 @@ import { LIMITS } from '@ellai/core/limits';
 import { and, asc, count, eq, isNull } from 'drizzle-orm';
 import type { Database } from '../db/client.js';
 import { AGENT_KINDS, TEXT_CAPS, agents, owners } from '../db/schema.js';
-import { hasQuoteMark } from '../decide/sentences.js';
+import { collapseApostrophes, hasQuoteMark } from '../decide/sentences.js';
 import { AGENT_TOKEN_PREFIX, hashBearerToken, isBearerToken, newBearerToken } from './tokens.js';
 
 export type AgentErrorCode = 'BAD_INPUT' | 'NOT_FOUND' | 'TOO_MANY_AGENTS';
@@ -68,7 +68,7 @@ export function checkLabel(label: unknown): string {
   if (CONTROL_CHARACTER.test(trimmed)) bad('the label must not contain control characters');
   if (HIDDEN_SPACE.test(trimmed)) bad('the label must not contain blank characters other than the plain space');
   if (hasQuoteMark(trimmed)) bad('the label must not contain quote marks other than an apostrophe');
-  const cleaned = trimmed.replace(SPACE_RUN, ' ');
+  const cleaned = collapseApostrophes(trimmed.replace(SPACE_RUN, ' '));
   // Counted in code points, as Postgres counts the column cap.
   const length = Array.from(cleaned).length;
   if (length === 0 || length > TEXT_CAPS.agentLabel) bad(`the label must be 1 to ${TEXT_CAPS.agentLabel} characters`);

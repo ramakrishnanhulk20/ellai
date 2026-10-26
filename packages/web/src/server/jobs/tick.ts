@@ -81,7 +81,10 @@ function owedOutcome(db: Database) {
   return and(eq(payments.settlement, 'verified'), eq(payments.delivered, false), notExists(outcome));
 }
 
-/** An owner whose allowance's rate window is known to be full asks the chain nothing about a refill until it ends (C22). */
+/**
+ * An owner whose refill_not_before is still ahead (a full rate window, a failed dry run, or a
+ * purse read at or above the threshold) asks the chain nothing about a refill until then (C22).
+ */
 function refillMayStart(now: Date) {
   return or(isNull(owners.refillNotBefore), lte(owners.refillNotBefore, now));
 }
@@ -208,13 +211,19 @@ async function ownersWithWork(db: Database, now: Date, walrusEpoch: number | nul
  * visited first (ownersWithWork). Each owner's last_ticked_at is set to `now` as its visit
  * starts, so an owner whose visit fails or is cut off goes to the back of the line like any
  * other. The visit runs in the Tatum scope { kind: 'jobs', ownerId }, so every request it makes is
- * charged to that owner's jobs share before the shared jobs day (C22, C28). Then, in order, each
+ * charged to that owner's jobs share before the shared jobs day (C22, C28), except the refill
+ * step's, which runs in { kind: 'refills' } and is charged to LIMITS.tatumCallsRefillsPerDay alone,
+ * so payments spending the jobs day and every owner's share leave refills able to run (C23, C28).
+ * Then, in order, each
  * step handed the deadline as `canStart`, the money steps first, so a slow relayer or a hung SEAL
  * read in the memory steps can never use up the time this owner's payments and refill need (C28):
  * 1. payments: every payment still 'pending', oldest first, until the deadline, is read once by settlePayment
  *    (tries 1; later ticks are the patience), which checks it against Ellai's own digest (C8)
  *    and counts a failed read past the payment's window in payments.settlement_failed_reads;
- *    every pass in the tick, for every owner, shares one epoch reading (oneEpochReading);
+ *    every pass in the tick, for every owner, shares one epoch reading (oneEpochReading). The
+ *    passes are paced: a payment whose window is still open is read at most once per
+ *    LIMITS.pendingPaymentReadIntervalMs, by payments.last_read_at, and one whose window has
+ *    closed on every visit, so the two-pass release keeps its timing (C22, C4);
  * 2. outcomes: every 'verified' payment stored as delivered false (never null) whose decision has
  *    no outcome memory yet, oldest first, becomes a delivered=false outcome memory through
  *    recordOutcome, idempotent per decision. That takes in a payment step 1 has just verified
@@ -311,7 +320,7 @@ export async function runJobsTick(args: JobsTickArgs): Promise<JobsTickSummary> 
     await step(ownerId, 'visited', async () => {
       await db.update(owners).set({ lastTickedAt: now() }).where(eq(owners.id, ownerId));
     });
-    // Every Tatum request of the visit, its steps' own included, is charged to this owner's jobs share (C22, C28).
+    // Every Tatum request of the visit, its steps' own included, is charged to this owner's jobs share; the refill step enters a scope of its own (C22, C28).
     await withTatumScope({ kind: 'jobs', ownerId }, () =>
       step(ownerId, 'owner', async () => {
         const [owner] = await db
@@ -331,7 +340,7 @@ export async function runJobsTick(args: JobsTickArgs): Promise<JobsTickSummary> 
             // Each settlement pass is a unit of its own, so the deadline is asked between them.
             if (!canStart()) break;
             await step(ownerId, 'payment', async () => {
-              const settled = await settlePayment({ db, ownerId, paymentId: payment.id, chain, tries: 1, intervalMs: LIMITS.settlementPollIntervalMs, sleep, now, readEpoch });
+              const settled = await settlePayment({ db, ownerId, paymentId: payment.id, chain, tries: 1, intervalMs: LIMITS.settlementPollIntervalMs, sleep, now, readEpoch, paced: true });
               if (settled === 'verified') summary.paymentsVerified += 1;
               else if (settled === 'not_landed') summary.paymentsNotLanded += 1;
               else if (settled === 'mismatch') summary.paymentsMismatched += 1;
@@ -358,8 +367,12 @@ export async function runJobsTick(args: JobsTickArgs): Promise<JobsTickSummary> 
 
         if (owner.allowanceId !== null && (owner.refillNotBefore === null || owner.refillNotBefore.getTime() <= now().getTime())) {
           await step(ownerId, 'refill', async () => {
-            // The tick's own clock, so the day's refill count and sent_at are read under the lock, after the reads before them (C26).
-            if ((await refillIfNeeded({ db, chain, ownerId, masterSecretHex, gasKeypair, now: now(), clock: now, canStart })) === 'refilled') summary.refills += 1;
+            // A pool of its own, so this owner's payments, or every owner's, spending the jobs day cannot stop the refill (C23, C28).
+            const outcome = await withTatumScope({ kind: 'refills' }, () =>
+              // The tick's own clock, so the day's refill count and sent_at are read under the lock, after the reads before them (C26).
+              refillIfNeeded({ db, chain, ownerId, masterSecretHex, gasKeypair, now: now(), clock: now, canStart }),
+            );
+            if (outcome === 'refilled') summary.refills += 1;
           });
         }
 

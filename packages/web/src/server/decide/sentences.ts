@@ -18,9 +18,18 @@ const UNSAFE_CHARACTERS = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu;
 // and N'Ko apostrophes, Hebrew geresh and gershayim, the Vedic nihshvasa, primes (NFKC folds a
 // double prime into two), the dingbat quote ornaments, turned and reversed commas, the ditto
 // mark, the saltillo and the fullwidth grave. Not covered: a letter or symbol that looks like a
-// quote only in some font, or a run of apostrophes, which ordinary text needs.
+// quote only in some font, or a run of apostrophes, which ordinary text needs one of at a time
+// and quoted() collapses (APOSTROPHE_RUN).
 const QUOTE_MARKS =
   /(?![\u0027\u2019])[\p{Quotation_Mark}\u0060\u00B4\u02B9-\u02BD\u02C8\u02CA\u02CB\u02DD\u02EE\u02F4-\u02F6\u030B\u030E\u030F\u055A\u059C-\u059E\u05F3\u05F4\u07F4\u07F5\u1CD3\u2032-\u2037\u2057\u275B-\u2760\u2E32\u2E41\u3003\uA78B\uA78C\uFF40\u{1F676}-\u{1F678}]/gu;
+// Two apostrophes side by side read as the double quote the sentences wrap text in, in either
+// form or mixed.
+const APOSTROPHE_RUN = /[\u0027\u2019]{2,}/gu;
+
+/** Each run of two or more apostrophes made one, since two side by side can read as a double quote. */
+export function collapseApostrophes(text: string): string {
+  return text.replace(APOSTROPHE_RUN, (run) => run.charAt(0));
+}
 
 /**
  * Whether text holds a quote mark other than an apostrophe, or a character that reads as one, as
@@ -48,15 +57,18 @@ export function hostLabel(host: string, startOfSentence = false): string {
 /**
  * Agent or owner text made safe to sit inside an Ellai sentence: look-alike forms folded,
  * control, format and line-break characters turned into spaces, every quote mark but the two
- * apostrophes and every character that reads as one removed (QUOTE_MARKS), runs of space
- * collapsed, cut to `maxChars` characters, then wrapped in double quotes, so the text can never
- * seem to close its quotes and start a sentence of its own.
+ * apostrophes and every character that reads as one removed (QUOTE_MARKS), every run of two or
+ * more apostrophes, U+0027 and U+2019 alike, cut to its first, runs of space collapsed, cut to
+ * `maxChars` characters, then wrapped in double quotes, so the text can never seem to close its
+ * quotes and start a sentence of its own.
  */
 export function quoted(text: string | null, maxChars: number): string {
   const cleaned = (text ?? '')
     .normalize('NFKC')
     .replace(UNSAFE_CHARACTERS, ' ')
     .replace(QUOTE_MARKS, '')
+    // After the removal, so a quote mark taken out from between two apostrophes cannot leave a pair.
+    .replace(APOSTROPHE_RUN, (run) => run.charAt(0))
     .replace(/\s+/gu, ' ')
     .trim();
   return `"${Array.from(cleaned).slice(0, maxChars).join('').trim()}"`;

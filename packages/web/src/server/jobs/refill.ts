@@ -239,7 +239,11 @@ async function forgetAllowance(db: Database, ownerId: string, allowanceId: strin
     .where(and(eq(owners.id, ownerId), eq(owners.allowanceId, allowanceId)));
 }
 
-/** Records when the allowance's full rate window ends, before which the tick asks the chain nothing for a refill (C22). */
+/**
+ * Records the time before which the tick asks the chain nothing for this owner's refill (C22): a
+ * full rate window's end, or a set wait after a failed dry run or a purse read at or above the
+ * threshold. Only while the owner still holds this allowance.
+ */
 async function waitForWindow(db: Database, ownerId: string, allowanceId: string, notBefore: Date): Promise<void> {
   await db
     .update(owners)
@@ -393,6 +397,10 @@ async function resolvePending(
  *    decides on the larger of the read and the ledger, so an idle owner costs no Tatum call.
  * 4. Otherwise the purse's USDC address balance is read, and the answer is 'not_needed' when
  *    core's refillDecision on the larger of that read and the ledger (purseForDecision) says no.
+ *    When that read is at or above LIMITS.purseRefillBelowAtomic, refill_not_before is also set
+ *    LIMITS.pendingPaymentReadIntervalMs after the clock read that follows it, while the owner
+ *    still holds this allowance, so a purse holding money Ellai's ledger does not know about costs
+ *    one read an hour, not one a tick (C22).
  * 5. Only for a refill that will be built is the allowance at the owner's stored allowance_id
  *    read, and it must pass C7 (funder is the owner, spender is the purse, USDC, not expired,
  *    room for one refill under the lifetime cap and in the current rate window); otherwise
@@ -415,8 +423,9 @@ async function resolvePending(
  * 7. After commit the signed bytes are dry-run with chain.simulate. Unless the dry run
  *    succeeds and moves exactly the refill, the row is 'failed', nothing is sent, and the
  *    call throws: RefillError DRY_RUN_FAILED, or the dry run's own ChainError (C6). A dry run
- *    that gave its verdict and failed also sets refill_not_before one LIMITS.purseRefillWindowMs
- *    ahead, while the owner still holds this allowance, so the tick does not try again sooner (C22).
+ *    that gave its verdict and failed also sets refill_not_before LIMITS.refillDryRunWaitMs (an
+ *    hour) ahead, while the owner still holds this allowance, so the tick does not try again
+ *    sooner (C22).
  * 8. Then the bytes are sent. A failure the chain reports is 'failed' and throws RefillError
  *    FAILED. A success is read back by its digest: exactly the refill is 'verified'; not
  *    readable yet stays 'pending' for the next call. Either way 'refilled'. An unknown send
@@ -478,7 +487,14 @@ export async function refillIfNeeded(args: RefillJobArgs): Promise<RefillOutcome
 
   if (!canStart()) return 'deferred';
   const purseReadAtomic = (await chain.getBalances(owner.purseAddress)).usdcAddressBalance;
-  if (!refillDecision({ purseUsdcAtomic: purseForDecision(purseReadAtomic, early), refillsInWindow: early.inWindow }).refill) return 'not_needed';
+  if (!refillDecision({ purseUsdcAtomic: purseForDecision(purseReadAtomic, early), refillsInWindow: early.inWindow }).refill) {
+    // Money that reached the purse outside Ellai keeps the read above the ledger, which alone
+    // would cost this read on every tick (C22).
+    if (purseReadAtomic >= BigInt(LIMITS.purseRefillBelowAtomic)) {
+      await waitForWindow(db, ownerId, allowanceId, new Date(clock().getTime() + LIMITS.pendingPaymentReadIntervalMs));
+    }
+    return 'not_needed';
+  }
 
   if (!canStart()) return 'deferred';
   let allowance: AllowanceReading;
@@ -564,8 +580,9 @@ export async function refillIfNeeded(args: RefillJobArgs): Promise<RefillOutcome
   if (rehearsal.status !== 'success' || !movedExactly(rehearsal, parties, prepared.row.amountAtomic)) {
     await markFailed(db, prepared.row.id);
     // An allowance whose funder holds no USDC passes every read but fails here, and would
-    // otherwise cost a full set of reads and a dry run on every tick (C22, D-1).
-    await waitForWindow(db, ownerId, allowanceId, new Date(clock().getTime() + LIMITS.purseRefillWindowMs));
+    // otherwise cost a full set of reads and a dry run on every tick (C22, D-1). Only an hour,
+    // since the owner can top up their wallet at any time.
+    await waitForWindow(db, ownerId, allowanceId, new Date(clock().getTime() + LIMITS.refillDryRunWaitMs));
     throw new RefillError('DRY_RUN_FAILED', 'the refill dry run did not move exactly the refill, so nothing was sent');
   }
 

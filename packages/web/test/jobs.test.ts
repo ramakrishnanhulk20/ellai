@@ -13,7 +13,8 @@
 // later call finds, and leaves rows from before that window was kept
 // waiting; asks its own ledger first, so across a day of ticks an owner whose ledger rules a
 // refill out costs no chain read, the onboarded owner's first refill included, and one below
-// it costs one purse read a tick and an allowance read only for the refill it sends; forgets an
+// it whose purse reads at or above the threshold costs one purse read an hour, 24 a day at most,
+// and an allowance read only for the refill it sends; forgets an
 // allowance that can never pay again and waits out a full rate window, reading nothing meanwhile.
 // pruneExpiredRows deletes only dead rows, in batches it repeats until each table comes
 // back short or its time slice ends, faster than the sign-in cap lets strangers add them,
@@ -35,12 +36,15 @@
 // never after its row. runJobsTick isolates each owner's and each step's failure behind a fixed code,
 // settles pending payments with one digest read a pass and remembers a paid seller stored as
 // delivering nothing exactly once (never one whose delivery is unknown) with one epoch reading for
-// every settlement pass in a tick, releases a lost payment only on a second pass
+// every settlement pass in a tick, reads a payment whose window is open at most once per
+// LIMITS.pendingPaymentReadIntervalMs and one whose window has closed every tick, releases a lost
+// payment only on a second pass
 // LIMITS.paymentReleaseGapMs after the first, records an outcome a paid call failed to record,
 // expires decisions for every owner without visiting one whose only work they are, fails aged
 // pending memories of owners it never visits, runs an owner's money steps before its memory steps,
 // charges each visit's chain reads to that owner's jobs scope and the shared reads to the jobs scope
-// alone, refills with the tick's own sleep, sends and confirms memories and then checks them
+// alone, refills from a Tatum pool of their own once payments spent the jobs day and every owner's
+// share, refills with the tick's own sleep, sends and confirms memories and then checks them
 // on chain, prunes, reads the gas wallet once an hour however many ticks run and warns when it is
 // low, takes at most LIMITS.jobsOwnersPerTick owners,
 // least recently visited first, stamped as each visit starts, and past its deadline starts no
@@ -82,7 +86,7 @@ import {
   signinNonces,
   stepUps,
 } from '../src/server/db/schema.js';
-import { type TatumScope, currentTatumScope, withTatumScope } from '../src/server/http/tatum-meter.js';
+import { type TatumScope, currentTatumScope, tatumMeter, withTatumScope } from '../src/server/http/tatum-meter.js';
 import { MEMORY_NAMESPACE } from '../src/server/memory/namespace.js';
 import { ownerDelegate } from '../src/server/memory/delegate.js';
 import { recordOutcome } from '../src/server/memory/outcome.js';
@@ -92,6 +96,7 @@ import { pruneExpiredRows } from '../src/server/jobs/prune.js';
 import { RefillError, refillIfNeeded } from '../src/server/jobs/refill.js';
 import { type JobsTickSummary, runJobsTick } from '../src/server/jobs/tick.js';
 import { onboardingState } from '../src/server/onboarding/state.js';
+import { settlePayment } from '../src/server/pay/settle.js';
 
 vi.mock('@ellai/core/memory', async (importOriginal) => ({
   ...(await importOriginal<typeof import('@ellai/core/memory')>()),
@@ -850,22 +855,44 @@ describe('refillIfNeeded', () => {
     expect(notGas(calls)).toEqual([]);
   });
 
-  it('reads the purse once a tick, and the allowance only for the refill it sends, while its ledger is below the threshold (C22, C23)', { timeout: 120_000 }, async () => {
+  it('reads a purse holding more than its ledger once, then nothing until LIMITS.pendingPaymentReadIntervalMs later, and the allowance only for the refill it sends (C22, C23)', async () => {
+    expect(LIMITS.pendingPaymentReadIntervalMs).toBe(6 * TICK_MS);
     const on = await freshDb();
     const w = await funded(on, { allowanceCheckedAt: NOW });
     // 0.06 USDC the owner sent the purse straight from their wallet: on chain, not in the ledger.
     const { chain, state, calls } = stubFor(w, BigInt(LIMITS.purseRefillBelowAtomic) + 10_000n, on);
     const tickAt = ticker(on, chain);
-    for (let n = 0; n < 143; n++) expect(await tickAt(n)).toMatchObject({ owners: 1, refills: 0, errors: [] });
-    expect(notGas(calls)).toEqual(Array<string>(143).fill(`getBalances:${w.purse}`));
+    expect(await tickAt(0)).toMatchObject({ owners: 1, refills: 0, errors: [] });
+    expect(notGas(calls)).toEqual([`getBalances:${w.purse}`]);
+    expect((await allowanceOf(w, on)).refillNotBefore).toEqual(new Date(NOW.getTime() + LIMITS.pendingPaymentReadIntervalMs));
+
+    // The purse runs low meanwhile; the owner waits out the hour before the next read finds it.
+    state.balances.set(w.purse, { usdcAddressBalance: LOW });
+    for (let n = 1; n < 6; n++) expect(await tickAt(n)).toMatchObject({ owners: 0, refills: 0, errors: [] });
+    expect(notGas(calls)).toEqual([`getBalances:${w.purse}`]);
 
     calls.length = 0;
-    state.balances.set(w.purse, { usdcAddressBalance: LOW });
-    expect(await tickAt(143)).toMatchObject({ owners: 1, refills: 1, errors: [] });
+    expect(await tickAt(6)).toMatchObject({ owners: 1, refills: 1, errors: [] });
     expect(notGas(calls).filter((call) => /^get(Balances|Allowance):/.test(call))).toEqual([`getBalances:${w.purse}`, `getAllowance:${w.allowanceId}`]);
     calls.length = 0;
-    expect(await tickAt(144)).toMatchObject({ owners: 1, refills: 0, errors: [] });
+    expect(await tickAt(7)).toMatchObject({ owners: 1, refills: 0, errors: [] });
     expect(notGas(calls)).toEqual([]);
+  });
+
+  it('reads a purse holding more than its ledger at most 24 times across a day of 144 ticks (C22)', { timeout: 120_000 }, async () => {
+    const on = await freshDb();
+    const w = await funded(on, { allowanceCheckedAt: NOW });
+    // Exactly at the threshold, which is no refill.
+    const { chain, calls } = stubFor(w, BigInt(LIMITS.purseRefillBelowAtomic), on);
+    const tickAt = ticker(on, chain);
+    const readOn: number[] = [];
+    for (let n = 0; n < 144; n++) {
+      const before = notGas(calls).length;
+      expect(await tickAt(n)).toMatchObject({ refills: 0, errors: [] });
+      if (notGas(calls).length > before) readOn.push(n);
+    }
+    expect(notGas(calls)).toEqual(Array<string>(24).fill(`getBalances:${w.purse}`));
+    expect(readOn).toEqual(Array.from({ length: 24 }, (_, i) => 6 * i));
   });
 
   it('reads an expired allowance once with a ledger at 0, forgets it, and reads nothing for that owner on the next three ticks (C22)', async () => {
@@ -1203,6 +1230,25 @@ describe('pruneExpiredRows', () => {
 const noSleep = async () => undefined;
 const tick = (on: Database, chain: Chain): Promise<JobsTickSummary> =>
   runJobsTick({ db: on, chain, masterSecretHex: MASTER, gasKeypair: GAS, now: () => NOW, sleep: noSleep });
+
+/** `chain` behind the real Tatum meter, as createChain's hook puts it: a refused call is a ChainError BUDGET with nothing sent. */
+function metered(chain: Chain, on: Database, now: () => Date): Chain {
+  const admit = tatumMeter(on, now);
+  return new Proxy(chain, {
+    get(target, property, receiver) {
+      const value: unknown = Reflect.get(target, property, receiver);
+      if (typeof value !== 'function') return value;
+      return async (...args: unknown[]) => {
+        try {
+          await admit({ transport: 'grpc', method: String(property) });
+        } catch {
+          throw new ChainError('BUDGET', `${String(property)} refused by the request budget, nothing was sent`);
+        }
+        return (value as (...given: unknown[]) => unknown)(...args);
+      };
+    },
+  });
+}
 
 function settled(purse: string, recipient: string, amount: bigint): TransactionResult {
   return {
@@ -1655,7 +1701,8 @@ describe('runJobsTick', () => {
     expect(second).toMatchObject({ owners: 1, paymentsVerified: 0, paymentsNotLanded: 1, outcomesRecorded: 0, errors: [] });
     expect(await settlement(lost.id)).toBe('not_landed');
     expect(await outcomesOf(w.ownerId, on)).toHaveLength(2);
-    expect([readsOf(notYet.digest), readsOf(lost.digest), readsOf(failedSeller.digest)]).toEqual([2, 2, 1]);
+    // notYet's window is still open and it was read half an hour ago, so only the lost one is read again.
+    expect([readsOf(notYet.digest), readsOf(lost.digest), readsOf(failedSeller.digest)]).toEqual([1, 2, 1]);
   });
 
   it('reads the epoch once a tick for 5 pending payments past their window, two owners between them, and releases each one on a second pass LIMITS.paymentReleaseGapMs later (C4, C22)', async () => {
@@ -1679,6 +1726,47 @@ describe('runJobsTick', () => {
     expect(counted()).toEqual([2, 10]);
     const released = await on.select({ settlement: payments.settlement }).from(payments);
     expect(released.map((row) => row.settlement)).toEqual(Array<string>(5).fill('not_landed'));
+  });
+
+  it('reads 10 payments a seller holds back for a day at most 10 x 24 times, then reads them every tick once their window closes and releases them on the two-pass rule (C4, C22)', { timeout: 120_000 }, async () => {
+    expect(LIMITS.pendingPaymentReadIntervalMs).toBe(3_600_000);
+    const on = await freshDb();
+    const w = await world(on);
+    const held: Array<typeof payments.$inferSelect> = [];
+    for (let i = 0; i < 10; i++) held.push(await payment(w, await decision(w, 'paid', ago(120_000), on), { signedAt: ago(120_000) }, on));
+    const { chain, state, calls } = stubChain(on);
+    const tickMs = 600_000;
+    const at = (n: number) => new Date(NOW.getTime() + n * tickMs);
+    const tickAt = (n: number) => runJobsTick({ db: on, chain, masterSecretHex: MASTER, gasKeypair: GAS, now: () => at(n), sleep: noSleep });
+    const reads = () => calls.filter((call) => call.startsWith('getTransactionResult')).length;
+    const rows = () => on.select({ settlement: payments.settlement, missingSince: payments.missingSince, lastReadAt: payments.lastReadAt }).from(payments);
+
+    // The paid call's own reads stamp nothing, so the tick still reads that payment first.
+    const first = held[0] as (typeof held)[number];
+    expect(await settlePayment({ db: on, ownerId: w.ownerId, paymentId: first.id, chain, tries: 1, intervalMs: 0, sleep: noSleep, now: () => NOW, inline: true })).toBe('pending');
+    expect((await rows()).map((row) => row.lastReadAt)).toEqual(Array<Date | null>(10).fill(null));
+    calls.length = 0;
+
+    // A day of ticks ten minutes apart, every window still open: a read an hour each, and the tick's one epoch reading.
+    for (let n = 0; n < 144; n++) expect(await tickAt(n)).toMatchObject({ owners: 1, paymentsVerified: 0, paymentsNotLanded: 0, errors: [] });
+    expect(reads()).toBe(10 * 24);
+    expect(calls.filter((call) => call === 'getCurrentEpoch')).toHaveLength(144);
+    expect((await rows()).map((row) => row.lastReadAt)).toEqual(Array<Date>(10).fill(at(138)));
+
+    expect(await tickAt(144)).toMatchObject({ owners: 1, paymentsNotLanded: 0, errors: [] });
+    expect(reads()).toBe(10 * 25);
+    // The window closes ten minutes after that read: from then on every tick reads every payment.
+    state.epoch = 102n;
+    expect(await tickAt(145)).toMatchObject({ owners: 1, paymentsNotLanded: 0, errors: [] });
+    expect(reads()).toBe(10 * 26);
+    expect((await rows()).map((row) => [row.settlement, row.missingSince])).toEqual(Array(10).fill(['pending', at(145)]));
+    // Released only by a pass LIMITS.paymentReleaseGapMs after the one that stamped missing_since.
+    expect(LIMITS.paymentReleaseGapMs).toBe(3 * tickMs);
+    for (const n of [146, 147]) expect(await tickAt(n)).toMatchObject({ owners: 1, paymentsNotLanded: 0, errors: [] });
+    expect(reads()).toBe(10 * 28);
+    expect(await tickAt(148)).toMatchObject({ owners: 1, paymentsNotLanded: 10, errors: [] });
+    expect(reads()).toBe(10 * 29);
+    expect((await rows()).map((row) => row.settlement)).toEqual(Array<string>(10).fill('not_landed'));
   });
 
   it("counts a payment's failed settlement reads on the payment row itself, one per tick", async () => {
@@ -2077,6 +2165,31 @@ describe('runJobsTick', () => {
     for (const { call, scope } of reads) expect(scope).toEqual({ kind: 'jobs', ownerId: digests.get(call.slice('getTransactionResult:'.length)) });
   });
 
+  it("refills a low purse after payments spent the jobs day and every owner's jobs share, since refills draw on a Tatum pool of their own (C23, C28)", async () => {
+    const on = await freshDb();
+    const low = await funded(on, { allowanceCheckedAt: NOW });
+    const other = await world(on);
+    for (const w of [low, other]) {
+      for (let i = 0; i < 5; i++) await payment(w, await decision(w, 'paid', ago(120_000), on), { signedAt: ago(120_000) }, on);
+    }
+    const stub = stubFor(low, 0n, on);
+    const chain = metered(stub.chain, on, () => NOW);
+    const spent: TatumScope[] = [{ kind: 'jobs' }, { kind: 'jobs', ownerId: low.ownerId }, { kind: 'jobs', ownerId: other.ownerId }];
+    await withLimit('tatumCallsJobsPerOwnerPerDay', 3, () =>
+      withLimit('tatumCallsJobsPerDay', 5, async () => {
+        // As the jobs route runs it. Whichever owner goes first sends three payment reads before its
+        // share runs out, which with the gas wallet and epoch reads spends the jobs day; every
+        // owner's five payment reads count toward its share of three.
+        expect(await withTatumScope({ kind: 'jobs' }, () => tick(on, chain))).toMatchObject({ owners: 2, refills: 1, paymentsVerified: 0, errors: [] });
+        for (const scope of spent) await expect(withTatumScope(scope, () => chain.getCurrentEpoch())).rejects.toMatchObject({ name: 'ChainError', code: 'BUDGET' });
+      }),
+    );
+    const refilled = one(await refillRows(low.ownerId, on));
+    expect(refilled).toMatchObject({ amountAtomic: REFILL, status: 'verified' });
+    const paymentReads = stub.calls.filter((call) => call.startsWith('getTransactionResult:') && call !== `getTransactionResult:${refilled.digest}`);
+    expect(paymentReads).toHaveLength(3);
+  });
+
   it('visits the 26th owner within three ticks when 26 owners all have an allowance, which is work that never runs out', { timeout: 120_000 }, async () => {
     const on = await freshDb();
     const all: Funded[] = [];
@@ -2085,9 +2198,10 @@ describe('runJobsTick', () => {
       all.push(await funded(on, { allowanceCheckedAt: ago(60_000 * (LIMITS.jobsOwnersPerTick + 1 - i)) }));
     }
     const last = all[LIMITS.jobsOwnersPerTick] as Funded;
-    const { chain, state } = stubChain(on);
-    // Every purse reads at the threshold, so each visit ends at not_needed and every allowance stays.
-    for (const w of all) state.balances.set(w.purse, { usdcAddressBalance: BigInt(LIMITS.purseRefillBelowAtomic) });
+    const { chain } = stubChain(on);
+    // Every ledger holds a verified refill, above the threshold, so each visit ends at not_needed
+    // with nothing read or waited for, and every allowance stays.
+    for (const w of all) await refillRow(w, ago(60_000), 'verified', on);
     const tickAt = (at: Date) => runJobsTick({ db: on, chain, masterSecretHex: MASTER, gasKeypair: GAS, now: () => at, sleep: noSleep });
 
     expect(await tickAt(NOW)).toMatchObject({ owners: LIMITS.jobsOwnersPerTick, timeBudgetReached: false, errors: [] });

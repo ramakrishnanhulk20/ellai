@@ -3,8 +3,8 @@
 // its window closed and its digest missing, never while the window is open, and a later call that
 // finds it records it as landed (A-F1, C4, C27); the day's refill count and the new row's sent_at
 // come from the clock read under the owner lock, after the reads before it (A-F5, C26); a dry run
-// that fails holds the allowance off for one refill window, only while the owner still holds that
-// allowance, and a dry run with no verdict does not (D-1, C22); an allowance expiring within
+// that fails holds the allowance off for LIMITS.refillDryRunWaitMs, an hour, only while the owner
+// still holds that allowance, and a dry run with no verdict does not (D-1, C22); an allowance expiring within
 // LIMITS.allowanceExpiryMarginMs of the clock read after it, or of the end of a full rate window,
 // is forgotten and nothing is built (A-F6, C30).
 // Does NOT cover: the jobs tick that calls refillIfNeeded (jobs.test.ts), the real Sui chain or
@@ -268,7 +268,8 @@ describe('refillIfNeeded, the money-path audit fixes', () => {
     expect(sentNow).toMatchObject({ status: 'verified', sentAt: at(14_000), verifiedAt: at(18_000) });
   });
 
-  it('holds the allowance off for one refill window after a dry run that fails, only while the owner still holds it, and not after a dry run with no verdict (D-1, C22)', async () => {
+  it('holds the allowance off for an hour after a dry run that fails, only while the owner still holds it, and not after a dry run with no verdict (D-1, C22)', async () => {
+    expect(LIMITS.refillDryRunWaitMs).toBe(3_600_000);
     const lockedAt = at(5_000);
     const failed = await funded();
     const stub = stubChain(failed);
@@ -278,7 +279,7 @@ describe('refillIfNeeded, the money-path audit fixes', () => {
     );
     expect(stub.executions).toEqual([]);
     expect(one(await refillRows(failed.ownerId)).status).toBe('failed');
-    expect(await ownerRow(failed.ownerId)).toMatchObject({ allowanceId: failed.allowanceId, refillNotBefore: new Date(lockedAt.getTime() + DAY) });
+    expect(await ownerRow(failed.ownerId)).toMatchObject({ allowanceId: failed.allowanceId, refillNotBefore: new Date(lockedAt.getTime() + LIMITS.refillDryRunWaitMs) });
 
     const replaced = await funded();
     const newer = canonicalSuiAddress(`0x${hex(32)}`);
