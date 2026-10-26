@@ -72,10 +72,23 @@ export const ZKLOGIN_CLIENT_LIMITS = [
   { name: 'zklogin-checks:client:day', limit: LIMITS.zkLoginChecksPerClientPerDay, windowMs: LIMITS.rateWindowDayMs },
 ] as const;
 
+/**
+ * Completed sign-ins one client may make in a day, counted before SIGN_IN_SHARED_DAY so one
+ * client cannot spend the shared day alone. Each sign-in can create an owner row and a session
+ * for any wallet, so these two bound the rows standing (C22, C34).
+ */
+export const SIGN_IN_CLIENT_DAY = { name: 'signins:client:day', limit: LIMITS.signInsPerClientPerDay, windowMs: LIMITS.rateWindowDayMs } as const;
+
+/** Completed sign-ins every client together may make in a day. */
+export const SIGN_IN_SHARED_DAY = { name: 'signins:day', limit: LIMITS.signInsPerDayGlobal, windowMs: LIMITS.rateWindowDayMs } as const;
+
 interface Site {
   host: string;
   origin: string;
 }
+
+/** A transaction open on the database. */
+type Tx = Parameters<Parameters<Database['transaction']>[0]>[0];
 
 interface SignedIn {
   ownerId: string;
@@ -225,6 +238,35 @@ async function holdZkLoginQuotas(db: Database, checks: number, now: Date): Promi
 }
 
 /**
+ * Counts one completed sign-in against the client's day, when a client key is given, and then
+ * against everyone's day (C22, C34). Past the client's, HttpError 429 rate_limited_today, and
+ * nothing of the shared day is spent; past the shared day, HttpError 503 chain_unavailable_today,
+ * whose "come back tomorrow" fits, with one fixed log line in that day.
+ */
+async function holdSignInDays(db: Database, clientKey: string | undefined, now: Date): Promise<void> {
+  if (clientKey !== undefined && clientKey !== '') {
+    const allowed = await consumeWindow(db, `${SIGN_IN_CLIENT_DAY.name}:${clientKey}`, SIGN_IN_CLIENT_DAY.limit, SIGN_IN_CLIENT_DAY.windowMs, now);
+    if (!allowed) throw new HttpError(429, 'rate_limited_today');
+  }
+  const turn = await consumeShared(db, SIGN_IN_SHARED_DAY.name, SIGN_IN_SHARED_DAY.limit, SIGN_IN_SHARED_DAY.windowMs, now);
+  if (turn.allowed) return;
+  if (turn.firstRefusal) console.error(`[ellai signin] quota_spent ${SIGN_IN_SHARED_DAY.name}`);
+  throw new HttpError(503, 'chain_unavailable_today');
+}
+
+/**
+ * The owner row for `address`, made here when there is none, and held FOR KEY SHARE until the
+ * transaction ends. emptyOwners deletes a day-old row nothing points at, and may do so between
+ * this sign-in's steps: once this lock is held its FOR UPDATE SKIP LOCKED passes the row by, and
+ * a row it deleted first is simply not found, so the caller makes it again. Undefined only then.
+ */
+async function heldOwner(tx: Tx, address: string, purseAddress: string, now: Date): Promise<{ id: string } | undefined> {
+  await tx.insert(owners).values({ suiAddress: address, purseAddress, createdAt: now }).onConflictDoNothing({ target: owners.suiAddress });
+  const [owner] = await tx.select({ id: owners.id }).from(owners).where(eq(owners.suiAddress, address)).for('key share');
+  return owner;
+}
+
+/**
  * The client with its one call the SDK makes for zkLogin, Sui's own check of the proof, watched.
  * The SDK answers a proof that does not hold with success false, so a throw from that call means
  * Sui could not be read, while every other throw during verification is about the signature.
@@ -309,7 +351,7 @@ interface SignInRequest {
 /**
  * A chain client for zkLogin always comes with the client key its checks are counted against,
  * so the per-client limits cannot be left out by mistake. Without one no zkLogin signature is
- * checked and there is nothing to count.
+ * checked, and the client key, when given, still counts the client's sign-ins for the day.
  */
 type ZkLoginChecking = { zkLoginClient?: undefined; clientKey?: string } | { zkLoginClient: ClientWithCoreApi; clientKey: string };
 
@@ -336,9 +378,16 @@ type ZkLoginChecking = { zkLoginClient?: undefined; clientKey?: string } | { zkL
  *    message names: Ed25519, Secp256k1, Secp256r1 and multisig offline, zkLogin through
  *    `zkLoginClient` with its own timeout, and CHAIN_UNAVAILABLE rather than BAD_SIGNATURE when
  *    Sui cannot be read for it.
- * 7. In one short transaction, the owner row is created on first sign-in with its derived purse
- *    address, and a session whose token hash alone is stored, expiring LIMITS.sessionTtlMs after
- *    `now`.
+ * 7. The sign-in is counted (C22, C34): against SIGN_IN_CLIENT_DAY for `clientKey`, past
+ *    LIMITS.signInsPerClientPerDay HttpError 429 rate_limited_today with nothing shared spent,
+ *    then against SIGN_IN_SHARED_DAY, past LIMITS.signInsPerDayGlobal HttpError 503
+ *    chain_unavailable_today, with one fixed log line per day. A caller without a client key
+ *    counts only against the shared day, so a route facing the internet passes the platform's
+ *    client address, as the verify route does.
+ * 8. In one short transaction, the owner row is created on first sign-in with its derived purse
+ *    address, or found, and held FOR KEY SHARE (heldOwner), so emptyOwners cannot delete it before
+ *    the session that points at it is written; a row it deleted between the steps is made again.
+ *    Then a session whose token hash alone is stored, expiring LIMITS.sessionTtlMs after `now`.
  *
  * Returns the owner id, the session token (to be set as the cookie, never stored), and its
  * expiry.
@@ -392,10 +441,12 @@ export async function completeSignIn(args: SignInRequest & ZkLoginChecking): Pro
     await holdZkLoginQuotas(args.db, checks, now);
   }
   if ((await recoveredAddress(args.message, args.signature, address, checks > 0 ? args.zkLoginClient : undefined)) !== address) refuse('BAD_SIGNATURE');
+  // Counted before the transaction, so the shared day's counter row is never held locked while
+  // an owner and a session are written, which would line every sign-in up behind it.
+  await holdSignInDays(args.db, args.clientKey, now);
 
   return args.db.transaction(async (tx) => {
-    await tx.insert(owners).values({ suiAddress: address, purseAddress, createdAt: now }).onConflictDoNothing({ target: owners.suiAddress });
-    const [owner] = await tx.select({ id: owners.id }).from(owners).where(eq(owners.suiAddress, address));
+    const owner = (await heldOwner(tx, address, purseAddress, now)) ?? (await heldOwner(tx, address, purseAddress, now));
     if (owner === undefined) throw new Error('The owner row is missing after it was created');
     await tx.insert(sessions).values({ ownerId: owner.id, tokenHash: session.hash, createdAt: now, expiresAt: sessionExpiresAt });
     return { ownerId: owner.id, sessionToken: session.token, expiresAt: sessionExpiresAt };

@@ -113,9 +113,27 @@ interface Ledger {
 }
 
 /**
+ * What Ellai's own records say the owner's purse holds (Ledger.balanceAtomic): every verified
+ * refill in, minus every signed payment out that has not been released. Payments are counted by
+ * owner, since each owner has exactly one purse and pays only from it (C7). Below zero when
+ * payments outran the refills Ellai recorded.
+ */
+export async function ledgerBalanceAtomic(db: DbHandle, ownerId: string): Promise<bigint> {
+  const [refilled] = await db
+    .select({ total: sql<string>`coalesce(sum(${refills.amountAtomic}), 0)::text` })
+    .from(refills)
+    .where(and(eq(refills.ownerId, ownerId), eq(refills.status, 'verified')));
+  const [paid] = await db
+    .select({ total: sql<string>`coalesce(sum(${payments.amountAtomic}), 0)::text` })
+    .from(payments)
+    .where(and(eq(payments.ownerId, ownerId), isNull(payments.releasedAt)));
+  return BigInt(refilled?.total ?? '0') - BigInt(paid?.total ?? '0');
+}
+
+/**
  * Whether a refill is still pending, every refill sent in the LIMITS.purseRefillWindowMs before
- * `now` (landed, failed, or not yet known), and the purse balance by Ellai's own records.
- * Payments are counted by owner, since each owner has exactly one purse and pays only from it (C7).
+ * `now` (landed, failed, or not yet known), and the purse balance by Ellai's own records
+ * (ledgerBalanceAtomic).
  */
 async function refillLedger(db: DbHandle, ownerId: string, now: Date): Promise<Ledger> {
   const [pending] = await db
@@ -127,15 +145,7 @@ async function refillLedger(db: DbHandle, ownerId: string, now: Date): Promise<L
     .select({ n: count() })
     .from(refills)
     .where(and(eq(refills.ownerId, ownerId), gte(refills.sentAt, new Date(now.getTime() - LIMITS.purseRefillWindowMs))));
-  const [refilled] = await db
-    .select({ total: sql<string>`coalesce(sum(${refills.amountAtomic}), 0)::text` })
-    .from(refills)
-    .where(and(eq(refills.ownerId, ownerId), eq(refills.status, 'verified')));
-  const [paid] = await db
-    .select({ total: sql<string>`coalesce(sum(${payments.amountAtomic}), 0)::text` })
-    .from(payments)
-    .where(and(eq(payments.ownerId, ownerId), isNull(payments.releasedAt)));
-  return { pending: pending !== undefined, inWindow: sent?.n ?? 0, balanceAtomic: BigInt(refilled?.total ?? '0') - BigInt(paid?.total ?? '0') };
+  return { pending: pending !== undefined, inWindow: sent?.n ?? 0, balanceAtomic: await ledgerBalanceAtomic(db, ownerId) };
 }
 
 /**
@@ -171,20 +181,58 @@ function windowRoom(allowance: AllowanceReading, now: Date): bigint | null {
   return allowance.periodLimit - (ended ? 0n : allowance.periodSpent);
 }
 
+// The latest time a JavaScript Date can hold. A window ending after it never ends for Ellai.
+const LAST_DATE_MS = 8_640_000_000_000_000n;
+
 /**
- * C7: the allowance as the chain holds it now debits this owner, pays only this owner's purse,
- * is over Sui Mainnet USDC, has not expired, and still has room for one whole refill under its
- * lifetime cap and in its current rate window, since a spend past either aborts on chain and
- * the gas wallet pays for nothing.
+ * C7: whether the allowance as the chain holds it now can pay one whole refill. 'serves' when it
+ * debits this owner, pays only this owner's purse, is over Sui Mainnet USDC, has not expired, and
+ * has room for the refill under its lifetime cap and in its current rate window, since a spend
+ * past either aborts on chain and the gas wallet pays for nothing.
+ *
+ * 'never' when no later reading can change that (C22): another funder or spender, another coin,
+ * expired, a lifetime cap with less than a refill left, or a rate limit smaller than one refill.
+ * Each of those is fixed when the allowance is made or only moves the wrong way. Otherwise only
+ * the current window is short, and the answer is the time it ends: one period from `now` when the
+ * reading cannot place the window, and 'never' when the allowance expires before that time.
  */
-function allowanceServes(allowance: AllowanceReading, owner: OwnerFacts, now: Date): boolean {
-  if (!sameAddress(allowance.funder, owner.suiAddress) || !sameAddress(allowance.spender, owner.purseAddress)) return false;
-  if (coinOrNull(allowance.coinType) !== USDC_TYPE_MAINNET) return false;
-  if (allowance.expirationMs !== null && allowance.expirationMs <= BigInt(now.getTime())) return false;
+function allowanceVerdict(allowance: AllowanceReading, owner: OwnerFacts, now: Date): 'serves' | 'never' | Date {
+  if (!sameAddress(allowance.funder, owner.suiAddress) || !sameAddress(allowance.spender, owner.purseAddress)) return 'never';
+  if (coinOrNull(allowance.coinType) !== USDC_TYPE_MAINNET) return 'never';
+  const nowMs = BigInt(now.getTime());
+  if (allowance.expirationMs !== null && allowance.expirationMs <= nowMs) return 'never';
   const refill = BigInt(LIMITS.purseRefillAtomic);
-  if (allowance.lifetimeCap !== null && allowance.lifetimeCap - allowance.spentTotal < refill) return false;
+  if (allowance.lifetimeCap !== null && allowance.lifetimeCap - allowance.spentTotal < refill) return 'never';
+  if (allowance.periodLimit !== null && allowance.periodLimit < refill) return 'never';
   const room = windowRoom(allowance, now);
-  return room === null || room >= refill;
+  if (room === null || room >= refill) return 'serves';
+  const { periodEndMs, periodMs } = allowance;
+  let endMs: bigint | null = null;
+  if (typeof allowance.periodSpent === 'bigint' && typeof periodEndMs === 'bigint' && periodEndMs > nowMs) endMs = periodEndMs;
+  else if (typeof periodMs === 'bigint' && periodMs > 0n) endMs = nowMs + periodMs;
+  if (endMs === null || endMs > LAST_DATE_MS) return 'never';
+  if (allowance.expirationMs !== null && allowance.expirationMs <= endMs) return 'never';
+  return new Date(Number(endMs));
+}
+
+/**
+ * Forgets an allowance that can never pay again, so onboarding shows it missing and the tick stops
+ * visiting this owner for refills (C22). Only the allowance read is cleared: one recorded since
+ * then stays.
+ */
+async function forgetAllowance(db: Database, ownerId: string, allowanceId: string): Promise<void> {
+  await db
+    .update(owners)
+    .set({ allowanceId: null, allowanceCheckedAt: null, refillNotBefore: null })
+    .where(and(eq(owners.id, ownerId), eq(owners.allowanceId, allowanceId)));
+}
+
+/** Records when the allowance's full rate window ends, before which the tick asks the chain nothing for a refill (C22). */
+async function waitForWindow(db: Database, ownerId: string, allowanceId: string, notBefore: Date): Promise<void> {
+  await db
+    .update(owners)
+    .set({ refillNotBefore: notBefore })
+    .where(and(eq(owners.id, ownerId), eq(owners.allowanceId, allowanceId)));
 }
 
 /**
@@ -320,8 +368,13 @@ async function resolvePending(
  * 5. Only for a refill that will be built is the allowance at the owner's stored allowance_id
  *    read, and it must pass C7 (funder is the owner, spender is the purse, USDC, not expired,
  *    room for one refill under the lifetime cap and in the current rate window); otherwise
- *    'refused' and nothing is built or sent. Then the chain facts (epoch, gas price, the
- *    allowance's initial shared version, a random nonce) are read, all before any lock.
+ *    'refused' and nothing is built or sent. The refusal is recorded so the chain is not asked
+ *    the same question again (C22, allowanceVerdict): an allowance that is gone or can never pay
+ *    again has allowance_id, allowance_checked_at and refill_not_before cleared in one update, and
+ *    one whose current rate window alone is short sets refill_not_before to the window's end,
+ *    which the jobs tick waits for. Either update touches the owner only while it still holds this
+ *    allowance id. Then the chain facts (epoch, gas price, the allowance's initial shared
+ *    version, a random nonce) are read, all before any lock.
  * 6. In one transaction holding the owner row FOR UPDATE: any refill still pending is
  *    'skipped_pending', so two calls can never refill twice; every refill sent in the last
  *    LIMITS.purseRefillWindowMs is counted, and core's refillDecision decides again on the larger of the balance read and
@@ -394,10 +447,21 @@ export async function refillIfNeeded(args: RefillJobArgs): Promise<RefillOutcome
     allowance = await chain.getAllowance(allowanceId);
   } catch (error) {
     // Revoked, or never there: nothing to spend from.
-    if (error instanceof ChainError && error.code === 'NOT_FOUND') return 'refused';
+    if (error instanceof ChainError && error.code === 'NOT_FOUND') {
+      await forgetAllowance(db, ownerId, allowanceId);
+      return 'refused';
+    }
     throw error;
   }
-  if (!allowanceServes(allowance, owner, now)) return 'refused';
+  const verdict = allowanceVerdict(allowance, owner, now);
+  if (verdict === 'never') {
+    await forgetAllowance(db, ownerId, allowanceId);
+    return 'refused';
+  }
+  if (verdict !== 'serves') {
+    await waitForWindow(db, ownerId, allowanceId, verdict);
+    return 'refused';
+  }
   if (!canStart()) return 'deferred';
   const epoch = await chain.getCurrentEpoch();
   if (!canStart()) return 'deferred';

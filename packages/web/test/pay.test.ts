@@ -2,7 +2,9 @@
 // unreadable price, asks and refusals that never sign, an approval signed once by the owner's
 // derived purse and sent as the same request plus the payment header, the pause, the per-payment
 // maximum and the daily budget checked again at signing, a pending payment of any age counted
-// against the budget, an agent revoked before signing, a short purse, an expired price, a price
+// against the budget, an agent revoked before signing, a short purse, an owner with no allowance
+// refused before any chain read however many grants it cycles through unless Ellai's own ledger
+// still holds the payment, an expired price, a price
 // that runs out while the chain is read (the clock is read after), a decision that no longer
 // matches its payment, a purse that moved, a request already in flight (open, pending until
 // its epoch window closes, or landed up to the edge of the paid call's window), a twin decision
@@ -38,7 +40,7 @@ import { verifyTransactionSignature } from '@mysten/sui/verify';
 import { and, eq } from 'drizzle-orm';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { type Database, createDb, migrate } from '../src/server/db/client.js';
-import { agents, decisions, memories, owners, payments, questions } from '../src/server/db/schema.js';
+import { agents, decisions, memories, owners, payments, questions, refills } from '../src/server/db/schema.js';
 import { answerQuestion } from '../src/server/decide/answer.js';
 import { type Recall, decide } from '../src/server/decide/decide.js';
 import { ownerDelegate } from '../src/server/memory/delegate.js';
@@ -99,10 +101,12 @@ function one<T>(rows: T[]): T {
   return row;
 }
 
+// An onboarded owner, with an allowance on record, unless the test says otherwise.
 async function world(owner: Partial<typeof owners.$inferInsert> = {}): Promise<World> {
   const suiAddress = canonicalSuiAddress(`0x${hex(32)}`);
   const derived = canonicalSuiAddress(derivePurseKeypair(MASTER, suiAddress).toSuiAddress());
-  const row = one(await db.insert(owners).values({ suiAddress, purseAddress: derived, ...owner }).returning());
+  const allowanceId = canonicalSuiAddress(`0x${hex(32)}`);
+  const row = one(await db.insert(owners).values({ suiAddress, purseAddress: derived, allowanceId, allowanceCheckedAt: NOW, ...owner }).returning());
   const agent = one(
     await db.insert(agents).values({ ownerId: row.id, label: 'Test agent', kind: 'external', tokenHash: hex(32), tokenPrefix: 'ellai_ab12' }).returning(),
   );
@@ -498,6 +502,53 @@ describe('paidFetch', () => {
     expect(one(await decisionRows(w.ownerId)).status).toBe('failed');
     expect(paidCalls(fetch)).toHaveLength(0);
     expect(await paymentRows(w.ownerId)).toHaveLength(0);
+  });
+
+  it("refuses purse_short before any chain read for an owner with no allowance and nothing on Ellai's ledger, so 31 grant cycles read the chain zero times (C22)", async () => {
+    const w = await world({ allowanceId: null, allowanceCheckedAt: null });
+    const { chain, calls } = stubChain(w);
+    const fetch = seller();
+    const attempt = (purpose: string) => run(w, { fetch, chain, purpose });
+    for (let cycle = 0; cycle < 31; cycle++) {
+      const asked = await attempt(`cycle ${cycle}`);
+      expect(asked).toMatchObject({ outcome: 'asked', rule: 'no_match' });
+      await answerQuestion({ db, ownerId: w.ownerId, decisionId: asked.decisionId ?? '', answer: 'approve', reason: null, delegatePublicKeyHex: w.delegate, namespace: MEMORY_NAMESPACE, now: NOW });
+      expect(await attempt(`cycle ${cycle} retried`)).toMatchObject({ outcome: 'failed', rule: 'grant', reason: "This account's purse does not hold enough USDC for this payment right now." });
+    }
+    expect(calls).toEqual({ epochs: 0, balances: [], reads: [] });
+    expect(paidCalls(fetch)).toHaveLength(0);
+    expect(await paymentRows(w.ownerId)).toHaveLength(0);
+  });
+
+  it('still signs from the float Ellai put in the purse after the allowance was forgotten, and refuses with no read once that float is below the payment (C22, C23)', async () => {
+    const w = await world({ allowanceId: null, allowanceCheckedAt: null });
+    // 0.15 USDC Ellai refilled, as its own records show; the allowance it came from was forgotten since.
+    await db.insert(refills).values({ ownerId: w.ownerId, allowanceId: canonicalSuiAddress(`0x${hex(32)}`), amountAtomic: 150_000n, digest: hex(32), sentAt: NOW, status: 'verified', verifiedAt: NOW });
+    const { recall } = await approvals(w);
+    const { chain, calls } = stubChain(w, { balance: 150_000n });
+    const sign = (d: { decisionId: string; payment: CanonicalPayment }) => signForDecision({ db, ownerId: w.ownerId, ...d, masterSecretHex: MASTER, chain, now: () => NOW });
+
+    expect(await sign(await approvedDecision(w, recall, 'first search'))).toHaveProperty('signed');
+    expect(calls).toMatchObject({ epochs: 1, balances: [w.purse] });
+    await storeDelivered(w.ownerId);
+
+    // Signed payments count as gone until released, so the ledger now holds one atomic unit less than a payment.
+    const elsewhere = await approvedDecision(w, recall, 'spent elsewhere');
+    await db.insert(payments).values({
+      decisionId: elsewhere.decisionId,
+      ownerId: w.ownerId,
+      purseAddress: w.purse,
+      recipient: RECIPIENT,
+      amountAtomic: 150_000n - 2n * PRICE + 1n,
+      digest: hex(32),
+      txBytesBase64: 'AA==',
+      signedAt: NOW,
+      validUntilEpoch: 101n,
+      sellerStatus: 200,
+      delivered: true,
+    });
+    expect(await sign(await approvedDecision(w, recall, 'third search'))).toEqual({ refusal: 'purse_short' });
+    expect(calls).toMatchObject({ epochs: 1, balances: [w.purse] });
   });
 
   it('fails without signing when the price expired before signing', async () => {

@@ -3,7 +3,8 @@
 // verify sends, once, to the chain client it was given (a 503 when that chain cannot answer,
 // with the nonce spent either way), its per-client limit keyed on the platform's client address
 // (429 with the nonce spent), a spent day answered with the day's own 429 and 503 wording, and
-// nothing read for any other key;
+// nothing read for any other key; the sign-in day caps per client and for everyone answered the
+// same way, with no cookie and no owner;
 // the session cookie, its flags and its name (__Host-ellai_session on https, read and cleared
 // under that name only, the plain name on http localhost); the same-origin check on all three;
 // the per-client and
@@ -30,7 +31,7 @@ import * as verifyRoute from '../src/app/api/auth/verify/route.js';
 import { type Database, createDb, migrate } from '../src/server/db/client.js';
 import { owners, sessions, signinNonces } from '../src/server/db/schema.js';
 import type { ServerEnv } from '../src/server/env.js';
-import { ZKLOGIN_CHECK_QUOTAS, ZKLOGIN_CLIENT_LIMITS } from '../src/server/auth/signin.js';
+import { SIGN_IN_CLIENT_DAY, SIGN_IN_SHARED_DAY, ZKLOGIN_CHECK_QUOTAS, ZKLOGIN_CLIENT_LIMITS } from '../src/server/auth/signin.js';
 import { type ServerContext, setServerContextFactory } from '../src/server/http/context.js';
 import { consumeShared, consumeWindow } from '../src/server/http/ratelimit.js';
 import { requireOwner } from '../src/server/http/session.js';
@@ -356,6 +357,34 @@ describe('zkLogin sign-in', () => {
     expect(await everyoneRefused.json()).toEqual({ error: 'chain_unavailable_today', message: "Ellai has used today's budget for reading Sui. Try again tomorrow (days are counted in UTC)." });
     expect(everyoneRefused.headers.get('set-cookie')).toBeNull();
     expect(verifyZkLoginSignature).not.toHaveBeenCalled();
+  });
+});
+
+describe('sign-in day caps', () => {
+  it("answers a client's spent day of sign-ins with 429 rate_limited_today and everyone's with 503 chain_unavailable_today, setting no cookie and making no owner (C22, C34)", async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    vi.stubEnv('VERCEL', '1');
+    // A day of its own, so the counters spent here touch no other test.
+    clock = new Date(Date.UTC(2031, 4, 1, 10));
+    const busy = '203.0.113.31';
+    await consumeWindow(db, `${SIGN_IN_CLIENT_DAY.name}:${busy}`, SIGN_IN_CLIENT_DAY.limit, SIGN_IN_CLIENT_DAY.windowMs, clock, SIGN_IN_CLIENT_DAY.limit);
+    const ownerOf = async (signer: Signer) => db.select().from(owners).where(eq(owners.suiAddress, canonicalSuiAddress(signer.toSuiAddress())));
+
+    const clientDay = await signedMessage();
+    const clientRefused = await verify({ message: clientDay.message, signature: clientDay.signature }, { forwardedFor: busy });
+    expect(clientRefused.status).toBe(429);
+    expect(await clientRefused.json()).toEqual({ error: 'rate_limited_today', message: 'Too many requests today. Try again tomorrow (days are counted in UTC).' });
+    expect(clientRefused.headers.get('set-cookie')).toBeNull();
+    expect(await ownerOf(clientDay.signer)).toEqual([]);
+
+    await consumeShared(db, SIGN_IN_SHARED_DAY.name, SIGN_IN_SHARED_DAY.limit, SIGN_IN_SHARED_DAY.windowMs, clock, SIGN_IN_SHARED_DAY.limit);
+    const sharedDay = await signedMessage();
+    const everyoneRefused = await verify({ message: sharedDay.message, signature: sharedDay.signature }, { forwardedFor: '198.51.100.31' });
+    expect(everyoneRefused.status).toBe(503);
+    expect(await everyoneRefused.json()).toEqual({ error: 'chain_unavailable_today', message: "Ellai has used today's budget for reading Sui. Try again tomorrow (days are counted in UTC)." });
+    expect(everyoneRefused.headers.get('set-cookie')).toBeNull();
+    expect(await ownerOf(sharedDay.signer)).toEqual([]);
   });
 });
 

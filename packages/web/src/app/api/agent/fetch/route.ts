@@ -1,6 +1,5 @@
 import { LIMITS } from '@ellai/core/limits';
-import { requireAgent, respondToAgent } from '../../../../server/http/agent-auth.js';
-import { withServerContext } from '../../../../server/http/context.js';
+import { scoped } from '../../../../server/http/context.js';
 import { jsonResponse, readJson } from '../../../../server/http/json.js';
 import { agentPaidFetch, paidFetchInput } from '../../../../server/mcp/server.js';
 
@@ -24,12 +23,7 @@ export const maxDuration = 300;
  * owner's agents together. A refusal or a question for the owner is still
  * 200: `outcome` says what Ellai did. No CORS headers: agents call from servers, not pages.
  */
-export async function POST(request: Request): Promise<Response> {
-  return respondToAgent(() =>
-    withServerContext(async (ctx) => {
-      const agent = await requireAgent(request, ctx);
-      const input = await readJson(request, paidFetchInput, LIMITS.agentBodyMaxBytes);
-      return jsonResponse(await agentPaidFetch(ctx, agent, input));
-    }),
-  );
-}
+export const POST = scoped('agent', async (request, ctx, agent): Promise<Response> => {
+  const input = await readJson(request, paidFetchInput, LIMITS.agentBodyMaxBytes);
+  return jsonResponse(await agentPaidFetch(ctx, agent, input));
+});

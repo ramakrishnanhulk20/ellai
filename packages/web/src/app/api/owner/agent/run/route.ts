@@ -2,11 +2,9 @@ import Anthropic from '@anthropic-ai/sdk';
 import { LIMITS } from '@ellai/core/limits';
 import { z } from 'zod';
 import { AgentTaskError, type PaidFetchInput, runAgentTask } from '../../../../../server/agent/run.js';
-import { withServerContext } from '../../../../../server/http/context.js';
-import { HttpError, respond } from '../../../../../server/http/errors.js';
+import { scoped } from '../../../../../server/http/context.js';
+import { HttpError } from '../../../../../server/http/errors.js';
 import { jsonResponse, readJson } from '../../../../../server/http/json.js';
-import { requireSameOrigin } from '../../../../../server/http/origin.js';
-import { requireOwner } from '../../../../../server/http/session.js';
 import { agentPaidFetch } from '../../../../../server/mcp/server.js';
 import type { PaidFetchResult } from '../../../../../server/pay/result.js';
 
@@ -44,38 +42,32 @@ function claudeClient(apiKey: string | undefined): Anthropic | null {
  * 'needs_key' and no model is called. 403 cross_origin, 401 signed_out, 400 for a bad body,
  * and 400 bad_task for a task that is empty or longer than LIMITS.agentTaskMaxChars.
  */
-export async function POST(request: Request): Promise<Response> {
-  return respond(() =>
-    withServerContext(async (ctx) => {
-      requireSameOrigin(request, ctx.env.APP_ORIGIN);
-      const { ownerId } = await requireOwner(request, ctx);
-      const { task } = await readJson(request, body, LIMITS.agentTaskBodyMaxBytes);
-      const paidFetchFor = async (agentId: string, input: PaidFetchInput, deadlineAt: number): Promise<PaidFetchResult> => {
-        const fetched = await agentPaidFetch(
-          ctx,
-          { ownerId, agentId },
-          { url: input.url, method: input.method, body: input.body ?? undefined, contentType: input.contentType ?? undefined, purpose: input.purpose },
-          { deadlineAt },
-        );
-        // runAgentTask labels the seller's answer as untrusted itself, under its own name.
-        const { sellerBodyIsUntrusted: _labelled, ...result } = fetched;
-        return result;
-      };
-      try {
-        const result = await runAgentTask({
-          db: ctx.db,
-          ownerId,
-          task,
-          appOrigin: ctx.env.APP_ORIGIN,
-          anthropic: claudeClient(ctx.env.ANTHROPIC_API_KEY),
-          paidFetchFor,
-          now: ctx.now,
-        });
-        return jsonResponse(result);
-      } catch (error) {
-        if (error instanceof AgentTaskError) throw new HttpError(400, 'bad_task');
-        throw error;
-      }
-    }),
-  );
-}
+export const POST = scoped('owner', async (request, ctx, { ownerId }): Promise<Response> => {
+  const { task } = await readJson(request, body, LIMITS.agentTaskBodyMaxBytes);
+  const paidFetchFor = async (agentId: string, input: PaidFetchInput, deadlineAt: number): Promise<PaidFetchResult> => {
+    const fetched = await agentPaidFetch(
+      ctx,
+      { ownerId, agentId },
+      { url: input.url, method: input.method, body: input.body ?? undefined, contentType: input.contentType ?? undefined, purpose: input.purpose },
+      { deadlineAt },
+    );
+    // runAgentTask labels the seller's answer as untrusted itself, under its own name.
+    const { sellerBodyIsUntrusted: _labelled, ...result } = fetched;
+    return result;
+  };
+  try {
+    const result = await runAgentTask({
+      db: ctx.db,
+      ownerId,
+      task,
+      appOrigin: ctx.env.APP_ORIGIN,
+      anthropic: claudeClient(ctx.env.ANTHROPIC_API_KEY),
+      paidFetchFor,
+      now: ctx.now,
+    });
+    return jsonResponse(result);
+  } catch (error) {
+    if (error instanceof AgentTaskError) throw new HttpError(400, 'bad_task');
+    throw error;
+  }
+});

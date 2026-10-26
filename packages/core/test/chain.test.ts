@@ -9,8 +9,12 @@
 // wrongly signed transaction refused by the network.
 // Offline too, against stand-in GraphQL pages: scanOwnedWalrusBlobs reading one bounded stretch,
 // handing back where the next starts, and its refusals; getWalrusEpoch against the shapes Tatum
-// returned for Walrus Mainnet, and its refusals.
-// Does NOT cover: a paid key's rate limits, the Walrus blob listing or scan against the live
+// returned for Walrus Mainnet, and its refusals. Offline, against a stand-in gRPC transport and
+// stand-in GraphQL answers: the beforeRequest hook running once for every page and every retry,
+// for calls made straight on chain.grpc (the SDK's zkLogin check among them) as well as through
+// the Chain methods, and a hook that throws sending nothing and failing the call as BUDGET, never
+// retried, with streaming calls refused.
+// Does NOT cover: the hook against the live gateway (no live test passes one), a paid key's rate limits, the Walrus blob listing or scan against the live
 // gateway (the probe script and the scratch cross-check exercise the listing), an owner that
 // actually holds USDC, a failed transaction's status read from chain (none is pinned
 // here), a dry run that executes and fails (probe:pay shows the refusal path), or a
@@ -25,8 +29,10 @@ import { GrpcTypes } from '@mysten/sui/grpc';
 import { Ed25519Keypair } from '@mysten/sui/keypairs/ed25519';
 import { Transaction, TransactionDataBuilder } from '@mysten/sui/transactions';
 import { normalizeSuiAddress, toBase58, toBase64 } from '@mysten/sui/utils';
+import { GrpcTransport } from '@protobuf-ts/grpc-transport';
+import { type MethodInfo, UnaryCall } from '@protobuf-ts/runtime-rpc';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
-import { ChainError, WALRUS_BLOB_TYPE, WALRUS_SYSTEM_OBJECT_ID, createChain } from '../src/chain.js';
+import { ChainError, type TatumCall, WALRUS_BLOB_TYPE, WALRUS_SYSTEM_OBJECT_ID, createChain } from '../src/chain.js';
 import { LIMITS } from '../src/limits.js';
 import { USDC_TYPE_MAINNET } from '../src/usdc.js';
 
@@ -640,6 +646,162 @@ describe('getAllowance shape checks, against stand-in GraphQL bodies', () => {
     const missing = await withGraphql({ data: { object: null } }, () => failureOf(chain.getAllowance(STAND_IN_ALLOWANCE)));
     expect(missing.code).toBe('NOT_FOUND');
     expect((await failureOf(chain.getAllowance('0x'))).code).toBe('INVALID_INPUT');
+  });
+});
+
+type GrpcAnswer = () => object | Promise<object>;
+
+/**
+ * Answers every gRPC call on chains created inside `run` with the next of `answers`, never reaching
+ * the network, and records each method sent. The SDK binds the transport's unary when the chain
+ * is made, so the stand-in is put on the prototype before `run` makes one.
+ */
+async function withGrpcAnswers<T>(answers: GrpcAnswer[], run: (sent: string[]) => Promise<T>): Promise<T> {
+  const sent: string[] = [];
+  const unary = vi.spyOn(GrpcTransport.prototype, 'unary').mockImplementation(((method: MethodInfo, input: object) => {
+    sent.push(method.name);
+    const answer = answers[sent.length - 1];
+    const response = Promise.resolve().then(answer ?? (() => Promise.reject(new Error('the test gave no answer for this call'))));
+    const after = <V>(value: V) => response.then(() => value);
+    return new UnaryCall(method, {}, input, after({}), response, after({ code: 'OK', detail: '' }), after({}));
+  }) as never);
+  try {
+    return await run(sent);
+  } finally {
+    unary.mockRestore();
+  }
+}
+
+const unavailable: GrpcAnswer = () => Promise.reject(rpcError('UNAVAILABLE'));
+const HOOK_MARKER = 'MARKER_hook_7c1e';
+const OTHER_COIN = '0x0000000000000000000000000000000000000000000000000000000000000abc::other::OTHER';
+
+function hookRecorder(refuse = false) {
+  const calls: TatumCall[] = [];
+  const beforeRequest = vi.fn(async (call: TatumCall) => {
+    calls.push(call);
+    if (refuse) throw new Error(`over budget ${HOOK_MARKER}`);
+  });
+  return { calls, beforeRequest };
+}
+
+describe('beforeRequest, against a stand-in gRPC transport and stand-in GraphQL answers', () => {
+  const holder = normalizeSuiAddress(`0x${'4c'.repeat(32)}`);
+
+  it('runs once for every request: each page and each retry, gRPC and GraphQL alike', async () => {
+    const { calls, beforeRequest } = hookRecorder();
+    const pageOne = { balances: [{ coinType: OTHER_COIN, balance: '5', addressBalance: '5' }], nextPageToken: Uint8Array.of(1) };
+    const pageTwo = {
+      balances: [
+        { coinType: USDC_TYPE_MAINNET, balance: '30', addressBalance: '20', coinBalance: '10' },
+        { coinType: SUI, balance: '7', coinBalance: '7' },
+      ],
+    };
+    const balances = await withGrpcAnswers([unavailable, async () => pageOne, async () => pageTwo], async (sent) => {
+      const local = createChain({ beforeRequest });
+      try {
+        const read = await local.getBalances(holder);
+        expect(sent).toEqual(['ListBalances', 'ListBalances', 'ListBalances']);
+        return read;
+      } finally {
+        local.close();
+      }
+    });
+    expect(balances).toEqual({ usdcAddressBalance: 20n, usdcCoinBalance: 10n, suiTotal: 7n });
+    expect(calls).toEqual(Array.from({ length: 3 }, () => ({ transport: 'grpc', method: 'ListBalances' })));
+
+    calls.length = 0;
+    const answers = [
+      new Response('busy', { status: 503 }),
+      new Response(JSON.stringify(blobPage([blobNode(1)], 'cursor-1')), { status: 200 }),
+      new Response(JSON.stringify(blobPage([blobNode(2)], null)), { status: 200 }),
+    ];
+    const fetched = vi.fn(async () => answers.shift() ?? new Response('{}', { status: 500 }));
+    vi.stubGlobal('fetch', fetched);
+    const local = createChain({ beforeRequest });
+    try {
+      expect(await local.listOwnedWalrusBlobs(holder)).toHaveLength(2);
+    } finally {
+      vi.unstubAllGlobals();
+      local.close();
+    }
+    expect(fetched).toHaveBeenCalledTimes(3);
+    expect(calls).toEqual(Array.from({ length: 3 }, () => ({ transport: 'graphql', method: 'EllaiOwnedWalrusBlobs' })));
+  });
+
+  it('sends nothing when the hook throws, failing the call as BUDGET with no retry and none of the hook text', async () => {
+    const { calls, beforeRequest } = hookRecorder(true);
+    const failures = await withGrpcAnswers([], async (sent) => {
+      const local = createChain({ beforeRequest });
+      try {
+        const refused = [await failureOf(local.getReferenceGasPrice()), await failureOf(local.executeTransaction(SIGNED_BYTES, [SIGNATURE]))];
+        expect(sent).toEqual([]);
+        return refused;
+      } finally {
+        local.close();
+      }
+    });
+    expect(calls).toEqual([
+      { transport: 'grpc', method: 'GetEpoch' },
+      { transport: 'grpc', method: 'ExecuteTransaction' },
+    ]);
+    for (const failure of failures) {
+      expect(failure).toMatchObject({ code: 'BUDGET', retryable: false });
+      expect(failure.message).not.toContain(HOOK_MARKER);
+    }
+
+    calls.length = 0;
+    const fetched = vi.fn(async () => new Response(JSON.stringify(allowanceBody()), { status: 200 }));
+    vi.stubGlobal('fetch', fetched);
+    const local = createChain({ beforeRequest });
+    try {
+      const failure = await failureOf(local.getAllowance(STAND_IN_ALLOWANCE));
+      expect(failure).toMatchObject({ code: 'BUDGET', retryable: false });
+    } finally {
+      vi.unstubAllGlobals();
+      local.close();
+    }
+    expect(fetched).not.toHaveBeenCalled();
+    expect(calls).toEqual([{ transport: 'graphql', method: 'EllaiAllowance' }]);
+  });
+
+  it('runs for calls made straight on chain.grpc, as the Sui SDK makes the zkLogin check, and refuses streaming calls', async () => {
+    const zkLoginCheck = { bytes: toBase64(new TextEncoder().encode('sign in')), signature: SIGNATURE, intentScope: 'PersonalMessage' as const, address: holder };
+    const allowed = hookRecorder();
+    const verdict = await withGrpcAnswers([async () => ({ isValid: true })], async (sent) => {
+      const local = createChain({ beforeRequest: allowed.beforeRequest });
+      try {
+        const checked = await local.grpc.core.verifyZkLoginSignature(zkLoginCheck);
+        expect(sent).toEqual(['VerifySignature']);
+        return checked;
+      } finally {
+        local.close();
+      }
+    });
+    expect(verdict).toEqual({ success: true, errors: [] });
+    expect(allowed.calls).toEqual([{ transport: 'grpc', method: 'VerifySignature' }]);
+
+    const refused = hookRecorder(true);
+    await withGrpcAnswers([], async (sent) => {
+      const stream = vi.spyOn(GrpcTransport.prototype, 'serverStreaming').mockImplementation(() => {
+        throw new Error('a streaming call reached the transport');
+      });
+      const local = createChain({ beforeRequest: refused.beforeRequest });
+      try {
+        const failure = await local.grpc.core.verifyZkLoginSignature(zkLoginCheck).then(
+          () => null,
+          (error: unknown) => error,
+        );
+        expect(failure).toMatchObject({ name: 'ChainError', code: 'BUDGET' });
+        expect(() => local.grpc.subscriptionService.subscribeCheckpoints({})).toThrow(ChainError);
+        expect(sent).toEqual([]);
+        expect(stream).not.toHaveBeenCalled();
+      } finally {
+        stream.mockRestore();
+        local.close();
+      }
+    });
+    expect(refused.calls).toEqual([{ transport: 'grpc', method: 'VerifySignature' }]);
   });
 });
 

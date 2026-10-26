@@ -3,12 +3,10 @@ import { eq } from 'drizzle-orm';
 import { z } from 'zod';
 import { owners } from '../../../../server/db/schema.js';
 import { formatUsdc } from '../../../../server/decide/sentences.js';
-import { withServerContext } from '../../../../server/http/context.js';
-import { HttpError, respond } from '../../../../server/http/errors.js';
+import { scoped } from '../../../../server/http/context.js';
+import { HttpError } from '../../../../server/http/errors.js';
 import { jsonResponse, readJson } from '../../../../server/http/json.js';
 import { atomicAmountText } from '../../../../server/http/owner-limits.js';
-import { requireSameOrigin } from '../../../../server/http/origin.js';
-import { requireOwner } from '../../../../server/http/session.js';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -94,38 +92,32 @@ function boundsProblem(current: Settings, change: Change): string | null {
  * 400 bad_body for a malformed body, 400 out_of_bounds for a value outside its bounds, with
  * nothing changed.
  */
-export async function PATCH(request: Request): Promise<Response> {
-  return respond(() =>
-    withServerContext(async (ctx) => {
-      requireSameOrigin(request, ctx.env.APP_ORIGIN);
-      const { ownerId } = await requireOwner(request, ctx);
-      const change = await readJson(request, body, LIMITS.settingsBodyMaxBytes);
+export const PATCH = scoped('owner', async (request, ctx, { ownerId }): Promise<Response> => {
+  const change = await readJson(request, body, LIMITS.settingsBodyMaxBytes);
 
-      const outcome = await ctx.db.transaction(async (tx) => {
-        const [current] = await tx.select(SETTINGS).from(owners).where(eq(owners.id, ownerId)).for('update');
-        // Owners are never deleted, so a session without one is treated as no session at all.
-        if (current === undefined) throw new HttpError(401, 'signed_out');
-        const problem = boundsProblem(current, change);
-        if (problem !== null) return { problem };
-        const [updated] = await tx
-          .update(owners)
-          .set({
-            paused: change.paused,
-            perPaymentMaxAtomic: change.perPaymentMaxAtomic,
-            dailyBudgetAtomic: change.dailyBudgetAtomic,
-            approvalsNeeded: change.approvalsNeeded,
-            distanceCutoff: change.distanceCutoff === undefined ? undefined : Math.fround(change.distanceCutoff),
-            autoPausedReason: change.clearAutoPause === true ? null : undefined,
-            publicProof: change.publicProof,
-          })
-          .where(eq(owners.id, ownerId))
-          .returning(SETTINGS);
-        if (updated === undefined) throw new Error('the settings update returned no row');
-        return { settings: updated };
-      });
+  const outcome = await ctx.db.transaction(async (tx) => {
+    const [current] = await tx.select(SETTINGS).from(owners).where(eq(owners.id, ownerId)).for('update');
+    // Owners are never deleted, so a session without one is treated as no session at all.
+    if (current === undefined) throw new HttpError(401, 'signed_out');
+    const problem = boundsProblem(current, change);
+    if (problem !== null) return { problem };
+    const [updated] = await tx
+      .update(owners)
+      .set({
+        paused: change.paused,
+        perPaymentMaxAtomic: change.perPaymentMaxAtomic,
+        dailyBudgetAtomic: change.dailyBudgetAtomic,
+        approvalsNeeded: change.approvalsNeeded,
+        distanceCutoff: change.distanceCutoff === undefined ? undefined : Math.fround(change.distanceCutoff),
+        autoPausedReason: change.clearAutoPause === true ? null : undefined,
+        publicProof: change.publicProof,
+      })
+      .where(eq(owners.id, ownerId))
+      .returning(SETTINGS);
+    if (updated === undefined) throw new Error('the settings update returned no row');
+    return { settings: updated };
+  });
 
-      if (outcome.problem !== undefined) throw new HttpError(400, 'out_of_bounds', outcome.problem);
-      return jsonResponse(outcome.settings);
-    }),
-  );
-}
+  if (outcome.problem !== undefined) throw new HttpError(400, 'out_of_bounds', outcome.problem);
+  return jsonResponse(outcome.settings);
+});

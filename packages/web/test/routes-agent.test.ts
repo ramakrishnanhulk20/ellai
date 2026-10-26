@@ -31,7 +31,7 @@ import * as mcpRoute from '../src/app/api/mcp/route.js';
 import { createAgentToken, revokeAgent } from '../src/server/auth/agents.js';
 import { completeSignIn, issueSignIn } from '../src/server/auth/signin.js';
 import { type Database, createDb, migrate } from '../src/server/db/client.js';
-import { decisions, payments } from '../src/server/db/schema.js';
+import { decisions, owners, payments } from '../src/server/db/schema.js';
 import { answerQuestion } from '../src/server/decide/answer.js';
 import type { ServerEnv } from '../src/server/env.js';
 import { setServerContextFactory } from '../src/server/http/context.js';
@@ -115,6 +115,9 @@ async function world(): Promise<World> {
   const signature = (await signer.signPersonalMessage(new TextEncoder().encode(message))).signature;
   const done = await completeSignIn({ db, message, signature, appOrigin: APP_ORIGIN, masterSecretHex: MASTER, sessionSecretHex: SECRET, now: clock });
   const address = canonicalSuiAddress(signer.toSuiAddress());
+  // An onboarded owner, as signing reads the purse only for an owner with an allowance or a float.
+  const allowanceId = canonicalSuiAddress(Ed25519Keypair.generate().toSuiAddress());
+  await db.update(owners).set({ allowanceId, allowanceCheckedAt: clock }).where(eq(owners.id, done.ownerId));
   const agent = await anotherAgent(done.ownerId);
   return {
     ownerId: done.ownerId,

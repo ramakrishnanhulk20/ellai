@@ -15,6 +15,7 @@ import {
   SUI_TYPE_ARG,
 } from '@mysten/sui/utils';
 import { GrpcTransport } from '@protobuf-ts/grpc-transport';
+import { type FinishedUnaryCall, type RpcInterceptor, UnaryCall } from '@protobuf-ts/runtime-rpc';
 import { z } from 'zod';
 import { canonicalSuiAddress } from './keys.js';
 import { LIMITS } from './limits.js';
@@ -94,7 +95,18 @@ export type ChainErrorCode =
   | 'UNAUTHORIZED'
   | 'UPSTREAM'
   | 'BAD_RESPONSE'
-  | 'LIMIT_EXCEEDED';
+  | 'LIMIT_EXCEEDED'
+  | 'BUDGET';
+
+/** One request about to be sent to Tatum, as createChain's beforeRequest hook sees it. */
+export interface TatumCall {
+  transport: 'grpc' | 'graphql';
+  /** The gRPC method name, or the GraphQL operation name ('graphql' when the query names none). */
+  method: string;
+}
+
+/** Runs before every request to Tatum. Throwing, for any reason, stops the request from being sent. */
+export type BeforeTatumRequest = (call: TatumCall) => void | Promise<void>;
 
 /**
  * Every failure from this module is a ChainError. Its message is written here from
@@ -230,9 +242,9 @@ export interface WalrusBlobScan {
 export interface Chain {
   /** True when an API key is sent with every request; false for the anonymous gateway. */
   readonly usesApiKey: boolean;
-  /** Raw gRPC client. Calls made on it directly get the transport timeout but no retries. */
+  /** Raw gRPC client. Calls made on it directly get the transport timeout and the beforeRequest hook, but no retries. */
   readonly grpc: SuiGrpcClient;
-  /** Raw GraphQL client. Calls made on it directly get the fetch timeout but no retries. */
+  /** Raw GraphQL client. Calls made on it directly get the fetch timeout and the beforeRequest hook, but no retries. */
   readonly graphql: SuiGraphQLClient;
   getReferenceGasPrice(): Promise<bigint>;
   getBalances(address: string): Promise<Balances>;
@@ -316,6 +328,61 @@ export function classifyChainError(error: unknown): ChainError {
 }
 
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+const GRAPHQL_OPERATION = /^\s*(?:query|mutation)\s+([A-Za-z_][A-Za-z0-9_]{0,63})\b/;
+
+/** The operation name a GraphQL request body names, or 'graphql'. Only a plain identifier is ever passed on. */
+function graphqlOperation(body: unknown): string {
+  if (typeof body !== 'string') return 'graphql';
+  try {
+    const { query } = JSON.parse(body) as { query?: unknown };
+    return (typeof query === 'string' ? GRAPHQL_OPERATION.exec(query)?.[1] : undefined) ?? 'graphql';
+  } catch {
+    return 'graphql';
+  }
+}
+
+/**
+ * Puts `admit` in front of every unary call on the transport, so calls the Sui SDK makes through
+ * the raw client pass it as well as this module's own. A unary call has to be returned at once,
+ * so it is returned as a promise of the real call made only after `admit` resolves. Streaming
+ * calls cannot be counted one request at a time, and Ellai makes none, so they are refused.
+ */
+function admittingInterceptor(admit: (call: TatumCall) => Promise<void>): RpcInterceptor {
+  const unmetered = (): never => {
+    throw new ChainError('BUDGET', 'streaming calls to Tatum cannot be counted, so none is sent');
+  };
+  return {
+    interceptUnary(next, method, input, options) {
+      // A UnaryCall is a thenable, so this settles once the whole call has.
+      const finished: Promise<FinishedUnaryCall<object, object>> = admit({ transport: 'grpc', method: method.name }).then(() => {
+        // An abort listener added after the signal fired never runs, so a call whose deadline
+        // passed while admit ran would otherwise still be sent.
+        if (options.abort?.aborted) throw new ChainError('TIMEOUT', `${method.name} was abandoned before it was sent`, true);
+        return next(method, input, options);
+      });
+      const part = <T>(pick: (call: FinishedUnaryCall<object, object>) => T): Promise<T> => {
+        const settled = finished.then(pick);
+        // As grpc-transport's own parts do: a caller that awaits only the response must not
+        // leave the other parts of a refused call as unhandled rejections.
+        settled.catch(() => undefined);
+        return settled;
+      };
+      return new UnaryCall(
+        method,
+        options.meta ?? {},
+        input,
+        part((call) => call.headers),
+        part((call) => call.response),
+        part((call) => call.status),
+        part((call) => call.trailers),
+      );
+    },
+    interceptServerStreaming: unmetered,
+    interceptClientStreaming: unmetered,
+    interceptDuplex: unmetered,
+  };
+}
 
 function badResponse(what: string): ChainError {
   return new ChainError('BAD_RESPONSE', `unexpected response from Tatum: ${what}`);
@@ -651,9 +718,27 @@ function allowanceCoinType(repr: string): string {
  * throws ChainError on any failure. Responses are size-capped: a GraphQL body at
  * LIMITS.graphqlMaxResponseBytes and a gRPC message at LIMITS.grpcMaxReceiveBytes; going
  * over either is LIMIT_EXCEEDED and is not retried.
+ *
+ * `beforeRequest`, when given, is awaited before every request sent to Tatum: each gRPC call on
+ * the transport, the Sui SDK's own calls through `grpc` included, each GraphQL fetch, each page
+ * and each retry. If it throws, nothing is sent and that request fails with ChainError BUDGET,
+ * which is never retried; streaming gRPC calls are then refused the same way, since they cannot
+ * be counted. Without it nothing runs before a request.
  */
-export function createChain(opts: { apiKey?: string }): Chain {
+export function createChain(opts: { apiKey?: string; beforeRequest?: BeforeTatumRequest }): Chain {
   const apiKey = opts.apiKey === '' ? undefined : opts.apiKey;
+  const { beforeRequest } = opts;
+  // The hook's own error is never kept: it is the caller's code, and its text is not this module's to pass on.
+  const admit =
+    beforeRequest === undefined
+      ? null
+      : async (call: TatumCall): Promise<void> => {
+          try {
+            await beforeRequest(call);
+          } catch {
+            throw new ChainError('BUDGET', `${call.method} refused by the request budget, nothing was sent`);
+          }
+        };
 
   const transport = new GrpcTransport({
     host: TATUM_GRPC_HOST,
@@ -661,10 +746,12 @@ export function createChain(opts: { apiKey?: string }): Chain {
     timeout: LIMITS.tatumTimeoutMs,
     clientOptions: { 'grpc.max_receive_message_length': LIMITS.grpcMaxReceiveBytes },
     ...(apiKey ? { meta: { [API_KEY_HEADER]: apiKey } } : {}),
+    ...(admit ? { interceptors: [admittingInterceptor(admit)] } : {}),
   });
   const grpc = new SuiGrpcClient({ network: 'mainnet', transport });
 
   const boundedFetch: typeof fetch = async (input, init) => {
+    if (admit) await admit({ transport: 'graphql', method: graphqlOperation(init?.body) });
     const timeout = AbortSignal.timeout(LIMITS.tatumTimeoutMs);
     const signal = init?.signal ? AbortSignal.any([init.signal, timeout]) : timeout;
     const response = await fetch(input, { ...init, signal });

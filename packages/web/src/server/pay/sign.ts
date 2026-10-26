@@ -8,6 +8,7 @@ import { normalizeStructTag } from '@mysten/sui/utils';
 import { and, eq, gt, ne, or } from 'drizzle-orm';
 import type { Database } from '../db/client.js';
 import { agents, decisions, owners, payments } from '../db/schema.js';
+import { ledgerBalanceAtomic } from '../jobs/refill.js';
 import { heldOrSpentAtomic } from './liability.js';
 
 /** The database, or a transaction open on it. */
@@ -132,7 +133,9 @@ function decidedThis(decision: typeof decisions.$inferSelect, payment: Canonical
  * the pause, the per-payment maximum, a payment already under way for the same request, and
  * the daily budget checked, and the budget debited, in the same step (C4, C5, C6, C7, C8).
  *
- * Before any lock: reads the chain's current epoch and the recorded purse's USDC address
+ * An owner with no allowance_id whose purse, by Ellai's own records (ledgerBalanceAtomic), holds
+ * less than the amount is 'purse_short' before anything is read from the chain. Then,
+ * before any lock: reads the chain's current epoch and the recorded purse's USDC address
  * balance; a balance below the amount is 'purse_short'. Then in one transaction: locks the
  * owner row FOR UPDATE and the decision row after it, in the order every other writer takes
  * them. The decision must be this owner's, 'open', and name the canonical payment's
@@ -169,8 +172,12 @@ export async function signForDecision(args: SignArgs): Promise<SignResult> {
   const ownerId = args.ownerId.toLowerCase();
   const decisionId = args.decisionId.toLowerCase();
 
-  const [recorded] = await db.select({ purseAddress: owners.purseAddress }).from(owners).where(eq(owners.id, ownerId));
+  const [recorded] = await db.select({ purseAddress: owners.purseAddress, allowanceId: owners.allowanceId }).from(owners).where(eq(owners.id, ownerId));
   if (recorded === undefined) return { refusal: 'not_open' };
+  // Without an allowance nothing refills the purse, so only the float Ellai's own records put there
+  // can pay; refusing on those records alone means a wallet that never had a refill cannot loop
+  // grants into chain reads, while one whose allowance was forgotten can still spend what is left (C22).
+  if (recorded.allowanceId === null && (await ledgerBalanceAtomic(db, ownerId)) < payment.amount) return { refusal: 'purse_short' };
   // Read before the transaction so no row lock is held while Tatum answers.
   const epoch = await chain.getCurrentEpoch();
   const { usdcAddressBalance } = await chain.getBalances(recorded.purseAddress);

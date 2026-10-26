@@ -47,20 +47,54 @@ async function ownerClient(db: Database, ownerId: string, masterSecretHex: strin
   return ownerMemoryClient(owner, masterSecretHex);
 }
 
-type SendState = 'not_sent' | 'sending' | 'refused' | 'answered';
+type SendState = 'not_sent' | 'sending' | 'unsent' | 'refused' | 'answered';
+
+// The steps SDK 0.1.8 takes inside a signed request before the request itself goes out: the
+// relayer's version check, and the SEAL session, which reads GET /config and then Sui.
+const SETUP_STEPS = ['ensureCompatibleRelayer', 'buildSealSession'] as const;
+
+/**
+ * Counts the failures of this client's setup steps (SETUP_STEPS). A call during which the count
+ * rose failed before its request went out, so the relayer never saw it and the failure says
+ * nothing about the rows, the jobs or the key. SDK 0.1.8's own setup errors (GET /version,
+ * /health, /config) carry their status only in the message, but the SEAL session reads Sui
+ * through @mysten/sui's JSON-RPC client, whose SuiHTTPStatusError carries the fullnode's HTTP
+ * status, which core would otherwise read as the relayer refusing the request.
+ */
+function watchSetupSteps(client: MemoryClient): () => number {
+  let failures = 0;
+  const steps = client as unknown as Record<(typeof SETUP_STEPS)[number], unknown>;
+  for (const name of SETUP_STEPS) {
+    const step = steps[name];
+    if (typeof step !== 'function') continue;
+    const run = step.bind(client) as () => Promise<unknown>;
+    steps[name] = async () => {
+      try {
+        return await run();
+      } catch (error) {
+        failures += 1;
+        throw error;
+      }
+    };
+  }
+  return () => failures;
+}
 
 /**
  * Watches each bulk write made on this client, from `start` to the next `start`. 'refused' is
  * an answer the relayer only ever gives before creating a job: any 4xx (validation, auth, rate
  * limit) or a 503 (writes paused, or the auth layer unable to reach Sui), per remember_bulk in
  * services/server/src/routes/remember.rs. 'answered' is a 2xx: the relayer took the write.
- * 'sending' left is no answer at all, a 500, 502 or 504, or a timeout, any of which may or may
- * not have stored something.
+ * 'unsent' is a setup step that failed before the request went out (watchSetupSteps), whatever
+ * status its error carries. 'sending' left is no answer at all, a 500, 502 or 504, or a timeout,
+ * any of which may or may not have stored something.
  */
 function watchBulkWrites(client: MemoryClient): { start: () => void; state: () => SendState } {
   let state: SendState = 'not_sent';
+  const setupFailures = watchSetupSteps(client);
   const send = client.rememberBulk.bind(client);
   client.rememberBulk = async (items) => {
+    const before = setupFailures();
     state = 'sending';
     try {
       const accepted = await send(items);
@@ -68,7 +102,8 @@ function watchBulkWrites(client: MemoryClient): { start: () => void; state: () =
       return accepted;
     } catch (error) {
       const status = typeof error === 'object' && error !== null ? (error as { status?: unknown }).status : undefined;
-      if (typeof status === 'number' && ((status >= 400 && status < 500) || status === HTTP_SERVICE_UNAVAILABLE)) state = 'refused';
+      if (setupFailures() > before) state = 'unsent';
+      else if (typeof status === 'number' && ((status >= 400 && status < 500) || status === HTTP_SERVICE_UNAVAILABLE)) state = 'refused';
       throw error;
     }
   };
@@ -108,6 +143,8 @@ async function attemptWrite(client: MemoryClient, watch: ReturnType<typeof watch
     };
   } catch (error) {
     if (watch.state() === 'answered') return { kind: 'untrackable' };
+    // Nothing reached the relayer, so the failure says nothing about the rows or the key.
+    if (watch.state() === 'unsent') return { kind: 'transient', error };
     if (isKeyRefused(error)) return { kind: 'key_refused', error };
     // Core gives WRITE only for its own checks or a 4xx, so 'sending' with WRITE cannot happen; it is excluded so it could never fail a row.
     if (error instanceof MemoryError && error.code === 'WRITE' && watch.state() !== 'sending') return { kind: 'refused_rows', error };
@@ -243,7 +280,8 @@ async function releaseLease(tx: Pick<Database, 'update'>, rows: Claimed[], now: 
  *   pending with no job id, each spends one of LIMITS.memoryWriteMaxAttempts, a row that reaches
  *   it is 'failed', and the pass goes on to its next write.
  * - A rate limit, an outage or a timeout (core's RATE_LIMITED, UPSTREAM or TIMEOUT: a 429, any
- *   5xx, no answer): nothing is spent, the rows stay pending under their lease, and the pass ends.
+ *   5xx, no answer), or a setup step that failed before the request went out, whatever status it
+ *   carries (watchBulkWrites): nothing is spent, the rows stay pending under their lease, and the pass ends.
  *   A row still unsent LIMITS.memoryWriteMaxAgeMs after created_at is 'failed' (C33). A timeout or
  *   a lost answer may have stored the write; sending it again then leaves an orphan blob.
  * - Answered without one usable job id per row: the relayer took them and they cannot be followed,
@@ -326,30 +364,46 @@ function readOf(job: Awaited<ReturnType<typeof checkJobs>>[number] | undefined, 
 
 const refusedAnswer = (error: unknown) => error instanceof MemoryError && error.code === 'WRITE';
 
+interface JobReads {
+  reads: JobRead[];
+  error?: unknown;
+  /** True when `error` came from a setup step, before any request went out (watchSetupSteps). */
+  unsent?: boolean;
+}
+
 /**
  * Core refuses a whole status answer when one entry in it fails its checks, so after that
  * refusal each job is read on its own, and a job whose own answer still fails is 'invalid'
- * instead of holding up the others. Any other failure leaves every job not yet read 'unread'
- * and is handed back. Reading alone costs one relayer point per job, at most
- * LIMITS.memoryJobConfirmBatch, which fits one pacing window with the first read. `canStart` is
- * asked before every read, and once it says no the jobs not yet read are left 'unread'.
+ * instead of holding up the others. A failure in a setup step (`setupFailures` rose during the
+ * read) never reached the relayer, so it is never a refused answer, whatever status it carries.
+ * It, and any other failure, leaves every job not yet read 'unread' and is handed back. Reading
+ * alone costs one relayer point per job, at most LIMITS.memoryJobConfirmBatch, which fits one
+ * pacing window with the first read. `canStart` is asked before every read, and once it says no
+ * the jobs not yet read are left 'unread'.
  */
-async function readJobs(client: MemoryClient, jobIds: string[], canStart: () => boolean): Promise<{ reads: JobRead[]; error?: unknown }> {
+async function readJobs(client: MemoryClient, jobIds: string[], canStart: () => boolean, setupFailures: () => number): Promise<JobReads> {
   if (!canStart()) return { reads: jobIds.map(() => UNREAD) };
+  const stopped = (reads: JobRead[], error: unknown, before: number): JobReads => ({
+    reads: [...reads, ...jobIds.slice(reads.length).map(() => UNREAD)],
+    error,
+    unsent: setupFailures() > before,
+  });
+  let before = setupFailures();
   try {
     const states = await checkJobs(client, jobIds);
     return { reads: jobIds.map((jobId, index) => readOf(states[index], jobId)) };
   } catch (error) {
-    if (!refusedAnswer(error)) return { reads: jobIds.map(() => UNREAD), error };
+    if (setupFailures() > before || !refusedAnswer(error)) return stopped([], error, before);
   }
   const reads: JobRead[] = [];
   for (const jobId of jobIds) {
     if (!canStart()) return { reads: [...reads, ...jobIds.slice(reads.length).map(() => UNREAD)] };
+    before = setupFailures();
     try {
       const [state] = await checkJobs(client, [jobId]);
       reads.push(readOf(state, jobId));
     } catch (error) {
-      if (!refusedAnswer(error)) return { reads: [...reads, ...jobIds.slice(reads.length).map(() => UNREAD)], error };
+      if (setupFailures() > before || !refusedAnswer(error)) return stopped(reads, error, before);
       reads.push({ state: 'invalid' });
     }
   }
@@ -375,8 +429,10 @@ async function readJobs(client: MemoryClient, jobIds: string[], canStart: () => 
  * says no before the first read, nothing is read or changed.
  *
  * When the relayer refuses Ellai's delegate key (core's DELEGATE: the owner removed it),
- * nothing is changed and that MemoryError is thrown. Any other MemoryError from a read is
- * thrown after the rows it does not touch are settled as above.
+ * nothing is changed and that MemoryError is thrown. A setup step that fails before a read's
+ * request goes out, whatever status it carries, is no answer from the relayer: it fails no job,
+ * and like any other MemoryError from a read it is thrown after the rows it does not touch are
+ * settled as above.
  *
  * Throws MemoryServiceError: BAD_INPUT, OWNER, NO_ACCOUNT (before touching any row);
  * MemoryError from core.
@@ -386,6 +442,7 @@ export async function confirmMemoryJobs(args: WriterArgs): Promise<{ confirmed: 
   const { db, now } = args;
   const canStart = args.canStart ?? (() => true);
   const { client } = await ownerClient(db, ownerId, args.masterSecretHex);
+  const setupFailures = watchSetupSteps(client);
   try {
     const sent = await db
       .select({ id: memories.id, jobId: memories.jobId, submittedAt: memories.submittedAt, createdAt: memories.createdAt })
@@ -397,12 +454,13 @@ export async function confirmMemoryJobs(args: WriterArgs): Promise<{ confirmed: 
     if (rows.length === 0) return { confirmed: 0, failed: 0, pending: 0 };
     if (!canStart()) return { confirmed: 0, failed: 0, pending: rows.length };
 
-    const { reads, error } = await readJobs(
+    const { reads, error, unsent } = await readJobs(
       client,
       rows.map((row) => row.jobId),
       canStart,
+      setupFailures,
     );
-    if (isKeyRefused(error)) throw error;
+    if (isKeyRefused(error) && unsent !== true) throw error;
 
     const pastAge = (row: (typeof rows)[number]) => now.getTime() - (row.submittedAt ?? row.createdAt).getTime() >= LIMITS.memoryJobMaxAgeMs;
     const done: Array<{ id: string; blobId: string }> = [];

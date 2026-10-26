@@ -3,11 +3,10 @@ import { LIMITS } from '@ellai/core/limits';
 import { and, count, desc, eq, gte, inArray, sql } from 'drizzle-orm';
 import type { Database } from '../../../../server/db/client.js';
 import { decisions, owners, payments } from '../../../../server/db/schema.js';
-import { withServerContext } from '../../../../server/http/context.js';
-import { HttpError, respond } from '../../../../server/http/errors.js';
+import { scoped } from '../../../../server/http/context.js';
+import { HttpError } from '../../../../server/http/errors.js';
 import { jsonResponse } from '../../../../server/http/json.js';
 import { limitOwnerChainCalls } from '../../../../server/http/owner-limits.js';
-import { requireOwner } from '../../../../server/http/session.js';
 import { onboardingState } from '../../../../server/onboarding/state.js';
 
 export const runtime = 'nodejs';
@@ -69,44 +68,41 @@ async function questionRate(db: Database, ownerId: string): Promise<{ asked: num
  * Only an owner with an allowance has a purse Ellai can fill, so only then is the purse read
  * through Tatum, and only then does the request count toward limitOwnerChainCalls's budgets at
  * one call (C22), answering with its 429 or 503 beyond them. An owner without one costs no chain read.
- * Atomic amounts are decimal strings.
+ * The read is also counted by the Tatum meter, as this owner from this client; a refusal there
+ * blanks the purse like any failed read. Atomic amounts are decimal strings.
  */
-export async function GET(request: Request): Promise<Response> {
-  return respond(() =>
-    withServerContext(async (ctx) => {
-      const { ownerId } = await requireOwner(request, ctx);
-      const now = ctx.now();
-      const [row] = await ctx.db
-        .select({
-          suiAddress: owners.suiAddress,
-          purseAddress: owners.purseAddress,
-          paused: owners.paused,
-          autoPausedReason: owners.autoPausedReason,
-          perPaymentMaxAtomic: owners.perPaymentMaxAtomic,
-          dailyBudgetAtomic: owners.dailyBudgetAtomic,
-          approvalsNeeded: owners.approvalsNeeded,
-          distanceCutoff: owners.distanceCutoff,
-          publicProof: owners.publicProof,
-          allowanceId: owners.allowanceId,
-        })
-        .from(owners)
-        .where(eq(owners.id, ownerId));
-      // Owners are never deleted, so a session without one is treated as no session at all.
-      if (row === undefined) throw new HttpError(401, 'signed_out');
-      const { allowanceId, ...owner } = row;
-      if (allowanceId !== null) {
-        const limited = await limitOwnerChainCalls(ctx, request, ownerId, PURSE_READ_CALLS);
-        if (limited !== null) return limited;
-      }
+export const GET = scoped('owner', async (request, ctx, { ownerId }): Promise<Response> => {
+  const now = ctx.now();
+  const [row] = await ctx.db
+    .select({
+      suiAddress: owners.suiAddress,
+      purseAddress: owners.purseAddress,
+      paused: owners.paused,
+      autoPausedReason: owners.autoPausedReason,
+      perPaymentMaxAtomic: owners.perPaymentMaxAtomic,
+      dailyBudgetAtomic: owners.dailyBudgetAtomic,
+      approvalsNeeded: owners.approvalsNeeded,
+      distanceCutoff: owners.distanceCutoff,
+      publicProof: owners.publicProof,
+      allowanceId: owners.allowanceId,
+    })
+    .from(owners)
+    .where(eq(owners.id, ownerId));
+  // The jobs tick prunes an owner only once it has no live session, so the row can be gone only
+  // if the session ended after the cookie was checked; that is treated as no session at all.
+  if (row === undefined) throw new HttpError(401, 'signed_out');
+  const { allowanceId, ...owner } = row;
+  if (allowanceId !== null) {
+    const limited = await limitOwnerChainCalls(ctx, request, ownerId, PURSE_READ_CALLS);
+    if (limited !== null) return limited;
+  }
 
-      const since = new Date(now.getTime() - LIMITS.overviewCountWindowMs);
-      const [onboarding, purse, counts, questionsPer20] = await Promise.all([
-        onboardingState({ db: ctx.db, ownerId }),
-        allowanceId === null ? null : purseBalance(ctx.chain, owner.purseAddress),
-        recentCounts(ctx.db, ownerId, since),
-        questionRate(ctx.db, ownerId),
-      ]);
-      return jsonResponse({ owner, onboarding, purse, counts, questionsPer20 });
-    }),
-  );
-}
+  const since = new Date(now.getTime() - LIMITS.overviewCountWindowMs);
+  const [onboarding, purse, counts, questionsPer20] = await Promise.all([
+    onboardingState({ db: ctx.db, ownerId }),
+    allowanceId === null ? null : purseBalance(ctx.chain, owner.purseAddress),
+    recentCounts(ctx.db, ownerId, since),
+    questionRate(ctx.db, ownerId),
+  ]);
+  return jsonResponse({ owner, onboarding, purse, counts, questionsPer20 });
+});

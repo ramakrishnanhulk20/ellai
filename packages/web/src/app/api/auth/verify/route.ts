@@ -3,7 +3,7 @@ import { z } from 'zod';
 import { sessionCookie } from '../../../../server/auth/sessions.js';
 import { completeSignIn } from '../../../../server/auth/signin.js';
 import { clientKey } from '../../../../server/http/client.js';
-import { withServerContext } from '../../../../server/http/context.js';
+import { scoped, withServerContext } from '../../../../server/http/context.js';
 import { respond } from '../../../../server/http/errors.js';
 import { jsonResponse, readJson } from '../../../../server/http/json.js';
 import { requireSameOrigin } from '../../../../server/http/origin.js';
@@ -37,7 +37,7 @@ const body = z.strictObject({ message: z.string().max(LIMITS.signinMessageMaxCha
  * checked against the chain right now or the shared zkLogin minute is spent, 503
  * chain_unavailable_today once the shared zkLogin day is spent.
  */
-export async function POST(request: Request): Promise<Response> {
+export const POST = scoped('anyone', async (request: Request): Promise<Response> => {
   return respond(() =>
     withServerContext(async (ctx) => {
       requireSameOrigin(request, ctx.env.APP_ORIGIN);
@@ -59,4 +59,4 @@ export async function POST(request: Request): Promise<Response> {
       return jsonResponse({ ownerId: signedIn.ownerId }, { headers: { 'set-cookie': cookie } });
     }),
   );
-}
+});

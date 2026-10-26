@@ -1,6 +1,6 @@
 import { LIMITS } from '@ellai/core/limits';
 import { clientKey } from '../../../../server/http/client.js';
-import { withServerContext } from '../../../../server/http/context.js';
+import { scoped, withServerContext } from '../../../../server/http/context.js';
 import { API_RESPONSE_HEADERS, respond } from '../../../../server/http/errors.js';
 import { readCappedBody } from '../../../../server/http/json.js';
 import { HANDLER_MESSAGES, handleWalletCheck, sellerPayTo } from '../../../../server/seller/handler.js';
@@ -40,7 +40,7 @@ function sellerResponse(status: number, headers: Record<string, string>, body: s
  * seller's own message for a body over LIMITS.challengeMaxBytes or not UTF-8; 503
  * seller_unavailable when the pay-to address cannot be worked out.
  */
-export async function POST(request: Request): Promise<Response> {
+export const POST = scoped('anyone', async (request: Request): Promise<Response> => {
   return respond(() =>
     withServerContext(async (ctx) => {
       const payTo = sellerPayTo(ctx.env);
@@ -60,4 +60,4 @@ export async function POST(request: Request): Promise<Response> {
       return sellerResponse(answer.status, answer.headers, answer.body);
     }),
   );
-}
+});

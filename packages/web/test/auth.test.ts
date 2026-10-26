@@ -7,7 +7,9 @@
 // zkLogin member cap refused with nothing counted; the per-client zkLogin limits per minute and per
 // day (429, the day's as rate_limited_today) counted before the shared quotas per minute and per
 // day (503, the day's as chain_unavailable_today), one check for each zkLogin member, with one log
-// line per spent window;
+// line per spent window; the sign-in day caps per client (429 rate_limited_today) and for everyone
+// (503 chain_unavailable_today), counted only once the signature holds and before any owner row;
+// an owner row pruned between the sign-in steps made again under a key-share lock;
 // the owner row and its derived purse; sessions, their cookie (named __Host-ellai_session
 // whenever it is Secure, and read under that name only) and their end; agent tokens,
 // their display prefixes, the cap on live external agents per owner (never counting the one
@@ -18,7 +20,8 @@
 // Does NOT cover: zkLogin against a real chain (there is no network here, and no real proof is
 // made; routes-auth also runs one through the route), passkey or
 // ML-DSA signatures, real wallet software, two database connections racing for one nonce or
-// for an owner's last agent place (PGlite serves one connection, so each race is run with
+// for an owner's last agent place or a prune deleting the owner a sign-in is writing (the
+// prune's delete runs inside the sign-in's own transaction) (PGlite serves one connection, so each race is run with
 // Promise.all on that one connection), a row lock blocking a second connection (the revoke test
 // shows the lock statement and that the revoke waits, but on PGlite the wait comes from its one
 // connection), or the routes that will call these functions with their same-origin check and
@@ -41,7 +44,16 @@ import { drizzle as drizzlePglite } from 'drizzle-orm/pglite';
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import { AgentError, authenticateAgent, createAgentToken, listAgents, revokeAgent } from '../src/server/auth/agents.js';
 import { endSession, readSessionCookie, resolveSession, sessionCookie } from '../src/server/auth/sessions.js';
-import { SignInError, type SignInErrorCode, ZKLOGIN_CHECK_QUOTAS, ZKLOGIN_CLIENT_LIMITS, completeSignIn, issueSignIn } from '../src/server/auth/signin.js';
+import {
+  SIGN_IN_CLIENT_DAY,
+  SIGN_IN_SHARED_DAY,
+  SignInError,
+  type SignInErrorCode,
+  ZKLOGIN_CHECK_QUOTAS,
+  ZKLOGIN_CLIENT_LIMITS,
+  completeSignIn,
+  issueSignIn,
+} from '../src/server/auth/signin.js';
 import { AGENT_TOKEN_PREFIX, type BearerTokenPrefix, SESSION_TOKEN_PREFIX, hashBearerToken, isBearerToken, newBearerToken } from '../src/server/auth/tokens.js';
 import { type Database, createDb, migrate } from '../src/server/db/client.js';
 import * as schema from '../src/server/db/schema.js';
@@ -668,7 +680,111 @@ describe('completeSignIn', () => {
     expect(await nonceUsedAt(overDay.issued.nonce)).toEqual(at(240_000));
     for (const line of signinLines()) expect(line).toMatch(/^\[ellai signin\] quota_spent zklogin-checks:(minute|day)$/);
   });
+
+  /** One Ed25519 sign-in at `now` from `clientKey`, signed by `signWith` (the address's own key unless given). */
+  async function daySignIn(now: Date, clientKey: string, signWith?: Signer) {
+    const signer = Ed25519Keypair.generate();
+    const issued = await issueSignIn({ db, address: signer.toSuiAddress(), appOrigin: APP_ORIGIN, now });
+    const outcome = await outcomeOf(complete(issued.message, await sign(signWith ?? signer, issued.message), { clientKey, now }));
+    const madeOwner = (await db.select().from(owners).where(eq(owners.suiAddress, canonicalSuiAddress(signer.toSuiAddress())))).length === 1;
+    return { issued, outcome, madeOwner };
+  }
+
+  it('holds one client to LIMITS.signInsPerClientPerDay sign-ins a day, counted only once the signature holds: 429 rate_limited_today past it, with no owner or session, while another client signs in (C22, C34)', { timeout: 60_000 }, async () => {
+    // A day of its own, so these counters start at zero.
+    const now = new Date('2026-12-06T08:00:00.000Z');
+    expect(SIGN_IN_CLIENT_DAY.limit).toBe(LIMITS.signInsPerClientPerDay);
+    expect(await daySignIn(now, 'busy-client', Ed25519Keypair.generate())).toMatchObject({ outcome: 'BAD_SIGNATURE', madeOwner: false });
+    const outcomes: string[] = [];
+    for (let i = 0; i < SIGN_IN_CLIENT_DAY.limit; i += 1) outcomes.push((await daySignIn(now, 'busy-client')).outcome);
+    expect(outcomes).toEqual(Array<string>(SIGN_IN_CLIENT_DAY.limit).fill('signed in'));
+
+    const sessionsBefore = await sessionCount();
+    const over = await daySignIn(now, 'busy-client');
+    expect(over).toMatchObject({ outcome: '429 rate_limited_today', madeOwner: false });
+    expect(await nonceUsedAt(over.issued.nonce)).toEqual(now);
+    expect(await sessionCount()).toBe(sessionsBefore);
+    expect((await daySignIn(now, 'another-client')).outcome).toBe('signed in');
+    expect((await daySignIn(new Date(now.getTime() + 86_400_000), 'busy-client')).outcome).toBe('signed in');
+  });
+
+  it('refuses every sign-in past LIMITS.signInsPerDayGlobal with 503 chain_unavailable_today, after the signature and before any owner row, logging the spent day once (C22, C34)', async () => {
+    const error = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    // A day no other test here signs in on, so the first refusal of the shared day is this test's.
+    const now = new Date('2026-12-09T08:00:00.000Z');
+    expect(SIGN_IN_SHARED_DAY.limit).toBe(LIMITS.signInsPerDayGlobal);
+    await consumeShared(db, SIGN_IN_SHARED_DAY.name, SIGN_IN_SHARED_DAY.limit, SIGN_IN_SHARED_DAY.windowMs, now, SIGN_IN_SHARED_DAY.limit);
+    const refused = [await daySignIn(now, 'first-client'), await daySignIn(now, 'second-client')];
+    expect(refused.map(({ outcome, madeOwner }) => ({ outcome, madeOwner }))).toEqual(Array(2).fill({ outcome: '503 chain_unavailable_today', madeOwner: false }));
+    for (const { issued } of refused) expect(await nonceUsedAt(issued.nonce)).toEqual(now);
+    expect(error.mock.calls.map((call) => call.join(' '))).toEqual(['[ellai signin] quota_spent signins:day']);
+    expect((await daySignIn(new Date(now.getTime() + 86_400_000), 'first-client')).outcome).toBe('signed in');
+  });
+
+  it('makes the owner row again when emptyOwners deletes it between the sign-in steps, holding it FOR KEY SHARE until the session is written (C34)', async () => {
+    const keypair = Ed25519Keypair.generate();
+    const address = canonicalSuiAddress(keypair.toSuiAddress());
+    const purseAddress = canonicalSuiAddress(derivePurseKeypair(MASTER, address).toSuiAddress());
+    // A two-day-old row with nothing pointing at it: just what emptyOwners deletes.
+    const old = one(await db.insert(owners).values({ suiAddress: address, purseAddress, createdAt: later(-2 * 86_400_000) }).returning({ id: owners.id }));
+    const client = (db as unknown as { $client: PGlite }).$client;
+    const sent: string[] = [];
+    const logged = drizzlePglite({ client, schema, logger: { logQuery: (query) => sent.push(query) } }) as unknown as Database;
+    const { message } = await issue(address);
+    const signature = await sign(keypair, message);
+
+    const result = await completeSignIn({ db: prunedMidway(logged, address), message, signature, appOrigin: APP_ORIGIN, masterSecretHex: MASTER, sessionSecretHex: SECRET, now: NOW, clientKey: 'racing-client' });
+    expect(result.ownerId).not.toBe(old.id);
+    expect(await db.select({ id: owners.id }).from(owners).where(eq(owners.suiAddress, address))).toEqual([{ id: result.ownerId }]);
+    expect(one(await db.select().from(sessions).where(eq(sessions.ownerId, result.ownerId))).tokenHash).toBe(hashBearerToken(result.sessionToken, SECRET));
+    const held = sent.filter((query) => /^select "id" from "owners" where "owners"\."sui_address" = \$1 for key share$/.test(query));
+    expect(held).toHaveLength(2);
+  });
 });
+
+type Tx = Parameters<Parameters<Database['transaction']>[0]>[0];
+
+/**
+ * `base`, except that inside a transaction the first owner insert is followed at once by the delete
+ * emptyOwners would make for `address`: an owner row pruned between the sign-in steps. PGlite serves
+ * one connection, so the delete runs inside the sign-in's own transaction.
+ */
+function prunedMidway(base: Database, address: string): Database {
+  let pruned = false;
+  const bound = (target: object, property: PropertyKey) => {
+    const value = Reflect.get(target, property);
+    return typeof value === 'function' ? value.bind(target) : value;
+  };
+  const pruning = (tx: Tx) =>
+    new Proxy(tx, {
+      get(inner, property) {
+        if (property !== 'insert') return bound(inner, property);
+        return (table: typeof owners) => {
+          const builder = inner.insert(table);
+          if (table !== owners || pruned) return builder;
+          return {
+            values: (values: typeof owners.$inferInsert) => ({
+              onConflictDoNothing: (config: { target: typeof owners.suiAddress }) =>
+                builder
+                  .values(values)
+                  .onConflictDoNothing(config)
+                  .then(async (result) => {
+                    pruned = true;
+                    await inner.delete(owners).where(eq(owners.suiAddress, address));
+                    return result;
+                  }),
+            }),
+          };
+        };
+      },
+    });
+  return new Proxy(base, {
+    get(target, property) {
+      if (property !== 'transaction') return bound(target, property);
+      return (run: (tx: Tx) => Promise<unknown>) => target.transaction((tx) => run(pruning(tx)));
+    },
+  });
+}
 
 describe('sessions', () => {
   it('resolves a session token, and never an agent token or a record id', async () => {

@@ -1,10 +1,9 @@
 import { and, desc, eq, lt } from 'drizzle-orm';
 import { memories } from '../../../../server/db/schema.js';
-import { withServerContext } from '../../../../server/http/context.js';
-import { HttpError, respond } from '../../../../server/http/errors.js';
+import { scoped } from '../../../../server/http/context.js';
+import { HttpError } from '../../../../server/http/errors.js';
 import { jsonResponse } from '../../../../server/http/json.js';
 import { PAGE_READ, cutPage, readPageQuery } from '../../../../server/http/owner-limits.js';
-import { requireOwner } from '../../../../server/http/session.js';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -20,34 +19,29 @@ export const dynamic = 'force-dynamic';
  * read (C13). 401 signed_out without a session, 400 bad_query for a query readPageQuery
  * refuses. Atomic amounts are decimal strings.
  */
-export async function GET(request: Request): Promise<Response> {
-  return respond(() =>
-    withServerContext(async (ctx) => {
-      const { ownerId } = await requireOwner(request, ctx);
-      const query = readPageQuery(request);
-      if (query === null) throw new HttpError(400, 'bad_query');
+export const GET = scoped('owner', async (request, ctx, { ownerId }): Promise<Response> => {
+  const query = readPageQuery(request);
+  if (query === null) throw new HttpError(400, 'bad_query');
 
-      const ownRows = eq(memories.ownerId, ownerId);
-      const read = await ctx.db
-        .select({
-          memoryId: memories.id,
-          kind: memories.kind,
-          verdict: memories.verdict,
-          recipient: memories.recipient,
-          amountAtomic: memories.amountAtomic,
-          sellerHost: memories.sellerHost,
-          sentence: memories.sentence,
-          status: memories.status,
-          blobId: memories.blobId,
-          createdAt: memories.createdAt,
-          confirmedAt: memories.confirmedAt,
-        })
-        .from(memories)
-        .where(query.before === null ? ownRows : and(ownRows, lt(memories.createdAt, query.before)))
-        .orderBy(desc(memories.createdAt), desc(memories.id))
-        .limit(PAGE_READ);
-      const { rows, nextBefore } = cutPage(read, query.limit);
-      return jsonResponse({ memories: rows, nextBefore });
-    }),
-  );
-}
+  const ownRows = eq(memories.ownerId, ownerId);
+  const read = await ctx.db
+    .select({
+      memoryId: memories.id,
+      kind: memories.kind,
+      verdict: memories.verdict,
+      recipient: memories.recipient,
+      amountAtomic: memories.amountAtomic,
+      sellerHost: memories.sellerHost,
+      sentence: memories.sentence,
+      status: memories.status,
+      blobId: memories.blobId,
+      createdAt: memories.createdAt,
+      confirmedAt: memories.confirmedAt,
+    })
+    .from(memories)
+    .where(query.before === null ? ownRows : and(ownRows, lt(memories.createdAt, query.before)))
+    .orderBy(desc(memories.createdAt), desc(memories.id))
+    .limit(PAGE_READ);
+  const { rows, nextBefore } = cutPage(read, query.limit);
+  return jsonResponse({ memories: rows, nextBefore });
+});

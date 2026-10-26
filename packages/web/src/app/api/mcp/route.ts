@@ -1,5 +1,4 @@
-import { requireAgent, respondToAgent } from '../../../server/http/agent-auth.js';
-import { withServerContext } from '../../../server/http/context.js';
+import { scoped } from '../../../server/http/context.js';
 import { API_RESPONSE_HEADERS } from '../../../server/http/errors.js';
 import { handleMcpRequest } from '../../../server/mcp/server.js';
 
@@ -19,14 +18,9 @@ export const maxDuration = 300;
  * failure is a tool result with isError and the same fixed JSON the HTTP routes send, the
  * per-minute limits' too_many_requests included.
  */
-export async function POST(request: Request): Promise<Response> {
-  return respondToAgent(() =>
-    withServerContext(async (ctx) => {
-      const agent = await requireAgent(request, ctx);
-      return handleMcpRequest(request, ctx, agent);
-    }),
-  );
-}
+export const POST = scoped('agent', async (request, ctx, agent): Promise<Response> => {
+  return handleMcpRequest(request, ctx, agent);
+});
 
 // A stateless server keeps no session to stream to or to end, so GET's event stream and
 // DELETE's session end do not exist here. The body is the JSON-RPC error the SDK itself sends.
@@ -36,11 +30,7 @@ function methodNotAllowed(): Response {
 }
 
 /** 405: this server is stateless, so there is no event stream to open. */
-export function GET(): Response {
-  return methodNotAllowed();
-}
+export const GET = scoped('anyone', (): Response => methodNotAllowed());
 
 /** 405: this server is stateless, so there is no session to end. */
-export function DELETE(): Response {
-  return methodNotAllowed();
-}
+export const DELETE = scoped('anyone', (): Response => methodNotAllowed());

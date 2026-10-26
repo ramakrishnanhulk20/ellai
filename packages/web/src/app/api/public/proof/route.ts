@@ -1,4 +1,4 @@
-import { withServerContext } from '../../../../server/http/context.js';
+import { scoped, withServerContext } from '../../../../server/http/context.js';
 import { respond } from '../../../../server/http/errors.js';
 import { jsonResponse } from '../../../../server/http/json.js';
 import { cachedPublicProof, readPublicProof } from '../../../../server/public/proof.js';
@@ -18,6 +18,6 @@ export const dynamic = 'force-dynamic';
  * only for that one read, so no anonymous request costs more (C22). 503 proof_unavailable when
  * the first read of a window fails and there is no earlier copy.
  */
-export async function GET(): Promise<Response> {
+export const GET = scoped('anyone', async (): Promise<Response> => {
   return respond(async () => jsonResponse(await cachedPublicProof(() => withServerContext((ctx) => readPublicProof(ctx.db)), Date.now())));
-}
+});

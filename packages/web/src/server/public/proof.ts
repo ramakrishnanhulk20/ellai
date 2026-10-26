@@ -1,6 +1,6 @@
 import { LIMITS } from '@ellai/core/limits';
 import { isValidTransactionDigest } from '@mysten/sui/utils';
-import { and, count, desc, eq, isNotNull, sql } from 'drizzle-orm';
+import { and, count, desc, eq, isNotNull, isNull, sql } from 'drizzle-orm';
 import type { Database } from '../db/client.js';
 import { type MEMORY_KINDS, decisions, memories, owners, payments } from '../db/schema.js';
 
@@ -16,7 +16,8 @@ export class ProofUnavailableError extends Error {
  * What /proof shows, every entry from Ellai's own records and only for owners who chose to be
  * shown (owners.public_proof), since each digest leads on chain to an owner's purse and wallet
  * (C18): payments Ellai verified on chain by its own digest, and memory writes Walrus Memory
- * confirmed whose blob the jobs tick then found on chain. The totals count those owners only.
+ * confirmed whose blob the jobs tick then found on chain and has not since seen Walrus stop
+ * storing. The totals count those owners only.
  * It holds no memory sentence, no purpose, no reason, no agent label and no owner or purse
  * address, so nothing an owner or an agent wrote is public. Atomic amounts are decimal strings
  * and times ISO strings; a memory's confirmedAt is when Walrus Memory confirmed it.
@@ -42,9 +43,9 @@ const BLOB_ID = /^[A-Za-z0-9_-]{1,128}$/;
  * Reads the public proof from the database: five reads, no chain call, each joined to its
  * owner and kept to owners with public_proof true. The latest LIMITS.publicProofLatest verified
  * payments, newest first, each with its explorer link; the latest LIMITS.publicProofLatest
- * memories confirmed by Walrus Memory and found on chain (chain_confirmed_at set), newest
- * first, by blob id and kind only; and the
- * totals, over the same owners, with an owner answer counted only once found on chain. A digest
+ * memories confirmed by Walrus Memory, found on chain (chain_confirmed_at set) and not expired
+ * there (chain_expired_at unset), newest first, by blob id and kind only; and the
+ * totals, over the same owners, with an owner answer counted only while it is so. A digest
  * that is not a Sui transaction digest, or a blob id that is not plain base64url, is left out
  * rather than linked or shown.
  */
@@ -52,7 +53,7 @@ export async function readPublicProof(db: Database): Promise<PublicProof> {
   const decidedCount = (outcome: 'approved' | 'asked', rule?: 'learned') =>
     sql`count(*) filter (where ${rule === undefined ? eq(decisions.outcome, outcome) : and(eq(decisions.outcome, outcome), eq(decisions.rule, rule))})`.mapWith(Number);
   const shown = eq(owners.publicProof, true);
-  const onChain = and(eq(memories.status, 'confirmed'), isNotNull(memories.blobId), isNotNull(memories.chainConfirmedAt));
+  const onChain = and(eq(memories.status, 'confirmed'), isNotNull(memories.blobId), isNotNull(memories.chainConfirmedAt), isNull(memories.chainExpiredAt));
   const [paid, answers, decided, latestPayments, latestMemories] = await Promise.all([
     db
       .select({ n: count(), total: sql<string>`coalesce(sum(${payments.amountAtomic}), 0)::text` })

@@ -492,12 +492,11 @@ export const LIMITS = {
   memoryWritesPerPass: 3,
   /**
    * How long a memory handed to the relayer stays claimed by that pass, counted from the pass's
-   * start, before another pass may send it: six minutes (C33). One SDK bulk write on a fresh
-   * client can make four relayer requests (version, health, config, the write) at
-   * memwalRequestTimeoutMs each plus a SEAL key read of Sui that has no limit of its own, so the
-   * only hard bound on a pass is its route's slowRouteMaxDurationS (the jobs route's 300 s). Past
-   * that the pass has recorded its job ids or been killed. Under the 10-minute jobs tick, so a
-   * row a rate limit turned away goes again at the next tick.
+   * start, before another pass may send it: six minutes (C33). Each SDK call is cut off at
+   * memwalCallTimeoutMs, but a request already signed inside it may still go out, and the hard
+   * bound on a pass is its route's slowRouteMaxDurationS (the jobs route's 300 s). Past that the
+   * pass has recorded its job ids or been killed. Under the 10-minute jobs tick, so a row a rate
+   * limit turned away goes again at the next tick.
    */
   memoryWriteLeaseMs: 360_000,
 } as const;

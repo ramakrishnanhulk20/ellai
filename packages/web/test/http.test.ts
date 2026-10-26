@@ -2,7 +2,7 @@
 // table of HTTP error codes, the same-origin check, the client key, the rate counter over a
 // minute or a longer window, one use or several at once, the shared quota every caller counts
 // against and the one request that first passes it in a window, pruning old
-// counters while keeping every window still read, the
+// counters in batches, oldest first and inside a time slice, while keeping every window still read, the
 // capped body and JSON readers and the
 // seller route reading with the capped one, bigint-safe responses, the session requirement with
 // its cookie read under the one name the app's origin gives, and
@@ -36,7 +36,7 @@ import { HttpError, httpErrorResponse, toErrorResponse } from '../src/server/htt
 import { jsonResponse, readCappedBody, readJson } from '../src/server/http/json.js';
 import { HANDLER_MESSAGES } from '../src/server/seller/handler.js';
 import { requireSameOrigin } from '../src/server/http/origin.js';
-import { consume, consumeShared, consumeWindow, pruneRateCounters } from '../src/server/http/ratelimit.js';
+import { consume, consumeShared, consumeWindow, pruneRateCounterBatch, pruneRateCounters } from '../src/server/http/ratelimit.js';
 import { requireOwner } from '../src/server/http/session.js';
 import { OnboardingError } from '../src/server/onboarding/state.js';
 import { SellerError } from '../src/server/seller/challenge.js';
@@ -408,6 +408,29 @@ describe('pruneRateCounters', () => {
     expect(await pruneRateCounters(db, now)).toBe(1);
     expect(await left()).toEqual([dayWindow.key, atRetention.key].sort());
     await expect(pruneRateCounters(untouchable, new Date(Number.NaN))).rejects.toThrow('not a date');
+    await expect(pruneRateCounterBatch(untouchable, new Date(Number.NaN))).rejects.toThrow('not a date');
+  });
+
+  it('deletes in batches of LIMITS.pruneBatch, oldest window first, and repeats only inside LIMITS.pruneTimeSliceMs (C34)', async () => {
+    // A year before the test above, so only these rows are past the retention at this `now`.
+    const now = new Date('2019-03-01T12:00:00.000Z');
+    const cutoffMs = now.getTime() - LIMITS.rateCounterRetentionMs;
+    const old = 2 * LIMITS.pruneBatch + 500;
+    const tag = `test:batch-${hex(4)}`;
+    await db.insert(rateCounters).values(Array.from({ length: old }, (_, i) => ({ key: `${tag}-${i}`, windowStart: new Date(cutoffMs - 60_000 * (old - i)), count: 1 })));
+    await db.insert(rateCounters).values({ key: `${tag}-kept`, windowStart: new Date(cutoffMs), count: 9 });
+    const mine = async () => (await db.select({ key: rateCounters.key }).from(rateCounters).where(like(rateCounters.key, `${tag}-%`))).map((row) => row.key);
+
+    // One batch takes the oldest windows; the ones it leaves are the newest of the old.
+    expect(await pruneRateCounterBatch(db, now)).toBe(LIMITS.pruneBatch);
+    expect((await mine()).sort()).toEqual([...Array.from({ length: old - LIMITS.pruneBatch }, (_, i) => `${tag}-${LIMITS.pruneBatch + i}`), `${tag}-kept`].sort());
+
+    // Every read of this clock is a whole time slice after the last, so only one batch runs.
+    let reads = 0;
+    const slow = () => new Date(now.getTime() + reads++ * LIMITS.pruneTimeSliceMs);
+    expect(await pruneRateCounters(db, now, slow)).toBe(LIMITS.pruneBatch);
+    expect(await pruneRateCounters(db, now, () => now)).toBe(500);
+    expect(await mine()).toEqual([`${tag}-kept`]);
   });
 });
 

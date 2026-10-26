@@ -23,6 +23,7 @@ import { z } from 'zod';
 import { type Database, createDb, migrate } from '../src/server/db/client.js';
 import { owners, sellerSales } from '../src/server/db/schema.js';
 import { formatUsdc } from '../src/server/decide/sentences.js';
+import { withTatumScope } from '../src/server/http/tatum-meter.js';
 import { SellerError } from '../src/server/seller/challenge.js';
 import { type SellerResponse, handleWalletCheck, sellerPayTo } from '../src/server/seller/handler.js';
 
@@ -238,7 +239,8 @@ async function main(): Promise<void> {
   }
 }
 
-main().catch((error: unknown) => {
+// Ellai's own work, as the tick is, so it runs in the jobs scope like the tick.
+withTatumScope({ kind: 'jobs' }, main).catch((error: unknown) => {
   console.error(`\nSTOPPED: ${failureLabel(error)}`);
   process.exitCode = 1;
 });

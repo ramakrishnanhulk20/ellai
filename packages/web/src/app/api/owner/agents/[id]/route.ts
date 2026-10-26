@@ -1,9 +1,6 @@
 import { revokeAgent } from '../../../../../server/auth/agents.js';
-import { withServerContext } from '../../../../../server/http/context.js';
-import { respond } from '../../../../../server/http/errors.js';
+import { scoped } from '../../../../../server/http/context.js';
 import { jsonResponse } from '../../../../../server/http/json.js';
-import { requireSameOrigin } from '../../../../../server/http/origin.js';
-import { requireOwner } from '../../../../../server/http/session.js';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -16,14 +13,8 @@ export const dynamic = 'force-dynamic';
  * shows that an id exists. The request must come from the app (C14). 403 cross_origin, 401
  * signed_out, 400 bad_input for an id that is not a uuid.
  */
-export async function DELETE(request: Request, { params }: { params: Promise<{ id: string }> }): Promise<Response> {
-  return respond(() =>
-    withServerContext(async (ctx) => {
-      requireSameOrigin(request, ctx.env.APP_ORIGIN);
-      const { ownerId } = await requireOwner(request, ctx);
-      const { id } = await params;
-      await revokeAgent({ db: ctx.db, ownerId, agentId: id, now: ctx.now() });
-      return jsonResponse({ revoked: true });
-    }),
-  );
-}
+export const DELETE = scoped('owner', async (_request, ctx, { ownerId }, { params }: { params: Promise<{ id: string }> }): Promise<Response> => {
+  const { id } = await params;
+  await revokeAgent({ db: ctx.db, ownerId, agentId: id, now: ctx.now() });
+  return jsonResponse({ revoked: true });
+});

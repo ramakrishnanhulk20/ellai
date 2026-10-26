@@ -2,7 +2,8 @@
 // with a stub chain: Ellai's wallet check seller bound to APP_ORIGIN whatever Host says, its
 // 402 and its paid 200 with a stubbed settlement, and its body cap; the jobs tick refused
 // without the exact secret, with its own Bearer challenge, and run with it, its summary in fixed codes only, and old rate
-// counters pruned; the public proof listing only verified payments and memories found on chain,
+// counters pruned; the public proof listing only verified payments and memories found on chain
+// and not since expired there,
 // only for owners who opted in and with totals over those owners only, with no sentence,
 // purpose, label or owner address, at most 20 of each, read from the
 // database at most once per cache window however many requests come, and its last good copy
@@ -35,7 +36,7 @@ import { agents, decisions, memories, owners, payments, rateCounters, sellerSale
 import type { ServerEnv } from '../src/server/env.js';
 import { setServerContextFactory } from '../src/server/http/context.js';
 import { HttpError, toErrorResponse } from '../src/server/http/errors.js';
-import { confirmBlobsOnChain } from '../src/server/jobs/blobs.js';
+import { confirmBlobsOnChain, expireBlobsOnChain } from '../src/server/jobs/blobs.js';
 import { MemoryServiceError } from '../src/server/memory/delegate.js';
 import { ProofUnavailableError } from '../src/server/public/proof.js';
 import { SellerError } from '../src/server/seller/challenge.js';
@@ -269,6 +270,7 @@ describe('POST /api/jobs/tick', () => {
       memoriesConfirmed: 0,
       memoriesFailed: 0,
       memoriesChainConfirmed: 0,
+      memoriesChainExpired: 0,
       paymentsVerified: 0,
       paymentsNotLanded: 0,
       paymentsMismatched: 0,
@@ -276,7 +278,8 @@ describe('POST /api/jobs/tick', () => {
       decisionsExpired: 1,
       questionsClosed: 0,
       refills: 0,
-      rowsPruned: 0,
+      // The two counters past the retention, deleted by the tick's own prune step.
+      rowsPruned: 2,
       gasWalletLow: false,
       timeBudgetReached: false,
       errors: [],
@@ -503,6 +506,32 @@ describe('GET /api/public/proof', () => {
     const after = await proof();
     expect(after.body.memories).toEqual([{ blobId, kind: 'owner_decision', confirmedAt: confirmedAt.toISOString() }]);
     expect(after.body.totals.confirmedOwnerAnswers).toBe(1);
+  });
+
+  it('stops listing and counting a memory once the tick sees the Walrus epoch reach the end its Blob was stored until (C18)', async () => {
+    const w = await proofOwner();
+    const confirmedAt = at(60_000);
+    const blobId = (await proofMemory(w, 'owner_decision', 'confirmed', confirmedAt, null)) ?? '';
+    const listing = (walrusEpoch: number) =>
+      ({
+        getWalrusEpoch: async () => walrusEpoch,
+        scanOwnedWalrusBlobs: async (owner: string): Promise<{ blobs: ScannedWalrusBlob[]; next: null }> => ({
+          blobs: owner === w.suiAddress ? [{ objectId: canonicalSuiAddress(`0x${hex(32)}`), blobId, registeredEpoch: 39, certifiedEpoch: 41, endEpoch: 54, deletable: true }] : [],
+          next: null,
+        }),
+      }) as unknown as Chain;
+
+    expect(await confirmBlobsOnChain({ db: proofDb.db, chain: listing(45), ownerId: w.ownerId, now: new Date(nowMs) })).toEqual({ checked: 1, confirmed: 1 });
+    nowMs += LIMITS.publicProofCacheMs;
+    const stored = await proof();
+    expect([stored.body.memories, stored.body.totals.confirmedOwnerAnswers]).toEqual([[{ blobId, kind: 'owner_decision', confirmedAt: confirmedAt.toISOString() }], 1]);
+
+    expect(await expireBlobsOnChain({ db: proofDb.db, chain: listing(53), ownerId: w.ownerId, now: new Date(nowMs) })).toEqual({ expired: 0 });
+    expect(await expireBlobsOnChain({ db: proofDb.db, chain: listing(54), ownerId: w.ownerId, now: new Date(nowMs) })).toEqual({ expired: 1 });
+    nowMs += LIMITS.publicProofCacheMs;
+    const ended = await proof();
+    expect([ended.body.memories, ended.body.totals.confirmedOwnerAnswers]).toEqual([[], 0]);
+    expect(ended.text).not.toContain(blobId);
   });
 
   it('never shows an owner who has not opted in, in the lists or the totals, until they opt in', async () => {

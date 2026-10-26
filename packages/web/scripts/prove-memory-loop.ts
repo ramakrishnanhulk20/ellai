@@ -23,6 +23,7 @@ import { agents, decisions, memories, owners, questions } from '../src/server/db
 import { AnswerError, answerQuestion } from '../src/server/decide/answer.js';
 import { DecideError, type DecideResult, type Recall, decide } from '../src/server/decide/decide.js';
 import { querySentence, requestKey } from '../src/server/decide/sentences.js';
+import { withTatumScope } from '../src/server/http/tatum-meter.js';
 import { MemoryServiceError, ownerDelegate } from '../src/server/memory/delegate.js';
 import { MEMORY_NAMESPACE } from '../src/server/memory/namespace.js';
 import { makeRecall } from '../src/server/memory/recall.js';
@@ -434,7 +435,8 @@ async function main(): Promise<void> {
   }
 }
 
-main().catch((error: unknown) => {
+// Ellai's own work, as the tick is, so it runs in the jobs scope like the tick.
+withTatumScope({ kind: 'jobs' }, main).catch((error: unknown) => {
   console.error(`\nSTOPPED: ${failureLabel(error)}`);
   process.exitCode = 1;
 });

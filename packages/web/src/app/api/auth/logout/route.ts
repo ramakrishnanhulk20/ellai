@@ -1,5 +1,5 @@
 import { endSession, readSessionCookie } from '../../../../server/auth/sessions.js';
-import { withServerContext } from '../../../../server/http/context.js';
+import { scoped, withServerContext } from '../../../../server/http/context.js';
 import { respond } from '../../../../server/http/errors.js';
 import { jsonResponse } from '../../../../server/http/json.js';
 import { requireSameOrigin } from '../../../../server/http/origin.js';
@@ -15,7 +15,7 @@ export const dynamic = 'force-dynamic';
  * only (403 cross_origin), so another site cannot sign the owner out. Answers
  * { signedOut: true } whether or not a session was open.
  */
-export async function POST(request: Request): Promise<Response> {
+export const POST = scoped('anyone', async (request: Request): Promise<Response> => {
   return respond(() =>
     withServerContext(async (ctx) => {
       requireSameOrigin(request, ctx.env.APP_ORIGIN);
@@ -25,4 +25,4 @@ export async function POST(request: Request): Promise<Response> {
       return jsonResponse({ signedOut: true }, { headers: { 'set-cookie': clearedSessionCookie(secure) } });
     }),
   );
-}
+});

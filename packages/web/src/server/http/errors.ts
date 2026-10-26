@@ -201,6 +201,7 @@ const CHAIN_STATUS: Readonly<Record<ChainErrorCode, number>> = {
   UPSTREAM: 502,
   BAD_RESPONSE: 502,
   LIMIT_EXCEEDED: 502,
+  BUDGET: 503,
 };
 
 // Every one of these is a seller answer Ellai would not act on, so each is a bad gateway.
@@ -293,6 +294,9 @@ function mapKnown(error: unknown): Mapped | null {
   if (error instanceof PaymentError) return coded(PAYMENT_STATUS[error.code], error.code, error.message);
   if (error instanceof SellerError) return { ...SELLER_UNAVAILABLE, logCode: 'SELLER' };
   if (error instanceof ProofUnavailableError) return { ...PROOF_UNAVAILABLE, logCode: 'PROOF' };
+  // Ellai's own Tatum budget refused the request (tatum-meter.ts), so it answers as every other
+  // spent day of chain reads does.
+  if (error instanceof ChainError && error.code === 'BUDGET') return coded(CHAIN_STATUS.BUDGET, 'chain_unavailable_today', HTTP_ERROR_MESSAGES.chain_unavailable_today);
   if (error instanceof ChainError) return fixed(CHAIN_STATUS, 'chain', error.code);
   if (error instanceof ChallengeError) return fixed(CHALLENGE_STATUS, 'challenge', error.code);
   if (error instanceof NetError) return fixed(NET_STATUS, 'net', error.code);
@@ -329,7 +333,8 @@ function codeOf(error: unknown): string | null {
  * its status with { error: code in lower case, message }, the message being that class's
  * fixed text; for ChainError, ChallengeError, NetError, MemoryError and MemoryServiceError the
  * code is prefixed with the kind (chain_timeout) and the message is one fixed sentence per
- * class, whatever the error itself says. Anything else, including a database error whose
+ * class, whatever the error itself says, except ChainError BUDGET, Ellai's Tatum budget refusing
+ * the request, which is 503 chain_unavailable_today. Anything else, including a database error whose
  * text carries SQL and parameters, becomes 500 { error: 'internal' } with nothing taken from
  * the error (C19). An HttpError 401 for a bearer credential (agent_unauthorized,
  * jobs_unauthorized) carries that credential's WWW-Authenticate challenge.

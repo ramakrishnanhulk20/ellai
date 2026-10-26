@@ -1,5 +1,4 @@
-import { requireAgent, respondToAgent } from '../../../../../server/http/agent-auth.js';
-import { withServerContext } from '../../../../../server/http/context.js';
+import { scoped } from '../../../../../server/http/context.js';
 import { jsonResponse } from '../../../../../server/http/json.js';
 import { agentDecision } from '../../../../../server/mcp/server.js';
 
@@ -16,12 +15,7 @@ export const dynamic = 'force-dynamic';
  * agent_unauthorized without a valid token, 429 too_many_requests past
  * LIMITS.agentDecisionReadsPerMinute for this agent, shared with check_decision.
  */
-export async function GET(request: Request, { params }: { params: Promise<{ id: string }> }): Promise<Response> {
-  return respondToAgent(() =>
-    withServerContext(async (ctx) => {
-      const agent = await requireAgent(request, ctx);
-      const { id } = await params;
-      return jsonResponse(await agentDecision(ctx, agent, id));
-    }),
-  );
-}
+export const GET = scoped('agent', async (_request, ctx, agent, { params }: { params: Promise<{ id: string }> }): Promise<Response> => {
+  const { id } = await params;
+  return jsonResponse(await agentDecision(ctx, agent, id));
+});

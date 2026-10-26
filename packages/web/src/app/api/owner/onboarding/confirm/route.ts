@@ -1,12 +1,9 @@
 import { LIMITS } from '@ellai/core/limits';
 import { z } from 'zod';
 import { TEXT_CAPS } from '../../../../../server/db/schema.js';
-import { withServerContext } from '../../../../../server/http/context.js';
-import { respond } from '../../../../../server/http/errors.js';
+import { scoped } from '../../../../../server/http/context.js';
 import { jsonResponse, readJson } from '../../../../../server/http/json.js';
 import { limitOwnerChainCalls, onboardingChainFailure } from '../../../../../server/http/owner-limits.js';
-import { requireSameOrigin } from '../../../../../server/http/origin.js';
-import { requireOwner } from '../../../../../server/http/session.js';
 import { CONFIRM_CHAIN_CALLS, confirmOnboardingTx } from '../../../../../server/onboarding/confirm.js';
 import { ONBOARDING_STEPS } from '../../../../../server/onboarding/state.js';
 
@@ -28,23 +25,17 @@ const body = z.strictObject({ step: z.enum(ONBOARDING_STEPS), digest: z.string()
  * chain shows something the step does not accept, 503 chain_unavailable when Sui cannot be read,
  * 503 chain_unavailable_today once every owner's day is spent.
  */
-export async function POST(request: Request): Promise<Response> {
-  return respond(() =>
-    withServerContext(async (ctx) => {
-      requireSameOrigin(request, ctx.env.APP_ORIGIN);
-      const { ownerId } = await requireOwner(request, ctx);
-      // Read first, so the calls counted are the ones this step makes; the body is capped at 1 KiB.
-      const { step, digest } = await readJson(request, body, LIMITS.onboardingConfirmBodyMaxBytes);
-      const limited = await limitOwnerChainCalls(ctx, request, ownerId, CONFIRM_CHAIN_CALLS[step]);
-      if (limited !== null) return limited;
-      try {
-        const { recorded } = await confirmOnboardingTx({ db: ctx.db, ownerId, step, digest, chain: ctx.chain, masterSecretHex: ctx.env.ELLAI_MASTER_SECRET, now: ctx.now() });
-        return jsonResponse({ recorded });
-      } catch (error) {
-        const answer = onboardingChainFailure(error);
-        if (answer === null) throw error;
-        return answer;
-      }
-    }),
-  );
-}
+export const POST = scoped('owner', async (request, ctx, { ownerId }): Promise<Response> => {
+  // Read first, so the calls counted are the ones this step makes; the body is capped at 1 KiB.
+  const { step, digest } = await readJson(request, body, LIMITS.onboardingConfirmBodyMaxBytes);
+  const limited = await limitOwnerChainCalls(ctx, request, ownerId, CONFIRM_CHAIN_CALLS[step]);
+  if (limited !== null) return limited;
+  try {
+    const { recorded } = await confirmOnboardingTx({ db: ctx.db, ownerId, step, digest, chain: ctx.chain, masterSecretHex: ctx.env.ELLAI_MASTER_SECRET, now: ctx.now() });
+    return jsonResponse({ recorded });
+  } catch (error) {
+    const answer = onboardingChainFailure(error);
+    if (answer === null) throw error;
+    return answer;
+  }
+});

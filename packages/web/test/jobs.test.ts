@@ -10,13 +10,20 @@
 // closed and further reads still miss it, and leaves rows from before that window was kept
 // waiting; asks its own ledger first, so across a day of ticks an owner whose ledger rules a
 // refill out costs no chain read, the onboarded owner's first refill included, and one below
-// it costs one purse read a tick and an allowance read only for the refill it sends.
+// it costs one purse read a tick and an allowance read only for the refill it sends; forgets an
+// allowance that can never pay again and waits out a full rate window, reading nothing meanwhile.
 // pruneExpiredRows deletes only dead rows, in batches it repeats until each table comes
 // back short or its time slice ends, faster than the sign-in cap lets strangers add them,
-// day-old owners nothing points at included.
+// day-old owners nothing points at included, 3,001 of them inside the time slice behind
+// 200,000 owners in use, and old rate counters first, before the tick does any owner's work.
 // confirmBlobsOnChain marks a memory only when its blob id is on one of the owner's own Walrus Blob
 // objects, certified and not past its end epoch by the Walrus epoch (read once an hour), reading
-// in stretches from a stored cursor. refillIfNeeded defers before any read past the deadline and
+// in stretches from a stored cursor, matching every waiting memory and keeping the latest end
+// epoch, filling that end in for memories found before it was kept and hiding one on no Blob of
+// the owner only after reading the whole listing in one call;
+// expireBlobsOnChain marks one expired once the Walrus epoch reaches that end, a bounded
+// number per call, and the tick reads that epoch only while a memory is stored on chain.
+// refillIfNeeded defers before any read past the deadline and
 // never after its row. runJobsTick isolates each owner's and each step's failure behind a fixed code,
 // settles pending payments and remembers a paid seller stored as delivering nothing exactly once
 // (never one whose delivery is unknown) with one epoch reading for every settlement pass in a
@@ -43,18 +50,19 @@ import { Ed25519Keypair } from '@mysten/sui/keypairs/ed25519';
 import { TransactionDataBuilder } from '@mysten/sui/transactions';
 import { SUI_TYPE_ARG, normalizeStructTag } from '@mysten/sui/utils';
 import { verifyTransactionSignature } from '@mysten/sui/verify';
-import { and, eq, isNull } from 'drizzle-orm';
+import { and, count, eq, isNull, like, sql } from 'drizzle-orm';
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { type Database, createDb, migrate } from '../src/server/db/client.js';
-import { agents, decisions, memories, owners, payments, questions, refills, sellerSales, sessions, signinNonces } from '../src/server/db/schema.js';
+import { agents, decisions, memories, owners, payments, questions, rateCounters, refills, sellerSales, sessions, signinNonces } from '../src/server/db/schema.js';
 import { MEMORY_NAMESPACE } from '../src/server/memory/namespace.js';
 import { ownerDelegate } from '../src/server/memory/delegate.js';
 import { recordOutcome } from '../src/server/memory/outcome.js';
-import { confirmBlobsOnChain } from '../src/server/jobs/blobs.js';
+import { confirmBlobsOnChain, expireBlobsOnChain } from '../src/server/jobs/blobs.js';
 import { expireDecisions } from '../src/server/jobs/expire.js';
 import { pruneExpiredRows } from '../src/server/jobs/prune.js';
 import { RefillError, refillIfNeeded } from '../src/server/jobs/refill.js';
 import { type JobsTickSummary, runJobsTick } from '../src/server/jobs/tick.js';
+import { onboardingState } from '../src/server/onboarding/state.js';
 
 vi.mock('@ellai/core/memory', async (importOriginal) => ({
   ...(await importOriginal<typeof import('@ellai/core/memory')>()),
@@ -332,6 +340,14 @@ const sendTimesOut = () => {
   throw new ChainError('TIMEOUT', 'Tatum executeTransaction: timed out; the transaction may have landed', true);
 };
 const refillRows = (ownerId: string, on: Database = db) => on.select().from(refills).where(eq(refills.ownerId, ownerId));
+const allowanceOf = async (w: World, on: Database = db) =>
+  one(
+    await on
+      .select({ allowanceId: owners.allowanceId, allowanceCheckedAt: owners.allowanceCheckedAt, refillNotBefore: owners.refillNotBefore })
+      .from(owners)
+      .where(eq(owners.id, w.ownerId)),
+  );
+const FORGOTTEN = { allowanceId: null, allowanceCheckedAt: null, refillNotBefore: null };
 
 async function refillRow(w: Funded, sentAt: Date, status: 'pending' | 'verified' | 'failed', on: Database = db) {
   return one(await on.insert(refills).values({ ownerId: w.ownerId, allowanceId: w.allowanceId, amountAtomic: REFILL, digest: randomDigest(), sentAt, status }).returning());
@@ -467,22 +483,28 @@ describe('refillIfNeeded', () => {
     expect(executions).toHaveLength(1);
   });
 
-  it("refuses, building and sending nothing, an allowance that is not this owner's, for this purse, in USDC, unexpired and with room", async () => {
-    const windowOpen = BigInt(NOW.getTime() + 1);
-    const variants: Array<Partial<AllowanceReading> | Error> = [
+  it("refuses, building and sending nothing, an allowance that is not this owner's, for this purse, in USDC, unexpired and with room, and records why (C22)", async () => {
+    const windowEnd = NOW.getTime() + 3_600_000;
+    const never: Array<Partial<AllowanceReading> | Error> = [
       { funder: randomAddress() },
       { spender: randomAddress() },
       { coinType: SUI_TYPE },
       { expirationMs: BigInt(NOW.getTime()) },
       { spentTotal: 1_000_000n - REFILL + 1n },
-      // The current rate window, still open, has less left than one refill.
-      { periodSpent: 500_000n - REFILL + 1n, periodEndMs: windowOpen },
-      // A rate limit whose window cannot be placed counts as full.
-      { periodSpent: null },
+      // A rate limit smaller than one refill has no room in any window.
+      { periodLimit: REFILL - 1n },
+      // The full window ends as the allowance expires, so no later window can pay either.
+      { periodSpent: 500_000n, periodEndMs: BigInt(windowEnd), expirationMs: BigInt(windowEnd) },
       new ChainError('NOT_FOUND', 'not found'),
     ];
-    for (const variant of variants) {
-      const w = await funded();
+    const waits: Array<[Partial<AllowanceReading>, Date]> = [
+      // The current rate window, still open, has less left than one refill.
+      [{ periodSpent: 500_000n - REFILL + 1n, periodEndMs: BigInt(windowEnd) }, new Date(windowEnd)],
+      // A rate limit whose window cannot be placed counts as full for one whole period.
+      [{ periodSpent: null }, new Date(NOW.getTime() + 86_400_000)],
+    ];
+    const refuse = async (variant: Partial<AllowanceReading> | Error) => {
+      const w = await funded(db, { allowanceCheckedAt: ago(60_000) });
       const { chain, state, calls, executions } = stubFor(w, 0n);
       state.allowances.set(w.allowanceId, variant instanceof Error ? variant : allowanceFor(w, variant));
       expect(await refill(w, chain)).toBe('refused');
@@ -490,12 +512,33 @@ describe('refillIfNeeded', () => {
       expect(calls).toEqual([`getBalances:${w.purse}`, `getAllowance:${w.allowanceId}`]);
       expect(executions).toHaveLength(0);
       expect(await refillRows(w.ownerId)).toHaveLength(0);
+      return { w, recorded: await allowanceOf(w) };
+    };
+    for (const variant of never) expect((await refuse(variant)).recorded).toEqual(FORGOTTEN);
+    for (const [variant, end] of waits) {
+      const { w, recorded } = await refuse(variant);
+      expect(recorded).toEqual({ allowanceId: w.allowanceId, allowanceCheckedAt: ago(60_000), refillNotBefore: end });
     }
+
+    // An allowance the owner replaced while the old one was being read is kept.
+    const replaced = await funded();
+    const stub = stubFor(replaced, 0n);
+    const newer = randomAddress();
+    const replacing = {
+      ...stub.chain,
+      getAllowance: async () => {
+        await db.update(owners).set({ allowanceId: newer }).where(eq(owners.id, replaced.ownerId));
+        return allowanceFor(replaced, { expirationMs: BigInt(NOW.getTime()) });
+      },
+    } as Chain;
+    expect(await refill(replaced, replacing)).toBe('refused');
+    expect((await allowanceOf(replaced)).allowanceId).toBe(newer);
 
     const moved = await funded(db, { purseAddress: randomAddress() });
     const { chain, calls } = stubFor(moved, 0n);
     expect(await refill(moved, chain)).toBe('refused');
     expect(calls).toEqual([]);
+    expect((await allowanceOf(moved)).allowanceId).toBe(moved.allowanceId);
     expect(await refill(await world(), chain)).toBe('refused');
   });
 
@@ -755,6 +798,41 @@ describe('refillIfNeeded', () => {
     expect(await tickAt(144)).toMatchObject({ owners: 1, refills: 0, errors: [] });
     expect(notGas(calls)).toEqual([]);
   });
+
+  it('reads an expired allowance once with a ledger at 0, forgets it, and reads nothing for that owner on the next three ticks (C22)', async () => {
+    const on = await freshDb();
+    const w = await funded(on, { allowanceCheckedAt: NOW });
+    const { chain, state, calls } = stubFor(w, 0n, on);
+    state.allowances.set(w.allowanceId, allowanceFor(w, { expirationMs: BigInt(NOW.getTime() - 1) }));
+    const tickAt = ticker(on, chain);
+    expect(await tickAt(0)).toMatchObject({ owners: 1, refills: 0, errors: [] });
+    expect(notGas(calls)).toEqual([`getBalances:${w.purse}`, `getAllowance:${w.allowanceId}`]);
+    expect(await allowanceOf(w, on)).toEqual(FORGOTTEN);
+    expect((await onboardingState({ db: on, ownerId: w.ownerId })).allowance).toBe('missing');
+
+    calls.length = 0;
+    for (let n = 1; n <= 3; n++) expect(await tickAt(n)).toMatchObject({ owners: 0, refills: 0, errors: [] });
+    expect(notGas(calls)).toEqual([]);
+  });
+
+  it('asks the chain nothing about a full rate window until it ends, then reads it again and refills (C22)', async () => {
+    const on = await freshDb();
+    const w = await funded(on, { allowanceCheckedAt: NOW });
+    const { chain, state, calls } = stubFor(w, 0n, on);
+    const windowEnd = new Date(NOW.getTime() + 2.5 * TICK_MS);
+    state.allowances.set(w.allowanceId, allowanceFor(w, { periodSpent: 500_000n, periodEndMs: BigInt(windowEnd.getTime()) }));
+    const tickAt = ticker(on, chain);
+    expect(await tickAt(0)).toMatchObject({ owners: 1, refills: 0, errors: [] });
+    expect(notGas(calls)).toEqual([`getBalances:${w.purse}`, `getAllowance:${w.allowanceId}`]);
+    expect(await allowanceOf(w, on)).toEqual({ allowanceId: w.allowanceId, allowanceCheckedAt: NOW, refillNotBefore: windowEnd });
+
+    calls.length = 0;
+    for (const n of [1, 2]) expect(await tickAt(n)).toMatchObject({ owners: 0, refills: 0, errors: [] });
+    expect(notGas(calls)).toEqual([]);
+    // Past the window's end the next spend opens a new window, so the same reading now has room.
+    expect(await tickAt(3)).toMatchObject({ owners: 1, refills: 1, errors: [] });
+    expect(notGas(calls).filter((call) => /^get(Balances|Allowance):/.test(call))).toEqual([`getBalances:${w.purse}`, `getAllowance:${w.allowanceId}`]);
+  });
 });
 
 describe('pruneExpiredRows', () => {
@@ -769,6 +847,10 @@ describe('pruneExpiredRows', () => {
     sellerSales: (await on.select().from(sellerSales)).length,
     sessions: (await on.select().from(sessions)).length,
   });
+  /** A per-client rate counter whose window started a minute or more past the retention. */
+  const oldCounter = (on: Database, i: number) =>
+    on.insert(rateCounters).values({ key: `http:old-${i}`, windowStart: ago(LIMITS.rateCounterRetentionMs + 60_000 * (i + 1)), count: 1 });
+  const oldCounters = async (on: Database) => (await on.select().from(rateCounters).where(like(rateCounters.key, 'http:old-%'))).length;
 
   it('deletes only rows that can never be used again: expired nonces, expired sales never sent, rejected sales long expired and sessions expired over a day ago', async () => {
     const on = await freshDb();
@@ -798,10 +880,10 @@ describe('pruneExpiredRows', () => {
     await session(on, w, new Date(NOW.getTime() + DAY), ago(DAY - 1));
     await session(on, w, new Date(NOW.getTime() + DAY));
 
-    expect(await pruneExpiredRows({ db: on, now: NOW })).toEqual({ signinNonces: 2, sellerSales: 4, sessions: 1, owners: 0 });
+    expect(await pruneExpiredRows({ db: on, now: NOW })).toEqual({ rateCounters: 0, signinNonces: 2, sellerSales: 4, sessions: 1, owners: 0 });
     expect(await kept(on)).toEqual({ signinNonces: 1, sellerSales: 6, sessions: 4 });
     expect((await on.select({ nonce: signinNonces.nonce }).from(signinNonces)).map((row) => row.nonce)).toEqual([liveNonce]);
-    expect(await pruneExpiredRows({ db: on, now: NOW })).toEqual({ signinNonces: 0, sellerSales: 0, sessions: 0, owners: 0 });
+    expect(await pruneExpiredRows({ db: on, now: NOW })).toEqual({ rateCounters: 0, signinNonces: 0, sellerSales: 0, sessions: 0, owners: 0 });
   });
 
   it('clears more expired nonces and empty owners in one call than the global sign-in cap lets strangers create between two ticks', async () => {
@@ -815,7 +897,7 @@ describe('pruneExpiredRows', () => {
       .values(Array.from({ length: created }, (_, i) => ({ nonce: hex(16), createdAt: ago(DAY), expiresAt: ago(1 + i) })));
     // Every verified sign-in can leave an owner row behind once its session has ended.
     await on.insert(owners).values(Array.from({ length: created }, () => ({ suiAddress: randomAddress(), purseAddress: randomAddress(), createdAt: dayOld() })));
-    expect(await pruneExpiredRows({ db: on, now: NOW, clock: () => NOW })).toEqual({ signinNonces: created, sellerSales: 0, sessions: 0, owners: created });
+    expect(await pruneExpiredRows({ db: on, now: NOW, clock: () => NOW })).toEqual({ rateCounters: 0, signinNonces: created, sellerSales: 0, sessions: 0, owners: created });
     expect(await kept(on)).toEqual({ signinNonces: 0, sellerSales: 0, sessions: 0 });
     expect(await ownerIds(on)).toEqual([]);
   });
@@ -827,17 +909,41 @@ describe('pruneExpiredRows', () => {
       await nonce(on, ago(DAY + i));
       await sale(on, ago(DAY + i));
       await session(on, w, ago(2 * DAY + i));
+      await oldCounter(on, i);
     }
     let reads = 0;
     // Every read of this clock is one whole time slice later than the one before.
     const slow = () => new Date(NOW.getTime() + reads++ * LIMITS.pruneTimeSliceMs);
     await withLimit('pruneBatch', 3, async () => {
-      expect(await pruneExpiredRows({ db: on, now: NOW, clock: slow })).toEqual({ signinNonces: 3, sellerSales: 3, sessions: 3, owners: 0 });
+      expect(await pruneExpiredRows({ db: on, now: NOW, clock: slow })).toEqual({ rateCounters: 3, signinNonces: 3, sellerSales: 3, sessions: 3, owners: 0 });
       expect(await kept(on)).toEqual({ signinNonces: 2, sellerSales: 2, sessions: 2 });
+      expect(await oldCounters(on)).toBe(2);
       const { chain } = stubChain(on);
-      expect(await tick(on, chain)).toMatchObject({ rowsPruned: 6, errors: [] });
+      expect(await tick(on, chain)).toMatchObject({ rowsPruned: 8, errors: [] });
     });
     expect(await kept(on)).toEqual({ signinNonces: 0, sellerSales: 0, sessions: 0 });
+    expect(await oldCounters(on)).toBe(0);
+  });
+
+  it('prunes old rate counters in the tick before the gas wallet read and any owner work, keeping every count still inside its window (C34)', async () => {
+    const on = await freshDb();
+    const w = await funded(on, { allowanceCheckedAt: NOW });
+    for (let i = 0; i < 3; i++) await oldCounter(on, i);
+    const atRetention = { key: 'http:at-retention', windowStart: ago(LIMITS.rateCounterRetentionMs), count: 4 };
+    await on.insert(rateCounters).values(atRetention);
+    const stub = stubFor(w, 0n, on);
+    const seen: number[] = [];
+    const chain = {
+      ...stub.chain,
+      getBalances: async (address: string) => {
+        seen.push(await oldCounters(on));
+        return stub.chain.getBalances(address);
+      },
+    } as Chain;
+    expect(await tick(on, chain)).toMatchObject({ owners: 1, refills: 1, rowsPruned: 3, errors: [] });
+    // The gas wallet read and then the owner's purse read: both found the old counters gone.
+    expect(seen).toEqual([0, 0]);
+    expect(await on.select().from(rateCounters).where(eq(rateCounters.key, atRetention.key))).toEqual([atRetention]);
   });
 
   const dayOld = () => ago(LIMITS.emptyOwnerKeepMs + 1);
@@ -869,12 +975,47 @@ describe('pruneExpiredRows', () => {
     const signedIn = await bareOwner(on);
     await session(on, signedIn, new Date(NOW.getTime() + 1));
     await session(on, signedIn, ago(1));
-    kept.push(withAgent, withDecision, withPayment, withMemory, signedIn);
+    // Refilled once, then its allowance was forgotten: the refill row still names it.
+    const withRefill = await bareOwner(on);
+    await on.insert(refills).values({ ownerId: withRefill.ownerId, allowanceId: randomAddress(), amountAtomic: REFILL, digest: randomDigest(), sentAt: ago(DAY), status: 'verified' });
+    kept.push(withAgent, withDecision, withPayment, withMemory, signedIn, withRefill);
 
-    expect(await pruneExpiredRows({ db: on, now: NOW })).toEqual({ signinNonces: 0, sellerSales: 0, sessions: 2, owners: 1 });
+    expect(await pruneExpiredRows({ db: on, now: NOW })).toEqual({ rateCounters: 0, signinNonces: 0, sellerSales: 0, sessions: 2, owners: 1 });
     expect(await ownerIds(on)).toEqual(kept.map((w) => w.ownerId).sort());
     expect([await sessionsOf(on, empty), await sessionsOf(on, signedIn)]).toEqual([0, 2]);
     expect(await pruneExpiredRows({ db: on, now: NOW })).toMatchObject({ owners: 0 });
+  });
+
+  it('clears 3,001 empty owners inside LIMITS.pruneTimeSliceMs on the wall clock while 200,000 older owners hold live sessions (C34)', { timeout: 600_000 }, async () => {
+    const on = await freshDb();
+    const live = 200_000;
+    const empty = 3_001;
+    // One statement: the live owners are the oldest, so the walk passes every one of them before
+    // it reaches an empty owner, and each live owner gets a session that ends a day from now.
+    await on.execute(sql`
+      with made as (
+        insert into owners (sui_address, purse_address, created_at)
+        select '0x' || lpad(to_hex(g), 64, '0'),
+               '0x' || md5(g::text) || md5((g + ${live + empty})::text),
+               case when g <= ${live} then ${ago(2 * DAY).toISOString()}::timestamptz - g * interval '1 millisecond'
+                    else ${dayOld().toISOString()}::timestamptz - (g - ${live}) * interval '1 millisecond' end
+        from generate_series(1, ${live + empty}::integer) g
+        returning id, created_at
+      )
+      insert into sessions (owner_id, token_hash, created_at, expires_at)
+      select id, md5(id::text), ${ago(3_600_000).toISOString()}::timestamptz, ${new Date(NOW.getTime() + DAY).toISOString()}::timestamptz
+      from made where created_at < ${ago(1.5 * DAY).toISOString()}::timestamptz
+    `);
+    const [before] = await on.select({ n: count() }).from(sessions);
+    expect(before?.n).toBe(live);
+
+    const startedMs = performance.now();
+    const pruned = await pruneExpiredRows({ db: on, now: NOW });
+    const tookMs = performance.now() - startedMs;
+    expect(pruned).toMatchObject({ owners: empty, sessions: 0 });
+    expect(tookMs).toBeLessThan(LIMITS.pruneTimeSliceMs);
+    const [after] = await on.select({ n: count() }).from(owners);
+    expect(after?.n).toBe(live);
   });
 
   it('repeats a full batch of empty owners only inside LIMITS.pruneTimeSliceMs, like every other rule, and the tick counts them', async () => {
@@ -976,6 +1117,22 @@ async function confirmedMemory(w: World, blobId: string, confirmedAt: Date, on: 
 }
 
 const chainConfirmedAt = async (id: string, on: Database) => one(await on.select({ at: memories.chainConfirmedAt }).from(memories).where(eq(memories.id, id))).at;
+const blobEndEpochOf = async (id: string, on: Database) => one(await on.select({ end: memories.blobEndEpoch }).from(memories).where(eq(memories.id, id))).end;
+const chainExpiredAt = async (id: string, on: Database) => one(await on.select({ at: memories.chainExpiredAt }).from(memories).where(eq(memories.id, id))).at;
+
+/** A memory found on chain five days ago, before blob_end_epoch was kept (migration 0004). */
+async function legacyMemory(w: World, blobId: string, on: Database): Promise<string> {
+  const id = await confirmedMemory(w, blobId, ago(5 * 86_400_000), on);
+  await on.update(memories).set({ chainConfirmedAt: ago(5 * 86_400_000 - 60_000) }).where(eq(memories.id, id));
+  return id;
+}
+
+/** A memory found on chain a day ago, its Blob stored until Walrus epoch `endEpoch`. */
+async function storedMemory(w: World, blobId: string, endEpoch: number, on: Database): Promise<string> {
+  const id = await confirmedMemory(w, blobId, ago(86_400_000), on);
+  await on.update(memories).set({ chainConfirmedAt: ago(86_400_000 - 60_000), blobEndEpoch: endEpoch }).where(eq(memories.id, id));
+  return id;
+}
 
 describe('confirmBlobsOnChain', () => {
   it("marks only memories whose blob id is among this owner's Walrus Blob objects, and asks the chain only when one is waiting", async () => {
@@ -1028,18 +1185,59 @@ describe('confirmBlobsOnChain', () => {
     expect(LIMITS.blobChainCheckMinAgeMs).toBe(60_000);
   });
 
-  it('checks at most LIMITS.blobConfirmBatch memories per call, oldest confirmation first', async () => {
+  it('matches every memory waiting in the age window against the pages it reads, not only the oldest LIMITS.blobConfirmBatch, and stores the latest end epoch of each', async () => {
     const on = await freshDb();
     const w = await world(on);
     const ids: string[] = [];
     for (let i = 0; i < 3; i++) ids.push(await confirmedMemory(w, `blob-${i}`, ago(60_000 * (3 - i)), on));
     const { chain, state } = stubChain(on);
-    state.blobs.set(w.suiAddress, [blob('blob-0'), blob('blob-1'), blob('blob-2')]);
+    // blob-1 is on two Blob objects, and the one stored longer says how long Walrus keeps it.
+    state.blobs.set(w.suiAddress, [blob('blob-0'), blob('blob-1'), blob('blob-1', { endEpoch: 60 }), blob('blob-2', { endEpoch: 50 }), blob('blob-not-mine')]);
     await withLimit('blobConfirmBatch', 2, async () => {
-      expect(await confirmBlobsOnChain({ db: on, chain, ownerId: w.ownerId, now: NOW })).toEqual({ checked: 2, confirmed: 2 });
-      expect(await chainConfirmedAt(ids[2] ?? '', on)).toBeNull();
-      expect(await confirmBlobsOnChain({ db: on, chain, ownerId: w.ownerId, now: NOW })).toEqual({ checked: 1, confirmed: 1 });
+      expect(await confirmBlobsOnChain({ db: on, chain, ownerId: w.ownerId, now: NOW })).toEqual({ checked: 3, confirmed: 3 });
     });
+    for (const id of ids) expect(await chainConfirmedAt(id, on)).toEqual(NOW);
+    expect(await Promise.all(ids.map((id) => blobEndEpochOf(id, on)))).toEqual([54, 60, 50]);
+  });
+
+  it('fills in the end epoch of memories found on chain before it was kept, an ended Blob included, and hides one on no Blob of the owner once one call read the whole listing (C18)', async () => {
+    const on = await freshDb();
+    const w = await world(on);
+    const stored = await legacyMemory(w, 'blob-old-stored', on);
+    const ended = await legacyMemory(w, 'blob-old-ended', on);
+    const gone = await legacyMemory(w, 'blob-old-gone', on);
+    const { chain, state, calls } = stubChain(on);
+    // An uncertified copy says nothing about how long Walrus keeps a blob.
+    state.blobs.set(w.suiAddress, [blob('blob-old-stored'), blob('blob-old-stored', { certifiedEpoch: null, endEpoch: 80 }), blob('blob-old-ended', { endEpoch: 44 })]);
+    // Nothing is waiting, so only the memories to fill in send the scan out.
+    expect(await confirmBlobsOnChain({ db: on, chain, ownerId: w.ownerId, now: NOW })).toEqual({ checked: 0, confirmed: 0 });
+    expect(calls).toEqual(['getWalrusEpoch', `scanOwnedWalrusBlobs:${w.suiAddress}:start`]);
+    expect(await Promise.all([stored, ended, gone].map((id) => blobEndEpochOf(id, on)))).toEqual([54, 44, null]);
+    expect(await Promise.all([stored, ended, gone].map((id) => chainExpiredAt(id, on)))).toEqual([null, null, NOW]);
+
+    // The Blob that ended at 44 is past Walrus epoch 45, so the expiry step retires its memory.
+    expect(await expireBlobsOnChain({ db: on, chain, ownerId: w.ownerId, now: NOW })).toEqual({ expired: 1 });
+    expect(await chainExpiredAt(ended, on)).toEqual(NOW);
+    calls.length = 0;
+    expect(await confirmBlobsOnChain({ db: on, chain, ownerId: w.ownerId, now: NOW })).toEqual({ checked: 0, confirmed: 0 });
+    expect(calls).toEqual([]);
+  });
+
+  it('never hides a memory lacking its end epoch on a listing read across calls, since a page cap proves presence, never absence (C18)', async () => {
+    const on = await freshDb();
+    const w = await world(on);
+    const gone = await legacyMemory(w, 'blob-old-gone', on);
+    const { chain, state } = stubChain(on);
+    state.blobs.set(w.suiAddress, Array.from({ length: 2 * LIMITS.graphqlPageSize }, (_, i) => blob(`blob-${i}`)));
+    const scanOnce = () => confirmBlobsOnChain({ db: on, chain, ownerId: w.ownerId, now: NOW });
+    await withLimit('blobScanPagesPerTick', 1, async () => {
+      // The top and the end of the listing, each in a call of its own.
+      await scanOnce();
+      await scanOnce();
+    });
+    expect(await chainExpiredAt(gone, on)).toBeNull();
+    await scanOnce();
+    expect(await chainExpiredAt(gone, on)).toEqual(NOW);
   });
 
   const cursorOf = async (w: World, on: Database) => one(await on.select({ cursor: owners.blobScanCursor }).from(owners).where(eq(owners.id, w.ownerId))).cursor;
@@ -1133,6 +1331,49 @@ describe('confirmBlobsOnChain', () => {
     expect(await cursorOf(w, on)).toBe('page-2');
     await expect(confirmBlobsOnChain({ db: on, chain: failing(false), ownerId: w.ownerId, now: NOW })).rejects.toMatchObject({ code: 'BAD_RESPONSE' });
     expect(await cursorOf(w, on)).toBeNull();
+  });
+});
+
+describe('expireBlobsOnChain', () => {
+  it('marks a memory expired once the Walrus epoch reaches its end epoch, never before, and reads nothing for an owner with none stored (C18, C22)', async () => {
+    const on = await freshDb();
+    const w = await world(on);
+    const ending = await storedMemory(w, 'blob-ending', 54, on);
+    const lasting = await storedMemory(w, 'blob-lasting', 60, on);
+    const at53 = stubChain(on);
+    at53.state.walrusEpoch = 53;
+    expect(await expireBlobsOnChain({ db: on, chain: at53.chain, ownerId: w.ownerId, now: NOW })).toEqual({ expired: 0 });
+
+    const at54 = stubChain(on);
+    at54.state.walrusEpoch = 54;
+    expect(await expireBlobsOnChain({ db: on, chain: at54.chain, ownerId: w.ownerId, now: NOW })).toEqual({ expired: 1 });
+    expect([await chainExpiredAt(ending, on), await chainExpiredAt(lasting, on)]).toEqual([NOW, null]);
+    expect(await expireBlobsOnChain({ db: on, chain: at54.chain, ownerId: w.ownerId, now: NOW })).toEqual({ expired: 0 });
+    expect(at54.calls).toEqual(['getWalrusEpoch']);
+
+    const bare = stubChain(on);
+    expect(await expireBlobsOnChain({ db: on, chain: bare.chain, ownerId: (await world(on)).ownerId, now: NOW })).toEqual({ expired: 0 });
+    // A stale reading is refreshed only while canStart says yes; a fresh one is used past the deadline.
+    expect(await expireBlobsOnChain({ db: on, chain: bare.chain, ownerId: w.ownerId, now: NOW, canStart: () => false })).toEqual({ expired: 0 });
+    expect(bare.calls).toEqual([]);
+    const third = await storedMemory(w, 'blob-third', 54, on);
+    expect(await expireBlobsOnChain({ db: on, chain: at54.chain, ownerId: w.ownerId, now: NOW, canStart: () => false })).toEqual({ expired: 1 });
+    expect(await chainExpiredAt(third, on)).toEqual(NOW);
+    expect(at54.calls).toEqual(['getWalrusEpoch']);
+    await expect(expireBlobsOnChain({ db: on, chain: bare.chain, ownerId: 'not-a-uuid', now: NOW })).rejects.toThrow('the owner id is not a uuid');
+  });
+
+  it('marks at most LIMITS.blobConfirmBatch per call, earliest end first', async () => {
+    const on = await freshDb();
+    const w = await world(on);
+    const ids = [await storedMemory(w, 'blob-52', 52, on), await storedMemory(w, 'blob-50', 50, on), await storedMemory(w, 'blob-51', 51, on)];
+    const { chain, state } = stubChain(on);
+    state.walrusEpoch = 54;
+    await withLimit('blobConfirmBatch', 2, async () => {
+      expect(await expireBlobsOnChain({ db: on, chain, ownerId: w.ownerId, now: NOW })).toEqual({ expired: 2 });
+      expect(await Promise.all(ids.map((id) => chainExpiredAt(id, on)))).toEqual([null, NOW, NOW]);
+      expect(await expireBlobsOnChain({ db: on, chain, ownerId: w.ownerId, now: NOW })).toEqual({ expired: 1 });
+    });
   });
 });
 
@@ -1388,6 +1629,61 @@ describe('runJobsTick', () => {
     expect(await chainConfirmedAt(old, on)).toBeNull();
   });
 
+  it('reads the Walrus epoch at most hourly and only while a memory is stored on chain, visits an owner once its Blob ends, and marks it expired (C18, C22)', async () => {
+    const on = await freshDb();
+    const w = await world(on);
+    const stored = await storedMemory(w, 'blob-stored', 54, on);
+    const { chain, state, calls } = stubChain(on);
+    const minutesOn = (minutes: number) =>
+      runJobsTick({ db: on, chain, masterSecretHex: MASTER, gasKeypair: GAS, now: () => new Date(NOW.getTime() + minutes * 60_000), sleep: noSleep });
+    const epochReads = () => calls.filter((call) => call === 'getWalrusEpoch').length;
+
+    expect(await minutesOn(0)).toMatchObject({ owners: 0, memoriesChainExpired: 0, errors: [] });
+    state.walrusEpoch = 54;
+    // The reading at 45 stands for the rest of the hour, so nothing has ended yet.
+    expect(await minutesOn(30)).toMatchObject({ owners: 0, memoriesChainExpired: 0, errors: [] });
+    expect(epochReads()).toBe(1);
+    expect(await minutesOn(60)).toMatchObject({ owners: 1, memoriesChainExpired: 1, errors: [] });
+    expect(await chainExpiredAt(stored, on)).toEqual(new Date(NOW.getTime() + 60 * 60_000));
+    // Nothing is stored on chain any more, so the next hour reads no epoch at all.
+    expect(await minutesOn(120)).toMatchObject({ owners: 0, memoriesChainExpired: 0, errors: [] });
+    expect(epochReads()).toBe(2);
+  });
+
+  it('visits an owner whose only work is a memory found on chain before blob_end_epoch was kept, fills it in, and then finds no work', async () => {
+    const on = await freshDb();
+    const w = await world(on);
+    const old = await legacyMemory(w, 'blob-old', on);
+    const { chain, state } = stubChain(on);
+    state.blobs.set(w.suiAddress, [blob('blob-old')]);
+    expect(await tick(on, chain)).toMatchObject({ owners: 1, memoriesChainExpired: 0, errors: [] });
+    expect(await blobEndEpochOf(old, on)).toBe(54);
+    expect(await tick(on, chain)).toMatchObject({ owners: 0, errors: [] });
+  });
+
+  it('records a failing Walrus epoch read as its own step and still visits every owner with other work', async () => {
+    const on = await freshDb();
+    const w = await world(on);
+    await storedMemory(w, 'blob-stored', 54, on);
+    const staleOpen = await decision(w, 'open', ago(LIMITS.staleOpenDecisionMs + 1), on);
+    const stub = stubChain(on);
+    const chain = {
+      ...stub.chain,
+      getWalrusEpoch: async () => {
+        throw new ChainError('UPSTREAM', 'Tatum getWalrusEpoch: gateway error', true);
+      },
+    } as Chain;
+    expect(await tick(on, chain)).toMatchObject({
+      owners: 1,
+      decisionsExpired: 1,
+      errors: [
+        { ownerId: '', step: 'walrus_epoch', code: 'CHAIN_UPSTREAM' },
+        { ownerId: w.ownerId, step: 'blob_expiry', code: 'CHAIN_UPSTREAM' },
+      ],
+    });
+    expect(await statusOf(staleOpen, on)).toBe('expired');
+  });
+
   it('records a failing blob scan as the owner\'s blobs step and still runs the owner\'s other steps', async () => {
     const on = await freshDb();
     const w = await world(on);
@@ -1414,6 +1710,7 @@ describe('runJobsTick', () => {
       memoriesConfirmed: 0,
       memoriesFailed: 0,
       memoriesChainConfirmed: 0,
+      memoriesChainExpired: 0,
       paymentsVerified: 0,
       paymentsNotLanded: 0,
       paymentsMismatched: 0,
@@ -1468,7 +1765,9 @@ describe('runJobsTick', () => {
       all.push(await funded(on, { allowanceCheckedAt: ago(60_000 * (LIMITS.jobsOwnersPerTick + 1 - i)) }));
     }
     const last = all[LIMITS.jobsOwnersPerTick] as Funded;
-    const { chain } = stubChain(on);
+    const { chain, state } = stubChain(on);
+    // Every purse reads at the threshold, so each visit ends at not_needed and every allowance stays.
+    for (const w of all) state.balances.set(w.purse, { usdcAddressBalance: BigInt(LIMITS.purseRefillBelowAtomic) });
     const tickAt = (at: Date) => runJobsTick({ db: on, chain, masterSecretHex: MASTER, gasKeypair: GAS, now: () => at, sleep: noSleep });
 
     expect(await tickAt(NOW)).toMatchObject({ owners: LIMITS.jobsOwnersPerTick, timeBudgetReached: false, errors: [] });

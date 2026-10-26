@@ -1,7 +1,7 @@
 import { LIMITS } from '@ellai/core/limits';
 import { z } from 'zod';
 import { issueSignIn } from '../../../../server/auth/signin.js';
-import { withServerContext } from '../../../../server/http/context.js';
+import { scoped, withServerContext } from '../../../../server/http/context.js';
 import { respond } from '../../../../server/http/errors.js';
 import { jsonResponse, readJson } from '../../../../server/http/json.js';
 import { requireSameOrigin } from '../../../../server/http/origin.js';
@@ -18,7 +18,7 @@ const body = z.strictObject({ address: z.string().max(LIMITS.signinAddressMaxCha
  * LIMITS.signInRequestsPerMinuteGlobal overall, since every call stores a nonce. 403 cross_origin, 429 rate_limited, 400 for a bad body or
  * an address that is not a Sui address.
  */
-export async function POST(request: Request): Promise<Response> {
+export const POST = scoped('anyone', async (request: Request): Promise<Response> => {
   return respond(() =>
     withServerContext(async (ctx) => {
       requireSameOrigin(request, ctx.env.APP_ORIGIN);
@@ -29,4 +29,4 @@ export async function POST(request: Request): Promise<Response> {
       return jsonResponse({ message: issued.message, expiresAt: issued.expiresAt });
     }),
   );
-}
+});

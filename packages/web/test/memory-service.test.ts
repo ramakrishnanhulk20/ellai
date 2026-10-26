@@ -1,11 +1,13 @@
 // Covers: the memory service on PGlite against a stand-in relayer client. submitPendingMemories
 // claims only this owner's pending, unsent rows written by the derived delegate in Ellai's
 // namespace, sends them once, never resubmits a row with a job id, counts only refusals about the
-// rows, keeps rows pending through rate limits, outages and timeouts until the age ceiling, sends
+// rows, keeps rows pending through rate limits, outages, timeouts and a setup step that fails
+// before the request leaves (even with a 4xx from the Sui read behind the SEAL session) until the age ceiling, sends
 // a row from a refused write alone so another row still goes, fails a row at the attempt ceiling,
 // marks rows failed when the relayer took them without usable job ids, counts and fails nothing
 // on a refused delegate key, and holds back a repeated sentence; confirmMemoryJobs maps done, failed and
-// pending, fails one malformed or clashing job alone, fails a job past the age ceiling, and
+// pending, fails one malformed or clashing job alone, fails no job when a setup step fails before
+// the status request leaves, fails a job past the age ceiling, and
 // changes nothing on a refused delegate key; neither holds a transaction across a relayer call,
 // so a pass leased elsewhere is skipped and a lease that ran out is taken again; both start no
 // call once canStart says no, every relayer call ends at the call ceiling, and both refuse an
@@ -22,6 +24,7 @@ import { deriveMemwalDelegateKeypair } from '@ellai/core/keys';
 import { LIMITS } from '@ellai/core/limits';
 import { createMemoryClient } from '@ellai/core/memory';
 import { USDC_TYPE_MAINNET } from '@ellai/core/usdc';
+import { SuiHTTPStatusError } from '@mysten/sui/jsonRpc';
 import { toHex } from '@mysten/sui/utils';
 import { eq } from 'drizzle-orm';
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -122,13 +125,14 @@ type Method = (...args: never[]) => Promise<unknown>;
  * over these shared mocks, as the writer wraps the bulk write on the client it is given.
  * Unset methods fail the test.
  */
-function relayer(methods: Partial<Record<'rememberBulk' | 'getRememberBulkStatus' | 'recall', Method>> = {}) {
+function relayer(methods: Partial<Record<'rememberBulk' | 'getRememberBulkStatus' | 'recall' | 'buildSealSession', Method>> = {}) {
   const untouched = () => Promise.reject(new Error('relayer was called'));
   const mocks = {
     rememberBulk: vi.fn(methods.rememberBulk ?? untouched),
     getRememberBulkStatus: vi.fn(methods.getRememberBulkStatus ?? untouched),
     recall: vi.fn(methods.recall ?? untouched),
     destroy: vi.fn(),
+    ...(methods.buildSealSession === undefined ? {} : { buildSealSession: vi.fn(methods.buildSealSession) }),
   };
   vi.mocked(createMemoryClient).mockImplementation(() => ({ ...mocks }) as never);
   return mocks;
@@ -349,6 +353,32 @@ describe('submitPendingMemories', () => {
     }
   });
 
+  it('spends nothing, and keeps the lease, when a setup step fails before the request leaves, even with a 4xx from the Sui read behind the SEAL session', async () => {
+    for (const [status, code] of [
+      [400, 'WRITE'],
+      [403, 'DELEGATE'],
+    ] as const) {
+      const owner = await newOwner();
+      const ids = [await pendingMemory(owner), await pendingMemory(owner)];
+      // As SDK 0.1.8 does: every bulk write builds its SEAL session first, and the session reads Sui
+      // through the JSON-RPC client, whose error carries the fullnode's status.
+      const sealFails = (async () => Promise.reject(new SuiHTTPStatusError(`Unexpected status code: ${status}`, status, 'refused'))) as Method;
+      const client = relayer({
+        buildSealSession: sealFails,
+        rememberBulk: async function (this: { buildSealSession: () => Promise<string> }, items: unknown[]) {
+          await this.buildSealSession();
+          return accepted(items);
+        } as Method,
+      });
+      await expect(submitPendingMemories(writer(owner))).rejects.toMatchObject({ name: 'MemoryError', code });
+      expect(client.buildSealSession).toHaveBeenCalledTimes(1);
+      for (const id of ids) expect(await row(id)).toMatchObject({ status: 'pending', jobId: null, submitAttempts: 0, submittedAt: NOW });
+      const later = relayer({ rememberBulk: accepted });
+      expect(await submitPendingMemories(writer(owner, tickOn(1)))).toEqual({ submitted: 2 });
+      expect(later.rememberBulk).toHaveBeenCalledTimes(1);
+    }
+  });
+
   it('marks rows failed, and never sends them again, when the relayer took the write without usable job ids', async () => {
     const owner = await newOwner();
     const ids = [await pendingMemory(owner), await pendingMemory(owner)];
@@ -536,6 +566,29 @@ describe('confirmMemoryJobs', () => {
     relayer({ getRememberBulkStatus: () => Promise.reject(Object.assign(new Error('bad gateway'), { status: 502 })) });
     await expect(confirmMemoryJobs(writer(unread))).rejects.toMatchObject({ name: 'MemoryError', code: 'UPSTREAM' });
     expect([(await row(unreadOld)).status, (await row(unreadYoung)).status]).toEqual(['failed', 'pending']);
+  });
+
+  it('fails no job and reads none alone when a setup step fails before the status request leaves, even with a 4xx from the Sui read behind the SEAL session', async () => {
+    for (const [status, code] of [
+      [400, 'WRITE'],
+      [403, 'DELEGATE'],
+    ] as const) {
+      const owner = await newOwner();
+      const young = await pendingMemory(owner, { jobId: `job-setup-${status}`, submittedAt: NOW });
+      const old = await pendingMemory(owner, { jobId: `job-setup-old-${status}`, submittedAt: new Date(NOW.getTime() - LIMITS.memoryJobMaxAgeMs) });
+      const client = relayer({
+        buildSealSession: (async () => Promise.reject(new SuiHTTPStatusError(`Unexpected status code: ${status}`, status, 'refused'))) as Method,
+        getRememberBulkStatus: async function (this: { buildSealSession: () => Promise<string> }, ids: string[]) {
+          await this.buildSealSession();
+          return { results: ids.map((id) => ({ job_id: id, status: 'done', blob_id: `blob-${id}` })) };
+        } as Method,
+      });
+      await expect(confirmMemoryJobs(writer(owner))).rejects.toMatchObject({ name: 'MemoryError', code });
+      expect(client.getRememberBulkStatus).toHaveBeenCalledTimes(1);
+      expect(await row(young)).toMatchObject({ status: 'pending', blobId: null, jobId: `job-setup-${status}` });
+      // As for any read that got no answer, the age ceiling still fails a job past it.
+      expect(await row(old)).toMatchObject({ status: 'failed', blobId: null });
+    }
   });
 
   it('changes nothing, even past the age ceiling, when the relayer refuses the delegate key, and throws DELEGATE', async () => {

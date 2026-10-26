@@ -1,11 +1,8 @@
 import { LIMITS } from '@ellai/core/limits';
 import { z } from 'zod';
-import { withServerContext } from '../../../../../server/http/context.js';
-import { respond } from '../../../../../server/http/errors.js';
+import { scoped } from '../../../../../server/http/context.js';
 import { jsonResponse, readJson } from '../../../../../server/http/json.js';
 import { atomicAmountText, limitOwnerChainCalls, onboardingChainFailure } from '../../../../../server/http/owner-limits.js';
-import { requireSameOrigin } from '../../../../../server/http/origin.js';
-import { requireOwner } from '../../../../../server/http/session.js';
 import { BUILD_CHAIN_CALLS, buildOnboardingTx } from '../../../../../server/onboarding/build.js';
 import { ONBOARDING_STEPS } from '../../../../../server/onboarding/state.js';
 
@@ -30,23 +27,17 @@ const body = z.strictObject({ step: z.enum(ONBOARDING_STEPS), allowance: allowan
  * 503 chain_unavailable when Sui cannot be read, 503 chain_unavailable_today once every owner's
  * day is spent.
  */
-export async function POST(request: Request): Promise<Response> {
-  return respond(() =>
-    withServerContext(async (ctx) => {
-      requireSameOrigin(request, ctx.env.APP_ORIGIN);
-      const { ownerId } = await requireOwner(request, ctx);
-      // Read first, so the calls counted are the ones this step makes; the body is capped at 1 KiB.
-      const { step, allowance: terms } = await readJson(request, body, LIMITS.onboardingBuildBodyMaxBytes);
-      const limited = await limitOwnerChainCalls(ctx, request, ownerId, BUILD_CHAIN_CALLS[step]);
-      if (limited !== null) return limited;
-      try {
-        const built = await buildOnboardingTx({ db: ctx.db, ownerId, step, allowance: terms, chain: ctx.chain, masterSecretHex: ctx.env.ELLAI_MASTER_SECRET, now: ctx.now() });
-        return jsonResponse(built);
-      } catch (error) {
-        const answer = onboardingChainFailure(error);
-        if (answer === null) throw error;
-        return answer;
-      }
-    }),
-  );
-}
+export const POST = scoped('owner', async (request, ctx, { ownerId }): Promise<Response> => {
+  // Read first, so the calls counted are the ones this step makes; the body is capped at 1 KiB.
+  const { step, allowance: terms } = await readJson(request, body, LIMITS.onboardingBuildBodyMaxBytes);
+  const limited = await limitOwnerChainCalls(ctx, request, ownerId, BUILD_CHAIN_CALLS[step]);
+  if (limited !== null) return limited;
+  try {
+    const built = await buildOnboardingTx({ db: ctx.db, ownerId, step, allowance: terms, chain: ctx.chain, masterSecretHex: ctx.env.ELLAI_MASTER_SECRET, now: ctx.now() });
+    return jsonResponse(built);
+  } catch (error) {
+    const answer = onboardingChainFailure(error);
+    if (answer === null) throw error;
+    return answer;
+  }
+});

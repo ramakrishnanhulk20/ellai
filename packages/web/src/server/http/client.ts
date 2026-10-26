@@ -66,9 +66,11 @@ export function addressKey(text: string): string {
  * overwrites with the connecting address, so a caller cannot choose it, put through
  * addressKey so an IPv6 client is keyed on its /64. Anywhere else no header is trusted at all,
  * because a caller can set any of them, and every request is the one client 'local'. The value
- * is in clear: ratelimit.ts hashes every key before it is stored.
+ * is in clear: ratelimit.ts hashes every key before it is stored. A handler called with no request
+ * at all, which Next never does, is keyed as one the platform did not vouch for.
  */
-export function clientKey(request: Request): string {
+export function clientKey(request: Request | undefined): string {
   if (process.env.VERCEL !== '1') return LOCAL_CLIENT;
+  if (request === undefined) return UNKNOWN_CLIENT;
   return addressKey(request.headers.get('x-forwarded-for')?.split(',')[0]?.trim() ?? '');
 }

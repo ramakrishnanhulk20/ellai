@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { LIMITS } from '@ellai/core/limits';
-import { lt, sql } from 'drizzle-orm';
+import { and, asc, lt, sql } from 'drizzle-orm';
 import type { Database } from '../db/client.js';
 import { rateCounters } from '../db/schema.js';
 import { clientKey } from './client.js';
@@ -86,7 +86,8 @@ export async function consumeShared(db: Database, name: string, limit: number, w
 }
 
 /**
- * Deletes every rate counter, the seller's and the built-in agent's included, whose window
+ * Deletes at most LIMITS.pruneBatch rate counters, the seller's and the built-in agent's
+ * included, oldest window first through rate_counters_window_start_idx, among those whose window
  * started more than LIMITS.rateCounterRetentionMs before `now`, and returns how many it deleted.
  * The retention is longer than the longest window any counter is read over (the agent run's
  * day), so a window that can still turn anyone away is never deleted; this only keeps the table
@@ -94,11 +95,37 @@ export async function consumeShared(db: Database, name: string, limit: number, w
  * retention, and a caller passing an earlier time, as an older cut-off, only keeps rows longer.
  * Throws Error for a `now` that is not a date.
  */
-export async function pruneRateCounters(db: Database, now: Date): Promise<number> {
+export async function pruneRateCounterBatch(db: Database, now: Date): Promise<number> {
   if (!(now instanceof Date) || Number.isNaN(now.getTime())) throw new Error('The current time is not a date');
-  const cutoff = new Date(now.getTime() - LIMITS.rateCounterRetentionMs);
-  const deleted = await db.delete(rateCounters).where(lt(rateCounters.windowStart, cutoff)).returning({ key: rateCounters.key });
+  const expired = lt(rateCounters.windowStart, new Date(now.getTime() - LIMITS.rateCounterRetentionMs));
+  const oldest = db
+    .select({ key: rateCounters.key, windowStart: rateCounters.windowStart })
+    .from(rateCounters)
+    .where(expired)
+    .orderBy(asc(rateCounters.windowStart))
+    .limit(LIMITS.pruneBatch);
+  const deleted = await db
+    .delete(rateCounters)
+    .where(and(expired, sql`(${rateCounters.key}, ${rateCounters.windowStart}) in ${oldest}`))
+    .returning({ key: rateCounters.key });
   return deleted.length;
+}
+
+/**
+ * pruneRateCounterBatch repeated until a batch comes back short or LIMITS.pruneTimeSliceMs has
+ * passed on `clock` (the wall clock unless given) since the first batch, so a backlog of
+ * per-client counters is cleared in bounded steps (C34). The jobs tick runs the batches inside its
+ * own prune step instead, beside the other tables. Returns how many it deleted. Throws Error for
+ * a `now` that is not a date.
+ */
+export async function pruneRateCounters(db: Database, now: Date, clock: () => Date = () => new Date()): Promise<number> {
+  const startedMs = clock().getTime();
+  let total = 0;
+  for (;;) {
+    const deleted = await pruneRateCounterBatch(db, now);
+    total += deleted;
+    if (deleted < LIMITS.pruneBatch || clock().getTime() - startedMs >= LIMITS.pruneTimeSliceMs) return total;
+  }
 }
 
 /**
