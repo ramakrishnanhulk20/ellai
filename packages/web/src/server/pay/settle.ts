@@ -18,6 +18,11 @@ export interface SettleArgs {
   sleep: (ms: number) => Promise<void>;
   /** The clock every settlement write is stamped with; the wall clock when left out. */
   now?: () => Date;
+  /**
+   * Reads the chain's current epoch; chain.getCurrentEpoch when left out. The jobs tick passes one
+   * reading shared by every settlement pass it makes (C22).
+   */
+  readEpoch?: () => Promise<bigint>;
 }
 
 /** Set as the owner's auto_paused_reason when a payment landed and was not the approved one (C8). */
@@ -61,10 +66,12 @@ async function stored(db: Database, ownerId: string, paymentId: string): Promise
  * and the purse that signed it (payments.purse_address): 'verified' sets verified_at;
  * 'mismatch' stores verifySettlement's fixed reason and, in the same transaction, sets the owner's auto_paused_reason to
  * SETTLEMENT_MISMATCH, so decide refuses every later payment until the owner reviews it. When
- * every read missed, the chain's epoch is read: only once it is past valid_until_epoch, and
- * LIMITS.paymentReleaseReads further reads taken after it all still miss, is the payment
- * 'not_landed', with released_at set so it stops counting against the daily budget. A window
- * still open, or an epoch that cannot be read, leaves 'pending' for a later pass.
+ * every read missed, the chain's epoch is read through `readEpoch`: only once it is past
+ * valid_until_epoch, and LIMITS.paymentReleaseReads further reads taken after it all still miss,
+ * is the payment 'not_landed', with released_at set so it stops counting against the daily
+ * budget. A window still open, or an epoch that cannot be read, leaves 'pending' for a later pass.
+ * A reading taken earlier, as the tick's shared one may be, is safe: epochs only go up, so an
+ * older reading can only hold a payment pending longer, and the release reads still come after it.
  *
  * A read that fails with any error but NOT_FOUND ends the pass. Once the epoch is past
  * valid_until_epoch, the pass is counted as one failed pass for this payment, and the pass that
@@ -84,6 +91,7 @@ async function stored(db: Database, ownerId: string, paymentId: string): Promise
 export async function settlePayment(args: SettleArgs): Promise<Settlement> {
   const { db, chain, sleep } = args;
   const now = args.now ?? (() => new Date());
+  const readEpoch = args.readEpoch ?? (() => chain.getCurrentEpoch());
   if (!Number.isSafeInteger(args.tries) || args.tries < 1 || args.tries > LIMITS.settlementPollTries) {
     throw new RangeError(`tries must be 1 to ${LIMITS.settlementPollTries}`);
   }
@@ -187,7 +195,7 @@ export async function settlePayment(args: SettleArgs): Promise<Settlement> {
 
   let epoch: bigint;
   try {
-    epoch = await chain.getCurrentEpoch();
+    epoch = await readEpoch();
   } catch {
     return 'pending';
   }

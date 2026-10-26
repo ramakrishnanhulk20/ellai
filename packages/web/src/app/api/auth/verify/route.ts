@@ -31,9 +31,11 @@ const body = z.strictObject({ message: z.string().max(LIMITS.signinMessageMaxCha
  * LIMITS.zkLoginChecksPerClientPerMinute and LIMITS.zkLoginChecksPerClientPerDay, and only then
  * against LIMITS.zkLoginChecksPerMinute and LIMITS.zkLoginChecksPerDay, shared by every caller;
  * past any of them nothing is read (C22, C34). Every other kind is checked offline and reads nothing.
- * 403 cross_origin, 429 rate_limited (this client's sign-in or zkLogin limit), 400 for a bad body
- * or message, 401 for a signature or nonce that does not hold up, 503 chain_unavailable when a
- * zkLogin proof cannot be checked against the chain right now or the shared zkLogin quota is spent.
+ * 403 cross_origin, 429 rate_limited (this client's sign-in limit or zkLogin minute), 429
+ * rate_limited_today (this client's zkLogin day), 400 for a bad body or message, 401 for a
+ * signature or nonce that does not hold up, 503 chain_unavailable when a zkLogin proof cannot be
+ * checked against the chain right now or the shared zkLogin minute is spent, 503
+ * chain_unavailable_today once the shared zkLogin day is spent.
  */
 export async function POST(request: Request): Promise<Response> {
   return respond(() =>

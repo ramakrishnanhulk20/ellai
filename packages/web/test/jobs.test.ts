@@ -8,7 +8,10 @@
 // window; never signs bytes that are not exactly the refill; keeps an unknown send pending and
 // reads that digest first next time; releases a lost refill only once its epoch window has
 // closed and further reads still miss it, and leaves rows from before that window was kept
-// waiting. pruneExpiredRows deletes only dead rows, in batches it repeats until each table comes
+// waiting; asks its own ledger first, so across a day of ticks an owner whose ledger rules a
+// refill out costs no chain read, the onboarded owner's first refill included, and one below
+// it costs one purse read a tick and an allowance read only for the refill it sends.
+// pruneExpiredRows deletes only dead rows, in batches it repeats until each table comes
 // back short or its time slice ends, faster than the sign-in cap lets strangers add them,
 // day-old owners nothing points at included.
 // confirmBlobsOnChain marks a memory only when its blob id is on one of the owner's own Walrus Blob
@@ -16,9 +19,11 @@
 // in stretches from a stored cursor. refillIfNeeded defers before any read past the deadline and
 // never after its row. runJobsTick isolates each owner's and each step's failure behind a fixed code,
 // settles pending payments and remembers a paid seller stored as delivering nothing exactly once
-// (never one whose delivery is unknown), records an outcome a paid call failed to record,
+// (never one whose delivery is unknown) with one epoch reading for every settlement pass in a
+// tick, records an outcome a paid call failed to record,
 // expires, refills with the tick's own sleep, sends and confirms memories and then checks them
-// on chain, prunes, warns on a low gas wallet, takes at most LIMITS.jobsOwnersPerTick owners,
+// on chain, prunes, reads the gas wallet once an hour however many ticks run and warns when it is
+// low, takes at most LIMITS.jobsOwnersPerTick owners,
 // least recently visited first, stamped as each visit starts, and past its deadline starts no
 // owner and no external call, with the deadline's arithmetic worked out from LIMITS.
 // Does NOT cover: the real Sui chain, Tatum or the relayer (scripts/prove-jobs.ts does those
@@ -392,8 +397,8 @@ describe('refillIfNeeded', () => {
     const row = one(await refillRows(w.ownerId));
     expect(row).toMatchObject({ allowanceId: w.allowanceId, amountAtomic: REFILL, sentAt: NOW, status: 'verified', verifiedAt: NOW });
     expect(calls).toEqual([
-      `getAllowance:${w.allowanceId}`,
       `getBalances:${w.purse}`,
+      `getAllowance:${w.allowanceId}`,
       'getCurrentEpoch',
       'getReferenceGasPrice',
       `simulate:${row.digest}`,
@@ -481,7 +486,8 @@ describe('refillIfNeeded', () => {
       const { chain, state, calls, executions } = stubFor(w, 0n);
       state.allowances.set(w.allowanceId, variant instanceof Error ? variant : allowanceFor(w, variant));
       expect(await refill(w, chain)).toBe('refused');
-      expect(calls).toEqual([`getAllowance:${w.allowanceId}`]);
+      // The allowance is read only once the balance says a refill will be sent.
+      expect(calls).toEqual([`getBalances:${w.purse}`, `getAllowance:${w.allowanceId}`]);
       expect(executions).toHaveLength(0);
       expect(await refillRows(w.ownerId)).toHaveLength(0);
     }
@@ -666,7 +672,7 @@ describe('refillIfNeeded', () => {
   });
 
   it("answers 'deferred' with nothing written or sent when canStart says no before any read it needs, and never stops once its row is written", async () => {
-    // One question before each of: the allowance, the purse balance, the epoch, the gas price, and the row.
+    // One question before each of: the purse balance, the allowance, the epoch, the gas price, and the row.
     const gates = 5;
     for (let yes = 0; yes < gates; yes++) {
       const w = await funded();
@@ -682,8 +688,8 @@ describe('refillIfNeeded', () => {
     let left = gates;
     expect(await refillIfNeeded({ db, chain, ownerId: w.ownerId, masterSecretHex: MASTER, gasKeypair: GAS, now: NOW, sleep: noNap, canStart: () => left-- > 0 })).toBe('refilled');
     expect(calls.map((call) => call.split(':')[0])).toEqual([
-      'getAllowance',
       'getBalances',
+      'getAllowance',
       'getCurrentEpoch',
       'getReferenceGasPrice',
       'simulate',
@@ -711,6 +717,44 @@ describe('refillIfNeeded', () => {
     expect(executions).toHaveLength(0);
     expect(one(await refillRows(w.ownerId)).status).toBe('pending');
   });
+
+  // The jobs workflow ticks every 10 minutes, so 144 ticks are a day.
+  const TICK_MS = 600_000;
+  const ticker = (on: Database, chain: Chain) => (n: number) =>
+    runJobsTick({ db: on, chain, masterSecretHex: MASTER, gasKeypair: GAS, now: () => new Date(NOW.getTime() + n * TICK_MS), sleep: noNap });
+  const notGas = (calls: string[]) => calls.filter((call) => call !== `getBalances:${GAS_ADDRESS}`);
+
+  it("refills an owner just onboarded on the first tick, and with that refill 'verified' in its ledger reads nothing from chain for it across the next 144 ticks (C22, C23)", { timeout: 120_000 }, async () => {
+    const on = await freshDb();
+    const w = await funded(on, { allowanceCheckedAt: NOW });
+    const { chain, calls } = stubFor(w, 0n, on);
+    const tickAt = ticker(on, chain);
+    expect(await tickAt(0)).toMatchObject({ owners: 1, refills: 1, errors: [] });
+    expect(one(await refillRows(w.ownerId, on))).toMatchObject({ amountAtomic: REFILL, status: 'verified' });
+
+    calls.length = 0;
+    for (let n = 1; n <= 144; n++) expect(await tickAt(n)).toMatchObject({ owners: 1, refills: 0, errors: [] });
+    // The purse still reads empty on chain, so any read would have shown up here; the ledger alone answered.
+    expect(notGas(calls)).toEqual([]);
+  });
+
+  it('reads the purse once a tick, and the allowance only for the refill it sends, while its ledger is below the threshold (C22, C23)', { timeout: 120_000 }, async () => {
+    const on = await freshDb();
+    const w = await funded(on, { allowanceCheckedAt: NOW });
+    // 0.06 USDC the owner sent the purse straight from their wallet: on chain, not in the ledger.
+    const { chain, state, calls } = stubFor(w, BigInt(LIMITS.purseRefillBelowAtomic) + 10_000n, on);
+    const tickAt = ticker(on, chain);
+    for (let n = 0; n < 143; n++) expect(await tickAt(n)).toMatchObject({ owners: 1, refills: 0, errors: [] });
+    expect(notGas(calls)).toEqual(Array<string>(143).fill(`getBalances:${w.purse}`));
+
+    calls.length = 0;
+    state.balances.set(w.purse, { usdcAddressBalance: LOW });
+    expect(await tickAt(143)).toMatchObject({ owners: 1, refills: 1, errors: [] });
+    expect(notGas(calls).filter((call) => /^get(Balances|Allowance):/.test(call))).toEqual([`getBalances:${w.purse}`, `getAllowance:${w.allowanceId}`]);
+    calls.length = 0;
+    expect(await tickAt(144)).toMatchObject({ owners: 1, refills: 0, errors: [] });
+    expect(notGas(calls)).toEqual([]);
+  });
 });
 
 describe('pruneExpiredRows', () => {
@@ -726,7 +770,7 @@ describe('pruneExpiredRows', () => {
     sessions: (await on.select().from(sessions)).length,
   });
 
-  it('deletes only rows that can never be used again: expired nonces, unpaid expired sales, rejected sales long expired and sessions expired over a day ago', async () => {
+  it('deletes only rows that can never be used again: expired nonces, expired sales never sent, rejected sales long expired and sessions expired over a day ago', async () => {
     const on = await freshDb();
     const w = await world(on);
     await nonce(on, ago(1));
@@ -736,7 +780,9 @@ describe('pruneExpiredRows', () => {
     await sale(on, ago(1));
     await sale(on, new Date(NOW.getTime() + 1));
     await sale(on, ago(DAY), { status: 'settled' });
+    // Refused, or turned away by a cap on sends, before its bytes were recorded: gone once expired, kept until then.
     await sale(on, ago(DAY), { status: 'rejected' });
+    await sale(on, new Date(NOW.getTime() + 1), { status: 'rejected' });
     // An issued sale holding a digest may have been paid, so it is never pruned as unpaid.
     await sale(on, ago(DAY), { digest: randomDigest() });
     // Waiting on the chain: kept for its buyer until LIMITS.sellerWaitingSaleKeepMs past its expiry.
@@ -752,7 +798,7 @@ describe('pruneExpiredRows', () => {
     await session(on, w, new Date(NOW.getTime() + DAY), ago(DAY - 1));
     await session(on, w, new Date(NOW.getTime() + DAY));
 
-    expect(await pruneExpiredRows({ db: on, now: NOW })).toEqual({ signinNonces: 2, sellerSales: 3, sessions: 1, owners: 0 });
+    expect(await pruneExpiredRows({ db: on, now: NOW })).toEqual({ signinNonces: 2, sellerSales: 4, sessions: 1, owners: 0 });
     expect(await kept(on)).toEqual({ signinNonces: 1, sellerSales: 6, sessions: 4 });
     expect((await on.select({ nonce: signinNonces.nonce }).from(signinNonces)).map((row) => row.nonce)).toEqual([liveNonce]);
     expect(await pruneExpiredRows({ db: on, now: NOW })).toEqual({ signinNonces: 0, sellerSales: 0, sessions: 0, owners: 0 });
@@ -1167,6 +1213,23 @@ describe('runJobsTick', () => {
     expect([readsOf(notYet.digest), readsOf(failedSeller.digest)]).toEqual([2, 1]);
   });
 
+  it('reads the epoch once in a tick that finds 5 pending payments past their window, two owners between them, and still releases each one (C22)', async () => {
+    const on = await freshDb();
+    const pair = [await world(on), await world(on)];
+    for (let i = 0; i < 5; i++) {
+      const w = pair[i % 2] as World;
+      // Signed for epochs up to 99; the stand-in chain is at 100 and never saw them.
+      await payment(w, await decision(w, 'paid', ago(120_000), on), { validUntilEpoch: 99n, signedAt: ago(120_000) }, on);
+    }
+    const { chain, calls } = stubChain(on);
+    expect(await tick(on, chain)).toMatchObject({ owners: 2, paymentsNotLanded: 5, errors: [] });
+    expect(calls.filter((call) => call === 'getCurrentEpoch')).toHaveLength(1);
+    // Each still has its own digest read and its LIMITS.paymentReleaseReads more after the epoch.
+    expect(calls.filter((call) => call.startsWith('getTransactionResult'))).toHaveLength(5 * (1 + LIMITS.paymentReleaseReads));
+    const released = await on.select({ settlement: payments.settlement }).from(payments);
+    expect(released.map((row) => row.settlement)).toEqual(Array<string>(5).fill('not_landed'));
+  });
+
   it("counts a payment's failed settlement reads on the payment row itself, one per tick", async () => {
     const on = await freshDb();
     const w = await world(on);
@@ -1246,7 +1309,8 @@ describe('runJobsTick', () => {
     stub.state.landed = (digest) => (digest === row.digest ? { status: 'success', balanceChanges: refillChanges(w) } : null);
     stub.state.balances.set(w.purse, { usdcAddressBalance: REFILL });
     expect(await tick(on, stub.chain)).toMatchObject({ owners: 1, refills: 0, errors: [] });
-    expect(stub.calls.slice(0, 2)).toEqual([`getBalances:${GAS_ADDRESS}`, `getTransactionResult:${row.digest}`]);
+    // The first tick took this hour's gas wallet read, so the digest is the first call of all.
+    expect(stub.calls.slice(0, 1)).toEqual([`getTransactionResult:${row.digest}`]);
     expect(one(await refillRows(w.ownerId, on)).status).toBe('verified');
     expect(stub.executions).toHaveLength(1);
   });
@@ -1363,7 +1427,22 @@ describe('runJobsTick', () => {
       errors: [],
     });
     state.balances.set(GAS_ADDRESS, { suiTotal: BigInt(LIMITS.gasWalletLowMist) - 1n });
-    expect((await tick(on, chain)).gasWalletLow).toBe(true);
+    const nextHour = await runJobsTick({ db: on, chain, masterSecretHex: MASTER, gasKeypair: GAS, now: () => new Date(NOW.getTime() + LIMITS.gasWalletCheckIntervalMs), sleep: noSleep });
+    expect(nextHour.gasWalletLow).toBe(true);
+  });
+
+  it('reads the gas wallet once across six ticks in one hour and again in the next hour, through a counter every instance shares (C21, C22)', async () => {
+    const on = await freshDb();
+    const { chain, calls } = stubChain(on);
+    expect(LIMITS.gasWalletCheckIntervalMs).toBe(3_600_000);
+    const tickAt = (minutes: number) => runJobsTick({ db: on, chain, masterSecretHex: MASTER, gasKeypair: GAS, now: () => new Date(NOW.getTime() + minutes * 60_000), sleep: noSleep });
+    const lows: Array<boolean | null> = [];
+    for (const minutes of [0, 10, 20, 30, 40, 50]) lows.push((await tickAt(minutes)).gasWalletLow);
+    expect(calls).toEqual([`getBalances:${GAS_ADDRESS}`]);
+    // The stand-in gas wallet holds no SUI, so the one reading says low; the ticks that did not read say nothing.
+    expect(lows).toEqual([true, null, null, null, null, null]);
+    expect((await tickAt(60)).gasWalletLow).toBe(true);
+    expect(calls).toEqual([`getBalances:${GAS_ADDRESS}`, `getBalances:${GAS_ADDRESS}`]);
   });
 
   it('handles at most LIMITS.jobsOwnersPerTick owners, oldest work first', async () => {

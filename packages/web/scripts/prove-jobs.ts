@@ -132,7 +132,7 @@ function printSummary(summary: JobsTickSummary): void {
   console.log(`  outcome memories recorded ${summary.outcomesRecorded}`);
   console.log(`  decisions expired ${summary.decisionsExpired}, questions closed ${summary.questionsClosed}`);
   console.log(`  refills sent ${summary.refills}`);
-  console.log(`  gas wallet low: ${summary.gasWalletLow ? 'YES' : 'no'}`);
+  console.log(`  gas wallet low: ${summary.gasWalletLow === null ? 'not read this tick' : summary.gasWalletLow ? 'YES' : 'no'}`);
   if (summary.errors.length === 0) console.log('  step errors: none');
   for (const error of summary.errors) console.log(`  step error: owner ${error.ownerId || 'none (gas wallet)'}, step ${error.step}, code ${error.code}`);
 }

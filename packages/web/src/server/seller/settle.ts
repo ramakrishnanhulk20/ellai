@@ -13,13 +13,16 @@ import { alias } from 'drizzle-orm/pg-core';
 import { z } from 'zod';
 import type { Database } from '../db/client.js';
 import { sellerSales } from '../db/schema.js';
-import { consumeShared } from '../http/ratelimit.js';
-import { type ChallengeTerms, cachedEpoch, readSellerChallengeId, sellerResource, timestampOf } from './challenge.js';
+import { consumeShared, consumeWindow, secondsLeftInWindow } from '../http/ratelimit.js';
+import { type ChallengeTerms, SellerError, cachedEpoch, readSellerChallengeId, sellerResource, timestampOf } from './challenge.js';
 
 export type SettleOutcome =
   | { ok: true; digest: string; payer: string }
-  /** `retryAfterSeconds` is set only on a recheck that came too soon: whole seconds, at least 1. */
-  | { ok: false; status: 402 | 409; reason: string; retryAfterSeconds?: number };
+  /**
+   * `retryAfterSeconds` is set on a recheck that came too soon and on every 429 and 503: whole
+   * seconds, at least 1, until the window that turned it away ends.
+   */
+  | { ok: false; status: 402 | 409 | 429 | 503; reason: string; retryAfterSeconds?: number };
 
 // Every reason is fixed text: nothing from the header, the bytes or the chain is copied in,
 // because a reason goes back to whoever sent the payment and may be logged on the way (C19).
@@ -37,6 +40,9 @@ export const SETTLE_REASONS = {
   failed: 'the payment did not succeed on chain',
   mismatch: 'the payment that landed is not the payment this challenge asks for',
   lapsed: 'the payment did not land on chain before its epoch window closed; ask for a new challenge',
+  executeRate: 'too many payments from this caller this minute; ask for a new challenge in a minute',
+  executeRateToday: 'too many payments from this caller today; ask for a new challenge tomorrow (days are counted in UTC)',
+  executeBusy: 'this seller has sent all the payments it can today; ask for a new challenge tomorrow (days are counted in UTC)',
 } as const;
 
 type Sale = typeof sellerSales.$inferSelect;
@@ -45,6 +51,13 @@ type Sleep = (ms: number) => Promise<void>;
 const timerSleep: Sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 // Named per sale, not per caller: the turn belongs to the sale, whoever presents its bytes.
 const RECHECK_QUOTA_PREFIX = 'seller-recheck:';
+const RECHECK_DAY_QUOTA = 'seller-rechecks:day';
+// The minute's limit comes first, so a caller past it spends nothing of its day.
+const EXECUTE_CLIENT_LIMITS = [
+  { name: 'seller-executes:client:minute', limit: LIMITS.sellerExecutesPerClientPerMinute, windowMs: LIMITS.rateWindowMinuteMs, reason: 'executeRate' },
+  { name: 'seller-executes:client:day', limit: LIMITS.sellerExecutesPerClientPerDay, windowMs: LIMITS.rateWindowDayMs, reason: 'executeRateToday' },
+] as const;
+const EXECUTE_QUOTA = 'seller-executes:day';
 const STRICT_BASE64 = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
 const base64Text = z.string().min(1).regex(STRICT_BASE64);
 
@@ -104,6 +117,25 @@ async function signedBy(txBytes: Uint8Array, signature: string, sender: string):
 }
 
 const refusal = (status: 402 | 409, reason: string): SettleOutcome => ({ ok: false, status, reason });
+
+/**
+ * Counts one send of a buyer's bytes against this caller's LIMITS.sellerExecutesPerClientPerMinute,
+ * then its LIMITS.sellerExecutesPerClientPerDay, then every caller's LIMITS.sellerExecutesPerDayGlobal,
+ * and returns null within all three (C22, C34). Past a caller's own limit the answer is 429 and
+ * nothing shared is spent; past the shared day it is 503, and the first refusal in that day logs
+ * the quota's fixed name. Every refusal carries the seconds until its window ends.
+ */
+async function executeCapRefusal(db: Database, callerKey: string, now: Date): Promise<SettleOutcome | null> {
+  for (const cap of EXECUTE_CLIENT_LIMITS) {
+    if (await consumeWindow(db, `${cap.name}:${callerKey}`, cap.limit, cap.windowMs, now)) continue;
+    console.warn(`[ellai seller] execute_limited ${cap.name}`);
+    return { ok: false, status: 429, reason: SETTLE_REASONS[cap.reason], retryAfterSeconds: secondsLeftInWindow(cap.windowMs, now) };
+  }
+  const turn = await consumeShared(db, EXECUTE_QUOTA, LIMITS.sellerExecutesPerDayGlobal, LIMITS.rateWindowDayMs, now);
+  if (turn.allowed) return null;
+  if (turn.firstRefusal) console.error(`[ellai seller] quota_spent ${EXECUTE_QUOTA}`);
+  return { ok: false, status: 503, reason: SETTLE_REASONS.executeBusy, retryAfterSeconds: turn.retryAfterSeconds };
+}
 
 /** A sale whose bytes were sent and whose outcome is not yet known. Only those same bytes can pick it up again. */
 function awaitingChain(sale: Sale): sale is Sale & { digest: string } {
@@ -238,8 +270,10 @@ async function confirmOnChain(closing: Closing): Promise<SettleOutcome> {
  * digest it holds (409 for any other), whatever the challenge's expiry, since the payment was
  * taken in time: the bytes and signature are checked again as below, then the sale's recheck is
  * counted through consumeShared, at most one per sale in each fixed window of
- * LIMITS.sellerRecheckIntervalMs whoever asks (one too soon is 402 unconfirmed with
- * retryAfterSeconds, and reads nothing), then the digest is read as after an unknown outcome.
+ * LIMITS.sellerRecheckIntervalMs whoever asks, and LIMITS.sellerRechecksPerDayGlobal a day across
+ * every sale (one too soon, or past the day's, is 402 unconfirmed with retryAfterSeconds and reads
+ * nothing; the day's first refusal logs its fixed name), then the digest is read as after an
+ * unknown outcome.
  * Otherwise the sale must still be 'issued' (409) and unexpired
  * (402); the nonce and epoch window are read back out of the id, which also proves the id was
  * issued for this resource, recipient and amount (402 otherwise); then the sale is claimed with
@@ -250,7 +284,13 @@ async function confirmOnChain(closing: Closing): Promise<SettleOutcome> {
  *
  * After the claim: core's assertPlainUsdcSend proves the bytes are byte for byte the plain
  * gasless USDC send of the stored amount to the stored recipient with this challenge's nonce
- * and window, from the sender; verifyTransactionSignature proves the sender signed them; the
+ * and window, from the sender; verifyTransactionSignature proves the sender signed them. Only
+ * then is the send counted against the caps on sends (executeCapRefusal, keyed on `callerKey`,
+ * which must be the platform's verified client address): past this caller's
+ * LIMITS.sellerExecutesPerClientPerMinute or LIMITS.sellerExecutesPerClientPerDay it is 429, past
+ * every caller's LIMITS.sellerExecutesPerDayGlobal it is 503, each with retryAfterSeconds, and
+ * nothing reaches Tatum (C22). A sale turned away there keeps no digest, so it is closed like any
+ * refusal before execution. Then the
  * digest of the bytes is recorded, unique across all sales, so one payment can never pay two
  * challenges; the bytes are executed once through Tatum. Only a definite answer closes the sale:
  * core's verifySettlement finding exactly the sender minus the amount and the recipient plus it
@@ -264,13 +304,15 @@ async function confirmOnChain(closing: Closing): Promise<SettleOutcome> {
  * for good (402 lapsed), and it is never read again. The bytes are never sent again.
  *
  * `sleep` waits between those reads; tests pass one that does not wait. Returns fixed-text
- * reasons only (SETTLE_REASONS). Throws only for database failures or an invalid `now`.
+ * reasons only (SETTLE_REASONS). Throws only for database failures, an invalid `now` or an empty
+ * `callerKey` (SellerError).
  */
 export async function settleWalletCheckPayment(args: {
   db: Database;
   chain: Chain;
   paymentHeader: string;
   resourceUrl: string;
+  callerKey: string;
   now: Date;
   sleep?: Sleep;
 }): Promise<SettleOutcome> {
@@ -278,6 +320,7 @@ export async function settleWalletCheckPayment(args: {
   const sleep = args.sleep ?? timerSleep;
   const nowMs = timestampOf(args.now);
   const now = new Date(nowMs);
+  if (typeof args.callerKey !== 'string' || args.callerKey === '') throw new SellerError('the caller key is missing');
 
   const target = sellerResource(args.resourceUrl);
   if (target === null) return refusal(402, SETTLE_REASONS.resource);
@@ -299,6 +342,12 @@ export async function settleWalletCheckPayment(args: {
     // Counted only after the bytes check out, so nobody without them can use up the buyer's turn.
     const turn = await consumeShared(db, `${RECHECK_QUOTA_PREFIX}${sale.id}`, 1, LIMITS.sellerRecheckIntervalMs, now);
     if (!turn.allowed) return { ok: false, status: 402, reason: SETTLE_REASONS.unconfirmed, retryAfterSeconds: turn.retryAfterSeconds };
+    // Every waiting sale's turns together, after the sale's own, so a turn too soon spends none of the day.
+    const day = await consumeShared(db, RECHECK_DAY_QUOTA, LIMITS.sellerRechecksPerDayGlobal, LIMITS.rateWindowDayMs, now);
+    if (!day.allowed) {
+      if (day.firstRefusal) console.error(`[ellai seller] quota_spent ${RECHECK_DAY_QUOTA}`);
+      return { ok: false, status: 402, reason: SETTLE_REASONS.unconfirmed, retryAfterSeconds: day.retryAfterSeconds };
+    }
     return confirmOnChain({ db, chain, sale, digest, expected, payer: payment.sender, now, sleep });
   }
 
@@ -317,6 +366,11 @@ export async function settleWalletCheckPayment(args: {
   const expected = expectedPayment(sale, target, terms);
   const refused = await paymentRefusal(payment, expected);
   if (refused !== null) return refusal(402, refused);
+
+  // Before the digest is recorded: a sale with a digest and no outcome waits on the chain, and
+  // its rechecks would read Tatum for bytes that were never sent.
+  const capped = await executeCapRefusal(db, args.callerKey, now);
+  if (capped !== null) return capped;
 
   const otherSale = alias(sellerSales, 'other_sale');
   const recorded = await db

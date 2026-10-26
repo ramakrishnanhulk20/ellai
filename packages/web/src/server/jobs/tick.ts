@@ -7,6 +7,7 @@ import { and, asc, eq, inArray, isNotNull, notExists, sql } from 'drizzle-orm';
 import { unionAll } from 'drizzle-orm/pg-core';
 import type { Database } from '../db/client.js';
 import { LIVE_DECISION_STATUSES, decisions, memories, owners, payments } from '../db/schema.js';
+import { consumeShared } from '../http/ratelimit.js';
 import { MemoryServiceError, ownerDelegate } from '../memory/delegate.js';
 import { recordOutcome } from '../memory/outcome.js';
 import { confirmMemoryJobs, isKeyRefused, submitPendingMemories } from '../memory/writer.js';
@@ -50,7 +51,8 @@ export interface JobsTickSummary {
   refills: number;
   /** Dead sign-in nonces, seller sales, sessions and empty owners deleted by this tick. */
   rowsPruned: number;
-  gasWalletLow: boolean;
+  /** Null when an earlier tick already took this window's one gas wallet read (LIMITS.gasWalletCheckIntervalMs). */
+  gasWalletLow: boolean | null;
   /** True when the tick's deadline (LIMITS.tickTimeBudgetMs) had passed by its end, so some owner or step may not have started. */
   timeBudgetReached: boolean;
   errors: JobsTickError[];
@@ -61,6 +63,8 @@ export interface JobsTickSummary {
 // owed an outcome, are still a bounded loop.
 const PAYMENTS_PER_OWNER = Math.ceil(LIMITS.onboardingDailyLimitMaxAtomic / LIMITS.minPaymentAtomic);
 const CODE = /^[A-Z][A-Z0-9_]{0,63}$/;
+// A shared counter, not a timestamp in memory, so every server instance running ticks shares the one read.
+const GAS_WALLET_CHECK = 'gas-wallet-check';
 
 /**
  * A verified payment stored as delivering nothing whose decision has no outcome memory yet. A
@@ -72,6 +76,19 @@ function owedOutcome(db: Database) {
     .from(memories)
     .where(and(eq(memories.ownerId, payments.ownerId), eq(memories.decisionId, payments.decisionId), eq(memories.kind, 'outcome')));
   return and(eq(payments.settlement, 'verified'), eq(payments.delivered, false), notExists(outcome));
+}
+
+/**
+ * One reading of the chain's epoch for a whole tick, taken the first time a settlement pass asks,
+ * so a backlog of payments past their window costs one epoch read rather than one each (C22). A
+ * failed reading is kept as well, and those passes leave their payments pending for the next tick.
+ */
+function oneEpochReading(chain: Chain): () => Promise<bigint> {
+  let reading: Promise<bigint> | null = null;
+  return () => {
+    reading ??= chain.getCurrentEpoch();
+    return reading;
+  };
 }
 
 /**
@@ -150,8 +167,10 @@ async function ownersWithWork(db: Database, now: Date): Promise<string[]> {
  * still ends inside LIMITS.tickEndByMs, under the route's limit (C21, C28). Database work goes on.
  * First pruneExpiredRows deletes dead rows in batches of LIMITS.pruneBatch for at most
  * LIMITS.pruneTimeSliceMs on this tick's clock (C22, C34). Then, before the deadline, the gas
- * wallet's SUI is read once: below LIMITS.gasWalletLowMist, unreadable or not read sets
- * gasWalletLow. Then it handles at most LIMITS.jobsOwnersPerTick owners with work, least recently
+ * wallet's SUI is read, but only by the first tick in each fixed LIMITS.gasWalletCheckIntervalMs
+ * window, counted through consumeShared so every instance shares it (C21, C22): below
+ * LIMITS.gasWalletLowMist, unreadable or not read sets gasWalletLow, a later tick in the same
+ * window leaves it null. Then it handles at most LIMITS.jobsOwnersPerTick owners with work, least recently
  * visited first (ownersWithWork). Each owner's last_ticked_at is set to `now` as its visit
  * starts, so an owner whose visit fails or is cut off goes to the back of the line like any
  * other. Then, in order, each step handed the deadline as `canStart`:
@@ -162,6 +181,7 @@ async function ownersWithWork(db: Database, now: Date): Promise<string[]> {
  * 2. payments: every payment still 'pending', oldest first, until the deadline, is read once by settlePayment
  *    (tries 1; later ticks are the patience), which checks it against Ellai's own digest (C8)
  *    and counts a failed read past the payment's window in payments.settlement_failed_reads;
+ *    every pass in the tick, for every owner, shares one epoch reading (oneEpochReading);
  * 3. outcomes: every 'verified' payment stored as delivered false (never null) whose decision has
  *    no outcome memory yet, oldest first, becomes a delivered=false outcome memory through
  *    recordOutcome, idempotent per decision. That takes in a payment step 2 has just verified
@@ -204,6 +224,7 @@ export async function runJobsTick(args: JobsTickArgs): Promise<JobsTickSummary> 
   const startedMs = now().getTime();
   const deadlineMs = startedMs + LIMITS.tickTimeBudgetMs;
   const canStart = () => now().getTime() < deadlineMs;
+  const readEpoch = oneEpochReading(chain);
 
   await step('', 'prune', async () => {
     const pruned = await pruneExpiredRows({ db, now: now(), clock: now });
@@ -212,8 +233,13 @@ export async function runJobsTick(args: JobsTickArgs): Promise<JobsTickSummary> 
 
   if (canStart()) {
     try {
-      const { suiTotal } = await chain.getBalances(gasKeypair.toSuiAddress());
-      summary.gasWalletLow = suiTotal < BigInt(LIMITS.gasWalletLowMist);
+      const turn = await consumeShared(db, GAS_WALLET_CHECK, 1, LIMITS.gasWalletCheckIntervalMs, now());
+      if (turn.allowed) {
+        const { suiTotal } = await chain.getBalances(gasKeypair.toSuiAddress());
+        summary.gasWalletLow = suiTotal < BigInt(LIMITS.gasWalletLowMist);
+      } else {
+        summary.gasWalletLow = null;
+      }
     } catch (error) {
       // Left true: a gas wallet that cannot be read is treated as one that needs looking at.
       summary.errors.push({ ownerId: '', step: 'gas_wallet', code: errorCode(error) });
@@ -268,7 +294,7 @@ export async function runJobsTick(args: JobsTickArgs): Promise<JobsTickSummary> 
           // One settlement pass is the longest unit the tick starts, so the deadline is asked between them.
           if (!canStart()) break;
           await step(ownerId, 'payment', async () => {
-            const settled = await settlePayment({ db, ownerId, paymentId: payment.id, chain, tries: 1, intervalMs: LIMITS.settlementPollIntervalMs, sleep, now });
+            const settled = await settlePayment({ db, ownerId, paymentId: payment.id, chain, tries: 1, intervalMs: LIMITS.settlementPollIntervalMs, sleep, now, readEpoch });
             if (settled === 'verified') summary.paymentsVerified += 1;
             else if (settled === 'not_landed') summary.paymentsNotLanded += 1;
             else if (settled === 'mismatch') summary.paymentsMismatched += 1;

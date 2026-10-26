@@ -78,8 +78,10 @@ function emptyOwner(tx: Pick<Database, 'select'>, now: Date) {
  * sign-in or a challenge (C22, C34):
  * - sign-in nonces whose expiry is before `now`, used or not: completeSignIn refuses an
  *   expired nonce, so the row decides nothing any more;
- * - Ellai's seller sales still 'issued' with no digest whose expiry is before `now`: a sale is
- *   claimed by leaving 'issued' while unexpired, so these were never paid;
+ * - Ellai's seller sales with no digest and no settled_at whose expiry is before `now`, either
+ *   still 'issued' or 'rejected': a sale is claimed by leaving 'issued' while unexpired, so an
+ *   issued one was never paid, and a rejected one was refused, or turned away by a cap on sends,
+ *   before its bytes were recorded or sent, so nothing can ever pick it up again;
  * - Ellai's seller sales 'rejected' and either still waiting on the chain (a digest, no
  *   settled_at) or closed for good (settled_at set), whose expiry is more than
  *   LIMITS.sellerWaitingSaleKeepMs before `now`: the payment's epoch window closed long before,
@@ -106,7 +108,12 @@ export async function pruneExpiredRows(args: PruneArgs): Promise<PruneSummary> {
   const waitingBefore = new Date(now.getTime() - LIMITS.sellerWaitingSaleKeepMs);
 
   const expiredNonce = lt(signinNonces.expiresAt, now);
-  const unpaidSale = and(lt(sellerSales.expiresAt, now), eq(sellerSales.status, 'issued'), isNull(sellerSales.digest));
+  const unsentSale = and(
+    lt(sellerSales.expiresAt, now),
+    inArray(sellerSales.status, ['issued', 'rejected']),
+    isNull(sellerSales.digest),
+    isNull(sellerSales.settledAt),
+  );
   const oldRejectedSale = and(
     lt(sellerSales.expiresAt, waitingBefore),
     eq(sellerSales.status, 'rejected'),
@@ -174,7 +181,7 @@ export async function pruneExpiredRows(args: PruneArgs): Promise<PruneSummary> {
             .returning({ nonce: signinNonces.nonce })
         ).length,
     },
-    { table: 'sellerSales', run: () => sales(unpaidSale) },
+    { table: 'sellerSales', run: () => sales(unsentSale) },
     { table: 'sellerSales', run: () => sales(oldRejectedSale) },
     {
       table: 'sessions',

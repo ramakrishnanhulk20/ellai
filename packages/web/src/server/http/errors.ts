@@ -27,6 +27,7 @@ export type HttpErrorCode =
   | 'cross_origin'
   | 'signed_out'
   | 'rate_limited'
+  | 'rate_limited_today'
   | 'not_found'
   | 'bad_content_type'
   | 'body_too_large'
@@ -40,7 +41,8 @@ export type HttpErrorCode =
   | 'too_many_requests'
   | 'bad_task'
   | 'chain_refused'
-  | 'chain_unavailable';
+  | 'chain_unavailable'
+  | 'chain_unavailable_today';
 
 /** The one code whose refusal may say which bound was passed, in a sentence Ellai wrote. */
 export type BoundsHttpErrorCode = 'out_of_bounds';
@@ -49,6 +51,8 @@ const HTTP_ERROR_MESSAGES: Readonly<Record<HttpErrorCode, string>> = {
   cross_origin: 'This request did not come from the Ellai app.',
   signed_out: 'Sign in to Ellai to continue.',
   rate_limited: 'Too many requests. Try again in a minute.',
+  // For a limit counted over a whole day, which a minute's wait does nothing for.
+  rate_limited_today: 'Too many requests today. Try again tomorrow (days are counted in UTC).',
   not_found: 'There is nothing here.',
   bad_content_type: 'Send the request body as application/json in UTF-8.',
   body_too_large: 'The request body is too large.',
@@ -63,6 +67,8 @@ const HTTP_ERROR_MESSAGES: Readonly<Record<HttpErrorCode, string>> = {
   bad_task: `The task must be 1 to ${LIMITS.agentTaskMaxChars} characters.`,
   chain_refused: 'Sui does not allow this step for your Walrus Memory account right now.',
   chain_unavailable: 'Ellai could not read Sui just now. Try again in a minute.',
+  // A shared quota counted over a whole day is spent: Ellai, not the caller, is over its budget.
+  chain_unavailable_today: "Ellai has used today's budget for reading Sui. Try again tomorrow (days are counted in UTC).",
 };
 
 // RFC 6750 section 3: a 401 from a resource behind a bearer token names the scheme it wants. Each

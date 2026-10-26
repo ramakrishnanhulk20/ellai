@@ -1,7 +1,7 @@
 // Covers: the HTTP plumbing under every route: error responses and their log lines, the one
 // table of HTTP error codes, the same-origin check, the client key, the rate counter over a
-// minute or a longer window, the shared quota every caller counts against and the one use that
-// first passes it in a window, pruning old
+// minute or a longer window, one use or several at once, the shared quota every caller counts
+// against and the one request that first passes it in a window, pruning old
 // counters while keeping every window still read, the
 // capped body and JSON readers and the
 // seller route reading with the capped one, bigint-safe responses, the session requirement with
@@ -201,9 +201,11 @@ describe('the one table of HTTP error codes', () => {
     [400, 'bad_query', 'The query string does not have the values this endpoint takes.'],
     [400, 'out_of_bounds', 'A value in the request is outside the bounds this endpoint allows.'],
     [429, 'too_many_requests', 'Too many requests. Try again in a minute.'],
+    [429, 'rate_limited_today', 'Too many requests today. Try again tomorrow (days are counted in UTC).'],
     [429, 'too_many_agent_creates', 'Too many agent keys were made this hour. Try again later.'],
     [422, 'chain_refused', 'Sui does not allow this step for your Walrus Memory account right now.'],
     [503, 'chain_unavailable', 'Ellai could not read Sui just now. Try again in a minute.'],
+    [503, 'chain_unavailable_today', "Ellai has used today's budget for reading Sui. Try again tomorrow (days are counted in UTC)."],
   ] as const)('answers %s %s with its fixed text, the same whether thrown or returned', async (status, code, message) => {
     const logs = captureLogs();
     for (const response of [toErrorResponse(new HttpError(status, code)), httpErrorResponse(new HttpError(status, code))]) {
@@ -369,6 +371,18 @@ describe('consumeShared', () => {
     expect((await consumeShared(db, name, 1, DAY_MS, minute)).retryAfterSeconds).toBe(DAY_MS / 1_000 - 9 * 3_600 - 40 * 60);
     await expect(consumeShared(untouchable, '', 1, 60_000, minute)).rejects.toThrow('the quota name is missing');
     await expect(consumeShared(untouchable, name, 0, 60_000, minute)).rejects.toThrow('positive integer');
+  });
+
+  it('counts several uses in one step, all of them even past the limit, and marks only the request that first passes it', async () => {
+    const name = `test-uses-${hex(4)}`;
+    expect(await consumeShared(db, name, 10, 60_000, minute, 4)).toMatchObject({ allowed: true, firstRefusal: false });
+    expect(await consumeShared(db, name, 10, 60_000, minute, 5)).toMatchObject({ allowed: true, firstRefusal: false });
+    expect(await consumeShared(db, name, 10, 60_000, minute, 3)).toMatchObject({ allowed: false, firstRefusal: true });
+    expect(await consumeShared(db, name, 10, 60_000, minute, 1)).toMatchObject({ allowed: false, firstRefusal: false });
+    const key = `test:${hex(4)}`;
+    expect(await consumeWindow(db, key, 5, 60_000, minute, 5)).toBe(true);
+    expect(await consumeWindow(db, key, 5, 60_000, minute)).toBe(false);
+    for (const uses of [0, -1, 1.5]) await expect(consumeWindow(untouchable, 'k', 1, 60_000, minute, uses)).rejects.toThrow('the use count must be a positive integer');
   });
 });
 

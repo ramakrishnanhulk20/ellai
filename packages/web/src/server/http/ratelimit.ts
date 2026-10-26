@@ -26,9 +26,10 @@ export interface SharedTurn {
 }
 
 // The count after this request, so callers can tell the first refusal in a window from the rest.
-async function countWindow(db: Database, key: string, limit: number, windowMs: number, now: Date): Promise<number> {
+async function countWindow(db: Database, key: string, limit: number, windowMs: number, now: Date, uses: number): Promise<number> {
   if (typeof key !== 'string' || key === '') throw new Error('the rate key is missing');
   if (!Number.isInteger(limit) || limit < 1) throw new Error('the rate limit must be a positive integer');
+  if (!Number.isSafeInteger(uses) || uses < 1) throw new Error('the use count must be a positive integer');
   if (!Number.isInteger(windowMs) || windowMs < 1 || windowMs >= LIMITS.rateCounterRetentionMs) {
     throw new Error('the rate window must be a whole number of milliseconds shorter than the counter retention');
   }
@@ -37,24 +38,31 @@ async function countWindow(db: Database, key: string, limit: number, windowMs: n
   const stored = `${STORED_KEY_PREFIX}${createHash('sha256').update(key, 'utf8').digest('hex')}`;
   const [counter] = await db
     .insert(rateCounters)
-    .values({ key: stored, windowStart, count: 1 })
-    .onConflictDoUpdate({ target: [rateCounters.key, rateCounters.windowStart], set: { count: sql`${rateCounters.count} + 1` } })
+    .values({ key: stored, windowStart, count: uses })
+    .onConflictDoUpdate({ target: [rateCounters.key, rateCounters.windowStart], set: { count: sql`${rateCounters.count} + ${uses}` } })
     .returning({ count: rateCounters.count });
   if (counter === undefined) throw new Error('the rate counter returned no row');
   return counter.count;
 }
 
 /**
- * Counts one request against `key` in the fixed window of `windowMs` that holds `now`, and says
- * whether it is within `limit`. The count is one atomic upsert, so concurrent requests can never
- * both read the old count. A request over the limit is still counted, so hammering does not
- * reset anything. Throws Error for an empty key, a limit that is not a positive integer, a
- * `now` that is not a date, or a window that is not a whole number of milliseconds shorter
+ * Counts `uses` (one unless given) against `key` in the fixed window of `windowMs` that holds
+ * `now`, and says whether the count is still within `limit`. The count is one atomic upsert, so
+ * concurrent requests can never both read the old count, and several uses go in together or not
+ * at all. A request over the limit is still counted, all its uses, so hammering does not reset
+ * anything. Throws Error for an empty key, a limit or use count that is not a positive integer,
+ * a `now` that is not a date, or a window that is not a whole number of milliseconds shorter
  * than LIMITS.rateCounterRetentionMs, since pruneRateCounters could delete a longer window
  * while it is still counting.
  */
-export async function consumeWindow(db: Database, key: string, limit: number, windowMs: number, now: Date): Promise<boolean> {
-  return (await countWindow(db, key, limit, windowMs, now)) <= limit;
+export async function consumeWindow(db: Database, key: string, limit: number, windowMs: number, now: Date, uses = 1): Promise<boolean> {
+  return (await countWindow(db, key, limit, windowMs, now, uses)) <= limit;
+}
+
+/** Whole seconds, at least 1, from `now` to the end of the fixed window of `windowMs` that holds it, for a Retry-After. */
+export function secondsLeftInWindow(windowMs: number, now: Date): number {
+  const windowEndMs = (Math.floor(now.getTime() / windowMs) + 1) * windowMs;
+  return Math.max(1, Math.ceil((windowEndMs - now.getTime()) / MS_PER_SECOND));
 }
 
 /** consumeWindow over the fixed minute (LIMITS.rateWindowMinuteMs) that holds `now`, with the same refusals. */
@@ -63,19 +71,18 @@ export async function consume(db: Database, key: string, perMinute: number, now:
 }
 
 /**
- * Counts one use of the quota `name` that every caller shares, the global cap that stands
- * behind a per-client one (C22), in the fixed window of `windowMs` that holds `now`. The count
- * is consumeWindow's, with its refusals, under a key no per-client key can equal. Count the
- * caller's own limit first, so a caller already over it never spends the shared one.
- * Returns whether this use is within `limit`, how long until the window ends, and whether this
- * is the window's first use past the limit (exactly one use in each window can be).
+ * Counts `uses` (one unless given) of the quota `name` that every caller shares, the global cap
+ * that stands behind a per-client one (C22), in the fixed window of `windowMs` that holds `now`.
+ * The count is consumeWindow's, with its refusals, under a key no per-client key can equal. Count
+ * the caller's own limit first, so a caller already over it never spends the shared one.
+ * Returns whether these uses are within `limit`, how long until the window ends, and whether this
+ * is the window's first request to pass the limit (exactly one request in each window can be).
  * Throws Error for an empty name, or for anything consumeWindow refuses.
  */
-export async function consumeShared(db: Database, name: string, limit: number, windowMs: number, now: Date): Promise<SharedTurn> {
+export async function consumeShared(db: Database, name: string, limit: number, windowMs: number, now: Date, uses = 1): Promise<SharedTurn> {
   if (typeof name !== 'string' || name === '') throw new Error('the quota name is missing');
-  const count = await countWindow(db, `${SHARED_KEY_PREFIX}${name}`, limit, windowMs, now);
-  const windowEndMs = (Math.floor(now.getTime() / windowMs) + 1) * windowMs;
-  return { allowed: count <= limit, retryAfterSeconds: Math.max(1, Math.ceil((windowEndMs - now.getTime()) / MS_PER_SECOND)), firstRefusal: count === limit + 1 };
+  const count = await countWindow(db, `${SHARED_KEY_PREFIX}${name}`, limit, windowMs, now, uses);
+  return { allowed: count <= limit, retryAfterSeconds: secondsLeftInWindow(windowMs, now), firstRefusal: count > limit && count - uses <= limit };
 }
 
 /**

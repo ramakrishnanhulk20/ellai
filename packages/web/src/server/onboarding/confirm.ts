@@ -11,6 +11,14 @@ import { owners } from '../db/schema.js';
 import { ownerDelegate } from '../memory/delegate.js';
 import { checkNow, checkStep, loadOwner, OnboardingError, type OnboardingStep, type OwnerRow } from './state.js';
 
+/**
+ * The Tatum calls confirmOnboardingTx's success path makes for each step, which the confirm route
+ * counts against the day's budgets before any of them (C22): the transaction's result and its
+ * facts, then findMemoryAccount's registry, registry entry and account, or the allowance itself
+ * (one GraphQL call).
+ */
+export const CONFIRM_CHAIN_CALLS: Readonly<Record<OnboardingStep, number>> = { memory_account: 5, add_delegate: 5, allowance: 3 };
+
 const { ChangedObject_IdOperation: IdOperation } = GrpcTypes;
 const FRAMEWORK_ADDRESS = normalizeSuiAddress('0x2');
 // The Chain interface reads a transaction's status and balance changes but not its sender or

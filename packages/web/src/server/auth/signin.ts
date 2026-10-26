@@ -191,22 +191,25 @@ function zkLoginChecksOf(signature: unknown): number {
 
 /**
  * Counts `checks` uses of each per-client limit for `clientKey`, the minute's first, and throws
- * HttpError 429 rate_limited once either is passed, before any shared quota is spent (C34). A
- * client past the minute's limit spends nothing of its day.
+ * once either is passed, before any shared quota is spent (C34): HttpError 429 rate_limited past
+ * the minute's, 429 rate_limited_today past the day's, since a minute's wait does nothing for a
+ * day's. A client past the minute's limit spends nothing of its day.
  */
 async function holdZkLoginClientLimits(db: Database, clientKey: string, checks: number, now: Date): Promise<void> {
   for (const limit of ZKLOGIN_CLIENT_LIMITS) {
     for (let check = 0; check < checks; check += 1) {
-      if (!(await consumeWindow(db, `${limit.name}:${clientKey}`, limit.limit, limit.windowMs, now))) throw new HttpError(429, 'rate_limited');
+      if (await consumeWindow(db, `${limit.name}:${clientKey}`, limit.limit, limit.windowMs, now)) continue;
+      throw new HttpError(429, limit.windowMs === LIMITS.rateWindowDayMs ? 'rate_limited_today' : 'rate_limited');
     }
   }
 }
 
 /**
- * Counts `checks` uses of each zkLogin quota, the minute's first, and refuses with
- * CHAIN_UNAVAILABLE once either is spent, before anything is sent to Sui (C22). The caller is
- * over no limit of its own: Ellai's shared budget for asking Sui is spent, which is what a
- * 503 chain_unavailable tells it, and its "try again in a minute" fits the minute's quota.
+ * Counts `checks` uses of each zkLogin quota, the minute's first, and refuses once either is
+ * spent, before anything is sent to Sui (C22). The caller is over no limit of its own: Ellai's
+ * shared budget for asking Sui is spent. Past the minute's quota that is CHAIN_UNAVAILABLE, a 503
+ * chain_unavailable whose "try again in a minute" fits; past the day's it is HttpError 503
+ * chain_unavailable_today, which says to come back tomorrow.
  * The first refusal in each window logs the quota's fixed name and nothing from the request.
  */
 async function holdZkLoginQuotas(db: Database, checks: number, now: Date): Promise<void> {
@@ -215,6 +218,7 @@ async function holdZkLoginQuotas(db: Database, checks: number, now: Date): Promi
       const turn = await consumeShared(db, quota.name, quota.limit, quota.windowMs, now);
       if (turn.allowed) continue;
       if (turn.firstRefusal) console.error(`[ellai signin] quota_spent ${quota.name}`);
+      if (quota.windowMs === LIMITS.rateWindowDayMs) throw new HttpError(503, 'chain_unavailable_today');
       refuse('CHAIN_UNAVAILABLE');
     }
   }
@@ -323,10 +327,11 @@ type ZkLoginChecking = { zkLoginClient?: undefined; clientKey?: string } | { zkL
  *    BAD_SIGNATURE with nothing counted. A zkLogin signature with no `zkLoginClient` is
  *    ZKLOGIN_UNAVAILABLE.
  * 4. The checks are counted against `clientKey`, which must be the platform's verified client
- *    address (C22): past LIMITS.zkLoginChecksPerClientPerMinute or
- *    LIMITS.zkLoginChecksPerClientPerDay, HttpError 429 rate_limited, and no shared quota is spent.
- * 5. They are then counted against ZKLOGIN_CHECK_QUOTAS, which every caller shares: past either,
- *    CHAIN_UNAVAILABLE (503 chain_unavailable), with one fixed log line per window.
+ *    address (C22): past LIMITS.zkLoginChecksPerClientPerMinute, HttpError 429 rate_limited, past
+ *    LIMITS.zkLoginChecksPerClientPerDay, 429 rate_limited_today, and no shared quota is spent.
+ * 5. They are then counted against ZKLOGIN_CHECK_QUOTAS, which every caller shares: past the
+ *    minute's, CHAIN_UNAVAILABLE (503 chain_unavailable), past the day's, HttpError 503
+ *    chain_unavailable_today, with one fixed log line per window.
  * 6. The signature is checked as a Sui personal message that must recover to the address the
  *    message names: Ed25519, Secp256k1, Secp256r1 and multisig offline, zkLogin through
  *    `zkLoginClient` with its own timeout, and CHAIN_UNAVAILABLE rather than BAD_SIGNATURE when
@@ -338,7 +343,8 @@ type ZkLoginChecking = { zkLoginClient?: undefined; clientKey?: string } | { zkL
  * Returns the owner id, the session token (to be set as the cookie, never stored), and its
  * expiry.
  * Throws SignInError: BAD_MESSAGE, WRONG_SITE, BAD_SIGNATURE, ZKLOGIN_UNAVAILABLE,
- * CHAIN_UNAVAILABLE, NONCE_UNKNOWN, NONCE_USED, NONCE_EXPIRED; and HttpError 429 rate_limited.
+ * CHAIN_UNAVAILABLE, NONCE_UNKNOWN, NONCE_USED, NONCE_EXPIRED; and HttpError 429 rate_limited or
+ * rate_limited_today, and 503 chain_unavailable_today.
  * A refused message or nonce never uses up the nonce; every refusal after the claim leaves it
  * used and creates nothing. Throws Error for server faults: a bad time, origin, master secret,
  * session secret, or an empty client key beside a zkLogin client.

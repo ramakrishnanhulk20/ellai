@@ -149,6 +149,17 @@ function purseForDecision(readAtomic: bigint, ledger: Ledger): bigint {
 }
 
 /**
+ * True when Ellai's ledger alone already rules a refill out, so the chain has nothing to tell
+ * (C22, C23). A read is never below zero, so purseForDecision is never below the ledger floored
+ * at zero, and refillDecision never refills a fuller purse than one it turns down: its no on that
+ * floor, at or above the threshold or past the day's refills, is its answer for any read.
+ */
+function ledgerRulesOut(ledger: Ledger): boolean {
+  const floor = ledger.balanceAtomic > 0n ? ledger.balanceAtomic : 0n;
+  return !refillDecision({ purseUsdcAtomic: floor, refillsInWindow: ledger.inWindow }).refill;
+}
+
+/**
  * What the allowance's rate limit still lets a spend take at `now`, or null with no rate limit.
  * A window whose end has passed counts as empty, because the module opens a new one at the next
  * spend. A window that cannot be placed counts as full.
@@ -297,30 +308,42 @@ async function resolvePending(
  *    LIMITS.paymentReleaseReads more reads, `sleep`ing LIMITS.settlementPollIntervalMs before
  *    each, still miss it: then it is 'failed', the same release rule as a payment's (C4), and
  *    this call goes on as if nothing were pending.
- * 2. The owner's recorded purse must be the purse derived from the master secret, and the
- *    allowance at the owner's stored allowance_id, read from chain now, must pass C7 (funder
- *    is the owner, spender is the purse, USDC, not expired, room for one refill under the
- *    lifetime cap and in the current rate window); otherwise 'refused' and nothing is built
- *    or sent.
- * 3. The purse's USDC address balance and the chain facts (epoch, gas price, the allowance's
- *    initial shared version, a random nonce) are read before any lock.
- * 4. In one transaction holding the owner row FOR UPDATE: any refill still pending is
+ * 2. The owner's recorded purse must be the purse derived from the master secret; otherwise
+ *    'refused' and nothing is read.
+ * 3. Ellai's ledger comes before any other chain read (C22, C23): with a refill still pending the
+ *    answer is 'skipped_pending', and when the ledger alone rules a refill out (ledgerRulesOut: a
+ *    balance at or above LIMITS.purseRefillBelowAtomic, or LIMITS.purseMaxRefillsPerDay already
+ *    sent) it is 'not_needed' with nothing read from chain. That answer is exact, since step 4
+ *    decides on the larger of the read and the ledger, so an idle owner costs no Tatum call.
+ * 4. Otherwise the purse's USDC address balance is read, and the answer is 'not_needed' when
+ *    core's refillDecision on the larger of that read and the ledger (purseForDecision) says no.
+ * 5. Only for a refill that will be built is the allowance at the owner's stored allowance_id
+ *    read, and it must pass C7 (funder is the owner, spender is the purse, USDC, not expired,
+ *    room for one refill under the lifetime cap and in the current rate window); otherwise
+ *    'refused' and nothing is built or sent. Then the chain facts (epoch, gas price, the
+ *    allowance's initial shared version, a random nonce) are read, all before any lock.
+ * 6. In one transaction holding the owner row FOR UPDATE: any refill still pending is
  *    'skipped_pending', so two calls can never refill twice; every refill sent in the last
- *    LIMITS.purseRefillWindowMs is counted, and core's refillDecision decides on the larger of the balance read and
+ *    LIMITS.purseRefillWindowMs is counted, and core's refillDecision decides again on the larger of the balance read and
  *    Ellai's ledger (purseForDecision), 'not_needed' when it says no (C23). The refill is
  *    built with buildRefill, checked with assertRefill, signed by the derived purse and by the
  *    gas wallet as sponsor, and its row is written with the digest of the signed bytes, their
  *    maxEpoch as valid_until_epoch, status 'pending', before anything leaves Ellai.
- * 5. After commit the signed bytes are dry-run with chain.simulate. Unless the dry run
+ * 7. After commit the signed bytes are dry-run with chain.simulate. Unless the dry run
  *    succeeds and moves exactly the refill, the row is 'failed', nothing is sent, and the
  *    call throws: RefillError DRY_RUN_FAILED, or the dry run's own ChainError (C6).
- * 6. Then the bytes are sent. A failure the chain reports is 'failed' and throws RefillError
+ * 8. Then the bytes are sent. A failure the chain reports is 'failed' and throws RefillError
  *    FAILED. A success is read back by its digest: exactly the refill is 'verified'; not
  *    readable yet stays 'pending' for the next call. Either way 'refilled'. An unknown send
  *    outcome stays 'pending' and the ChainError is thrown.
  *
- * `canStart` is asked before every chain read in steps 1 to 3 and once more before step 4; when
- * it says no the call answers 'deferred' with nothing built, written or sent. Steps 5 and 6 are
+ * The ledger counts this purse's money in as its 'verified' refills, and this function is the
+ * only way Ellai puts money in: the first refill after onboarding is this call's too, made by the
+ * first tick once confirmOnboardingTx has recorded the allowance, and it is 'verified' once it
+ * lands. Money anyone else sends shows only in the read, which can only raise the decision.
+ *
+ * `canStart` is asked before every chain read in steps 1 to 5 and once more before step 6; when
+ * it says no the call answers 'deferred' with nothing built, written or sent. Steps 7 and 8 are
  * never cut short, since bytes whose row is written but which were never sent would hold up
  * refills until their epoch window closed and still count toward the day's refills. Together
  * they take at most three bounded Tatum calls.
@@ -354,6 +377,17 @@ export async function refillIfNeeded(args: RefillJobArgs): Promise<RefillOutcome
 
   const purse = derivePurseKeypair(args.masterSecretHex, owner.suiAddress);
   if (!sameAddress(purse.toSuiAddress(), owner.purseAddress)) return 'refused';
+  // The same checks run again under the lock below. These only spare the chain reads when no
+  // refill can happen now; a payment signed before the lock can only lower the ledger, and the
+  // next call sees that.
+  const early = await refillLedger(db, ownerId, now);
+  if (early.pending) return 'skipped_pending';
+  if (ledgerRulesOut(early)) return 'not_needed';
+
+  if (!canStart()) return 'deferred';
+  const purseReadAtomic = (await chain.getBalances(owner.purseAddress)).usdcAddressBalance;
+  if (!refillDecision({ purseUsdcAtomic: purseForDecision(purseReadAtomic, early), refillsInWindow: early.inWindow }).refill) return 'not_needed';
+
   if (!canStart()) return 'deferred';
   let allowance: AllowanceReading;
   try {
@@ -364,15 +398,6 @@ export async function refillIfNeeded(args: RefillJobArgs): Promise<RefillOutcome
     throw error;
   }
   if (!allowanceServes(allowance, owner, now)) return 'refused';
-
-  if (!canStart()) return 'deferred';
-  const purseReadAtomic = (await chain.getBalances(owner.purseAddress)).usdcAddressBalance;
-  // The same checks run again under the lock below. This pass only saves two chain reads when
-  // no refill can happen now; a payment signed before the lock can only lower the ledger, and
-  // the next call sees that.
-  const early = await refillLedger(db, ownerId, now);
-  if (early.pending) return 'skipped_pending';
-  if (!refillDecision({ purseUsdcAtomic: purseForDecision(purseReadAtomic, early), refillsInWindow: early.inWindow }).refill) return 'not_needed';
   if (!canStart()) return 'deferred';
   const epoch = await chain.getCurrentEpoch();
   if (!canStart()) return 'deferred';

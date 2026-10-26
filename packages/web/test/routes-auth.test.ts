@@ -2,7 +2,8 @@
 // nonce, verify and logout end to end with a real Ed25519 key; a zkLogin sign-in whose proof
 // verify sends, once, to the chain client it was given (a 503 when that chain cannot answer,
 // with the nonce spent either way), its per-client limit keyed on the platform's client address
-// (429 with the nonce spent), and nothing read for any other key;
+// (429 with the nonce spent), a spent day answered with the day's own 429 and 503 wording, and
+// nothing read for any other key;
 // the session cookie, its flags and its name (__Host-ellai_session on https, read and cleared
 // under that name only, the plain name on http localhost); the same-origin check on all three;
 // the per-client and
@@ -29,7 +30,9 @@ import * as verifyRoute from '../src/app/api/auth/verify/route.js';
 import { type Database, createDb, migrate } from '../src/server/db/client.js';
 import { owners, sessions, signinNonces } from '../src/server/db/schema.js';
 import type { ServerEnv } from '../src/server/env.js';
+import { ZKLOGIN_CHECK_QUOTAS, ZKLOGIN_CLIENT_LIMITS } from '../src/server/auth/signin.js';
 import { type ServerContext, setServerContextFactory } from '../src/server/http/context.js';
+import { consumeShared, consumeWindow } from '../src/server/http/ratelimit.js';
 import { requireOwner } from '../src/server/http/session.js';
 
 let handle: Awaited<ReturnType<typeof createDb>>;
@@ -329,6 +332,30 @@ describe('zkLogin sign-in', () => {
     expect(await replay.json()).toMatchObject({ error: 'nonce_used' });
     expect((await verify(await zkLoginSigned(), other)).status).toBe(200);
     expect(verifyZkLoginSignature).toHaveBeenCalledTimes(LIMITS.zkLoginChecksPerClientPerMinute + 1);
+  });
+
+  it("answers a spent day with the day's wording, 429 rate_limited_today for the client and 503 chain_unavailable_today for everyone, reading nothing (C22, C34)", async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    vi.stubEnv('VERCEL', '1');
+    verifyZkLoginSignature.mockResolvedValue({ success: true, errors: [] });
+    // A day of its own, so the counters spent here touch no other test.
+    clock = new Date(Date.UTC(2031, 3, 1, 10));
+    const [, clientDay] = ZKLOGIN_CLIENT_LIMITS;
+    const [, sharedDay] = ZKLOGIN_CHECK_QUOTAS;
+    const busy = '203.0.113.21';
+    for (let use = 0; use < clientDay.limit; use += 1) await consumeWindow(db, `${clientDay.name}:${busy}`, clientDay.limit, clientDay.windowMs, clock);
+
+    const clientRefused = await verify(await zkLoginSigned(), { forwardedFor: busy });
+    expect(clientRefused.status).toBe(429);
+    expect(await clientRefused.json()).toEqual({ error: 'rate_limited_today', message: 'Too many requests today. Try again tomorrow (days are counted in UTC).' });
+
+    for (let use = 0; use < sharedDay.limit; use += 1) await consumeShared(db, sharedDay.name, sharedDay.limit, sharedDay.windowMs, clock);
+    const everyoneRefused = await verify(await zkLoginSigned(), { forwardedFor: '198.51.100.21' });
+    expect(everyoneRefused.status).toBe(503);
+    expect(await everyoneRefused.json()).toEqual({ error: 'chain_unavailable_today', message: "Ellai has used today's budget for reading Sui. Try again tomorrow (days are counted in UTC)." });
+    expect(everyoneRefused.headers.get('set-cookie')).toBeNull();
+    expect(verifyZkLoginSignature).not.toHaveBeenCalled();
   });
 });
 

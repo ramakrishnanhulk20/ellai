@@ -6,9 +6,12 @@
 // signature that is not the sender's, are refused after the claim and never executed; a
 // settlement mismatch or failure is refused and closed; an unknown execution outcome is read
 // back by its digest and settled if it landed, and otherwise left open to the same bytes alone,
-// so a retry delivers; that retry is read at most once per recheck window, and the sale is
+// so a retry delivers; that retry is read at most once per recheck window, rechecks of every sale
+// together at most LIMITS.sellerRechecksPerDayGlobal times a day, and the sale is
 // closed for good once its epoch window has closed and a final read misses; a challenge pays once and one payment never pays
-// two challenges; the unpaid rate limit per caller and for every caller together; one epoch
+// two challenges; the unpaid rate limit per caller and for every caller together; the caps on
+// sends per caller a minute and a day and for every caller a day, counted only after the offline
+// checks and never reaching the chain past them; one epoch
 // read per cache window; the wallet check summary and its blob cap; the pay-to
 // fallback; and no response ever carries the payment header, its bytes or its signature.
 // Does NOT cover: the live chain or Tatum (`npm run prove:seller` pays one 0.01 USDC live),
@@ -208,8 +211,16 @@ const noWait = async (ms: number) => {
   waits.push(ms);
 };
 
-function settle(chain: Chain, paymentHeaderValue: string, options: { resourceUrl?: string; now?: Date } = {}) {
-  return settleWalletCheckPayment({ db, chain, paymentHeader: paymentHeaderValue, resourceUrl: options.resourceUrl ?? RESOURCE, now: options.now ?? NOW, sleep: noWait });
+function settle(chain: Chain, paymentHeaderValue: string, options: { resourceUrl?: string; now?: Date; callerKey?: string } = {}) {
+  return settleWalletCheckPayment({
+    db,
+    chain,
+    paymentHeader: paymentHeaderValue,
+    resourceUrl: options.resourceUrl ?? RESOURCE,
+    callerKey: options.callerKey ?? `caller-${randomBytes(8).toString('hex')}`,
+    now: options.now ?? NOW,
+    sleep: noWait,
+  });
 }
 
 function call(chain: Chain, options: { method?: string; headers?: Record<string, string>; body?: string; callerKey?: string; now?: Date } = {}) {
@@ -608,6 +619,118 @@ describe('settleWalletCheckPayment', () => {
       expect(await settle(chain, header)).toEqual({ ok: false, status: 402, reason: SETTLE_REASONS.header });
     }
     expect((await saleOf(issued.challengeId)).status).toBe('issued');
+  });
+
+  const DAY_MS = 86_400_000;
+  // The start of the UTC day `days` after NOW's, a day no other test sends payments in.
+  const dayAfter = (days: number) => Math.floor(NOW.getTime() / DAY_MS) * DAY_MS + days * DAY_MS;
+
+  it('stops a flood of payments signed by empty wallets from one caller at 3 a minute and 20 a day, sending none past either (C22, C34)', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    const { chain, calls } = stubChain({ execute: failedOnChain });
+    const at = (minute: number, second: number) => new Date(dayAfter(2) + minute * 60_000 + second * 1_000);
+    const attempt = async (now: Date, callerKey = '203.0.113.66') => {
+      const payment = asBuyer(await call(chain, { callerKey, now }));
+      const { header } = await pay(payment, Ed25519Keypair.generate());
+      return { header, challengeId: payment.challengeId ?? '', answer: await call(chain, { headers: { 'content-type': 'application/json', 'X-PAYMENT': header }, callerKey, now }) };
+    };
+    expect([LIMITS.sellerExecutesPerClientPerMinute, LIMITS.sellerExecutesPerClientPerDay]).toEqual([3, 20]);
+
+    const statuses: number[][] = [];
+    const refused: Array<Awaited<ReturnType<typeof attempt>>> = [];
+    for (let minute = 0; minute < 7; minute++) {
+      const row: number[] = [];
+      for (let second = 1; second <= 4; second++) {
+        const sent = await attempt(at(minute, second));
+        row.push(sent.answer.status);
+        if (sent.answer.status === 429) refused.push(sent);
+      }
+      statuses.push(row);
+    }
+    // Sui runs an empty wallet's send and fails it, a definite answer: 402. A send the minute's
+    // limit turns away counts nothing toward the day, so the day's 20th send is in minute 6.
+    expect(statuses).toEqual([...Array<number[]>(6).fill([402, 402, 402, 429]), [402, 402, 429, 429]]);
+    expect(calls.executions).toHaveLength(20);
+    const [firstRefused, , , , , , dayRefused, minuteRefused] = refused;
+    expect(firstRefused?.answer).toMatchObject({ status: 429, headers: { 'Retry-After': '56' } });
+    expect(JSON.parse(firstRefused?.answer.body ?? '{}')).toEqual({ error: SETTLE_REASONS.executeRate });
+    expect(dayRefused?.answer).toMatchObject({ status: 429, headers: { 'Retry-After': String(DAY_MS / 1_000 - 6 * 60 - 3) } });
+    expect(JSON.parse(dayRefused?.answer.body ?? '{}')).toEqual({ error: SETTLE_REASONS.executeRateToday });
+    expect(JSON.parse(minuteRefused?.answer.body ?? '{}')).toEqual({ error: SETTLE_REASONS.executeRate });
+
+    expect((await attempt(at(7, 1))).answer.status).toBe(429);
+    expect(calls.executions).toHaveLength(20);
+    // Another caller still has its own minute and day.
+    expect((await attempt(at(7, 2), '203.0.113.67')).answer.status).toBe(402);
+    expect(calls.executions).toHaveLength(21);
+
+    // A sale turned away keeps no digest, so its bytes can never send rechecks to the chain.
+    expect(await saleOf(firstRefused?.challengeId ?? '')).toMatchObject({ status: 'rejected', digest: null, settledAt: null });
+    const again = await call(chain, { headers: { 'content-type': 'application/json', 'X-PAYMENT': firstRefused?.header ?? '' }, callerKey: '203.0.113.68', now: at(8, 1) });
+    expect(JSON.parse(again.body)).toEqual({ error: SETTLE_REASONS.used });
+    expect(calls.executions).toHaveLength(21);
+    expect(calls.reads).toEqual([]);
+    const lines = warn.mock.calls.map((line) => line.join(' '));
+    expect([lines.filter((line) => line.endsWith('client:minute')).length, lines.filter((line) => line.endsWith('client:day')).length]).toEqual([7, 2]);
+    expect(lines.every((line) => line.startsWith('[ellai seller] execute_limited seller-executes:client:'))).toBe(true);
+    warn.mockRestore();
+  });
+
+  it('rechecks waiting sales at most LIMITS.sellerRechecksPerDayGlobal times a day across every sale, answering the next as still waiting with Retry-After and no chain read (C22)', async () => {
+    const error = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    const { chain, calls } = stubChain({ execute: executionUnknown });
+    const at = (ms: number) => new Date(dayAfter(4) + ms);
+    const waiting = { ok: false, status: 402, reason: SETTLE_REASONS.unconfirmed };
+    // Two sales left waiting by sends Tatum gave no answer to.
+    const headers: string[] = [];
+    for (const second of [0, 1]) {
+      const issued = await issue(chain, RESOURCE, at(second * 1_000));
+      const { header } = await pay(asBuyer(issued));
+      expect(await settle(chain, header, { now: at(second * 1_000) })).toEqual(waiting);
+      headers.push(header);
+    }
+    const readsBefore = calls.reads.length;
+    expect(LIMITS.sellerRechecksPerDayGlobal).toBe(100);
+
+    // Each sale once in each of 50 recheck windows: 100 rechecks, each reading the chain.
+    for (let window = 1; window <= 50; window++) {
+      for (const header of headers) expect(await settle(chain, header, { now: at(window * LIMITS.sellerRecheckIntervalMs) })).toEqual(waiting);
+    }
+    expect(calls.reads.length - readsBefore).toBe(100 * LIMITS.chainReadAfterWriteTries);
+    // A new window for the sale, but not for the day.
+    const nextMs = 51 * LIMITS.sellerRecheckIntervalMs;
+    expect(await settle(chain, headers[0] ?? '', { now: at(nextMs) })).toEqual({ ...waiting, retryAfterSeconds: (DAY_MS - nextMs) / 1_000 });
+    expect(await settle(chain, headers[1] ?? '', { now: at(nextMs) })).toMatchObject({ ...waiting, retryAfterSeconds: (DAY_MS - nextMs) / 1_000 });
+    expect(calls.reads.length - readsBefore).toBe(100 * LIMITS.chainReadAfterWriteTries);
+    expect(calls.executions).toHaveLength(2);
+    expect(error.mock.calls.map((line) => line.join(' '))).toEqual(['[ellai seller] quota_spent seller-rechecks:day']);
+    error.mockRestore();
+  });
+
+  it('sends at most LIMITS.sellerExecutesPerDayGlobal payments a day across every caller, turning the next away with 503 and logging the spent quota once (C22)', async () => {
+    const error = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    const { chain, calls } = stubChain({ execute: failedOnChain });
+    const now = new Date(dayAfter(3) + 60_000);
+    const paid = async (callerKey: string) => {
+      const issued = await issue(chain, RESOURCE, now);
+      const { header } = await pay(asBuyer(issued), Ed25519Keypair.generate());
+      return { challengeId: issued.challengeId, outcome: await settle(chain, header, { callerKey, now }) };
+    };
+    expect(LIMITS.sellerExecutesPerDayGlobal).toBe(150);
+    for (let i = 0; i < LIMITS.sellerExecutesPerDayGlobal; i++) {
+      // Three from each caller, the most one may send in a minute.
+      expect((await paid(`198.51.100.${Math.floor(i / 3)}`)).outcome).toEqual({ ok: false, status: 402, reason: SETTLE_REASONS.failed });
+    }
+    expect(calls.executions).toHaveLength(150);
+
+    const busy = await paid('192.0.2.151');
+    expect(busy.outcome).toEqual({ ok: false, status: 503, reason: SETTLE_REASONS.executeBusy, retryAfterSeconds: DAY_MS / 1_000 - 60 });
+    expect(await saleOf(busy.challengeId)).toMatchObject({ status: 'rejected', digest: null, settledAt: null });
+    expect((await paid('192.0.2.152')).outcome).toMatchObject({ ok: false, status: 503 });
+    expect(calls.executions).toHaveLength(150);
+    expect(calls.reads).toEqual([]);
+    expect(error.mock.calls.map((line) => line.join(' '))).toEqual(['[ellai seller] quota_spent seller-executes:day']);
+    error.mockRestore();
   });
 });
 

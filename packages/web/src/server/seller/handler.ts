@@ -127,7 +127,7 @@ async function handle(args: Parameters<typeof handleWalletCheck>[0]): Promise<Se
     }
   }
 
-  const settled = await settleWalletCheckPayment({ db, chain, paymentHeader: payment.value, resourceUrl: args.url, now: args.now, sleep: args.sleep });
+  const settled = await settleWalletCheckPayment({ db, chain, paymentHeader: payment.value, resourceUrl: args.url, callerKey: args.callerKey, now: args.now, sleep: args.sleep });
   if (!settled.ok) {
     return json(settled.status, { error: settled.reason }, settled.retryAfterSeconds === undefined ? {} : { 'Retry-After': String(settled.retryAfterSeconds) });
   }
@@ -152,7 +152,8 @@ async function handle(args: Parameters<typeof handleWalletCheck>[0]): Promise<Se
  * Otherwise it is a fresh 402 challenge from issueWalletCheckChallenge (503 when one cannot be
  * issued). With
  * X-PAYMENT, settleWalletCheckPayment must take the payment (its 402 or 409 otherwise, with
- * Retry-After on a recheck of a waiting sale that came too soon) before
+ * Retry-After on a recheck of a waiting sale that came too soon; its 429 past this caller's caps
+ * on sends and its 503 past every caller's, both with Retry-After, keyed on the same `callerKey`) before
  * the wallet check is read, waiting with `sleep` between its chain reads when an outcome is
  * unknown; the 200 carries the check as JSON and X-PAYMENT-RESPONSE with the digest. If the
  * check cannot be read after the payment settled, the answer is 502 with the same receipt.

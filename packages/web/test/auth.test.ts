@@ -5,8 +5,9 @@
 // refusal after that claim leaving the nonce used and no session; zkLogin through a stub client,
 // including a chain that cannot be read answering CHAIN_UNAVAILABLE (503); a signature past the
 // zkLogin member cap refused with nothing counted; the per-client zkLogin limits per minute and per
-// day (429) counted before the shared quotas per minute and per day (503), one check for each
-// zkLogin member, with one log line per spent window;
+// day (429, the day's as rate_limited_today) counted before the shared quotas per minute and per
+// day (503, the day's as chain_unavailable_today), one check for each zkLogin member, with one log
+// line per spent window;
 // the owner row and its derived purse; sessions, their cookie (named __Host-ellai_session
 // whenever it is Secure, and read under that name only) and their end; agent tokens,
 // their display prefixes, the cap on live external agents per owner (never counting the one
@@ -618,15 +619,16 @@ describe('completeSignIn', () => {
 
     const outcomes: string[] = [];
     for (let i = 0; i <= perDay; i += 1) outcomes.push(await signInAs('daily-client', new Date(day + Math.floor(i / perMinute) * 60_000)));
-    expect(outcomes).toEqual([...Array<string>(perDay).fill('signed in'), '429 rate_limited']);
+    // The day's refusal says so, since waiting a minute would not help.
+    expect(outcomes).toEqual([...Array<string>(perDay).fill('signed in'), '429 rate_limited_today']);
 
     const freshMinute = new Date(day + (Math.floor(perDay / perMinute) + 1) * 60_000);
-    expect(await signInAs('daily-client', freshMinute)).toBe('429 rate_limited');
+    expect(await signInAs('daily-client', freshMinute)).toBe('429 rate_limited_today');
     expect(await signInAs('another-client', freshMinute)).toBe('signed in');
     expect(verifyZkLoginSignature).toHaveBeenCalledTimes(perDay + 1);
   });
 
-  it('refuses zkLogin checks past the shared minute or day quota with CHAIN_UNAVAILABLE before any chain call, the nonce used up, counts each zkLogin member of a multisig, and logs a spent window once (C22, C34)', { timeout: 60_000 }, async () => {
+  it('refuses zkLogin checks past the shared minute quota with CHAIN_UNAVAILABLE and past the day quota with 503 chain_unavailable_today, before any chain call, the nonce used up, counts each zkLogin member of a multisig, and logs a spent window once (C22, C34)', { timeout: 60_000 }, async () => {
     const error = vi.spyOn(console, 'error').mockImplementation(() => undefined);
     const signinLines = () => error.mock.calls.map((call) => call.map(String).join(' ')).filter((line) => line.startsWith('[ellai signin]'));
     const [perMinute, perDay] = ZKLOGIN_CHECK_QUOTAS;
@@ -661,7 +663,7 @@ describe('completeSignIn', () => {
 
     await fillShared(perDay, perDay.limit, at(180_000));
     const overDay = await attempt(at(240_000));
-    await refused(overDay.run(at(240_000)), 'CHAIN_UNAVAILABLE');
+    expect(await outcomeOf(overDay.run(at(240_000)))).toBe('503 chain_unavailable_today');
     expect(verifyZkLoginSignature).toHaveBeenCalledTimes(1);
     expect(await nonceUsedAt(overDay.issued.nonce)).toEqual(at(240_000));
     for (const line of signinLines()) expect(line).toMatch(/^\[ellai signin\] quota_spent zklogin-checks:(minute|day)$/);

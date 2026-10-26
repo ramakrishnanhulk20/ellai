@@ -32,7 +32,10 @@ function sellerResponse(status: number, headers: Record<string, string>, body: s
  * Sui address. A public seller route: no session, no agent token. Without X-PAYMENT the answer
  * is a 402 challenge (429 past LIMITS.sellerChallengesPerMinute for the caller's verified
  * address, C22); with one, the payment is settled before the check is read (see
- * handleWalletCheck). The challenge is bound to APP_ORIGIN plus this path, never to the Host
+ * handleWalletCheck), and its bytes reach Tatum only within the caps on sends counted on that
+ * same address: 429 past LIMITS.sellerExecutesPerClientPerMinute or
+ * LIMITS.sellerExecutesPerClientPerDay, 503 past LIMITS.sellerExecutesPerDayGlobal for every
+ * caller, each with Retry-After (C22). The challenge is bound to APP_ORIGIN plus this path, never to the Host
  * header, so a request sent under another name cannot move what a payment is for. 400 with the
  * seller's own message for a body over LIMITS.challengeMaxBytes or not UTF-8; 503
  * seller_unavailable when the pay-to address cannot be worked out.

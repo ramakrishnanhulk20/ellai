@@ -12,6 +12,14 @@ import { checkNow, checkStep, loadOwner, OnboardingError, type OnboardingStep } 
 
 /** Stored on chain next to Ellai's key on the owner's Walrus Memory account. */
 export const DELEGATE_LABEL = 'Ellai';
+
+/**
+ * The Tatum calls buildOnboardingTx's success path makes for each step, which the build route
+ * counts against the day's budgets before any of them (C22): the registry and the owner's registry
+ * entry, the account too for a delegate, then the one simulate call that resolves the
+ * transaction; or the epoch and the gas price for an allowance.
+ */
+export const BUILD_CHAIN_CALLS: Readonly<Record<OnboardingStep, number>> = { memory_account: 3, add_delegate: 4, allowance: 2 };
 // A unit conversion: the owner sets how long the allowance runs as a count of days.
 const MS_PER_DAY = 86_400_000;
 const MAX_DAYS = Math.floor(LIMITS.onboardingAllowanceMaxMs / MS_PER_DAY);

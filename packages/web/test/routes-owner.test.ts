@@ -1,7 +1,8 @@
 // Covers: the owner routes called as Next would call them, with Request objects, on PGlite
 // with a stub chain: a cookie from the real sign-in routes opening the overview; the session
 // requirement on every owner route; the overview's settings, onboarding, purse, counts and
-// question rate, with bigints as strings and a chain failure as purse null; the question list
+// question rate, with bigints as strings, a chain failure as purse null, and no chain read at all
+// for an owner with no allowance; the question list
 // with Ellai's payment facts apart from agent text; answering, with its memory and grant; one
 // owner never seeing or answering another's question; same origin on the answer; and that an
 // unexpected failure, including a real database error carrying SQL, is a bare 500.
@@ -107,6 +108,12 @@ async function signedInOwner(): Promise<Owner> {
   const { message } = await issueSignIn({ db, address: signer.toSuiAddress(), appOrigin: APP_ORIGIN, now: clock });
   const done = await completeSignIn({ db, message, signature: await sign(signer, message), appOrigin: APP_ORIGIN, masterSecretHex: MASTER, sessionSecretHex: SECRET, now: clock });
   return { ownerId: done.ownerId, address: canonicalSuiAddress(signer.toSuiAddress()), cookie: `__Host-ellai_session=${done.sessionToken}` };
+}
+
+/** Records an allowance for the owner, as onboarding's confirm step does, so the overview has a purse to read. */
+async function withAllowance(owner: Owner): Promise<Owner> {
+  await db.update(owners).set({ allowanceId: address(), allowanceCheckedAt: clock }).where(eq(owners.id, owner.ownerId));
+  return owner;
 }
 
 async function agentFor(ownerId: string, label = 'Travel agent'): Promise<string> {
@@ -271,7 +278,7 @@ describe('the session requirement', () => {
 });
 
 describe('GET /api/owner/overview', () => {
-  it('opens with the cookie the real sign-in routes set, and reads the owner from the session alone', async () => {
+  it('opens with the cookie the real sign-in routes set, reads the owner from the session alone, and reads no chain for an owner with no allowance', async () => {
     const signer = Ed25519Keypair.generate();
     const post = (path: string, body: unknown) => new Request(`${APP_ORIGIN}${path}`, { method: 'POST', headers: { origin: APP_ORIGIN, 'content-type': 'application/json' }, body: JSON.stringify(body) });
     const { message } = (await (await nonceRoute.POST(post('/api/auth/nonce', { address: signer.toSuiAddress() }))).json()) as { message: string };
@@ -298,11 +305,22 @@ describe('GET /api/owner/overview', () => {
         publicProof: false,
       },
       onboarding: { memoryAccount: 'missing', delegate: 'missing', allowance: 'missing', purseAddress },
-      purse: { usdcAtomic: '123456' },
+      purse: null,
       counts: { asked: 0, approved: 0, refused: 0, paid: 0 },
       questionsPer20: { asked: 0, window: 0 },
     });
-    expect(getBalances).toHaveBeenCalledWith(purseAddress);
+    expect(getBalances).not.toHaveBeenCalled();
+  });
+
+  it("reads the purse's USDC from chain once the owner has an allowance, and the rest of the answer keeps its shape", async () => {
+    const owner = await withAllowance(await signedInOwner());
+    const purseAddress = canonicalSuiAddress(derivePurseKeypair(MASTER, owner.address).toSuiAddress());
+    const body = (await (await overview(owner.cookie)).json()) as Record<string, unknown>;
+    expect(body.purse).toEqual({ usdcAtomic: '123456' });
+    expect(body.onboarding).toEqual({ memoryAccount: 'missing', delegate: 'missing', allowance: 'present', purseAddress });
+    expect(Object.keys(body)).toEqual(['owner', 'onboarding', 'purse', 'counts', 'questionsPer20']);
+    expect(Object.keys(body.owner as object)).not.toContain('allowanceId');
+    expect(getBalances.mock.calls).toEqual([[purseAddress]]);
   });
 
   it("shows whether /proof lists the owner, off until the owner opts in, and never another owner's setting", async () => {
@@ -318,7 +336,7 @@ describe('GET /api/owner/overview', () => {
   });
 
   it('writes every atomic amount as an exact decimal string, even past 2^53', async () => {
-    const owner = await signedInOwner();
+    const owner = await withAllowance(await signedInOwner());
     await db.update(owners).set({ perPaymentMaxAtomic: 9_223_372_036_854_775_807n, dailyBudgetAtomic: 9_007_199_254_740_993n }).where(eq(owners.id, owner.ownerId));
     getBalances.mockResolvedValue({ usdcAddressBalance: 18_446_744_073_709_551_615n, usdcCoinBalance: 0n, suiTotal: 0n });
     const text = await (await overview(owner.cookie)).text();
@@ -328,7 +346,7 @@ describe('GET /api/owner/overview', () => {
   });
 
   it('gives purse null, not a 500, when the chain cannot be read, logging only a fixed code', async () => {
-    const owner = await signedInOwner();
+    const owner = await withAllowance(await signedInOwner());
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
     for (const failure of [new ChainError('TIMEOUT', 'timed out', true), new Error(MARKER)]) {
       getBalances.mockRejectedValueOnce(failure);

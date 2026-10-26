@@ -6,12 +6,16 @@ import { decisions, owners, payments } from '../../../../server/db/schema.js';
 import { withServerContext } from '../../../../server/http/context.js';
 import { HttpError, respond } from '../../../../server/http/errors.js';
 import { jsonResponse } from '../../../../server/http/json.js';
-import { limitOwnerChainReads } from '../../../../server/http/owner-limits.js';
+import { limitOwnerChainCalls } from '../../../../server/http/owner-limits.js';
 import { requireOwner } from '../../../../server/http/session.js';
 import { onboardingState } from '../../../../server/onboarding/state.js';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
+
+// One ListBalances page on the success path. A purse sent more than LIMITS.balancePageSize coin
+// types reads more pages; scratchpad/tatum-budget.md counts that as the worst case.
+const PURSE_READ_CALLS = 1;
 
 // The balance is shown, never acted on, so a chain that cannot be read blanks it rather than
 // failing the whole page. Only the class and code of the failure are logged.
@@ -56,23 +60,23 @@ async function questionRate(db: Database, ownerId: string): Promise<{ asked: num
 /**
  * The signed-in owner's dashboard: their settings, including publicProof (whether /proof lists
  * their payments and memories, off until they opt in), onboarding progress, the purse's USDC read
- * from chain (purse is null when the chain cannot be read), counts of asked, approved and
- * refused decisions and verified payments over the last LIMITS.overviewCountWindowMs (30 days),
- * and questionsPer20: of the latest LIMITS.overviewQuestionWindow (20) approved or asked
- * decisions, how many were asked, with `window` saying how many there were. The owner comes
- * from the session alone (C13); 401 signed_out without one.
- * Every call reads the purse through Tatum, so it counts toward the owner's
- * LIMITS.ownerChainReadsPerMinute (C22): 429 too_many_requests beyond it.
+ * from chain (purse is null when the owner has no allowance or the chain cannot be read), counts
+ * of asked, approved and refused decisions and verified payments over the last
+ * LIMITS.overviewCountWindowMs (30 days), and questionsPer20: of the latest
+ * LIMITS.overviewQuestionWindow (20) approved or asked decisions, how many were asked, with
+ * `window` saying how many there were. The owner comes from the session alone (C13); 401
+ * signed_out without one.
+ * Only an owner with an allowance has a purse Ellai can fill, so only then is the purse read
+ * through Tatum, and only then does the request count toward limitOwnerChainCalls's budgets at
+ * one call (C22), answering with its 429 or 503 beyond them. An owner without one costs no chain read.
  * Atomic amounts are decimal strings.
  */
 export async function GET(request: Request): Promise<Response> {
   return respond(() =>
     withServerContext(async (ctx) => {
       const { ownerId } = await requireOwner(request, ctx);
-      const limited = await limitOwnerChainReads(ctx, ownerId);
-      if (limited !== null) return limited;
       const now = ctx.now();
-      const [owner] = await ctx.db
+      const [row] = await ctx.db
         .select({
           suiAddress: owners.suiAddress,
           purseAddress: owners.purseAddress,
@@ -83,16 +87,22 @@ export async function GET(request: Request): Promise<Response> {
           approvalsNeeded: owners.approvalsNeeded,
           distanceCutoff: owners.distanceCutoff,
           publicProof: owners.publicProof,
+          allowanceId: owners.allowanceId,
         })
         .from(owners)
         .where(eq(owners.id, ownerId));
       // Owners are never deleted, so a session without one is treated as no session at all.
-      if (owner === undefined) throw new HttpError(401, 'signed_out');
+      if (row === undefined) throw new HttpError(401, 'signed_out');
+      const { allowanceId, ...owner } = row;
+      if (allowanceId !== null) {
+        const limited = await limitOwnerChainCalls(ctx, request, ownerId, PURSE_READ_CALLS);
+        if (limited !== null) return limited;
+      }
 
       const since = new Date(now.getTime() - LIMITS.overviewCountWindowMs);
       const [onboarding, purse, counts, questionsPer20] = await Promise.all([
         onboardingState({ db: ctx.db, ownerId }),
-        purseBalance(ctx.chain, owner.purseAddress),
+        allowanceId === null ? null : purseBalance(ctx.chain, owner.purseAddress),
         recentCounts(ctx.db, ownerId, since),
         questionRate(ctx.db, ownerId),
       ]);

@@ -236,10 +236,34 @@ export const LIMITS = {
   questionTtlMs: 86_400_000,
   /** Gas wallet SUI below which the jobs tick warns: 0.1 SUI in MIST. */
   gasWalletLowMist: 100_000_000,
+  /**
+   * How often the gas wallet's SUI is read, across every jobs tick and server instance: once an
+   * hour, not every tick (C21, C22). It falls only by sponsored refill gas, at most
+   * LIMITS.refillGasBudgetMist a refill, so a reading an hour old is close enough to warn on.
+   */
+  gasWalletCheckIntervalMs: 3_600_000,
   /** Paid-fetch calls one agent may make per minute through the agent API or MCP (C22). */
   agentCallsPerMinute: 30,
   /** Reads one owner may make per minute on owner routes that touch Tatum (C22). */
   ownerChainReadsPerMinute: 30,
+  /**
+   * Tatum calls, not requests, one owner's requests to owner routes may make in a day (C22). Each
+   * request is counted at the calls its success path makes for what it asked (the overview 1,
+   * onboarding 2 to 5 by step), since the minute's cap alone would let one owner spend 43,200.
+   */
+  ownerChainReadsPerDay: 200,
+  /**
+   * Tatum calls, not requests, owner routes may make in a day across every owner together, counted
+   * the same way (C22). Any wallet signs in for free, so per-owner caps alone bound nothing; this is
+   * at most 2,000 of the 100,000 lifetime credits a day.
+   */
+  ownerChainReadsPerDayGlobal: 1_000,
+  /**
+   * Tatum calls owner routes may make in a day for requests from one client, keyed on the address
+   * the platform vouches for, however many free wallets it signs in (C34). Spending
+   * LIMITS.ownerChainReadsPerDayGlobal then takes at least 4 clients.
+   */
+  ownerChainCallsPerClientPerDay: 300,
   /** How long the public proof page's answer is reused before it is read again (C22). */
   publicProofCacheMs: 60_000,
   /** Built-in agent runs one owner may start per hour, so a public demo cannot burn the Claude credit. */
@@ -326,8 +350,28 @@ export const LIMITS = {
    * can ask (C21, C22).
    */
   sellerRecheckIntervalMs: 30_000,
+  /**
+   * Rechecks of waiting sales a day across every sale together (C22). Each costs up to 7 gRPC calls
+   * and anyone holding a waiting sale's bytes may ask once every LIMITS.sellerRecheckIntervalMs, so
+   * this holds all of them to at most 700 calls a day.
+   */
+  sellerRechecksPerDayGlobal: 100,
   /** Unpaid seller challenges issued per minute across every caller (C22). */
   sellerChallengesPerMinuteGlobal: 300,
+  /**
+   * Payments one client may have the seller send through Tatum in a minute (C22). A send is a paid
+   * call that goes out even for bytes an empty wallet signed, so it is counted only once every
+   * offline check has passed, just before the call.
+   */
+  sellerExecutesPerClientPerMinute: 3,
+  /** Payments one client may have the seller send in a day, so one caller cannot spend the shared day alone (C34). */
+  sellerExecutesPerClientPerDay: 20,
+  /**
+   * Payments the seller sends for every caller together in a day (C22). A send is 1 to 2 gRPC calls
+   * when Tatum answers, so strangers can spend at most about 600 of the 100,000 lifetime credits a
+   * day this way, and a sale that settles pays 0.01 USDC for its wallet check's reads.
+   */
+  sellerExecutesPerDayGlobal: 150,
   /** zkLogin sign-in checks against the chain per minute across every caller (C22). */
   zkLoginChecksPerMinute: 30,
   /**

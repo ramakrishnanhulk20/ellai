@@ -7,7 +7,8 @@
 // the owner, chain and master secret to the onboarding functions and their summaries and
 // refusals back unchanged; settings held to their bounds at each edge, the auto pause cleared
 // only on request, the public proof opt-in starting off and switched for the signed-in owner
-// only; and one shared per-owner limit on the routes that read Sui.
+// only; and the limits the routes that read Sui share: per owner a minute and a day, and for
+// every owner a day, with the overview counted only for an owner with an allowance.
 // Does NOT cover: a real chain or wallet (the chain is stubbed and core's Walrus Memory builders
 // are stand-ins; onboarding.test and prove:onboarding cover those), two database connections
 // racing a settings change against signing (PGlite serves one connection, so the FOR UPDATE
@@ -16,7 +17,7 @@ import { randomBytes } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { type Chain, ChainError } from '@ellai/core/chain';
 import { LIMITS } from '@ellai/core/limits';
-import { buildCreateAccountTx, findMemoryAccount, MemoryError } from '@ellai/core/memory';
+import { buildAddDelegateTx, buildCreateAccountTx, findMemoryAccount, MemoryError } from '@ellai/core/memory';
 import { USDC_TYPE_MAINNET } from '@ellai/core/usdc';
 import type { Signer } from '@mysten/sui/cryptography';
 import { GrpcTypes } from '@mysten/sui/grpc';
@@ -43,9 +44,10 @@ import { agents, decisionCitations, decisions, memories, owners, payments } from
 import type { ServerEnv } from '../src/server/env.js';
 import { type ServerContextFactory, setServerContextFactory } from '../src/server/http/context.js';
 import { HttpError, type HttpErrorCode } from '../src/server/http/errors.js';
+import { limitOwnerChainCalls } from '../src/server/http/owner-limits.js';
 import { MEMORY_NAMESPACE } from '../src/server/memory/namespace.js';
-import { buildOnboardingTx } from '../src/server/onboarding/build.js';
-import { confirmOnboardingTx } from '../src/server/onboarding/confirm.js';
+import { BUILD_CHAIN_CALLS, buildOnboardingTx } from '../src/server/onboarding/build.js';
+import { CONFIRM_CHAIN_CALLS, confirmOnboardingTx } from '../src/server/onboarding/confirm.js';
 
 vi.mock('@ellai/core/memory', async (importOriginal) => ({
   ...(await importOriginal<typeof import('@ellai/core/memory')>()),
@@ -153,6 +155,7 @@ beforeEach(() => {
 
 afterEach(() => {
   vi.restoreAllMocks();
+  vi.unstubAllEnvs();
 });
 
 function one<T>(rows: T[]): T {
@@ -177,6 +180,12 @@ async function signedInOwner(): Promise<Owner> {
   const done = await completeSignIn({ db, message, signature: await sign(signer, message), appOrigin: APP_ORIGIN, masterSecretHex: MASTER, sessionSecretHex: SECRET, now: clock });
   const row = one(await db.select({ suiAddress: owners.suiAddress }).from(owners).where(eq(owners.id, done.ownerId)));
   return { ownerId: done.ownerId, address: row.suiAddress, cookie: `__Host-ellai_session=${done.sessionToken}` };
+}
+
+/** Records an allowance for the owner, as onboarding's confirm step does, so the overview has a purse to read. */
+async function withAllowance(owner: Owner): Promise<Owner> {
+  await db.update(owners).set({ allowanceId: address(), allowanceCheckedAt: clock }).where(eq(owners.id, owner.ownerId));
+  return owner;
 }
 
 async function agentFor(ownerId: string, label = 'Travel agent'): Promise<string> {
@@ -936,10 +945,11 @@ describe('error answers', () => {
   });
 });
 
-describe('the per-owner limit on routes that read Sui', () => {
+describe('the limits on routes that read Sui', () => {
   it('turns away the 31st overview, build or confirm call in one minute for one owner with 429, others and the next minute untouched', async () => {
-    const owner = await signedInOwner();
-    const other = await signedInOwner();
+    const owner = await withAllowance(await signedInOwner());
+    const other = await withAllowance(await signedInOwner());
+    const noAllowance = await signedInOwner();
     vi.mocked(buildCreateAccountTx).mockResolvedValue(ACCOUNT_BYTES);
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
     expect(LIMITS.ownerChainReadsPerMinute).toBe(30);
@@ -957,11 +967,117 @@ describe('the per-owner limit on routes that read Sui', () => {
     expect(getTransactionResult).not.toHaveBeenCalled();
     expect(warn.mock.calls.map((call) => call.join(' '))).toEqual(Array(3).fill('[ellai http] owner_chain too_many_requests'));
 
-    // Reads that touch no chain are not counted against it.
+    // Reads that touch no chain are not counted against it, and an overview with no allowance reads none.
     expect((await onboarding(owner.cookie)).status).toBe(200);
     expect((await listDecisions(owner.cookie)).status).toBe(200);
+    for (let i = 0; i <= LIMITS.ownerChainReadsPerMinute; i += 1) expect((await overview(noAllowance.cookie)).status).toBe(200);
+    expect(getBalances.mock.calls.length).toBe(balanceReads);
     expect((await overview(other.cookie)).status).toBe(200);
     clock = new Date(clock.getTime() + 60_000);
     expect((await overview(owner.cookie)).status).toBe(200);
+  });
+
+  it('counts each request at the Tatum calls it makes and turns one owner away past 200 calls in a day with 429, long before 200 requests, the minute limit spending none of the day, others and the next day untouched', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    // A fixed UTC day no other test counts in, so every count starts at nothing.
+    const dayStart = Date.UTC(2031, 1, 1);
+    const minute = (n: number) => new Date(dayStart + HOUR_MS + n * 60_000);
+    clock = minute(0);
+    const owner = await withAllowance(await signedInOwner());
+    const other = await withAllowance(await signedInOwner());
+    vi.mocked(buildCreateAccountTx).mockResolvedValue(ACCOUNT_BYTES);
+    expect([LIMITS.ownerChainReadsPerMinute, LIMITS.ownerChainReadsPerDay, BUILD_CHAIN_CALLS.memory_account]).toEqual([30, 200, 3]);
+    const buildOnce = async () => (await build({ step: 'memory_account' }, { cookie: owner.cookie })).status;
+
+    // 30 builds are 90 calls; the 31st request is the minute's to refuse, and costs the day nothing.
+    for (let i = 0; i < LIMITS.ownerChainReadsPerMinute; i += 1) expect(await buildOnce()).toBe(200);
+    expect(await buildOnce()).toBe(429);
+    clock = minute(1);
+    for (let i = 0; i < LIMITS.ownerChainReadsPerMinute; i += 1) expect(await buildOnce()).toBe(200);
+    clock = minute(2);
+    for (let i = 0; i < 6; i += 1) expect(await buildOnce()).toBe(200);
+    // 66 builds and two overviews: exactly 200 calls, in 68 requests.
+    expect((await overview(owner.cookie)).status).toBe(200);
+    expect((await overview(owner.cookie)).status).toBe(200);
+    // Still inside this minute's 30, so only the day can be what turns these away.
+    const balanceReads = getBalances.mock.calls.length;
+    const builds = vi.mocked(buildOnboardingTx).mock.calls.length;
+    for (const refused of [await overview(owner.cookie), await build({ step: 'memory_account' }, { cookie: owner.cookie }), await confirm({ step: 'memory_account', digest: DIGEST }, { cookie: owner.cookie })]) {
+      expect(refused.status).toBe(429);
+      expect(await refused.json()).toEqual({ error: 'rate_limited_today', message: 'Too many requests today. Try again tomorrow (days are counted in UTC).' });
+    }
+    expect(getBalances.mock.calls.length).toBe(balanceReads);
+    expect(vi.mocked(buildOnboardingTx).mock.calls.length).toBe(builds);
+    expect(getTransactionResult).not.toHaveBeenCalled();
+    const lines = warn.mock.calls.map((call) => call.join(' '));
+    expect(lines).toEqual(['[ellai http] owner_chain too_many_requests', ...Array<string>(3).fill('[ellai http] owner_chain rate_limited_today')]);
+
+    expect((await overview(other.cookie)).status).toBe(200);
+    clock = new Date(dayStart + 86_400_000 + HOUR_MS);
+    expect((await overview(owner.cookie)).status).toBe(200);
+  });
+
+  it("counts a confirm and a delegate build at their own step's calls, 5 and 4 (C22)", async () => {
+    quiet();
+    clock = new Date(Date.UTC(2031, 1, 2, 10));
+    const owner = await withAllowance(await signedInOwner());
+    chainOwner = owner.address;
+    vi.mocked(findMemoryAccount).mockResolvedValue({ accountId: address(), delegates: [] });
+    vi.mocked(buildAddDelegateTx).mockResolvedValue(ACCOUNT_BYTES);
+    expect(BUILD_CHAIN_CALLS).toEqual({ memory_account: 3, add_delegate: 4, allowance: 2 });
+    expect(CONFIRM_CHAIN_CALLS).toEqual({ memory_account: 5, add_delegate: 5, allowance: 3 });
+
+    // 28 confirms are 140 calls; 15 delegate builds a minute later bring the day to exactly 200.
+    for (let i = 0; i < 28; i += 1) expect((await confirm({ step: 'memory_account', digest: DIGEST }, { cookie: owner.cookie })).status).toBe(200);
+    clock = new Date(clock.getTime() + 60_000);
+    for (let i = 0; i < 15; i += 1) expect((await build({ step: 'add_delegate' }, { cookie: owner.cookie })).status).toBe(200);
+    const refused = await build({ step: 'add_delegate' }, { cookie: owner.cookie });
+    expect([refused.status, ((await refused.json()) as { error: string }).error]).toEqual([429, 'rate_limited_today']);
+  });
+
+  const fromClient = (client: string) => new Request(`${APP_ORIGIN}/api/owner/onboarding/confirm`, { headers: { 'x-forwarded-for': client } });
+
+  it('turns one client away past 300 Tatum calls in a day however many owners it signs in, with 429 rate_limited_today, while another client goes on (C34)', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    vi.stubEnv('VERCEL', '1');
+    const at = new Date(Date.UTC(2031, 3, 1, 10));
+    const ctx = { db, chain, env: ENV, now: () => at };
+    expect(LIMITS.ownerChainCallsPerClientPerDay).toBe(300);
+    // Ten fresh owners at 30 calls each, every one inside its own minute and day.
+    for (let n = 0; n < 10; n += 1) {
+      const ownerId = `owner-${hex(8)}`;
+      for (let i = 0; i < 6; i += 1) expect(await limitOwnerChainCalls(ctx, fromClient('203.0.113.40'), ownerId, CONFIRM_CHAIN_CALLS.memory_account)).toBeNull();
+    }
+    const refused = await limitOwnerChainCalls(ctx, fromClient('203.0.113.40'), `owner-${hex(8)}`, 1);
+    expect(refused?.status).toBe(429);
+    expect(await refused?.json()).toEqual({ error: 'rate_limited_today', message: 'Too many requests today. Try again tomorrow (days are counted in UTC).' });
+    expect(await limitOwnerChainCalls(ctx, fromClient('198.51.100.40'), `owner-${hex(8)}`, 1)).toBeNull();
+    expect(warn.mock.calls.map((call) => call.join(' '))).toEqual(['[ellai http] owner_chain client rate_limited_today']);
+    await expect(limitOwnerChainCalls(ctx, fromClient('198.51.100.40'), `owner-${hex(8)}`, 0)).rejects.toThrow('the call count must be a positive integer');
+  });
+
+  it('turns away the call past 1,000 in one day across every owner and client with 503 chain_unavailable_today, which takes at least 4 clients, logging it once and open again the next day (C22, C34)', async () => {
+    const error = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    vi.stubEnv('VERCEL', '1');
+    const at = new Date(Date.UTC(2031, 2, 1, 10));
+    const ctx = { db, chain, env: ENV, now: () => at };
+    expect([LIMITS.ownerChainReadsPerDayGlobal, LIMITS.ownerChainCallsPerClientPerDay]).toEqual([1_000, 300]);
+    // 5 calls a request and 30 requests an owner, inside every owner's minute and day.
+    const spend = async (client: string, calls: number) => {
+      let ownerId = '';
+      for (let i = 0; i < calls / 5; i += 1) {
+        if (i % 30 === 0) ownerId = `owner-${hex(8)}`;
+        expect(await limitOwnerChainCalls(ctx, fromClient(client), ownerId, 5)).toBeNull();
+      }
+    };
+    for (const client of ['203.0.113.1', '203.0.113.2', '203.0.113.3']) await spend(client, LIMITS.ownerChainCallsPerClientPerDay);
+    // Three clients' whole days leave 100 calls, which a fourth spends.
+    await spend('203.0.113.4', 100);
+    const refused = await limitOwnerChainCalls(ctx, fromClient('203.0.113.5'), `owner-${hex(8)}`, 1);
+    expect(refused?.status).toBe(503);
+    expect(await refused?.json()).toEqual({ error: 'chain_unavailable_today', message: "Ellai has used today's budget for reading Sui. Try again tomorrow (days are counted in UTC)." });
+    expect((await limitOwnerChainCalls(ctx, fromClient('203.0.113.6'), `owner-${hex(8)}`, 1))?.status).toBe(503);
+    expect(error.mock.calls.map((call) => call.join(' '))).toEqual(['[ellai http] quota_spent owner-chain-reads:day']);
+    expect(await limitOwnerChainCalls({ ...ctx, now: () => new Date(at.getTime() + 86_400_000) }, fromClient('203.0.113.5'), `owner-${hex(8)}`, 1)).toBeNull();
   });
 });
