@@ -190,8 +190,9 @@ function chainChecksOf(signature: string): number {
 /**
  * The chain checks a signature needs, refused as BAD_SIGNATURE when it does not parse or carries
  * more than LIMITS.zkLoginMembersMax zkLogin members, before anything is counted or sent to Sui.
+ * Shared with the step-up check, so both read a signature the same way.
  */
-function zkLoginChecksOf(signature: unknown): number {
+export function zkLoginChecksOf(signature: unknown): number {
   if (typeof signature !== 'string' || signature === '') refuse('BAD_SIGNATURE');
   let checks: number;
   try {
@@ -291,9 +292,16 @@ function watchedClient(client: ClientWithCoreApi): { client: ClientWithCoreApi; 
   return { client: watched, chainFailed: () => failed };
 }
 
-// `client` is given only for a signature already counted as needing Sui, so a signature counted
-// as offline that the SDK still wanted to send somewhere fails as BAD_SIGNATURE instead.
-async function recoveredAddress(message: string, signature: string, claimed: string, client: ClientWithCoreApi | undefined): Promise<string> {
+/**
+ * The canonical address a Sui personal-message signature over `message` recovers to, for every
+ * scheme the SDK verifies: Ed25519, Secp256k1, Secp256r1 and multisig offline, zkLogin through
+ * `client`. Throws SignInError BAD_SIGNATURE for a signature that does not hold, CHAIN_UNAVAILABLE
+ * when Sui could not be read for a zkLogin proof, and HttpError 503 chain_unavailable_today when
+ * the client's check throws ChainError BUDGET. Shared with the step-up check.
+ * `client` is given only for a signature zkLoginChecksOf counted as needing Sui, so a signature
+ * counted as offline that the SDK still wanted to send somewhere fails as BAD_SIGNATURE instead.
+ */
+export async function recoveredAddress(message: string, signature: string, claimed: string, client: ClientWithCoreApi | undefined): Promise<string> {
   const watched = client === undefined ? undefined : watchedClient(client);
   try {
     // The claimed address is passed so the SDK picks the matching zkLogin address form;

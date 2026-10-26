@@ -27,7 +27,9 @@ export interface AgentSummary {
 }
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-const CONTROL_CHARACTER = /\p{Cc}/u;
+// Format characters (bidi overrides, zero-width joiners) and line or paragraph separators too: a
+// label is shown in the wallet message the owner signs, and these can make it read as other text.
+const CONTROL_CHARACTER = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u;
 
 function bad(message: string): never {
   throw new AgentError('BAD_INPUT', message);
@@ -43,7 +45,8 @@ function checkNow(now: Date): Date {
   return now;
 }
 
-function checkLabel(label: unknown): string {
+/** Trimmed, 1 to TEXT_CAPS.agentLabel code points, no control or format characters. Throws AgentError BAD_INPUT. */
+export function checkLabel(label: unknown): string {
   if (typeof label !== 'string') bad('the label must be text');
   const trimmed = label.trim();
   // Counted in code points, as Postgres counts the column cap.

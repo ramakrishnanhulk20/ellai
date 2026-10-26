@@ -3,7 +3,9 @@
 // that changes state; decision and memory history holding only the owner's own rows, newest
 // first, paged by before and limit without losing or repeating rows that share a millisecond;
 // agent tokens shown once and never again, revoking one stopping it, at most ten made an hour
-// and twenty held at once by one owner; onboarding passing
+// and twenty held at once by one owner, each made and each loosening setting changed with a step-up
+// the owner's wallet signed (step-up.test covers which changes need one and every refusal of it),
+// the step-up route held to the session and the app's origin like the rest; onboarding passing
 // the owner, chain and master secret to the onboarding functions and their summaries and
 // refusals back unchanged, a Tatum budget refusal as chain_unavailable_today; settings held to their bounds at each edge, the auto pause cleared
 // only on request, the public proof opt-in starting off and switched for the signed-in owner
@@ -35,6 +37,7 @@ import * as confirmRoute from '../src/app/api/owner/onboarding/confirm/route.js'
 import * as onboardingRoute from '../src/app/api/owner/onboarding/route.js';
 import * as overviewRoute from '../src/app/api/owner/overview/route.js';
 import * as settingsRoute from '../src/app/api/owner/settings/route.js';
+import * as stepUpRoute from '../src/app/api/owner/step-up/route.js';
 import { authenticateAgent } from '../src/server/auth/agents.js';
 import { endSession } from '../src/server/auth/sessions.js';
 import { completeSignIn, issueSignIn } from '../src/server/auth/signin.js';
@@ -168,6 +171,7 @@ interface Owner {
   ownerId: string;
   address: string;
   cookie: string;
+  signer: Signer;
 }
 
 async function sign(signer: Signer, message: string): Promise<string> {
@@ -179,7 +183,7 @@ async function signedInOwner(): Promise<Owner> {
   const { message } = await issueSignIn({ db, address: signer.toSuiAddress(), appOrigin: APP_ORIGIN, now: clock });
   const done = await completeSignIn({ db, message, signature: await sign(signer, message), appOrigin: APP_ORIGIN, masterSecretHex: MASTER, sessionSecretHex: SECRET, now: clock });
   const row = one(await db.select({ suiAddress: owners.suiAddress }).from(owners).where(eq(owners.id, done.ownerId)));
-  return { ownerId: done.ownerId, address: row.suiAddress, cookie: `__Host-ellai_session=${done.sessionToken}` };
+  return { ownerId: done.ownerId, address: row.suiAddress, cookie: `__Host-ellai_session=${done.sessionToken}`, signer };
 }
 
 /** Records an allowance for the owner, as onboarding's confirm step does, so the overview has a purse to read. */
@@ -273,11 +277,32 @@ const onboarding = (cookie?: string) => onboardingRoute.GET(get('/api/owner/onbo
 const build = (body: unknown, options: SendOptions = {}) => buildRoute.POST(send('POST', '/api/owner/onboarding/build', body, options));
 const confirm = (body: unknown, options: SendOptions = {}) => confirmRoute.POST(send('POST', '/api/owner/onboarding/confirm', body, options));
 const patchSettings = (body: unknown, options: SendOptions = {}) => settingsRoute.PATCH(send('PATCH', '/api/owner/settings', body, options));
+const askStepUp = (body: unknown, options: SendOptions = {}) => stepUpRoute.POST(send('POST', '/api/owner/step-up', body, options));
 const overview = (cookie?: string) => overviewRoute.GET(get('/api/owner/overview', cookie));
 
 async function json<T>(response: Response, status = 200): Promise<T> {
   expect(response.status).toBe(status);
   return (await response.json()) as T;
+}
+
+/** Asks for a step-up for exactly this change and signs its message with the owner's wallet, as the app does. */
+async function stepUpFor(owner: Owner, action: string, change: Record<string, unknown>): Promise<{ nonce: string; signature: string }> {
+  const asked = await askStepUp({ action, change }, { cookie: owner.cookie });
+  expect(asked.status).toBe(200);
+  const { nonce, message } = (await asked.json()) as { nonce: string; message: string };
+  return { nonce, signature: await sign(owner.signer, message) };
+}
+
+const createSigned = async (owner: Owner, label: string) => createAgent({ label, stepUp: await stepUpFor(owner, 'create_agent', { label }) }, { cookie: owner.cookie });
+
+/**
+ * Sends a settings change as the app does: on its own, and when the route answers
+ * step_up_required, again with a step-up the owner's wallet signed for exactly that change.
+ */
+async function changeSettings(owner: Owner, change: Record<string, unknown>): Promise<Response> {
+  const plain = await patchSettings(change, { cookie: owner.cookie });
+  if (plain.status !== 403 || ((await plain.clone().json()) as { error: string }).error !== 'step_up_required') return plain;
+  return patchSettings({ ...change, stepUp: await stepUpFor(owner, 'loosen_settings', change) }, { cookie: owner.cookie });
 }
 
 async function refusedWith(response: Response, status: number, code: string): Promise<void> {
@@ -351,6 +376,7 @@ describe('route files', () => {
     ['onboarding/build', buildRoute],
     ['onboarding/confirm', confirmRoute],
     ['settings', settingsRoute],
+    ['step-up', stepUpRoute],
   ])('%s runs on Node and is never cached or prerendered', (_name, route) => {
     expect(route.runtime).toBe('nodejs');
     expect(route.dynamic).toBe('force-dynamic');
@@ -515,7 +541,7 @@ const agentList = async (cookie: string) => (await json<{ agents: AgentListed[] 
 describe('GET and POST /api/owner/agents', () => {
   it('shows a new token once, never cached, and never again, nor its hash', async () => {
     const owner = await signedInOwner();
-    const created = await createAgent({ label: '  Trip planner  ' }, { cookie: owner.cookie });
+    const created = await createSigned(owner, '  Trip planner  ');
     expect(created.headers.get('cache-control')).toBe('no-store');
     const { agentId, token, displayPrefix } = await json<{ agentId: string; token: string; displayPrefix: string }>(created);
     expect(token).toMatch(/^ellai_agent_[A-Za-z0-9_-]{43}$/);
@@ -537,10 +563,10 @@ describe('GET and POST /api/owner/agents', () => {
   it("lists only this owner's agents, oldest first", async () => {
     const owner = await signedInOwner();
     const other = await signedInOwner();
-    const first = await json<{ agentId: string }>(await createAgent({ label: 'First' }, { cookie: owner.cookie }));
+    const first = await json<{ agentId: string }>(await createSigned(owner, 'First'));
     clock = new Date(clock.getTime() + 1_000);
-    const second = await json<{ agentId: string }>(await createAgent({ label: 'Second' }, { cookie: owner.cookie }));
-    await createAgent({ label: 'Theirs' }, { cookie: other.cookie });
+    const second = await json<{ agentId: string }>(await createSigned(owner, 'Second'));
+    await createSigned(other, 'Theirs');
     expect((await agentList(owner.cookie)).map((a) => [a.agentId, a.label])).toEqual([
       [first.agentId, 'First'],
       [second.agentId, 'Second'],
@@ -563,7 +589,7 @@ describe('GET and POST /api/owner/agents', () => {
     ];
     for (const [sent, status, code] of cases) await refusedWith(await createAgent(sent, { cookie: owner.cookie }), status, code);
     expect(await agentList(owner.cookie)).toEqual([]);
-    const longest = await json<{ agentId: string }>(await createAgent({ label: '\u{1F600}'.repeat(60) }, { cookie: owner.cookie }));
+    const longest = await json<{ agentId: string }>(await createSigned(owner, '\u{1F600}'.repeat(60)));
     expect((await agentList(owner.cookie)).map((a) => a.agentId)).toEqual([longest.agentId]);
   });
 
@@ -574,15 +600,15 @@ describe('GET and POST /api/owner/agents', () => {
     expect(LIMITS.agentCreatesPerHour).toBe(10);
     // The first call is a bad body: it is counted before the body is read.
     await refusedWith(await createAgent({}, { cookie: owner.cookie }), 400, 'bad_body');
-    for (let i = 2; i <= 10; i += 1) expect((await createAgent({ label: `Agent ${i}` }, { cookie: owner.cookie })).status).toBe(200);
-    const refused = await createAgent({ label: 'One more' }, { cookie: owner.cookie });
+    for (let i = 2; i <= 10; i += 1) expect((await createSigned(owner, `Agent ${i}`)).status).toBe(200);
+    const refused = await createSigned(owner, 'One more');
     expect(refused.status).toBe(429);
     expect(await refused.json()).toEqual({ error: 'too_many_agent_creates', message: new HttpError(429, 'too_many_agent_creates').message });
     expect(await agentList(owner.cookie)).toHaveLength(9);
 
-    expect((await createAgent({ label: 'Theirs' }, { cookie: other.cookie })).status).toBe(200);
+    expect((await createSigned(other, 'Theirs')).status).toBe(200);
     clock = new Date(Math.floor(clock.getTime() / HOUR_MS) * HOUR_MS + HOUR_MS);
-    expect((await createAgent({ label: 'Next hour' }, { cookie: owner.cookie })).status).toBe(200);
+    expect((await createSigned(owner, 'Next hour')).status).toBe(200);
   });
 
   it('refuses a 21st live agent with 409 too_many_agents, and takes one again after a revoke', async () => {
@@ -590,18 +616,18 @@ describe('GET and POST /api/owner/agents', () => {
     const owner = await signedInOwner();
     const held = [];
     for (let i = 0; i < LIMITS.agentsPerOwnerMax; i += 1) held.push(await agentFor(owner.ownerId, `Agent ${i + 1}`));
-    const refused = await createAgent({ label: 'Agent 21' }, { cookie: owner.cookie });
+    const refused = await createSigned(owner, 'Agent 21');
     expect(refused.status).toBe(409);
     expect(await refused.json()).toEqual({ error: 'too_many_agents', message: 'an owner may hold at most 20 agents at once; revoke one first' });
     expect(await json(await revoke(held[0] ?? '', { cookie: owner.cookie }))).toEqual({ revoked: true });
-    expect((await createAgent({ label: 'Agent 21' }, { cookie: owner.cookie })).status).toBe(200);
+    expect((await createSigned(owner, 'Agent 21')).status).toBe(200);
   });
 });
 
 describe('DELETE /api/owner/agents/[id]', () => {
   it('stops the token at once, and shows when in the list', async () => {
     const owner = await signedInOwner();
-    const { agentId, token } = await json<{ agentId: string; token: string }>(await createAgent({ label: 'Trip planner' }, { cookie: owner.cookie }));
+    const { agentId, token } = await json<{ agentId: string; token: string }>(await createSigned(owner, 'Trip planner'));
     const revokedAt = clock;
     expect(await json(await revoke(agentId, { cookie: owner.cookie }))).toEqual({ revoked: true });
     expect(await authenticateAgent({ db, token, sessionSecretHex: SECRET })).toBeNull();
@@ -614,7 +640,7 @@ describe('DELETE /api/owner/agents/[id]', () => {
     quiet();
     const mine = await signedInOwner();
     const theirs = await signedInOwner();
-    const { agentId, token } = await json<{ agentId: string; token: string }>(await createAgent({ label: 'Theirs' }, { cookie: theirs.cookie }));
+    const { agentId, token } = await json<{ agentId: string; token: string }>(await createSigned(theirs, 'Theirs'));
     const stolen = await revoke(agentId, { cookie: mine.cookie });
     const missing = await revoke(MISSING_ID, { cookie: mine.cookie });
     expect([stolen.status, missing.status]).toEqual([404, 404]);
@@ -780,18 +806,18 @@ describe('PATCH /api/owner/settings', () => {
   it("changes only what is sent, on this owner's row only, and returns the settings after the change", async () => {
     const owner = await signedInOwner();
     const other = await signedInOwner();
-    const changed = await json<SettingsBody>(await patchSettings({ paused: true, perPaymentMaxAtomic: '200000', dailyBudgetAtomic: '1000000', approvalsNeeded: 3, distanceCutoff: 0.3 }, { cookie: owner.cookie }));
+    const changed = await json<SettingsBody>(await changeSettings(owner, { paused: true, perPaymentMaxAtomic: '200000', dailyBudgetAtomic: '1000000', approvalsNeeded: 3, distanceCutoff: 0.3 }));
     expect(changed).toEqual({ paused: true, autoPausedReason: null, perPaymentMaxAtomic: '200000', dailyBudgetAtomic: '1000000', approvalsNeeded: 3, distanceCutoff: 0.3, publicProof: false });
     expect(await storedSettings(owner.ownerId)).toEqual({ paused: true, autoPausedReason: null, perPaymentMaxAtomic: 200_000n, dailyBudgetAtomic: 1_000_000n, approvalsNeeded: 3, distanceCutoff: 0.3, publicProof: false });
     expect(await json(await patchSettings({ approvalsNeeded: 4 }, { cookie: owner.cookie }))).toEqual({ ...changed, approvalsNeeded: 4 });
-    expect(await json(await patchSettings({ paused: false }, { cookie: owner.cookie }))).toEqual({ ...changed, approvalsNeeded: 4, paused: false });
+    expect(await json(await changeSettings(owner, { paused: false }))).toEqual({ ...changed, approvalsNeeded: 4, paused: false });
     expect(await storedSettings(other.ownerId)).toEqual({ ...DEFAULTS, perPaymentMaxAtomic: 50_000n, dailyBudgetAtomic: 500_000n });
   });
 
   it('holds every bound at its edge, refusing just past it with nothing changed', async () => {
     quiet();
     const owner = await signedInOwner();
-    const ok = async (change: Record<string, unknown>) => expect((await patchSettings(change, { cookie: owner.cookie })).status).toBe(200);
+    const ok = async (change: Record<string, unknown>) => expect((await changeSettings(owner, change)).status).toBe(200);
     const refused = async (change: Record<string, unknown>) => {
       const before = await storedSettings(owner.ownerId);
       await refusedWith(await patchSettings(change, { cookie: owner.cookie }), 400, 'out_of_bounds');
@@ -846,7 +872,7 @@ describe('PATCH /api/owner/settings', () => {
     const owner = await signedInOwner();
     const other = await signedInOwner();
     expect((await storedSettings(owner.ownerId)).publicProof).toBe(false);
-    expect(await json<SettingsBody>(await patchSettings({ publicProof: true }, { cookie: owner.cookie }))).toEqual({ ...DEFAULTS, publicProof: true });
+    expect(await json<SettingsBody>(await changeSettings(owner, { publicProof: true }))).toEqual({ ...DEFAULTS, publicProof: true });
     expect((await storedSettings(owner.ownerId)).publicProof).toBe(true);
     expect((await storedSettings(other.ownerId)).publicProof).toBe(false);
     expect((await json<SettingsBody>(await patchSettings({ paused: true }, { cookie: owner.cookie }))).publicProof).toBe(true);
@@ -858,9 +884,9 @@ describe('PATCH /api/owner/settings', () => {
     const owner = await signedInOwner();
     await db.update(owners).set({ autoPausedReason: 'A payment landed that was not the one approved.' }).where(eq(owners.id, owner.ownerId));
     for (const change of [{ paused: false }, { paused: true }, { paused: false, approvalsNeeded: 3 }]) {
-      expect((await json<SettingsBody>(await patchSettings(change, { cookie: owner.cookie }))).autoPausedReason).toBe('A payment landed that was not the one approved.');
+      expect((await json<SettingsBody>(await changeSettings(owner, change))).autoPausedReason).toBe('A payment landed that was not the one approved.');
     }
-    const cleared = await json<SettingsBody>(await patchSettings({ clearAutoPause: true }, { cookie: owner.cookie }));
+    const cleared = await json<SettingsBody>(await changeSettings(owner, { clearAutoPause: true }));
     expect(cleared).toMatchObject({ autoPausedReason: null, paused: false, approvalsNeeded: 3 });
     expect((await storedSettings(owner.ownerId)).autoPausedReason).toBeNull();
   });
@@ -878,6 +904,7 @@ describe('the session and origin requirements', () => {
     ['onboarding confirm', (cookie) => confirm({ step: 'memory_account', digest: DIGEST }, cookie === undefined ? {} : { cookie })],
     ['settings', (cookie) => patchSettings({ paused: true }, cookie === undefined ? {} : { cookie })],
     ['settings public proof', (cookie) => patchSettings({ publicProof: true }, cookie === undefined ? {} : { cookie })],
+    ['step-up', (cookie) => askStepUp({ action: 'loosen_settings', change: { publicProof: true } }, cookie === undefined ? {} : { cookie })],
   ];
 
   it.each(routes)('%s is 401 signed_out with no cookie, a junk cookie, or a session that has ended', async (_name, run) => {
@@ -900,12 +927,13 @@ describe('the session and origin requirements', () => {
     ['onboarding confirm', (options) => confirm({ step: 'memory_account', digest: DIGEST }, options)],
     ['settings', (options) => patchSettings({ paused: true }, options)],
     ['settings public proof', (options) => patchSettings({ publicProof: true }, options)],
+    ['step-up', (options) => askStepUp({ action: 'create_agent', change: { label: 'From elsewhere' } }, options)],
   ];
 
   it.each(changing)('%s is 403 cross_origin from another site or with no Origin, changing nothing', async (_name, run) => {
     quiet();
     const owner = await signedInOwner();
-    const { agentId, token } = await json<{ agentId: string; token: string }>(await createAgent({ label: 'Mine' }, { cookie: owner.cookie }));
+    const { agentId, token } = await json<{ agentId: string; token: string }>(await createSigned(owner, 'Mine'));
     const before = await storedSettings(owner.ownerId);
     for (const origin of ['https://evil.example', 'https://ellai.example.evil.example', 'null', null]) {
       const response = await run({ cookie: owner.cookie, origin }, agentId);
@@ -921,7 +949,7 @@ describe('the session and origin requirements', () => {
 });
 
 describe('error answers', () => {
-  const ROUTES = ['decisions', 'memories', 'agents', 'agents/[id]', 'onboarding', 'onboarding/build', 'onboarding/confirm', 'settings', 'overview'];
+  const ROUTES = ['decisions', 'memories', 'agents', 'agents/[id]', 'onboarding', 'onboarding/build', 'onboarding/confirm', 'settings', 'step-up', 'overview'];
 
   it('come from the one table in errors.ts: no owner route, nor the helpers they share, writes an error body by hand', async () => {
     const files = [...ROUTES.map((route) => `../src/app/api/owner/${route}/route.ts`), '../src/server/http/owner-limits.ts'];

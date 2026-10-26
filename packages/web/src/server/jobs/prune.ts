@@ -1,7 +1,7 @@
 import { LIMITS } from '@ellai/core/limits';
 import { and, asc, eq, gt, gte, inArray, isNotNull, isNull, lt, lte, notExists, or, sql } from 'drizzle-orm';
 import type { Database } from '../db/client.js';
-import { agents, decisions, memories, owners, refills, sellerSales, sessions, signinNonces } from '../db/schema.js';
+import { agents, decisions, memories, owners, refills, sellerSales, sessions, signinNonces, stepUps } from '../db/schema.js';
 import { pruneRateCounterBatch } from '../http/ratelimit.js';
 
 export interface PruneArgs {
@@ -18,6 +18,7 @@ export interface PruneArgs {
 export interface PruneSummary {
   rateCounters: number;
   signinNonces: number;
+  stepUps: number;
   sellerSales: number;
   sessions: number;
   owners: number;
@@ -36,11 +37,13 @@ const counted = (deleted: number) => ({ deleted, full: deleted >= LIMITS.pruneBa
 /**
  * An owner row that sign-in made and nothing else ever used: created more than
  * LIMITS.emptyOwnerKeepMs before `now`, with no allowance, no Walrus Memory account and no
- * delegate registration on the row itself, no live session, and no agent, decision, memory or
- * refill. Each of those is found through an index that leads with owner_id:
+ * delegate registration on the row itself, no live session, and no agent, decision, memory,
+ * refill or step-up. Each of those is found through an index that leads with owner_id:
  * sessions_owner_expires_at_idx, agents_owner_idx, decisions_owner_created_at_idx,
- * memories_owner_created_at_idx and refills_owner_idx, so the check costs a few index probes
- * per owner however large those tables grow (C34).
+ * memories_owner_created_at_idx, refills_owner_idx and step_ups_owner_idx, so the check costs a
+ * few index probes per owner however large those tables grow (C34). A step-up outlives the
+ * session that asked for it when the owner signs out within LIMITS.stepUpTtlMs, so an owner with
+ * no live session can still hold an unexpired one; it is kept until the step-ups rule deletes it.
  *
  * The other tables that name an owner need no check of their own, because none of their rows can
  * exist for an owner without a decision: a question, a grant, a grant use, a decision citation
@@ -64,6 +67,7 @@ function emptyOwner(tx: Pick<Database, 'select'>, now: Date) {
     notExists(tx.select(one).from(decisions).where(eq(decisions.ownerId, owners.id))),
     notExists(tx.select(one).from(memories).where(eq(memories.ownerId, owners.id))),
     notExists(tx.select(one).from(refills).where(eq(refills.ownerId, owners.id))),
+    notExists(tx.select(one).from(stepUps).where(eq(stepUps.ownerId, owners.id))),
   );
 }
 
@@ -76,6 +80,8 @@ function emptyOwner(tx: Pick<Database, 'select'>, now: Date) {
  *   count still inside its window is kept;
  * - sign-in nonces whose expiry is before `now`, used or not: completeSignIn refuses an
  *   expired nonce, so the row decides nothing any more;
+ * - step-ups whose expiry is before `now`, used or not: claimStepUp refuses an expired one, so the
+ *   row decides nothing any more. They go before empty owners, whose step-ups hold them back;
  * - Ellai's seller sales with no digest and no settled_at whose expiry is before `now`, either
  *   still 'issued' or 'rejected': a sale is claimed by leaving 'issued' while unexpired, so an
  *   issued one was never paid, and a rejected one was refused, or turned away by a cap on sends,
@@ -109,6 +115,7 @@ export async function pruneExpiredRows(args: PruneArgs): Promise<PruneSummary> {
   const waitingBefore = new Date(now.getTime() - LIMITS.sellerWaitingSaleKeepMs);
 
   const expiredNonce = lt(signinNonces.expiresAt, now);
+  const expiredStepUp = lt(stepUps.expiresAt, now);
   const unsentSale = and(
     lt(sellerSales.expiresAt, now),
     inArray(sellerSales.status, ['issued', 'rejected']),
@@ -132,7 +139,7 @@ export async function pruneExpiredRows(args: PruneArgs): Promise<PruneSummary> {
       ).length,
     );
 
-  const summary: PruneSummary = { rateCounters: 0, signinNonces: 0, sellerSales: 0, sessions: 0, owners: 0 };
+  const summary: PruneSummary = { rateCounters: 0, signinNonces: 0, stepUps: 0, sellerSales: 0, sessions: 0, owners: 0 };
 
   // Where this call's walk through owners_created_at_idx has reached, so each batch after the
   // first starts past the owners in use that an earlier one already stepped over. A Date holds
@@ -196,6 +203,18 @@ export async function pruneExpiredRows(args: PruneArgs): Promise<PruneSummary> {
                 ),
               )
               .returning({ nonce: signinNonces.nonce })
+          ).length,
+        ),
+    },
+    {
+      table: 'stepUps',
+      run: async () =>
+        counted(
+          (
+            await db
+              .delete(stepUps)
+              .where(and(expiredStepUp, inArray(stepUps.nonce, db.select({ nonce: stepUps.nonce }).from(stepUps).where(expiredStepUp).orderBy(asc(stepUps.expiresAt)).limit(LIMITS.pruneBatch))))
+              .returning({ nonce: stepUps.nonce })
           ).length,
         ),
     },

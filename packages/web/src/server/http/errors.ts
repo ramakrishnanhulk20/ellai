@@ -42,7 +42,11 @@ export type HttpErrorCode =
   | 'bad_task'
   | 'chain_refused'
   | 'chain_unavailable'
-  | 'chain_unavailable_today';
+  | 'chain_unavailable_today'
+  | 'step_up_required'
+  | 'step_up_rejected'
+  | 'step_up_not_needed'
+  | 'too_many_step_ups';
 
 /** The one code whose refusal may say which bound was passed, in a sentence Ellai wrote. */
 export type BoundsHttpErrorCode = 'out_of_bounds';
@@ -69,6 +73,11 @@ const HTTP_ERROR_MESSAGES: Readonly<Record<HttpErrorCode, string>> = {
   chain_unavailable: 'Ellai could not read Sui just now. Try again in a minute.',
   // A shared quota counted over a whole day is spent: Ellai, not the caller, is over its budget.
   chain_unavailable_today: "Ellai has used today's budget for reading Sui. Try again tomorrow (days are counted in UTC).",
+  step_up_required: 'This change needs a fresh signature from your wallet. Ask for a confirmation message and sign it.',
+  // One text for every reason a step-up fails, so the answer says nothing about which check it failed.
+  step_up_rejected: 'The wallet confirmation was not accepted. Ask for a new confirmation message and sign it.',
+  step_up_not_needed: 'This change does not need a wallet confirmation. Send it on its own.',
+  too_many_step_ups: 'Too many wallet confirmations were asked for this hour. Try again later.',
 };
 
 // RFC 6750 section 3: a 401 from a resource behind a bearer token names the scheme it wants. Each

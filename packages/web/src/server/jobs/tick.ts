@@ -259,7 +259,7 @@ export async function runJobsTick(args: JobsTickArgs): Promise<JobsTickSummary> 
 
   await step('', 'prune', async () => {
     const pruned = await pruneExpiredRows({ db, now: now(), clock: now });
-    summary.rowsPruned += pruned.rateCounters + pruned.signinNonces + pruned.sellerSales + pruned.sessions + pruned.owners;
+    summary.rowsPruned += pruned.rateCounters + pruned.signinNonces + pruned.stepUps + pruned.sellerSales + pruned.sessions + pruned.owners;
   });
 
   if (canStart()) {

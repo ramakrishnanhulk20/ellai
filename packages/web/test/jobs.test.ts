@@ -16,7 +16,8 @@
 // pruneExpiredRows deletes only dead rows, in batches it repeats until each table comes
 // back short or its time slice ends, faster than the sign-in cap lets strangers add them,
 // day-old owners nothing points at included, 3,001 of them inside the time slice behind
-// 200,000 owners in use, and old rate counters first, before the tick does any owner's work.
+// 200,000 owners in use, expired step-ups before them while an owner holding an unexpired one is
+// kept, and old rate counters first, before the tick does any owner's work.
 // confirmBlobsOnChain marks a memory only when its blob id is on one of the owner's own Walrus Blob
 // objects, certified and not past its end epoch by the Walrus epoch (read once an hour), reading
 // in stretches from a stored cursor, kept through a Tatum budget refusal, a rejected key or a
@@ -56,7 +57,7 @@ import { verifyTransactionSignature } from '@mysten/sui/verify';
 import { and, count, eq, isNull, like, sql } from 'drizzle-orm';
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { type Database, createDb, migrate } from '../src/server/db/client.js';
-import { agents, decisions, memories, owners, payments, questions, rateCounters, refills, sellerSales, sessions, signinNonces } from '../src/server/db/schema.js';
+import { agents, decisions, memories, owners, payments, questions, rateCounters, refills, sellerSales, sessions, signinNonces, stepUps } from '../src/server/db/schema.js';
 import { MEMORY_NAMESPACE } from '../src/server/memory/namespace.js';
 import { ownerDelegate } from '../src/server/memory/delegate.js';
 import { recordOutcome } from '../src/server/memory/outcome.js';
@@ -903,10 +904,10 @@ describe('pruneExpiredRows', () => {
     await session(on, w, new Date(NOW.getTime() + DAY), ago(DAY - 1));
     await session(on, w, new Date(NOW.getTime() + DAY));
 
-    expect(await pruneExpiredRows({ db: on, now: NOW })).toEqual({ rateCounters: 0, signinNonces: 2, sellerSales: 4, sessions: 1, owners: 0 });
+    expect(await pruneExpiredRows({ db: on, now: NOW })).toEqual({ rateCounters: 0, signinNonces: 2, stepUps: 0, sellerSales: 4, sessions: 1, owners: 0 });
     expect(await kept(on)).toEqual({ signinNonces: 1, sellerSales: 6, sessions: 4 });
     expect((await on.select({ nonce: signinNonces.nonce }).from(signinNonces)).map((row) => row.nonce)).toEqual([liveNonce]);
-    expect(await pruneExpiredRows({ db: on, now: NOW })).toEqual({ rateCounters: 0, signinNonces: 0, sellerSales: 0, sessions: 0, owners: 0 });
+    expect(await pruneExpiredRows({ db: on, now: NOW })).toEqual({ rateCounters: 0, signinNonces: 0, stepUps: 0, sellerSales: 0, sessions: 0, owners: 0 });
   });
 
   it('clears more expired nonces and empty owners in one call than the global sign-in cap lets strangers create between two ticks', async () => {
@@ -920,7 +921,7 @@ describe('pruneExpiredRows', () => {
       .values(Array.from({ length: created }, (_, i) => ({ nonce: hex(16), createdAt: ago(DAY), expiresAt: ago(1 + i) })));
     // Every verified sign-in can leave an owner row behind once its session has ended.
     await on.insert(owners).values(Array.from({ length: created }, () => ({ suiAddress: randomAddress(), purseAddress: randomAddress(), createdAt: dayOld() })));
-    expect(await pruneExpiredRows({ db: on, now: NOW, clock: () => NOW })).toEqual({ rateCounters: 0, signinNonces: created, sellerSales: 0, sessions: 0, owners: created });
+    expect(await pruneExpiredRows({ db: on, now: NOW, clock: () => NOW })).toEqual({ rateCounters: 0, signinNonces: created, stepUps: 0, sellerSales: 0, sessions: 0, owners: created });
     expect(await kept(on)).toEqual({ signinNonces: 0, sellerSales: 0, sessions: 0 });
     expect(await ownerIds(on)).toEqual([]);
   });
@@ -938,7 +939,7 @@ describe('pruneExpiredRows', () => {
     // Every read of this clock is one whole time slice later than the one before.
     const slow = () => new Date(NOW.getTime() + reads++ * LIMITS.pruneTimeSliceMs);
     await withLimit('pruneBatch', 3, async () => {
-      expect(await pruneExpiredRows({ db: on, now: NOW, clock: slow })).toEqual({ rateCounters: 3, signinNonces: 3, sellerSales: 3, sessions: 3, owners: 0 });
+      expect(await pruneExpiredRows({ db: on, now: NOW, clock: slow })).toEqual({ rateCounters: 3, signinNonces: 3, stepUps: 0, sellerSales: 3, sessions: 3, owners: 0 });
       expect(await kept(on)).toEqual({ signinNonces: 2, sellerSales: 2, sessions: 2 });
       expect(await oldCounters(on)).toBe(2);
       const { chain } = stubChain(on);
@@ -1003,10 +1004,29 @@ describe('pruneExpiredRows', () => {
     await on.insert(refills).values({ ownerId: withRefill.ownerId, allowanceId: randomAddress(), amountAtomic: REFILL, digest: randomDigest(), sentAt: ago(DAY), status: 'verified' });
     kept.push(withAgent, withDecision, withPayment, withMemory, signedIn, withRefill);
 
-    expect(await pruneExpiredRows({ db: on, now: NOW })).toEqual({ rateCounters: 0, signinNonces: 0, sellerSales: 0, sessions: 2, owners: 1 });
+    expect(await pruneExpiredRows({ db: on, now: NOW })).toEqual({ rateCounters: 0, signinNonces: 0, stepUps: 0, sellerSales: 0, sessions: 2, owners: 1 });
     expect(await ownerIds(on)).toEqual(kept.map((w) => w.ownerId).sort());
     expect([await sessionsOf(on, empty), await sessionsOf(on, signedIn)]).toEqual([0, 2]);
     expect(await pruneExpiredRows({ db: on, now: NOW })).toMatchObject({ owners: 0 });
+  });
+
+  it('deletes expired step-ups, used or not, before empty owners, and keeps an empty owner while it holds an unexpired one', async () => {
+    const on = await freshDb();
+    const stepUp = (w: World, expiresAt: Date, usedAt: Date | null = null) =>
+      on.insert(stepUps).values({ nonce: hex(16), ownerId: w.ownerId, action: 'create_agent', changeHash: hex(32), message: 'Confirm', createdAt: ago(DAY), expiresAt, usedAt });
+    await bareOwner(on);
+    const expired = await bareOwner(on);
+    await stepUp(expired, ago(1));
+    await stepUp(expired, ago(1), ago(2));
+    // Signed out within the step-up's five minutes: no live session, but an unexpired step-up.
+    const holding = await bareOwner(on);
+    await stepUp(holding, new Date(NOW.getTime() + 1));
+
+    expect(await pruneExpiredRows({ db: on, now: NOW })).toEqual({ rateCounters: 0, signinNonces: 0, stepUps: 2, sellerSales: 0, sessions: 0, owners: 2 });
+    expect(await ownerIds(on)).toEqual([holding.ownerId]);
+    expect(await pruneExpiredRows({ db: on, now: new Date(NOW.getTime() + 2) })).toMatchObject({ stepUps: 1, owners: 1 });
+    expect(await ownerIds(on)).toEqual([]);
+    expect(await on.select().from(stepUps)).toEqual([]);
   });
 
   it('clears 3,001 empty owners inside LIMITS.pruneTimeSliceMs on the wall clock while 200,000 older owners hold live sessions (C34)', { timeout: 600_000 }, async () => {
