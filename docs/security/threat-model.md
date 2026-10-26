@@ -180,7 +180,7 @@ Each invariant names the risk it closes. Every backend work order carries the in
 - **C5 (A4, G3). One decision, at most one payment.**
   - Polls, retries and idempotent replays return the identical stored material, never a fresh signature.
   - A stored result comes back only when the full canonical request matches. A reused key with any difference is refused.
-  - Payment material expires within a short window that Ellai sets, whatever expiry the challenge asks for.
+  - Ellai hands payment material out only inside a short window it sets, whatever expiry the challenge asks for. Once out, the material stays valid on chain until its ValidDuring epoch window closes, because Sui does not yet accept a timestamp bound on a transaction (dry run, 2026-10-25), so C25 counts it against the budget until then.
 - **C6 (A3). Keys sign only what Ellai built.**
   - The purse key signs only the C1 send and the refill transaction.
   - The MPP proof is a personal message that Ellai serialises from C1 fields and the digest it computed itself.
@@ -215,13 +215,15 @@ Each invariant names the risk it closes. Every backend work order carries the in
 - **C11 (A5, G2). A refusal always wins.**
   - A past owner refusal for the canonical recipient blocks automatic approval regardless of purpose text, distance cutoff, top-K cut-off, index lag, memory expiry, or how many approvals exist.
   - The refusal check is therefore an exact lookup by recipient in Ellai's own store, not a similarity search.
+  - The lookup keys on the owner and the canonical recipient, never on a namespace label.
 - **C12 (A10). No answer means ask.**
   - The outcome is "ask", or "refuse" when a hard limit applies, never "approve", if a search:
     - errors or times out
     - returns a 429 or a 5xx
     - comes back empty
     - returns a hit without a numeric distance
-    - reaches its result limit
+    - reaches its result limit with its farthest hit still inside the owner's cutoff and too few visible approvals
+  - Search serves only approvals: refusals (C11) and bad outcomes (C32) are exact lookups in Ellai's own tables. A result cut by its limit can therefore only hide approvals, so enough visible approvals are enough.
   - An owner answer binds future decisions from the moment Ellai records it, whether or not its memory write has finished.
 
 **Identity and authority**
@@ -229,23 +231,26 @@ Each invariant names the risk it closes. Every backend work order carries the in
   - An agent token resolves to exactly one owner through a constant-time hash lookup.
   - Owner, namespace, purse, budget and rate limits come from that lookup, never from a request field.
   - A decision, its reasons and its material go only to the token that created it.
-  - Revoking a token stops new decisions at once, and stops material being released for that token's pending ones.
+  - Revoking a token stops new decisions at once, and stops any signature for that token's pending ones from then on (C35).
 - **C14 (A9, G4). A sign-in signature works once, for Ellai, for minutes.**
   - Accept it only for a message that names Ellai's domain, a nonce the server issued and has not seen used, and an expiry.
   - The session principal is the address recovered from the signature, using the same address normaliser as everywhere else.
   - Every action that changes state needs a session cookie (HttpOnly, Secure, SameSite) and a same-origin check.
 - **C15 (A8, G4). The owner approves exactly what will be paid.**
   - The question screen shows C1's recipient, amount, asset and network, visibly set apart from agent and seller text.
-  - The owner's answer binds to that decision id and that canonical payment. If the challenge expires or changes, the old yes authorises nothing.
+  - An owner's yes becomes a one-time grant for the agent's retry: the same agent, the same recipient, at most the approved amount, the same seller URL, method and body, within 10 minutes, used once. Anything else, or a grant expired or used, authorises nothing.
   - Pending questions are capped per token (C22).
-- **C16 (A7, A9, G5). The built-in demo agent is just an agent.** It goes through the same endpoint, gate, limits and token check as an external agent holding a demo token, and has no in-process path to a signer.
+- **C16 (A7, A9, G5). The built-in agent is just an agent.** It goes through the same gate, limits and owner checks as an external agent, buys only from Ellai's seller catalog with the catalog's URL and method whatever the model asks, and has no in-process path to a signer. The model never approves a payment.
 
 **Outputs**
 - **C17 (A8, G4). Attacker text stays text.**
-  - Purpose, host, challenge fields, reasons, memory text, seller bodies and chain strings render as plain text in every UI, /proof and the docs. Never as HTML, never auto-linked.
+  - Purpose, host, challenge fields, reasons, memory text, seller bodies, chain strings and the built-in agent's model text (which a seller body can steer) render as plain text in every UI, /proof and the docs. Never as HTML, never auto-linked.
   - Outputs to agents, over HTTP and MCP, carry Ellai-written reasons and memory ids. They never include memory sentences, and any field echoed back is marked as quoted data.
 - **C18 (A8, A13, G5). Public pages show only what Ellai did.**
   - /proof and the live counts list only payments and blobs that are in Ellai's own records and confirmed on chain. Anything else found at an owner, purse or gas address is ignored.
+  - A memory counts as confirmed on chain only once its blob id is found on a certified, unexpired Walrus Blob object owned by the owner, read through Tatum; the relayer's word is not enough.
+  - A page cap can prove presence, never absence: a listing cut short defers the rest to a later read and never stops it.
+  - An owner's payments and memories appear on a public page only if that owner opted in, since each digest leads to their wallet (Ram, 2026-10-25).
   - No memory text appears on a public page.
 - **C19 (A12). Secrets and bearer values stay put.**
   - Keys, agent tokens, cookies, signed transaction bytes and unused proofs never appear in logs, error messages, memory text, namespace names, URLs or public pages.
@@ -260,16 +265,53 @@ Each invariant names the risk it closes. Every backend work order carries the in
   - Send no Ellai credentials, cookies or agent tokens to sellers.
 - **C21 (A10, A11). Every external call is bounded.**
   - Calls to sellers, the relayer and Tatum each have a timeout, a response size cap and a retry ceiling.
+  - A library call that makes requests of its own (the Walrus Memory SDK) gets an outer time limit as well, since its inner steps may have none.
   - Every polling loop (memory jobs, settlement, balances) has an iteration ceiling and ends in an explicit failed state the owner can see.
 - **C22 (A11, G5). Anonymous traffic cannot spend shared quotas.**
   - No public or anonymous request triggers a paid upstream call per request. Public pages read a cache refreshed on a fixed schedule.
+  - Where an anonymous request must reach a paid upstream (Ellai's seller sending a buyer's payment, a zkLogin check), it does so only inside per-client and global daily caps sized to the credit budget, and a capped request never calls upstream.
+  - Any wallet can sign in for free, so owner routes that read the chain have a cap across all owners as well as per owner.
+  - Background work reads the chain only when Ellai's own records say there is something to learn: an idle owner costs nothing.
   - The demo has global caps on live sessions, demo spend per day and memory writes per hour, and they hold however many sessions exist.
   - Pay-requests and pending questions are capped per token and per owner.
   - Rate limits key on the platform's verified client address, never on a header the client sets.
 - **C23 (A3, A11). The float stays small.**
   - The purse balance never exceeds the configured float, even when a balance read is wrong. Refills happen only below a threshold, at most N per window, each of a fixed maximum size.
   - On chain, the float is the true per-payment cap, because a plain send has no cap of its own.
+  - The refill rule trusts the larger of the chain read and Ellai's ledger, which is safe only while every purse outflow is a payments row. Any new way out of the purse (an owner sweep, a withdraw) must be written to the ledger first, or refills stop.
 - **C24 (A2). Stored text is never code.** Every query is parameterised. Every parsed challenge is a fresh object built from known fields, never a merge of the raw JSON.
+
+**Added at the backend review (2026-10-25)**
+- **C25 (A4, A10). The budget counts liability, not age.**
+  - Every unreleased payment still pending counts against the daily budget, however long ago it was signed. A settled payment counts for 24 hours from signing.
+  - One function defines what counts, and decide and signing both read it, so they never disagree about what is left.
+- **C26 (A4). Clocks are read after I/O.** An expiry or window check uses a time read after the last network call it depends on, inside the lock that guards the write it allows.
+- **C27 (A10, A3). No single read is truth.**
+  - A missing entry in a chain answer is unknown, not zero.
+  - A refill is decided on the larger of the chain read and Ellai's own ledger, so a wrong read can only refill less.
+- **C28 (A10, A11). Every owner gets a turn.**
+  - The jobs tick takes owners least recently visited first, stamps each visit when it starts, and starts no external call past a deadline set so the slowest single call, with its retries, still ends inside the route's limit. Every owner with pending work is visited within a bounded number of ticks however many owners there are.
+  - Any count toward a verdict (failed settlement reads, write attempts) lives on the row it judges, so it outlives however long the rotation takes.
+- **C29 (A1, G1). Ellai's own seller never closes a sale on an unknown outcome.**
+  - When it cannot tell whether the buyer's bytes landed, it reads their digest, settles and delivers if the chain shows the payment, and lets the same payment resume.
+  - It rejects only on a definite refusal or a mismatch. Rechecks are limited per sale, and a sale whose window closed without the payment is closed for good.
+- **C30 (A3, A11). The gas wallet signs only after a successful dry run.** A refill is simulated first and sent only when the dry run succeeds and moves exactly the refill, and only when the allowance's current window still has room for it.
+- **C31 (A2). Repeated JSON keys are refused.** A challenge body or header copy that repeats a key at any level is refused, since parsers disagree on which copy wins.
+- **C32 (A5, G2). A bad outcome makes Ellai ask from the moment it happens.**
+  - A payment that landed or may still land and was not delivered (delivered false or unknown), or a mismatch, blocks automatic approval to that recipient.
+  - The block lifts only at an owner's yes to a question asked after that payment's outcome was last recorded, so a yes the owner gave before a seller failed never clears the failure.
+  - The reason shown is the worst one: a mismatch, then a delivery that failed, then a delivery not yet seen.
+- **C33 (A10, A11). Every memory write ends.**
+  - Each write reaches Walrus or a visible failed state within a set number of attempts and a set age, and one refused write never holds back the owner's others.
+  - Only a refusal about the write spends an attempt. A rate limit or an outage only ages it.
+  - No database transaction or row lock stays open across a relayer call. A row being written is leased for longer than the call can take, and a write accepted but never recorded is an orphan blob Ellai never cites (C9).
+- **C34 (A11, G5). Every per-client limit has a global cap.**
+  - Anonymous work (sign-in nonces, zkLogin checks, seller challenges) is capped across all callers as well as per client, and its rows are pruned on a schedule.
+  - Cleanup outpaces the caps: every table anonymous callers can fill loses at least as many rows a day as the caps let in, through an indexed key, within a time slice of its own.
+  - A sign-in nonce is burned before any chain check or shared quota, so a failed attempt cannot be retried on it and one caller cannot spend the shared quota without spending nonces.
+  - Shared caps on paid upstream calls are sized to the credit budget. Exhausting one can lock out everyone using that path until the window ends; that is accepted, logged, and bounded per client.
+  - IPv6 clients are keyed on their /64, since one host can hold the whole prefix.
+- **C35 (A6, G3). Revoke and sign share the owner lock.** Revoking an agent takes the owner row lock that signing takes, so a revoke lands either before a signature, which then refuses, or after it, when that payment is counted and verified like any other.
 
 **1. Primitives over lists**
 - **Addresses and coin types:** one normaliser from the Sui SDK on every side (`normalizeSuiAddress`, `normalizeStructTag`).
@@ -331,6 +373,8 @@ Each invariant names the risk it closes. Every backend work order carries the in
 - keep paying when Walrus or Tatum is down; it asks or refuses instead
 - cap each payment on chain. The on-chain ceiling is the float plus the allowance caps, and fixed windows let up to twice the periodic limit through across a window boundary (Sui allowance FAQ).
 - stop an approved agent spending badly within its limits
+- stop a replay of a landed payment's header: its bytes and signature are public on chain, so anyone can present them to the seller, a property of x402 bearer payments
+- stop a caller that is not a browser with Origin checks; they stop cross-site browser requests only
 - survive a full server compromise beyond what the chain bounds; how much that is depends on the option (below)
 
 ## Option-sensitive risks

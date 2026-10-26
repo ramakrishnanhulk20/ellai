@@ -152,10 +152,10 @@ Every rule is fixed code. No AI model ever decides about money.
 
 1. **Hard limits first.** Paused owner, a payment above the owner's per-payment maximum, or a daily budget already spent: refuse.
 2. **A refusal always wins (C11).** An exact lookup by recipient address in Ellai's own records. If the owner ever refused this recipient, refuse and cite that memory.
-3. **Bad outcomes make Ellai stricter.** If this recipient took a payment and returned nothing since the owner last approved it, ask, and cite the outcome.
-4. **A one-time grant.** When the owner answers yes to a question, that yes allows exactly one payment with the same recipient, at most the same amount, from the same seller request, within ten minutes. Then it is used up.
+3. **Bad outcomes make Ellai stricter.** If this recipient took a payment and returned nothing, or has not yet been seen to deliver, ask and cite the outcome. Only the owner's yes to a question asked after that payment lifts it (C32).
+4. **A one-time grant.** When the owner answers yes to a question, that yes allows exactly one payment from the same agent, to the same recipient, at most the same amount, from the same seller request, within ten minutes. Then it is used up.
 5. **Learned approval.** Recall the closest past decisions from the owner's Walrus Memory, with a distance cutoff. Approve only if at least two of the owner's own approvals are for the same recipient, at or above this amount, and close in meaning to this purpose. Trust follows the money: approvals for one recipient never count for another (C2).
-6. **Otherwise ask.** A search that errors, comes back empty, lacks a numeric distance, or reaches its result limit means ask (C12).
+6. **Otherwise ask.** A search that errors, comes back empty or lacks a numeric distance means ask. A search cut off by its result limit can only hide more approvals, since refusals and bad outcomes are exact lookups, so it approves on enough visible approvals and asks otherwise (C12).
 
 Only memories Ellai wrote from an owner's answer count toward approval. Outcomes never do (C9). Rules read Ellai's structured copy of each memory, keyed by its Walrus blob id, never the sentence text (C10).
 
