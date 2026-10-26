@@ -349,6 +349,8 @@ export const questions = pgTable(
     memoryId: uuid('memory_id'),
   },
   (t) => [
+    // Deleting an owner checks this foreign key, so pruning empty owners needs it indexed.
+    index('questions_owner_idx').on(t.ownerId),
     sameOwner('questions_decision_same_owner_fk', [t.decisionId, t.ownerId], [decisions.id, decisions.ownerId]),
     sameOwner('questions_memory_same_owner_fk', [t.memoryId, t.ownerId], [memories.id, memories.ownerId]),
     // An answer binds future decisions from the moment it is recorded (C12), so an
@@ -376,6 +378,8 @@ export const grants = pgTable(
   },
   (t) => [
     unique('grants_id_owner_id_unique').on(t.id, t.ownerId),
+    // Deleting an owner checks this foreign key, so pruning empty owners needs it indexed.
+    index('grants_owner_idx').on(t.ownerId),
     sameOwner('grants_decision_same_owner_fk', [t.decisionId, t.ownerId], [decisions.id, decisions.ownerId]),
     positive('grants_max_amount_positive', t.maxAmountAtomic),
     oneOf('grants_seller_method_known', t.sellerMethod, SELLER_METHODS),

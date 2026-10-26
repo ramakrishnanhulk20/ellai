@@ -36,6 +36,13 @@
       "when": 1793000963901,
       "tag": "0004_moaning_stryfe",
       "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "7",
+      "when": 1793003726438,
+      "tag": "0005_first_proudstar",
+      "breakpoints": true
     }
   ]
 }

@@ -308,7 +308,7 @@ export const LIMITS = {
   memoryWriteMaxAttempts: 5,
   /** A memory write job still not done after this long is marked failed: six hours. */
   memoryJobMaxAgeMs: 21_600_000,
-  /** Memory blob ids checked against the chain per owner per tick. */
+  /** Memories marked expired per owner per tick once the Walrus epoch passes their Blob's end; the rest wait for the next tick. */
   blobConfirmBatch: 50,
   /**
    * How long after Walrus Memory confirms a memory the tick keeps looking for its blob on chain:
