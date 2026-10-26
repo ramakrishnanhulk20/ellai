@@ -421,9 +421,23 @@ export const LIMITS = {
   /**
    * Requests to Tatum the jobs tick may make for one owner in a day, counted before the shared
    * jobs day, so owners who cost the tick reads without paying cannot starve everyone else's
-   * settlement and refills (C22, C28).
+   * settlement (C22, C28). Refills draw from tatumCallsRefillsPerDay instead.
    */
   tatumCallsJobsPerOwnerPerDay: 200,
+  /**
+   * Requests to Tatum the refill step may make in a day, a pool of its own that the payments step
+   * cannot spend, so owners holding many unsettled payments cannot stop other owners' purses
+   * being refilled (C22, C23, C28).
+   */
+  tatumCallsRefillsPerDay: 500,
+  /**
+   * The least time between two tick reads of one pending payment whose window is still open: an
+   * hour. The paid call read it already, and a payment the seller is holding back costs a read
+   * per tick otherwise (C22).
+   */
+  pendingPaymentReadIntervalMs: 3_600_000,
+  /** How long the refill step waits after a failed dry run before trying again: an hour, since the owner may top up their wallet at any time and failed rows already count toward purseMaxRefillsPerDay. */
+  refillDryRunWaitMs: 3_600_000,
   /**
    * Requests to Tatum callers with no owner (strangers buying a wallet check, sign-in) may cause
    * in a day, counted inside tatumCallsPerDayGlobal, so they can never take the share owners need
