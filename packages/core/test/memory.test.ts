@@ -23,7 +23,7 @@ import { deriveDynamicFieldID, normalizeStructTag, normalizeSuiAddress, toBase64
 import { type MemWal, MemWalMock } from '@mysten-incubation/memwal';
 import { RpcError } from '@protobuf-ts/runtime-rpc';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import type { Chain } from '../src/chain.js';
+import { type Chain, ChainError } from '../src/chain.js';
 import { LIMITS } from '../src/limits.js';
 import {
   buildAddDelegateTx,
@@ -506,6 +506,15 @@ describe('ensureMemoryAccount against a stand-in chain', () => {
     } finally {
       vi.resetModules();
     }
+  });
+
+  it('passes a budget refusal on as the ChainError it is, tried once, so callers can say try tomorrow', async () => {
+    const getObjects = vi.fn(async () => {
+      throw new ChainError('BUDGET', 'the Tatum request budget refused this request');
+    });
+    const chain = { usesApiKey: true, grpc: { getObjects } } as unknown as Chain;
+    await expect(findMemoryAccount(chain, normalizeSuiAddress(`0x${'b2'.repeat(32)}`))).rejects.toMatchObject({ name: 'ChainError', code: 'BUDGET' });
+    expect(getObjects).toHaveBeenCalledTimes(1);
   });
 });
 

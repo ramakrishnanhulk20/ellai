@@ -145,6 +145,9 @@ function rpcErrorIn(error: unknown): { rpcError: object; code: string } | null {
 function tatumFailure(error: unknown, fallback: MemoryErrorCode): MemoryError {
   if (error instanceof MemoryError) return error;
   if (error instanceof ChainError) {
+    // The caller's own Tatum budget refused it and nothing was sent; callers answer that with
+    // "try tomorrow", so it must reach them as it is, never as a Tatum failure.
+    if (error.code === 'BUDGET') throw error;
     if (error.code === 'RATE_LIMITED') return new MemoryError('RATE_LIMITED', 'Tatum rate limited a Walrus Memory account step');
     if (error.code === 'TIMEOUT') return new MemoryError('TIMEOUT', 'Tatum did not answer a Walrus Memory account step in time');
     return new MemoryError('UPSTREAM', `Tatum refused a Walrus Memory account step (${error.code})`);
