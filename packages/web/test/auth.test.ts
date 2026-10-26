@@ -1,9 +1,12 @@
 // Covers: wallet sign-in end to end on PGlite with real Ed25519, Secp256k1, Secp256r1 and
 // multisig keys; the message shape and every refusal of a message, a signature or a nonce, the
-// site and nonce checked before any chain read; a refused signature using up its nonce, so ten
-// tries of one zkLogin message reach the chain once; zkLogin through a stub client, including a
-// chain that cannot be read answering CHAIN_UNAVAILABLE (503); the shared zkLogin quotas per
-// minute and per day refusing before any chain call, one check counted for each zkLogin member;
+// site and nonce checked before any chain read; the nonce used up before anything is counted, so
+// ten tries of one zkLogin message reach the chain once and spend no client's places; every
+// refusal after that claim leaving the nonce used and no session; zkLogin through a stub client,
+// including a chain that cannot be read answering CHAIN_UNAVAILABLE (503); a signature past the
+// zkLogin member cap refused with nothing counted; the per-client zkLogin limits per minute and per
+// day (429) counted before the shared quotas per minute and per day (503), one check for each
+// zkLogin member, with one log line per spent window;
 // the owner row and its derived purse; sessions, their cookie (named __Host-ellai_session
 // whenever it is Secure, and read under that name only) and their end; agent tokens,
 // their display prefixes, the cap on live external agents per owner (never counting the one
@@ -18,7 +21,7 @@
 // Promise.all on that one connection), a row lock blocking a second connection (the revoke test
 // shows the lock statement and that the revoke waits, but on PGlite the wait comes from its one
 // connection), or the routes that will call these functions with their same-origin check and
-// rate limits.
+// rate limits (routes-auth runs the per-client zkLogin limit through the verify route).
 import { createHmac, randomBytes } from 'node:crypto';
 import type { PGlite } from '@electric-sql/pglite';
 import { canonicalSuiAddress, derivePurseKeypair } from '@ellai/core/keys';
@@ -37,13 +40,13 @@ import { drizzle as drizzlePglite } from 'drizzle-orm/pglite';
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import { AgentError, authenticateAgent, createAgentToken, listAgents, revokeAgent } from '../src/server/auth/agents.js';
 import { endSession, readSessionCookie, resolveSession, sessionCookie } from '../src/server/auth/sessions.js';
-import { SignInError, type SignInErrorCode, ZKLOGIN_CHECK_QUOTAS, completeSignIn, issueSignIn } from '../src/server/auth/signin.js';
+import { SignInError, type SignInErrorCode, ZKLOGIN_CHECK_QUOTAS, ZKLOGIN_CLIENT_LIMITS, completeSignIn, issueSignIn } from '../src/server/auth/signin.js';
 import { AGENT_TOKEN_PREFIX, type BearerTokenPrefix, SESSION_TOKEN_PREFIX, hashBearerToken, isBearerToken, newBearerToken } from '../src/server/auth/tokens.js';
 import { type Database, createDb, migrate } from '../src/server/db/client.js';
 import * as schema from '../src/server/db/schema.js';
 import { TEXT_CAPS, agents, owners, sessions, signinNonces } from '../src/server/db/schema.js';
-import { toErrorResponse } from '../src/server/http/errors.js';
-import { consumeShared } from '../src/server/http/ratelimit.js';
+import { HttpError, toErrorResponse } from '../src/server/http/errors.js';
+import { consumeShared, consumeWindow } from '../src/server/http/ratelimit.js';
 
 let handle: Awaited<ReturnType<typeof createDb>>;
 let db: Database;
@@ -60,6 +63,7 @@ afterAll(async () => {
 
 afterEach(() => {
   vi.useRealTimers();
+  vi.restoreAllMocks();
 });
 
 const hex = (bytes: number) => randomBytes(bytes).toString('hex');
@@ -76,8 +80,6 @@ const untouchable = new Proxy({} as Database, {
   },
 });
 
-type CompleteArgs = Parameters<typeof completeSignIn>[0];
-
 function one<T>(rows: T[]): T {
   const [row] = rows;
   if (row === undefined) throw new Error('expected a row');
@@ -92,8 +94,17 @@ function issue(address: string, appOrigin = APP_ORIGIN) {
   return issueSignIn({ db, address, appOrigin, now: NOW });
 }
 
-function complete(message: string, signature: string, overrides: Partial<CompleteArgs> = {}) {
-  return completeSignIn({ db, message, signature, appOrigin: APP_ORIGIN, masterSecretHex: MASTER, sessionSecretHex: SECRET, now: NOW, ...overrides });
+interface CompleteOptions {
+  now?: Date;
+  zkLoginClient?: ClientWithCoreApi;
+  clientKey?: string;
+}
+
+// Each call is a client of its own unless the test names one, so the per-client zkLogin limits
+// turn away only the tests that are about them.
+function complete(message: string, signature: string, options: CompleteOptions = {}) {
+  const base = { db, message, signature, appOrigin: APP_ORIGIN, masterSecretHex: MASTER, sessionSecretHex: SECRET, now: options.now ?? NOW, clientKey: options.clientKey ?? `client-${hex(8)}` };
+  return options.zkLoginClient === undefined ? completeSignIn(base) : completeSignIn({ ...base, zkLoginClient: options.zkLoginClient });
 }
 
 async function signIn(signer: Signer = Ed25519Keypair.generate()) {
@@ -139,6 +150,46 @@ async function zkLoginSignature(message: string): Promise<string> {
     maxEpoch: '10',
     userSignature: await sign(Ed25519Keypair.generate(), message),
   });
+}
+
+/** A multisig carrying `count` copies of one zkLogin member's signature, so it needs `count` chain checks. */
+function zkLoginMembers(count: number): (message: string) => Promise<string> {
+  return async (message) => {
+    const member = fromBase64(await zkLoginSignature(message)).slice(1);
+    const multisig = bcs.MultiSig.serialize(
+      {
+        sigs: Array.from({ length: count }, () => ({ ZkLogin: member })),
+        bitmap: 2 ** count - 1,
+        multisig_pk: { pk_map: [{ pubKey: { ED25519: Ed25519Keypair.generate().getPublicKey().toRawBytes() }, weight: 1 }], threshold: 1 },
+      },
+      { maxSize: 65_536 },
+    ).toBytes();
+    return toBase64(new Uint8Array([SIGNATURE_SCHEME_TO_FLAG.MultiSig, ...multisig]));
+  };
+}
+
+async function zkLoginAttempt(now: Date, signature: (message: string) => Promise<string> = zkLoginSignature) {
+  const issued = await issueSignIn({ db, address: ZKLOGIN_ADDRESS, appOrigin: APP_ORIGIN, now });
+  return { issued, signed: await signature(issued.message) };
+}
+
+const nonceUsedAt = async (nonce: string) => one(await db.select().from(signinNonces).where(eq(signinNonces.nonce, nonce))).usedAt;
+const sessionCount = async () => (await db.select().from(sessions)).length;
+
+async function fillShared(quota: (typeof ZKLOGIN_CHECK_QUOTAS)[number], uses: number, now: Date): Promise<void> {
+  for (let use = 0; use < uses; use += 1) await consumeShared(db, quota.name, quota.limit, quota.windowMs, now);
+}
+
+/** What a sign-in ended in: 'signed in', a SignInError code, or an HttpError's status and code. */
+async function outcomeOf(run: Promise<unknown>): Promise<string> {
+  try {
+    await run;
+    return 'signed in';
+  } catch (error) {
+    if (error instanceof HttpError) return `${error.status} ${error.code}`;
+    if (error instanceof SignInError) return error.code;
+    throw error;
+  }
 }
 
 /** A stand-in chain client whose only call is Sui's zkLogin check, answered by `answer`. */
@@ -436,29 +487,148 @@ describe('completeSignIn', () => {
     error.mockRestore();
   });
 
-  it('uses up the nonce before asking Sui, so ten tries of one fake zkLogin signature, in turn or all at once, reach Sui once each (C14, C22)', async () => {
+  it('uses up the nonce before anything is counted, so ten tries of one fake zkLogin signature, in turn or all at once, reach Sui once and spend no place of their client (C14, C34)', async () => {
     const { client, verifyZkLoginSignature } = zkLoginClient(async () => ({ success: false, errors: ['the proof does not verify'] }));
-    const sessionsBefore = (await db.select().from(sessions)).length;
+    const sessionsBefore = await sessionCount();
+    const clientKey = 'replaying-client';
 
     const inTurn = await issue(ZKLOGIN_ADDRESS);
     const inTurnSignature = await zkLoginSignature(inTurn.message);
     const codes: string[] = [];
     for (let attempt = 0; attempt < 10; attempt += 1) {
-      codes.push(((await refusal(complete(inTurn.message, inTurnSignature, { zkLoginClient: client }))) as SignInError).code);
+      codes.push(await outcomeOf(complete(inTurn.message, inTurnSignature, { zkLoginClient: client, clientKey })));
     }
     expect(codes).toEqual(['BAD_SIGNATURE', ...Array<string>(9).fill('NONCE_USED')]);
     expect(verifyZkLoginSignature).toHaveBeenCalledTimes(1);
 
     const atOnce = await issue(ZKLOGIN_ADDRESS);
     const atOnceSignature = await zkLoginSignature(atOnce.message);
-    const raced = await Promise.allSettled(Array.from({ length: 10 }, () => complete(atOnce.message, atOnceSignature, { zkLoginClient: client })));
-    const racedCodes = raced.map((outcome) => (outcome.status === 'rejected' ? (outcome.reason as SignInError).code : 'SIGNED_IN')).sort();
+    const racedCodes = (await Promise.all(Array.from({ length: 10 }, () => outcomeOf(complete(atOnce.message, atOnceSignature, { zkLoginClient: client, clientKey }))))).sort();
     expect(racedCodes).toEqual(['BAD_SIGNATURE', ...Array<string>(9).fill('NONCE_USED')]);
     expect(verifyZkLoginSignature).toHaveBeenCalledTimes(2);
-    expect(await db.select().from(sessions)).toHaveLength(sessionsBefore);
+    expect(await sessionCount()).toBe(sessionsBefore);
+
+    // Eighteen replays later the client has spent two places, so it has exactly one left this minute.
+    expect(LIMITS.zkLoginChecksPerClientPerMinute).toBe(3);
+    const third = await issue(ZKLOGIN_ADDRESS);
+    expect(await outcomeOf(complete(third.message, await zkLoginSignature(third.message), { zkLoginClient: client, clientKey }))).toBe('BAD_SIGNATURE');
+    const fourth = await issue(ZKLOGIN_ADDRESS);
+    expect(await outcomeOf(complete(fourth.message, await zkLoginSignature(fourth.message), { zkLoginClient: client, clientKey }))).toBe('429 rate_limited');
+    expect(verifyZkLoginSignature).toHaveBeenCalledTimes(3);
   });
 
-  it('refuses zkLogin checks past the shared minute or day quota with CHAIN_UNAVAILABLE before any chain call, leaving the nonce, and counts each zkLogin member of a multisig (C22)', { timeout: 60_000 }, async () => {
+  it('leaves the nonce used and creates no session for every refusal after the claim: too many members, a client limit, a spent quota, a proof Sui rejects and a chain that cannot answer (C14, C34)', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    const [perMinute] = ZKLOGIN_CHECK_QUOTAS;
+    const [clientMinute] = ZKLOGIN_CLIENT_LIMITS;
+    const rejects = zkLoginClient(async () => ({ success: false, errors: ['the proof does not verify'] }));
+    const unreachable = zkLoginClient(async () => {
+      throw new Error('UNAVAILABLE: the gateway did not answer');
+    });
+    const accepts = zkLoginClient(async () => ({ success: true, errors: [] }));
+    // A day of its own, one minute per case, so each case's counters start at zero.
+    const minute = (n: number) => new Date(Date.parse('2026-12-05T00:00:00.000Z') + n * 60_000);
+    const cases: Array<{ expected: string; client: ClientWithCoreApi; prepare?: (now: Date, clientKey: string) => Promise<void>; signature?: (message: string) => Promise<string> }> = [
+      { expected: 'BAD_SIGNATURE', client: accepts.client, signature: zkLoginMembers(LIMITS.zkLoginMembersMax + 1) },
+      {
+        expected: '429 rate_limited',
+        client: accepts.client,
+        prepare: async (now, clientKey) => {
+          for (let use = 0; use < clientMinute.limit; use += 1) await consumeWindow(db, `${clientMinute.name}:${clientKey}`, clientMinute.limit, clientMinute.windowMs, now);
+        },
+      },
+      { expected: 'CHAIN_UNAVAILABLE', client: accepts.client, prepare: (now) => fillShared(perMinute, perMinute.limit, now) },
+      { expected: 'BAD_SIGNATURE', client: rejects.client },
+      { expected: 'CHAIN_UNAVAILABLE', client: unreachable.client },
+    ];
+    const sessionsBefore = await sessionCount();
+    for (const [index, refusalCase] of cases.entries()) {
+      const now = minute(index);
+      const clientKey = `refused-client-${index}`;
+      await refusalCase.prepare?.(now, clientKey);
+      const { issued, signed } = await zkLoginAttempt(now, refusalCase.signature);
+      expect(await outcomeOf(complete(issued.message, signed, { zkLoginClient: refusalCase.client, clientKey, now }))).toBe(refusalCase.expected);
+      expect(await nonceUsedAt(issued.nonce)).toEqual(now);
+      expect(await outcomeOf(complete(issued.message, signed, { zkLoginClient: accepts.client, now }))).toBe('NONCE_USED');
+    }
+    expect(await sessionCount()).toBe(sessionsBefore);
+    expect(accepts.verifyZkLoginSignature).not.toHaveBeenCalled();
+    expect(rejects.verifyZkLoginSignature).toHaveBeenCalledTimes(1);
+    expect(unreachable.verifyZkLoginSignature).toHaveBeenCalledTimes(1);
+  });
+
+  it('refuses a signature with more zkLogin members than LIMITS.zkLoginMembersMax as BAD_SIGNATURE before any chain call, counting nothing for its client or for anyone (C34)', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    const { client, verifyZkLoginSignature } = zkLoginClient(async () => ({ success: true, errors: [] }));
+    const [perMinute] = ZKLOGIN_CHECK_QUOTAS;
+    const perClient = LIMITS.zkLoginChecksPerClientPerMinute;
+    const now = new Date('2026-12-03T09:00:00.000Z');
+    // Exactly the places one client may take are left in the shared minute.
+    await fillShared(perMinute, perMinute.limit - perClient, now);
+
+    const over = await zkLoginAttempt(now, zkLoginMembers(LIMITS.zkLoginMembersMax + 1));
+    expect(await outcomeOf(complete(over.issued.message, over.signed, { zkLoginClient: client, clientKey: 'member-client', now }))).toBe('BAD_SIGNATURE');
+    expect(verifyZkLoginSignature).not.toHaveBeenCalled();
+
+    // The same client still has all its places, and they are all that is left for anyone.
+    for (let i = 0; i < perClient; i += 1) {
+      const { issued, signed } = await zkLoginAttempt(now);
+      expect(await outcomeOf(complete(issued.message, signed, { zkLoginClient: client, clientKey: 'member-client', now }))).toBe('signed in');
+    }
+    const after = await zkLoginAttempt(now);
+    expect(await outcomeOf(complete(after.issued.message, after.signed, { zkLoginClient: client, clientKey: 'another-client', now }))).toBe('CHAIN_UNAVAILABLE');
+    expect(verifyZkLoginSignature).toHaveBeenCalledTimes(perClient);
+  });
+
+  it('counts one client against its own limit before the shared quota, so three requests from one client with fresh nonces take at most three places of the minute, and the rest are 429 rate_limited (C34)', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    expect(ZKLOGIN_CLIENT_LIMITS.map((limit) => limit.limit)).toEqual([LIMITS.zkLoginChecksPerClientPerMinute, LIMITS.zkLoginChecksPerClientPerDay]);
+    const { client, verifyZkLoginSignature } = zkLoginClient(async () => ({ success: true, errors: [] }));
+    const [perMinute] = ZKLOGIN_CHECK_QUOTAS;
+    const perClient = LIMITS.zkLoginChecksPerClientPerMinute;
+    const now = new Date('2026-12-02T09:00:00.000Z');
+    // One place more than this client may take is left in the shared minute.
+    await fillShared(perMinute, perMinute.limit - perClient - 1, now);
+
+    const outcomes: string[] = [];
+    for (let i = 0; i < perClient + 2; i += 1) {
+      const { issued, signed } = await zkLoginAttempt(now);
+      outcomes.push(await outcomeOf(complete(issued.message, signed, { zkLoginClient: client, clientKey: 'one-client', now })));
+    }
+    expect(outcomes).toEqual([...Array<string>(perClient).fill('signed in'), '429 rate_limited', '429 rate_limited']);
+    expect(verifyZkLoginSignature).toHaveBeenCalledTimes(perClient);
+
+    // The one place left proves the refused requests took none of it.
+    const other = await zkLoginAttempt(now);
+    expect(await outcomeOf(complete(other.issued.message, other.signed, { zkLoginClient: client, clientKey: 'another-client', now }))).toBe('signed in');
+    const last = await zkLoginAttempt(now);
+    expect(await outcomeOf(complete(last.issued.message, last.signed, { zkLoginClient: client, clientKey: 'a-third-client', now }))).toBe('CHAIN_UNAVAILABLE');
+    expect(verifyZkLoginSignature).toHaveBeenCalledTimes(perClient + 1);
+  });
+
+  it('holds one client to LIMITS.zkLoginChecksPerClientPerDay checks a day, whatever minute they come in, while another client still signs in (C34)', { timeout: 60_000 }, async () => {
+    const { client, verifyZkLoginSignature } = zkLoginClient(async () => ({ success: true, errors: [] }));
+    const day = Date.parse('2026-12-04T00:00:00.000Z');
+    const perMinute = LIMITS.zkLoginChecksPerClientPerMinute;
+    const perDay = LIMITS.zkLoginChecksPerClientPerDay;
+    const signInAs = async (clientKey: string, now: Date) => {
+      const { issued, signed } = await zkLoginAttempt(now);
+      return outcomeOf(complete(issued.message, signed, { zkLoginClient: client, clientKey, now }));
+    };
+
+    const outcomes: string[] = [];
+    for (let i = 0; i <= perDay; i += 1) outcomes.push(await signInAs('daily-client', new Date(day + Math.floor(i / perMinute) * 60_000)));
+    expect(outcomes).toEqual([...Array<string>(perDay).fill('signed in'), '429 rate_limited']);
+
+    const freshMinute = new Date(day + (Math.floor(perDay / perMinute) + 1) * 60_000);
+    expect(await signInAs('daily-client', freshMinute)).toBe('429 rate_limited');
+    expect(await signInAs('another-client', freshMinute)).toBe('signed in');
+    expect(verifyZkLoginSignature).toHaveBeenCalledTimes(perDay + 1);
+  });
+
+  it('refuses zkLogin checks past the shared minute or day quota with CHAIN_UNAVAILABLE before any chain call, the nonce used up, counts each zkLogin member of a multisig, and logs a spent window once (C22, C34)', { timeout: 60_000 }, async () => {
+    const error = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    const signinLines = () => error.mock.calls.map((call) => call.map(String).join(' ')).filter((line) => line.startsWith('[ellai signin]'));
     const [perMinute, perDay] = ZKLOGIN_CHECK_QUOTAS;
     expect([perMinute.limit, perDay.limit]).toEqual([LIMITS.zkLoginChecksPerMinute, LIMITS.zkLoginChecksPerDay]);
     const { client, verifyZkLoginSignature } = zkLoginClient(async () => ({ success: true, errors: [] }));
@@ -466,46 +636,35 @@ describe('completeSignIn', () => {
     const day = Date.parse('2026-12-01T00:00:00.000Z');
     const at = (ms: number) => new Date(day + ms);
     const attempt = async (now: Date, signature?: (message: string) => Promise<string>) => {
-      const issued = await issueSignIn({ db, address: ZKLOGIN_ADDRESS, appOrigin: APP_ORIGIN, now });
-      const signed = await (signature ?? zkLoginSignature)(issued.message);
-      return { issued, signed, run: (when: Date) => complete(issued.message, signed, { zkLoginClient: client, now: when }) };
-    };
-    const fill = async (quota: (typeof ZKLOGIN_CHECK_QUOTAS)[number], uses: number, now: Date) => {
-      for (let use = 0; use < uses; use += 1) await consumeShared(db, quota.name, quota.limit, quota.windowMs, now);
+      const { issued, signed } = await zkLoginAttempt(now, signature);
+      return { issued, run: (when: Date) => complete(issued.message, signed, { zkLoginClient: client, now: when }) };
     };
 
-    await fill(perMinute, perMinute.limit, at(1_000));
+    await fillShared(perMinute, perMinute.limit, at(1_000));
     const overMinute = await attempt(at(2_000));
     const unavailable = await refused(overMinute.run(at(2_000)), 'CHAIN_UNAVAILABLE');
     expect(toErrorResponse(unavailable).status).toBe(503);
+    await refused((await attempt(at(3_000))).run(at(3_000)), 'CHAIN_UNAVAILABLE');
     expect(verifyZkLoginSignature).not.toHaveBeenCalled();
-    expect(one(await db.select().from(signinNonces).where(eq(signinNonces.nonce, overMinute.issued.nonce))).usedAt).toBeNull();
-    await expect(overMinute.run(at(60_000))).resolves.toMatchObject({ ownerId: expect.any(String) });
+    expect(await nonceUsedAt(overMinute.issued.nonce)).toEqual(at(2_000));
+    expect(signinLines()).toEqual(['[ellai signin] quota_spent zklogin-checks:minute']);
+
+    // Its nonce is spent, so the next minute only a fresh sign-in gets through.
+    await refused(overMinute.run(at(60_000)), 'NONCE_USED');
+    await expect((await attempt(at(60_000))).run(at(60_000))).resolves.toMatchObject({ ownerId: expect.any(String) });
     expect(verifyZkLoginSignature).toHaveBeenCalledTimes(1);
 
     // Two zkLogin members are two checks, so one place left in the minute is not enough.
-    const zkLoginPair = async (message: string) => {
-      const member = fromBase64(await zkLoginSignature(message)).slice(1);
-      const pair = bcs.MultiSig.serialize(
-        {
-          sigs: [{ ZkLogin: member }, { ZkLogin: member }],
-          bitmap: 3,
-          multisig_pk: { pk_map: [{ pubKey: { ED25519: Ed25519Keypair.generate().getPublicKey().toRawBytes() }, weight: 1 }], threshold: 1 },
-        },
-        { maxSize: 65_536 },
-      ).toBytes();
-      return toBase64(new Uint8Array([SIGNATURE_SCHEME_TO_FLAG.MultiSig, ...pair]));
-    };
-    await fill(perMinute, perMinute.limit - 1, at(120_000));
-    const pair = await attempt(at(120_000), zkLoginPair);
-    await refused(pair.run(at(120_000)), 'CHAIN_UNAVAILABLE');
+    await fillShared(perMinute, perMinute.limit - 1, at(120_000));
+    await refused((await attempt(at(120_000), zkLoginMembers(2))).run(at(120_000)), 'CHAIN_UNAVAILABLE');
     expect(verifyZkLoginSignature).toHaveBeenCalledTimes(1);
 
-    await fill(perDay, perDay.limit, at(180_000));
+    await fillShared(perDay, perDay.limit, at(180_000));
     const overDay = await attempt(at(240_000));
     await refused(overDay.run(at(240_000)), 'CHAIN_UNAVAILABLE');
     expect(verifyZkLoginSignature).toHaveBeenCalledTimes(1);
-    expect(one(await db.select().from(signinNonces).where(eq(signinNonces.nonce, overDay.issued.nonce))).usedAt).toBeNull();
+    expect(await nonceUsedAt(overDay.issued.nonce)).toEqual(at(240_000));
+    for (const line of signinLines()) expect(line).toMatch(/^\[ellai signin\] quota_spent zklogin-checks:(minute|day)$/);
   });
 });
 

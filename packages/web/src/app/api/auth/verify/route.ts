@@ -2,6 +2,7 @@ import { LIMITS } from '@ellai/core/limits';
 import { z } from 'zod';
 import { sessionCookie } from '../../../../server/auth/sessions.js';
 import { completeSignIn } from '../../../../server/auth/signin.js';
+import { clientKey } from '../../../../server/http/client.js';
 import { withServerContext } from '../../../../server/http/context.js';
 import { respond } from '../../../../server/http/errors.js';
 import { jsonResponse, readJson } from '../../../../server/http/json.js';
@@ -23,13 +24,16 @@ const body = z.strictObject({ message: z.string().max(LIMITS.signinMessageMaxCha
  * Same origin only, and rate-limited like the nonce step.
  * A zkLogin proof can only be checked by Sui itself, so a zkLogin signature, alone or as
  * multisig members, is checked through the context chain's gRPC client: one Tatum read for each
- * zkLogin member that signed, within that client's timeout (C21). Those reads are counted first
- * against LIMITS.zkLoginChecksPerMinute and LIMITS.zkLoginChecksPerDay, shared by every caller,
- * and past either nothing is read (C22). The nonce is used up before the read, so a refused
- * signature cannot be tried again on it. Every other kind is checked offline and reads nothing.
- * 403 cross_origin, 429 rate_limited, 400 for a bad body or message, 401 for a signature or
- * nonce that does not hold up, 503 chain_unavailable when a zkLogin proof cannot be checked
- * against the chain right now or the shared zkLogin quota is spent.
+ * zkLogin member that signed, within that client's timeout (C21). The nonce is used up first, so
+ * a replay or a refused signature can never be tried again on it. A signature with more than
+ * LIMITS.zkLoginMembersMax zkLogin members is refused before anything is counted. The reads are
+ * then counted against this client, keyed on the platform's verified address, up to
+ * LIMITS.zkLoginChecksPerClientPerMinute and LIMITS.zkLoginChecksPerClientPerDay, and only then
+ * against LIMITS.zkLoginChecksPerMinute and LIMITS.zkLoginChecksPerDay, shared by every caller;
+ * past any of them nothing is read (C22, C34). Every other kind is checked offline and reads nothing.
+ * 403 cross_origin, 429 rate_limited (this client's sign-in or zkLogin limit), 400 for a bad body
+ * or message, 401 for a signature or nonce that does not hold up, 503 chain_unavailable when a
+ * zkLogin proof cannot be checked against the chain right now or the shared zkLogin quota is spent.
  */
 export async function POST(request: Request): Promise<Response> {
   return respond(() =>
@@ -47,6 +51,7 @@ export async function POST(request: Request): Promise<Response> {
         sessionSecretHex: ctx.env.SESSION_SECRET,
         now,
         zkLoginClient: ctx.chain.grpc,
+        clientKey: clientKey(request),
       });
       const cookie = sessionCookie(signedIn.sessionToken, signedIn.expiresAt, cookieIsSecure(ctx.env.APP_ORIGIN));
       return jsonResponse({ ownerId: signedIn.ownerId }, { headers: { 'set-cookie': cookie } });

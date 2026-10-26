@@ -1,7 +1,8 @@
 // Covers: the sign-in routes called as Next would call them, with Request objects, on PGlite:
 // nonce, verify and logout end to end with a real Ed25519 key; a zkLogin sign-in whose proof
 // verify sends, once, to the chain client it was given (a 503 when that chain cannot answer,
-// with the nonce spent either way), and nothing read for any other key;
+// with the nonce spent either way), its per-client limit keyed on the platform's client address
+// (429 with the nonce spent), and nothing read for any other key;
 // the session cookie, its flags and its name (__Host-ellai_session on https, read and cleared
 // under that name only, the plain name on http localhost); the same-origin check on all three;
 // the per-client and
@@ -15,6 +16,7 @@
 import { randomBytes } from 'node:crypto';
 import type { Chain } from '@ellai/core/chain';
 import { canonicalSuiAddress } from '@ellai/core/keys';
+import { LIMITS } from '@ellai/core/limits';
 import type { Signer } from '@mysten/sui/cryptography';
 import { Ed25519Keypair } from '@mysten/sui/keypairs/ed25519';
 import { toBase64 } from '@mysten/sui/utils';
@@ -303,6 +305,30 @@ describe('zkLogin sign-in', () => {
     const fresh = await zkLoginSigned();
     expect((await verify(fresh)).status).toBe(200);
     expect(verifyZkLoginSignature).toHaveBeenCalledTimes(2);
+  });
+
+  it("holds one client to LIMITS.zkLoginChecksPerClientPerMinute zkLogin checks a minute, keyed on Vercel's address: 429 rate_limited with its nonce spent, while another client still signs in (C34)", async () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    vi.stubEnv('VERCEL', '1');
+    verifyZkLoginSignature.mockResolvedValue({ success: true, errors: [] });
+    const busy = { forwardedFor: '203.0.113.7' };
+    const other = { forwardedFor: '198.51.100.7' };
+    const statuses = [];
+    for (let i = 0; i < LIMITS.zkLoginChecksPerClientPerMinute; i += 1) statuses.push((await verify(await zkLoginSigned(), busy)).status);
+    expect(statuses).toEqual(Array<number>(LIMITS.zkLoginChecksPerClientPerMinute).fill(200));
+
+    const limited = await zkLoginSigned();
+    const response = await verify(limited, busy);
+    expect(response.status).toBe(429);
+    expect(await response.json()).toEqual({ error: 'rate_limited', message: 'Too many requests. Try again in a minute.' });
+    expect(response.headers.get('set-cookie')).toBeNull();
+    expect(verifyZkLoginSignature).toHaveBeenCalledTimes(LIMITS.zkLoginChecksPerClientPerMinute);
+
+    const replay = await verify(limited, other);
+    expect(replay.status).toBe(401);
+    expect(await replay.json()).toMatchObject({ error: 'nonce_used' });
+    expect((await verify(await zkLoginSigned(), other)).status).toBe(200);
+    expect(verifyZkLoginSignature).toHaveBeenCalledTimes(LIMITS.zkLoginChecksPerClientPerMinute + 1);
   });
 });
 

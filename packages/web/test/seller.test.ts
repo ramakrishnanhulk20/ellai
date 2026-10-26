@@ -521,16 +521,16 @@ describe('settleWalletCheckPayment', () => {
     const payment = asBuyer(await call(chain));
     const { signed, header } = await pay(payment);
     expect(payment.maxEpoch).toBe(EPOCH + 1n);
-    // Each step is past the epoch cache, so every recheck sees the epoch set before it.
-    const minutes = (n: number) => new Date(NOW.getTime() + n * 60_000);
+    // Each step is one full epoch cache after the last, so every recheck reads the epoch set before it.
+    const step = (n: number) => new Date(NOW.getTime() + n * LIMITS.epochCacheMs);
     const recheck = (now: Date) => settle(chain, header, { now });
     const waiting = { ok: false, status: 402, reason: SETTLE_REASONS.unconfirmed };
     const tries = LIMITS.chainReadAfterWriteTries;
 
-    expect(await recheck(minutes(0))).toEqual(waiting);
+    expect(await recheck(step(0))).toEqual(waiting);
     // At the window's last epoch the bytes can still land, so the sale waits.
     state.epoch = EPOCH + 1n;
-    expect(await recheck(minutes(2))).toEqual(waiting);
+    expect(await recheck(step(1))).toEqual(waiting);
     expect(calls.reads).toHaveLength(2 * tries);
 
     // Past the window, a final read the chain cannot answer leaves it waiting too.
@@ -538,16 +538,16 @@ describe('settleWalletCheckPayment', () => {
     state.read = () => {
       throw new ChainError('UPSTREAM', 'Tatum getTransactionResult: gateway error', true);
     };
-    expect(await recheck(minutes(4))).toEqual(waiting);
+    expect(await recheck(step(2))).toEqual(waiting);
     expect(calls.reads).toHaveLength(3 * tries + 1);
     expect(await saleOf(payment.challengeId ?? '')).toMatchObject({ status: 'rejected', digest: signed.digest, settledAt: null });
 
     state.read = () => null;
-    expect(await recheck(minutes(6))).toEqual({ ok: false, status: 402, reason: SETTLE_REASONS.lapsed });
+    expect(await recheck(step(3))).toEqual({ ok: false, status: 402, reason: SETTLE_REASONS.lapsed });
     expect(calls.reads).toHaveLength(4 * tries + 2);
-    expect(await saleOf(payment.challengeId ?? '')).toMatchObject({ status: 'rejected', digest: signed.digest, settledAt: minutes(6) });
+    expect(await saleOf(payment.challengeId ?? '')).toMatchObject({ status: 'rejected', digest: signed.digest, settledAt: step(3) });
 
-    expect(await recheck(minutes(8))).toEqual({ ok: false, status: 409, reason: SETTLE_REASONS.used });
+    expect(await recheck(step(4))).toEqual({ ok: false, status: 409, reason: SETTLE_REASONS.used });
     expect(calls.reads).toHaveLength(4 * tries + 2);
     expect(calls.executions).toEqual([signed.digest]);
   });
@@ -668,7 +668,7 @@ describe('handleWalletCheck', () => {
     expect((await call(chain, { callerKey, now: new Date(NOW.getTime() + 60_000) })).status).toBe(402);
   });
 
-  it('serves 100 callers in a minute from one epoch read, and holds every caller together to LIMITS.sellerChallengesPerMinuteGlobal (C22)', async () => {
+  it('serves 100 callers in a minute from one epoch read, holds every caller together to LIMITS.sellerChallengesPerMinuteGlobal, and reads the epoch again only once LIMITS.epochCacheMs has passed (C22)', async () => {
     const { chain, calls } = stubChain();
     // Two hours after NOW, a minute no other test counts in.
     const minute = NOW.getTime() + 7_200_000;
@@ -688,8 +688,13 @@ describe('handleWalletCheck', () => {
     expect(calls.epochs).toBe(1);
     expect(await saleCount()).toBe(before + LIMITS.sellerChallengesPerMinuteGlobal);
 
-    // The next minute is a new shared window, and by then the cached epoch is a minute old.
+    // The next minute is a new shared window, still served from the one reading.
     expect((await call(chain, { callerKey: 'caller-never-seen', now: at(60_000) })).status).toBe(402);
+    expect(calls.epochs).toBe(1);
+    expect((await call(chain, { callerKey: 'caller-before-the-cache-ends', now: at(LIMITS.epochCacheMs - 1) })).status).toBe(402);
+    expect(calls.epochs).toBe(1);
+    // A reading LIMITS.epochCacheMs old is read again, once.
+    expect((await call(chain, { callerKey: 'caller-after-the-cache', now: at(LIMITS.epochCacheMs) })).status).toBe(402);
     expect(calls.epochs).toBe(2);
   });
 

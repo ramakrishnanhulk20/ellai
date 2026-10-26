@@ -106,11 +106,12 @@ async function readEpoch(chain: Chain, cache: EpochCache, startedAtMs: number): 
 
 /**
  * The epoch a new challenge starts at, read through Tatum at most once per
- * LIMITS.epochCacheMs for each chain, with callers that arrive during a read sharing it (C22).
- * A reading is reused only while `nowMs` is no earlier than the read and less than
+ * LIMITS.epochCacheMs (an hour) for each chain, with callers that arrive during a read sharing
+ * it (C22). A reading is reused only while `nowMs` is no earlier than the read and less than
  * LIMITS.epochCacheMs after it. The window [epoch, epoch + 1] stays open through the whole of
- * the next epoch, and a Sui Mainnet epoch lasts about a day, so a reading that young always
- * names the epoch the chain is in or the one just before, and the window is open when issued.
+ * the next epoch, and a Sui Mainnet epoch lasts about a day, so a reading an hour old or younger
+ * names the epoch the chain is in or the one just before, and the window is open when issued,
+ * with most of a day left in it. That holds only while the cache stays well under one epoch.
  * Throws ChainError when the read fails and SellerError when it answers an epoch that does
  * not fit or that is lower than one already read; an expired reading is never fallen back on.
  */
@@ -130,8 +131,9 @@ async function challengeEpoch(chain: Chain, nowMs: number): Promise<bigint> {
 /**
  * The chain's current epoch from the same cache challengeEpoch keeps, so a seller rechecking a
  * sale spends no more epoch reads than issuing does (C22). A reading is never later than the
- * real epoch, since epochs only go up, so a window it shows as closed has closed. Throws as
- * challengeEpoch does.
+ * real epoch, since epochs only go up, so a window it shows as closed has closed. It can lag
+ * the chain by up to LIMITS.epochCacheMs, which only delays closing a lapsed sale, never
+ * closes one early. Throws as challengeEpoch does.
  */
 export function cachedEpoch(chain: Chain, nowMs: number): Promise<bigint> {
   return challengeEpoch(chain, nowMs);

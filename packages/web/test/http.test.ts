@@ -1,6 +1,7 @@
 // Covers: the HTTP plumbing under every route: error responses and their log lines, the one
 // table of HTTP error codes, the same-origin check, the client key, the rate counter over a
-// minute or a longer window, the shared quota every caller counts against, pruning old
+// minute or a longer window, the shared quota every caller counts against and the one use that
+// first passes it in a window, pruning old
 // counters while keeping every window still read, the
 // capped body and JSON readers and the
 // seller route reading with the capped one, bigint-safe responses, the session requirement with
@@ -357,11 +358,13 @@ describe('consumeWindow', () => {
 describe('consumeShared', () => {
   const minute = new Date('2026-10-25T09:40:00.000Z');
 
-  it('counts one quota for every caller, apart from any per-client key of the same text, with the seconds left in its window', async () => {
+  it('counts one quota for every caller, apart from any per-client key of the same text, with the seconds left in its window and its first refusal marked once', async () => {
     const name = `test-shared-${hex(4)}`;
-    expect(await consumeShared(db, name, 2, 60_000, minute)).toEqual({ allowed: true, retryAfterSeconds: 60 });
-    expect(await consumeShared(db, name, 2, 60_000, new Date(minute.getTime() + 15_500))).toEqual({ allowed: true, retryAfterSeconds: 45 });
-    expect(await consumeShared(db, name, 2, 60_000, new Date(minute.getTime() + 59_999))).toEqual({ allowed: false, retryAfterSeconds: 1 });
+    expect(await consumeShared(db, name, 2, 60_000, minute)).toEqual({ allowed: true, retryAfterSeconds: 60, firstRefusal: false });
+    expect(await consumeShared(db, name, 2, 60_000, new Date(minute.getTime() + 15_500))).toEqual({ allowed: true, retryAfterSeconds: 45, firstRefusal: false });
+    expect(await consumeShared(db, name, 2, 60_000, new Date(minute.getTime() + 59_998))).toEqual({ allowed: false, retryAfterSeconds: 1, firstRefusal: true });
+    expect(await consumeShared(db, name, 2, 60_000, new Date(minute.getTime() + 59_999))).toEqual({ allowed: false, retryAfterSeconds: 1, firstRefusal: false });
+    expect((await consumeShared(db, name, 2, 60_000, new Date(minute.getTime() + 60_000))).firstRefusal).toBe(false);
     expect(await consume(db, name, 1, minute)).toBe(true);
     expect((await consumeShared(db, name, 1, DAY_MS, minute)).retryAfterSeconds).toBe(DAY_MS / 1_000 - 9 * 3_600 - 40 * 60);
     await expect(consumeShared(untouchable, '', 1, 60_000, minute)).rejects.toThrow('the quota name is missing');
