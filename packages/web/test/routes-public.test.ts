@@ -267,7 +267,7 @@ describe('POST /api/jobs/tick', () => {
     const response = await tick({ authorization: `bearer ${JOBS_SECRET}` });
     expect(response.status).toBe(200);
     expect(await response.json()).toEqual({
-      owners: 1,
+      owners: 0,
       memoriesSubmitted: 0,
       memoriesConfirmed: 0,
       memoriesFailed: 0,

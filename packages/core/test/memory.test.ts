@@ -1,7 +1,9 @@
 // Covers: the input refusals of rememberSentences and recallSentences, the bulk write and
-// wait against the SDK's own MemWalMock, failed jobs, recall's numeric-distance rule (C12)
-// and cutoff, that errors never carry the delegate secret or upstream text (C19), the
-// relayer URL rule, the relayer response size cap (C21) and the delegate key length check.
+// wait against the SDK's own MemWalMock, failed jobs, recall's numeric-distance rule and its
+// 0 to LIMITS.recallDistanceMax range (C12) and cutoff, that errors never carry the delegate
+// secret or upstream text (C19), the relayer URL rule, the relayer response size cap (C21), the
+// delegate key length check, and relayer points paced per delegate key across clients, waited for
+// or refused at once when told not to wait (on fake timers).
 // submitSentences sending exactly once without waiting, and checkJobs mapping each relayer
 // state and refusing every malformed status answer. Against a stand-in chain: a gRPC refusal wrapped in a SimulationError keeping the failing
 // step's own code, and Tatum being paced at the anonymous rate only without an API key.
@@ -253,6 +255,25 @@ describe('recallSentences', () => {
     }
   });
 
+  it('throws RECALL when any hit has a distance below 0 or above LIMITS.recallDistanceMax, and keeps hits at both ends (C12)', async () => {
+    expect(LIMITS.recallDistanceMax).toBe(2);
+    const good = { blob_id: 'blob-1', text: 'A matching fact.', distance: 0.2 };
+    for (const distance of [-0.001, -1, LIMITS.recallDistanceMax + 0.001, 7]) {
+      const { asMemWal } = stubClient({ recall: async () => ({ results: [good, { blob_id: 'blob-2', text: 'Another fact.', distance }], total: 2 }) });
+      const error = await caught(recallSentences(asMemWal, NAMESPACE, 'which fact matches?', { limit: 5, maxDistance: LIMITS.recallDistanceMax }));
+      expect(error.code).toBe('RECALL');
+      expect(error.message).toBe(`recall hit 2 has a distance outside 0 to ${LIMITS.recallDistanceMax}`);
+    }
+    const ends = [
+      { blob_id: 'blob-same', text: 'The same fact.', distance: 0 },
+      { blob_id: 'blob-opposite', text: 'The opposite fact.', distance: LIMITS.recallDistanceMax },
+    ];
+    const { asMemWal } = stubClient({ recall: async () => ({ results: ends, total: 2 }) });
+    const hits = await recallSentences(asMemWal, NAMESPACE, 'which fact matches?', { limit: 5, maxDistance: LIMITS.recallDistanceMax });
+    // The cutoff is strict, so a hit at the far end is read and checked but never returned.
+    expect(hits.map((hit) => [hit.blobId, hit.distance])).toEqual([['blob-same', 0]]);
+  });
+
   it('returns hits under the cutoff with their distances, and [] when nothing is close', async () => {
     const mock = MemWalMock.create({
       initialMemories: [
@@ -343,6 +364,44 @@ describe('createMemoryClient', () => {
       expect(fetchStub).toHaveBeenCalledWith(`${DEFAULT_RELAYER_URL}/health`, expect.anything());
     } finally {
       vi.resetModules();
+    }
+  });
+});
+
+describe('relayer pacing', () => {
+  /** A real client for `delegate` whose bulk write is a stand-in that accepts one job per sentence. */
+  function pacedClient(delegate: Ed25519Keypair) {
+    const client = createMemoryClient({ delegate, accountId: ACCOUNT_ID });
+    const rememberBulk = vi.fn(async (items: unknown[]) => ({ job_ids: items.map((_, index) => `job-${index}`), total: items.length, status: 'running' }));
+    Object.assign(client, { rememberBulk });
+    return { client, rememberBulk };
+  }
+
+  it('counts relayer points per delegate key across every client made for it, so a second client waits out the first one\'s window (B-N6)', async () => {
+    expect(LIMITS.memwalPointsPerMinute).toBe(3 * LIMITS.memwalBulkPoints);
+    const delegate = Ed25519Keypair.generate();
+    const first = pacedClient(delegate);
+    const second = pacedClient(delegate);
+    const otherKey = pacedClient(Ed25519Keypair.generate());
+    vi.useFakeTimers();
+    try {
+      for (let write = 0; write < 3; write++) await submitSentences(first.client, NAMESPACE, [`Fact number ${write}.`]);
+      // Told not to wait, the same key is refused at once and nothing is sent.
+      const refused = await caught(submitSentences(second.client, NAMESPACE, ['Another fact.'], { waitForPoints: false }));
+      expect(refused.code).toBe('RATE_LIMITED');
+      expect(second.rememberBulk).not.toHaveBeenCalled();
+      // Another delegate key has a window of its own.
+      expect(await submitSentences(otherKey.client, NAMESPACE, ['A third fact.'], { waitForPoints: false })).toEqual(['job-0']);
+
+      const waiting = submitSentences(second.client, NAMESPACE, ['Another fact.']);
+      await vi.advanceTimersByTimeAsync(LIMITS.memwalPacingWindowMs - 1);
+      expect(second.rememberBulk).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(1);
+      expect(await waiting).toEqual(['job-0']);
+      expect(second.rememberBulk).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+      for (const { client } of [first, second, otherKey]) client.destroy();
     }
   });
 });

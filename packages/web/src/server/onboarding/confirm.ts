@@ -179,7 +179,8 @@ async function confirmAllowance(
   const state = await chain.getAllowance(created.objectId).catch((error: unknown) => notLanded(error, `Sui does not show allowance ${created.objectId} yet`));
   const problem = allowanceProblem(state, ownerAddress, canonicalSuiAddress(owner.purseAddress), now);
   if (problem !== null) refuse(problem);
-  await db.update(owners).set({ allowanceId: created.objectId, allowanceCheckedAt: now }).where(eq(owners.id, owner.id));
+  // A wait set for the allowance this one replaces says nothing about this one's rate window.
+  await db.update(owners).set({ allowanceId: created.objectId, allowanceCheckedAt: now, refillNotBefore: null }).where(eq(owners.id, owner.id));
   return created.objectId;
 }
 
@@ -195,7 +196,8 @@ async function confirmAllowance(
  * - allowance: exactly one allowance must have been created by the transaction, and getAllowance
  *   must show it drawing USDC from the owner's address, spent only by the owner's purse,
  *   with a total cap, a one-day window and limit, and an end date within the onboarding
- *   maxima; allowance_id and allowance_checked_at are recorded. The allowance id comes
+ *   maxima; allowance_id and allowance_checked_at are recorded and refill_not_before is
+ *   cleared, so the jobs tick reads the new allowance at its next visit. The allowance id comes
  *   from the transaction's effects, never from the caller.
  * Anything else refuses and records nothing. Idempotent: confirming the same step again
  * records the same values.

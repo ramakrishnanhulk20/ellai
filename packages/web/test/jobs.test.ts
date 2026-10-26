@@ -1,5 +1,6 @@
 // Covers: the jobs tick on PGlite with a stand-in chain and a stand-in relayer. expireDecisions
-// closes stale open decisions and old unanswered questions and nothing fresher. refillIfNeeded
+// closes every owner's stale open decisions and old unanswered questions in one bounded call,
+// oldest first, and nothing fresher. refillIfNeeded
 // refills a low purse once, signed by the purse and the gas wallet, with its row written before
 // the send and a dry run that must move exactly the refill before it; never while a refill is
 // pending, nor in the call that finds one landed, past the daily count, past the float, or on a
@@ -7,8 +8,9 @@
 // owner's, for this purse, in USDC, unexpired and with room under its cap and in its rate
 // window; never signs bytes that are not exactly the refill; keeps an unknown send pending and
 // reads that digest first next time, but marks one the Tatum budget kept from leaving failed;
-// releases a lost refill only once its epoch window has
-// closed and further reads still miss it, and leaves rows from before that window was kept
+// releases a lost refill only once its epoch window has closed and a call
+// LIMITS.paymentReleaseGapMs after the first that saw it missing misses it too, recording one a
+// later call finds, and leaves rows from before that window was kept
 // waiting; asks its own ledger first, so across a day of ticks an owner whose ledger rules a
 // refill out costs no chain read, the onboarded owner's first refill included, and one below
 // it costs one purse read a tick and an allowance read only for the refill it sends; forgets an
@@ -17,7 +19,9 @@
 // back short or its time slice ends, faster than the sign-in cap lets strangers add them,
 // day-old owners nothing points at included, 3,001 of them inside the time slice behind
 // 200,000 owners in use, expired step-ups before them while an owner holding an unexpired one is
-// kept, and old rate counters first, before the tick does any owner's work.
+// kept, decisions closed without a payment past their keep time with their citations, grant uses
+// and questions, never one a payment, a memory or a grant names, and old rate counters first,
+// before the tick does any owner's work.
 // confirmBlobsOnChain marks a memory only when its blob id is on one of the owner's own Walrus Blob
 // objects, certified and not past its end epoch by the Walrus epoch (read once an hour), reading
 // in stretches from a stored cursor, kept through a Tatum budget refusal, a rejected key or a
@@ -29,10 +33,14 @@
 // number per call, and the tick reads that epoch only while a memory is stored on chain.
 // refillIfNeeded defers before any read past the deadline and
 // never after its row. runJobsTick isolates each owner's and each step's failure behind a fixed code,
-// settles pending payments and remembers a paid seller stored as delivering nothing exactly once
-// (never one whose delivery is unknown) with one epoch reading for every settlement pass in a
-// tick, records an outcome a paid call failed to record,
-// expires, refills with the tick's own sleep, sends and confirms memories and then checks them
+// settles pending payments with one digest read a pass and remembers a paid seller stored as
+// delivering nothing exactly once (never one whose delivery is unknown) with one epoch reading for
+// every settlement pass in a tick, releases a lost payment only on a second pass
+// LIMITS.paymentReleaseGapMs after the first, records an outcome a paid call failed to record,
+// expires decisions for every owner without visiting one whose only work they are, fails aged
+// pending memories of owners it never visits, runs an owner's money steps before its memory steps,
+// charges each visit's chain reads to that owner's jobs scope and the shared reads to the jobs scope
+// alone, refills with the tick's own sleep, sends and confirms memories and then checks them
 // on chain, prunes, reads the gas wallet once an hour however many ticks run and warns when it is
 // low, takes at most LIMITS.jobsOwnersPerTick owners,
 // least recently visited first, stamped as each visit starts, and past its deadline starts no
@@ -57,7 +65,24 @@ import { verifyTransactionSignature } from '@mysten/sui/verify';
 import { and, count, eq, isNull, like, sql } from 'drizzle-orm';
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { type Database, createDb, migrate } from '../src/server/db/client.js';
-import { agents, decisions, memories, owners, payments, questions, rateCounters, refills, sellerSales, sessions, signinNonces, stepUps } from '../src/server/db/schema.js';
+import {
+  agents,
+  decisionCitations,
+  decisions,
+  grantUses,
+  grants,
+  memories,
+  owners,
+  payments,
+  questions,
+  rateCounters,
+  refills,
+  sellerSales,
+  sessions,
+  signinNonces,
+  stepUps,
+} from '../src/server/db/schema.js';
+import { type TatumScope, currentTatumScope, withTatumScope } from '../src/server/http/tatum-meter.js';
 import { MEMORY_NAMESPACE } from '../src/server/memory/namespace.js';
 import { ownerDelegate } from '../src/server/memory/delegate.js';
 import { recordOutcome } from '../src/server/memory/outcome.js';
@@ -370,41 +395,50 @@ async function withLimit(name: keyof typeof LIMITS, value: number, run: () => Pr
 }
 
 describe('expireDecisions', () => {
-  it('expires a stale open decision with no payment and an old unanswered question, and nothing fresher', async () => {
-    const w = await world();
-    const staleOpen = await decision(w, 'open', ago(LIMITS.staleOpenDecisionMs + 1));
-    const freshOpen = await decision(w, 'open', ago(LIMITS.staleOpenDecisionMs));
-    const signedOpen = await decision(w, 'open', ago(LIMITS.staleOpenDecisionMs + 1));
-    await payment(w, signedOpen);
-    const oldAsked = await decision(w, 'asked', ago(LIMITS.questionTtlMs + 1));
-    const freshAsked = await decision(w, 'asked', ago(LIMITS.questionTtlMs));
-    const oldPaid = await decision(w, 'paid', ago(LIMITS.questionTtlMs * 2));
-    const other = await world();
-    const othersStale = await decision(other, 'open', ago(LIMITS.staleOpenDecisionMs + 1));
+  it("expires every owner's stale open decisions with no payment and old unanswered questions in one call, and nothing fresher", async () => {
+    const on = await freshDb();
+    const w = await world(on);
+    const staleOpen = await decision(w, 'open', ago(LIMITS.staleOpenDecisionMs + 1), on);
+    const freshOpen = await decision(w, 'open', ago(LIMITS.staleOpenDecisionMs), on);
+    const signedOpen = await decision(w, 'open', ago(LIMITS.staleOpenDecisionMs + 1), on);
+    await payment(w, signedOpen, {}, on);
+    const oldAsked = await decision(w, 'asked', ago(LIMITS.questionTtlMs + 1), on);
+    const freshAsked = await decision(w, 'asked', ago(LIMITS.questionTtlMs), on);
+    const answered = await decision(w, 'asked', ago(LIMITS.questionTtlMs + 1), on);
+    await on.update(questions).set({ answer: 'refuse', answeredAt: ago(1) }).where(eq(questions.decisionId, answered));
+    const oldPaid = await decision(w, 'paid', ago(LIMITS.questionTtlMs * 2), on);
+    const other = await world(on);
+    const othersStale = await decision(other, 'open', ago(LIMITS.staleOpenDecisionMs + 1), on);
+    const othersAsked = await decision(other, 'asked', ago(LIMITS.questionTtlMs + 1), on);
 
-    expect(await expireDecisions({ db, ownerId: w.ownerId, now: NOW })).toEqual({ decisionsExpired: 1, questionsClosed: 1 });
-    expect(await statusOf(staleOpen)).toBe('expired');
-    expect(await statusOf(oldAsked)).toBe('expired');
+    expect(await expireDecisions({ db: on, now: NOW })).toEqual({ decisionsExpired: 2, questionsClosed: 2 });
     for (const [id, status] of [
+      [staleOpen, 'expired'],
+      [oldAsked, 'expired'],
+      [othersStale, 'expired'],
+      [othersAsked, 'expired'],
       [freshOpen, 'open'],
       [signedOpen, 'open'],
       [freshAsked, 'asked'],
+      [answered, 'asked'],
       [oldPaid, 'paid'],
-      [othersStale, 'open'],
     ] as const) {
-      expect(await statusOf(id)).toBe(status);
+      expect(await statusOf(id, on)).toBe(status);
     }
-    expect(await expireDecisions({ db, ownerId: w.ownerId, now: NOW })).toEqual({ decisionsExpired: 0, questionsClosed: 0 });
+    expect(await expireDecisions({ db: on, now: NOW })).toEqual({ decisionsExpired: 0, questionsClosed: 0 });
+    await expect(expireDecisions({ db: on, now: new Date(Number.NaN) })).rejects.toThrow('the current time is not a date');
   });
 
-  it('leaves an old asked decision whose question was answered, and expires nothing for an unknown owner', async () => {
-    const w = await world();
-    const answered = await decision(w, 'asked', ago(LIMITS.questionTtlMs + 1));
-    await db.update(questions).set({ answer: 'refuse', answeredAt: ago(1) }).where(eq(questions.decisionId, answered));
-    expect(await expireDecisions({ db, ownerId: w.ownerId, now: NOW })).toEqual({ decisionsExpired: 0, questionsClosed: 0 });
-    expect(await statusOf(answered)).toBe('asked');
-    expect(await expireDecisions({ db, ownerId: randomUUID(), now: NOW })).toEqual({ decisionsExpired: 0, questionsClosed: 0 });
-    await expect(expireDecisions({ db, ownerId: 'not-a-uuid', now: NOW })).rejects.toThrow('the owner id is not a uuid');
+  it('expires at most LIMITS.pruneBatch decisions in one call, oldest first, and the rest in the next', async () => {
+    const on = await freshDb();
+    const w = await world(on);
+    const ids: string[] = [];
+    for (let i = 0; i < 3; i++) ids.push(await decision(w, 'open', ago(LIMITS.staleOpenDecisionMs + 1_000 * (3 - i)), on));
+    await withLimit('pruneBatch', 2, async () => {
+      expect(await expireDecisions({ db: on, now: NOW })).toEqual({ decisionsExpired: 2, questionsClosed: 0 });
+      expect(await Promise.all(ids.map((id) => statusOf(id, on)))).toEqual(['expired', 'expired', 'open']);
+      expect(await expireDecisions({ db: on, now: NOW })).toEqual({ decisionsExpired: 1, questionsClosed: 0 });
+    });
   });
 });
 
@@ -685,7 +719,7 @@ describe('refillIfNeeded', () => {
     expect(stub.executions).toHaveLength(1);
   });
 
-  it('fails a lost refill only once its epoch window has closed and three more reads miss it, and may then refill', async () => {
+  it('fails a lost refill only once its epoch window has closed and a call LIMITS.paymentReleaseGapMs after the first that saw it closed misses it too, and may then refill', async () => {
     const w = await funded();
     const { chain, state, calls, executions } = stubFor(w, 0n);
     const send = state.execute;
@@ -695,25 +729,33 @@ describe('refillIfNeeded', () => {
     const expiration = bcs.TransactionData.parse(executions[0]?.txBytes ?? new Uint8Array()).V1?.expiration;
     const signedMaxEpoch = expiration?.$kind === 'ValidDuring' ? expiration.ValidDuring.maxEpoch : undefined;
     expect([lost.status, lost.validUntilEpoch, signedMaxEpoch]).toEqual(['pending', 101n, '101']);
+    const readLost = `getTransactionResult:${lost.digest}`;
+    const lostRow = async () => one((await refillRows(w.ownerId)).filter((row) => row.id === lost.id));
 
-    const naps: number[] = [];
-    const sleep = async (ms: number) => {
-      naps.push(ms);
-    };
+    // The window is still open: nothing is marked.
     state.execute = send;
     state.epoch = 101n;
     calls.length = 0;
-    expect(await refill(w, chain, NOW, db, sleep)).toBe('skipped_pending');
-    expect(calls).toEqual([`getTransactionResult:${lost.digest}`, 'getCurrentEpoch']);
-    expect(naps).toEqual([]);
+    expect(await refill(w, chain)).toBe('skipped_pending');
+    expect(calls).toEqual([readLost, 'getCurrentEpoch']);
+    expect(await lostRow()).toMatchObject({ status: 'pending', missingSince: null });
 
+    // The first call that sees the window closed and the digest missing only marks it.
     state.epoch = 102n;
     calls.length = 0;
-    expect(await refill(w, chain, NOW, db, sleep)).toBe('refilled');
-    expect(LIMITS.paymentReleaseReads).toBe(3);
-    expect(naps).toEqual([LIMITS.settlementPollIntervalMs, LIMITS.settlementPollIntervalMs, LIMITS.settlementPollIntervalMs]);
-    const readLost = `getTransactionResult:${lost.digest}`;
-    expect(calls.slice(0, 5)).toEqual([readLost, 'getCurrentEpoch', readLost, readLost, readLost]);
+    expect(await refill(w, chain)).toBe('skipped_pending');
+    expect(calls).toEqual([readLost, 'getCurrentEpoch']);
+    expect(await lostRow()).toMatchObject({ status: 'pending', missingSince: NOW });
+
+    // A miss sooner than LIMITS.paymentReleaseGapMs after that changes nothing.
+    expect(await refill(w, chain, new Date(NOW.getTime() + LIMITS.paymentReleaseGapMs - 1))).toBe('skipped_pending');
+    expect(await lostRow()).toMatchObject({ status: 'pending', missingSince: NOW });
+    expect(executions).toHaveLength(1);
+
+    calls.length = 0;
+    expect(await refill(w, chain, new Date(NOW.getTime() + LIMITS.paymentReleaseGapMs))).toBe('refilled');
+    expect(calls.slice(0, 2)).toEqual([readLost, 'getCurrentEpoch']);
+    expect(calls.filter((call) => call === readLost)).toHaveLength(1);
     const rows = await refillRows(w.ownerId);
     expect(rows.map((row) => [row.digest === lost.digest, row.status, row.validUntilEpoch]).sort()).toEqual([
       [false, 'verified', 103n],
@@ -722,7 +764,7 @@ describe('refillIfNeeded', () => {
     expect(executions).toHaveLength(2);
   });
 
-  it('records a lost refill that one of the later reads finds, instead of failing it', async () => {
+  it('records a lost refill that a later call finds, instead of failing it', async () => {
     const w = await funded();
     const { chain, state } = stubFor(w, 0n);
     state.execute = sendTimesOut;
@@ -730,12 +772,15 @@ describe('refillIfNeeded', () => {
     const lost = one(await refillRows(w.ownerId));
 
     state.epoch = 102n;
-    let reads = 0;
-    state.landed = (digest) => (digest === lost.digest && ++reads === 3 ? { status: 'success', balanceChanges: refillChanges(w) } : null);
+    expect(await refill(w, chain)).toBe('skipped_pending');
+    expect(one(await refillRows(w.ownerId))).toMatchObject({ id: lost.id, status: 'pending', missingSince: NOW });
+
+    // The node the first call asked was behind: by the second call the chain shows it.
+    const later = new Date(NOW.getTime() + LIMITS.paymentReleaseGapMs);
+    state.landed = (digest) => (digest === lost.digest ? { status: 'success', balanceChanges: refillChanges(w) } : null);
     state.balances.set(w.purse, { usdcAddressBalance: REFILL });
-    expect(await refill(w, chain)).toBe('resolved_pending');
-    expect(reads).toBe(3);
-    expect(one(await refillRows(w.ownerId))).toMatchObject({ id: lost.id, status: 'verified', verifiedAt: NOW });
+    expect(await refill(w, chain, later)).toBe('resolved_pending');
+    expect(one(await refillRows(w.ownerId))).toMatchObject({ id: lost.id, status: 'verified', verifiedAt: later });
   });
 
   it("answers 'deferred' with nothing written or sent when canStart says no before any read it needs, and never stops once its row is written", async () => {
@@ -904,10 +949,10 @@ describe('pruneExpiredRows', () => {
     await session(on, w, new Date(NOW.getTime() + DAY), ago(DAY - 1));
     await session(on, w, new Date(NOW.getTime() + DAY));
 
-    expect(await pruneExpiredRows({ db: on, now: NOW })).toEqual({ rateCounters: 0, signinNonces: 2, stepUps: 0, sellerSales: 4, sessions: 1, owners: 0 });
+    expect(await pruneExpiredRows({ db: on, now: NOW })).toEqual({ rateCounters: 0, signinNonces: 2, stepUps: 0, sellerSales: 4, sessions: 1, decisions: 0, owners: 0 });
     expect(await kept(on)).toEqual({ signinNonces: 1, sellerSales: 6, sessions: 4 });
     expect((await on.select({ nonce: signinNonces.nonce }).from(signinNonces)).map((row) => row.nonce)).toEqual([liveNonce]);
-    expect(await pruneExpiredRows({ db: on, now: NOW })).toEqual({ rateCounters: 0, signinNonces: 0, stepUps: 0, sellerSales: 0, sessions: 0, owners: 0 });
+    expect(await pruneExpiredRows({ db: on, now: NOW })).toEqual({ rateCounters: 0, signinNonces: 0, stepUps: 0, sellerSales: 0, sessions: 0, decisions: 0, owners: 0 });
   });
 
   it('clears more expired nonces and empty owners in one call than the global sign-in cap lets strangers create between two ticks', async () => {
@@ -921,7 +966,7 @@ describe('pruneExpiredRows', () => {
       .values(Array.from({ length: created }, (_, i) => ({ nonce: hex(16), createdAt: ago(DAY), expiresAt: ago(1 + i) })));
     // Every verified sign-in can leave an owner row behind once its session has ended.
     await on.insert(owners).values(Array.from({ length: created }, () => ({ suiAddress: randomAddress(), purseAddress: randomAddress(), createdAt: dayOld() })));
-    expect(await pruneExpiredRows({ db: on, now: NOW, clock: () => NOW })).toEqual({ rateCounters: 0, signinNonces: created, stepUps: 0, sellerSales: 0, sessions: 0, owners: created });
+    expect(await pruneExpiredRows({ db: on, now: NOW, clock: () => NOW })).toEqual({ rateCounters: 0, signinNonces: created, stepUps: 0, sellerSales: 0, sessions: 0, decisions: 0, owners: created });
     expect(await kept(on)).toEqual({ signinNonces: 0, sellerSales: 0, sessions: 0 });
     expect(await ownerIds(on)).toEqual([]);
   });
@@ -939,7 +984,7 @@ describe('pruneExpiredRows', () => {
     // Every read of this clock is one whole time slice later than the one before.
     const slow = () => new Date(NOW.getTime() + reads++ * LIMITS.pruneTimeSliceMs);
     await withLimit('pruneBatch', 3, async () => {
-      expect(await pruneExpiredRows({ db: on, now: NOW, clock: slow })).toEqual({ rateCounters: 3, signinNonces: 3, stepUps: 0, sellerSales: 3, sessions: 3, owners: 0 });
+      expect(await pruneExpiredRows({ db: on, now: NOW, clock: slow })).toEqual({ rateCounters: 3, signinNonces: 3, stepUps: 0, sellerSales: 3, sessions: 3, decisions: 0, owners: 0 });
       expect(await kept(on)).toEqual({ signinNonces: 2, sellerSales: 2, sessions: 2 });
       expect(await oldCounters(on)).toBe(2);
       const { chain } = stubChain(on);
@@ -1004,7 +1049,7 @@ describe('pruneExpiredRows', () => {
     await on.insert(refills).values({ ownerId: withRefill.ownerId, allowanceId: randomAddress(), amountAtomic: REFILL, digest: randomDigest(), sentAt: ago(DAY), status: 'verified' });
     kept.push(withAgent, withDecision, withPayment, withMemory, signedIn, withRefill);
 
-    expect(await pruneExpiredRows({ db: on, now: NOW })).toEqual({ rateCounters: 0, signinNonces: 0, stepUps: 0, sellerSales: 0, sessions: 2, owners: 1 });
+    expect(await pruneExpiredRows({ db: on, now: NOW })).toEqual({ rateCounters: 0, signinNonces: 0, stepUps: 0, sellerSales: 0, sessions: 2, decisions: 0, owners: 1 });
     expect(await ownerIds(on)).toEqual(kept.map((w) => w.ownerId).sort());
     expect([await sessionsOf(on, empty), await sessionsOf(on, signedIn)]).toEqual([0, 2]);
     expect(await pruneExpiredRows({ db: on, now: NOW })).toMatchObject({ owners: 0 });
@@ -1022,11 +1067,90 @@ describe('pruneExpiredRows', () => {
     const holding = await bareOwner(on);
     await stepUp(holding, new Date(NOW.getTime() + 1));
 
-    expect(await pruneExpiredRows({ db: on, now: NOW })).toEqual({ rateCounters: 0, signinNonces: 0, stepUps: 2, sellerSales: 0, sessions: 0, owners: 2 });
+    expect(await pruneExpiredRows({ db: on, now: NOW })).toEqual({ rateCounters: 0, signinNonces: 0, stepUps: 2, sellerSales: 0, sessions: 0, decisions: 0, owners: 2 });
     expect(await ownerIds(on)).toEqual([holding.ownerId]);
     expect(await pruneExpiredRows({ db: on, now: new Date(NOW.getTime() + 2) })).toMatchObject({ stepUps: 1, owners: 1 });
     expect(await ownerIds(on)).toEqual([]);
     expect(await on.select().from(stepUps)).toEqual([]);
+  });
+
+  it('deletes decisions closed without a payment over LIMITS.closedDecisionKeepMs ago with their citations, grant uses and questions, and keeps any a payment, a memory or a grant names (C34)', async () => {
+    const on = await freshDb();
+    const w = await world(on);
+    const old = ago(LIMITS.closedDecisionKeepMs + 1);
+    const closed = async (status: 'refused' | 'expired' | 'failed', createdAt = old) => {
+      const id = await decision(w, status === 'expired' ? 'asked' : status, createdAt, on);
+      if (status === 'expired') await on.update(decisions).set({ status }).where(eq(decisions.id, id));
+      return id;
+    };
+    const memoryNaming = async (decisionId: string | null) =>
+      one(
+        await on
+          .insert(memories)
+          .values({
+            ownerId: w.ownerId,
+            kind: 'outcome',
+            decisionId,
+            sentence: `On 2026-09-01 a paid seller delivered nothing ${hex(4)}.`,
+            namespace: MEMORY_NAMESPACE,
+            writerPublicKey: ownerDelegate(MASTER, w.suiAddress).publicKeyHex,
+            status: 'confirmed',
+            createdAt: old,
+          })
+          .returning({ id: memories.id }),
+      ).id;
+    const grantFor = async (decisionId: string) =>
+      one(
+        await on
+          .insert(grants)
+          .values({ ownerId: w.ownerId, decisionId, recipient: RECIPIENT, maxAmountAtomic: PRICE, sellerUrl: 'https://hotels.example/v1/rooms', sellerMethod: 'POST', bodyHash: hex(32), expiresAt: new Date(old.getTime() + LIMITS.grantTtlMs) })
+          .returning({ id: grants.id }),
+      ).id;
+
+    const refused = await closed('refused');
+    // Its question goes with it.
+    const unanswered = await closed('expired');
+    // A retry that used an answered decision's grant and cited a memory, then failed before signing.
+    const answered = await decision(w, 'answered', old, on);
+    const failedRetry = await closed('failed');
+    await on.insert(grantUses).values({ grantId: await grantFor(answered), ownerId: w.ownerId, decisionId: failedRetry, usedAt: old });
+    await on.insert(decisionCitations).values({ decisionId: failedRetry, memoryId: await memoryNaming(null), ownerId: w.ownerId });
+
+    const young = await closed('refused', ago(LIMITS.closedDecisionKeepMs));
+    const withPayment = await closed('failed');
+    await payment(w, withPayment, {}, on);
+    const named = await closed('expired');
+    await memoryNaming(named);
+    const owningGrant = await closed('expired');
+    await grantFor(owningGrant);
+    const paid = await decision(w, 'paid', old, on);
+    await payment(w, paid, {}, on);
+
+    expect(await pruneExpiredRows({ db: on, now: NOW })).toMatchObject({ decisions: 3, owners: 0 });
+    const left = (await on.select({ id: decisions.id }).from(decisions)).map((row) => row.id).sort();
+    expect(left).toEqual([answered, young, withPayment, named, owningGrant, paid].sort());
+    expect((await on.select().from(questions)).map((row) => row.decisionId).sort()).toEqual([named, owningGrant].sort());
+    expect(await on.select().from(grantUses)).toEqual([]);
+    expect(await on.select().from(decisionCitations)).toEqual([]);
+    expect((await on.select({ decisionId: grants.decisionId }).from(grants)).map((row) => row.decisionId).sort()).toEqual([answered, owningGrant].sort());
+    for (const id of [refused, unanswered, failedRetry]) expect(left).not.toContain(id);
+    expect(await pruneExpiredRows({ db: on, now: NOW })).toMatchObject({ decisions: 0 });
+  });
+
+  it('deletes closed decisions in batches of LIMITS.pruneBatch, oldest first, and repeats a full batch only inside LIMITS.pruneTimeSliceMs', async () => {
+    const on = await freshDb();
+    const w = await world(on);
+    const ids: string[] = [];
+    for (let i = 0; i < 5; i++) ids.push(await decision(w, 'refused', ago(LIMITS.closedDecisionKeepMs + 1_000 * (5 - i)), on));
+    let reads = 0;
+    const slow = () => new Date(NOW.getTime() + reads++ * LIMITS.pruneTimeSliceMs);
+    await withLimit('pruneBatch', 2, async () => {
+      expect(await pruneExpiredRows({ db: on, now: NOW, clock: slow })).toMatchObject({ decisions: 2 });
+      const left = async () => (await on.select({ id: decisions.id }).from(decisions)).map((row) => row.id).sort();
+      expect(await left()).toEqual(ids.slice(2).sort());
+      expect(await pruneExpiredRows({ db: on, now: NOW, clock: () => NOW })).toMatchObject({ decisions: 3 });
+      expect(await left()).toEqual([]);
+    });
   });
 
   it('clears 3,001 empty owners inside LIMITS.pruneTimeSliceMs on the wall clock while 200,000 older owners hold live sessions (C34)', { timeout: 600_000 }, async () => {
@@ -1477,11 +1601,12 @@ describe('runJobsTick', () => {
     } as Chain;
 
     const summary = await tick(on, chain);
-    // The gas wallet is read first, before any owner, so a busy tick cannot crowd it out.
+    // The gas wallet is read first, before any owner, so a busy tick cannot crowd it out; within a
+    // visit the money steps run before the memory steps.
     expect(summary.errors).toEqual([
       { ownerId: '', step: 'gas_wallet', code: 'UNEXPECTED' },
-      { ownerId: first.ownerId, step: 'memory_submit', code: 'MEMORY_RATE_LIMITED' },
       { ownerId: first.ownerId, step: 'refill', code: 'CHAIN_UPSTREAM' },
+      { ownerId: first.ownerId, step: 'memory_submit', code: 'MEMORY_RATE_LIMITED' },
     ]);
     expect(summary).toMatchObject({ owners: 2, decisionsExpired: 1, questionsClosed: 1, refills: 1, gasWalletLow: true });
     expect([await statusOf(staleOpen, on), await statusOf(oldAsked, on), await statusOf(freshOpen, on)]).toEqual(['expired', 'expired', 'open']);
@@ -1490,7 +1615,7 @@ describe('runJobsTick', () => {
     for (const error of summary.errors) expect(error.code).toMatch(/^[A-Z][A-Z0-9_]*$/);
   });
 
-  it('settles each pending payment once, and remembers a paid seller that delivered nothing exactly once across two ticks, never one whose delivery is unknown', async () => {
+  it('settles each pending payment with one read a pass, releases a lost one on the second pass, and remembers a paid seller that delivered nothing exactly once across two ticks, never one whose delivery is unknown', async () => {
     const on = await freshDb();
     const w = await world(on);
     const paid = async (sellerStatus: number | null, delivered: boolean | null, overrides: Partial<typeof payments.$inferInsert> = {}) =>
@@ -1515,23 +1640,25 @@ describe('runJobsTick', () => {
     state.landed = (digest) => landed.get(digest) ?? null;
 
     const first = await tick(on, chain);
-    expect(first).toMatchObject({ owners: 1, paymentsVerified: 4, paymentsNotLanded: 1, paymentsMismatched: 1, outcomesRecorded: 2, errors: [] });
+    expect(first).toMatchObject({ owners: 1, paymentsVerified: 4, paymentsNotLanded: 0, paymentsMismatched: 1, outcomesRecorded: 2, errors: [] });
     const outcomes = await outcomesOf(w.ownerId, on);
     expect(outcomes.map((row) => row.decisionId).sort()).toEqual([failedSeller.decisionId, silent.decisionId].sort());
     for (const row of outcomes) expect(row).toMatchObject({ verdict: null, status: 'pending', writerPublicKey: ownerDelegate(MASTER, w.suiAddress).publicKeyHex });
     const settlement = async (id: string) => one(await on.select({ settlement: payments.settlement }).from(payments).where(eq(payments.id, id))).settlement;
-    expect(await settlement(lost.id)).toBe('not_landed');
+    // The first pass past the window only marks the lost one missing.
+    expect(await settlement(lost.id)).toBe('pending');
     expect(await settlement(wrong.id)).toBe('mismatch');
     expect(await settlement(notYet.id)).toBe('pending');
-    expect(readsOf(notYet.digest)).toBe(1);
+    expect([readsOf(notYet.digest), readsOf(lost.digest)]).toEqual([1, 1]);
 
-    const second = await tick(on, chain);
-    expect(second).toMatchObject({ owners: 1, paymentsVerified: 0, outcomesRecorded: 0, errors: [] });
+    const second = await runJobsTick({ db: on, chain, masterSecretHex: MASTER, gasKeypair: GAS, now: () => new Date(NOW.getTime() + LIMITS.paymentReleaseGapMs), sleep: noSleep });
+    expect(second).toMatchObject({ owners: 1, paymentsVerified: 0, paymentsNotLanded: 1, outcomesRecorded: 0, errors: [] });
+    expect(await settlement(lost.id)).toBe('not_landed');
     expect(await outcomesOf(w.ownerId, on)).toHaveLength(2);
-    expect([readsOf(notYet.digest), readsOf(failedSeller.digest)]).toEqual([2, 1]);
+    expect([readsOf(notYet.digest), readsOf(lost.digest), readsOf(failedSeller.digest)]).toEqual([2, 2, 1]);
   });
 
-  it('reads the epoch once in a tick that finds 5 pending payments past their window, two owners between them, and still releases each one (C22)', async () => {
+  it('reads the epoch once a tick for 5 pending payments past their window, two owners between them, and releases each one on a second pass LIMITS.paymentReleaseGapMs later (C4, C22)', async () => {
     const on = await freshDb();
     const pair = [await world(on), await world(on)];
     for (let i = 0; i < 5; i++) {
@@ -1540,10 +1667,16 @@ describe('runJobsTick', () => {
       await payment(w, await decision(w, 'paid', ago(120_000), on), { validUntilEpoch: 99n, signedAt: ago(120_000) }, on);
     }
     const { chain, calls } = stubChain(on);
-    expect(await tick(on, chain)).toMatchObject({ owners: 2, paymentsNotLanded: 5, errors: [] });
-    expect(calls.filter((call) => call === 'getCurrentEpoch')).toHaveLength(1);
-    // Each still has its own digest read and its LIMITS.paymentReleaseReads more after the epoch.
-    expect(calls.filter((call) => call.startsWith('getTransactionResult'))).toHaveLength(5 * (1 + LIMITS.paymentReleaseReads));
+    const tickAfter = (ms: number) => runJobsTick({ db: on, chain, masterSecretHex: MASTER, gasKeypair: GAS, now: () => new Date(NOW.getTime() + ms), sleep: noSleep });
+    const counted = () => [calls.filter((call) => call === 'getCurrentEpoch').length, calls.filter((call) => call.startsWith('getTransactionResult')).length];
+
+    // One epoch reading for the whole tick and one digest read per payment; the pass only marks each missing.
+    expect(await tickAfter(0)).toMatchObject({ owners: 2, paymentsNotLanded: 0, errors: [] });
+    expect(counted()).toEqual([1, 5]);
+    expect((await on.select({ missingSince: payments.missingSince }).from(payments)).map((row) => row.missingSince)).toEqual(Array<Date>(5).fill(NOW));
+
+    expect(await tickAfter(LIMITS.paymentReleaseGapMs)).toMatchObject({ owners: 2, paymentsNotLanded: 5, errors: [] });
+    expect(counted()).toEqual([2, 10]);
     const released = await on.select({ settlement: payments.settlement }).from(payments);
     expect(released.map((row) => row.settlement)).toEqual(Array<string>(5).fill('not_landed'));
   });
@@ -1591,7 +1724,7 @@ describe('runJobsTick', () => {
     expect(calls.filter((call) => call.startsWith('getTransactionResult'))).toEqual([]);
   });
 
-  it('hands its sleep to the refill job, which waits on it while it confirms a lost refill', async () => {
+  it('hands its clock to the refill job, which stamps a lost refill with the time after its reads and fails it on a tick LIMITS.paymentReleaseGapMs later, never sleeping (C26)', async () => {
     const on = await freshDb();
     const w = await funded(on);
     const lost = one(
@@ -1600,15 +1733,36 @@ describe('runJobsTick', () => {
         .values({ ownerId: w.ownerId, allowanceId: w.allowanceId, amountAtomic: REFILL, digest: randomDigest(), sentAt: ago(3_600_000), validUntilEpoch: 99n, status: 'pending' })
         .returning(),
     );
-    const { chain } = stubFor(w, REFILL, on);
+    const stub = stubFor(w, REFILL, on);
+    let clockMs = NOW.getTime();
+    // Each epoch read takes a minute, so a stamp from the time handed in before the reads would be a minute early.
+    const chain = {
+      ...stub.chain,
+      getCurrentEpoch: async () => {
+        clockMs += 60_000;
+        return stub.chain.getCurrentEpoch();
+      },
+    } as Chain;
     const naps: number[] = [];
-    const sleep = async (ms: number) => {
-      naps.push(ms);
-    };
-    const summary = await runJobsTick({ db: on, chain, masterSecretHex: MASTER, gasKeypair: GAS, now: () => NOW, sleep });
-    expect(summary).toMatchObject({ owners: 1, refills: 0, errors: [] });
-    expect(naps).toEqual(Array(LIMITS.paymentReleaseReads).fill(LIMITS.settlementPollIntervalMs));
+    const tickNow = () =>
+      runJobsTick({
+        db: on,
+        chain,
+        masterSecretHex: MASTER,
+        gasKeypair: GAS,
+        now: () => new Date(clockMs),
+        sleep: async (ms: number) => {
+          naps.push(ms);
+        },
+      });
+
+    expect(await tickNow()).toMatchObject({ owners: 1, refills: 0, errors: [] });
+    expect(one(await refillRows(w.ownerId, on))).toMatchObject({ id: lost.id, status: 'pending', missingSince: new Date(NOW.getTime() + 60_000) });
+    // Its own epoch read then brings this tick's clock to exactly LIMITS.paymentReleaseGapMs after the stamp.
+    clockMs = NOW.getTime() + LIMITS.paymentReleaseGapMs;
+    expect(await tickNow()).toMatchObject({ owners: 1, refills: 0, errors: [] });
     expect(one(await refillRows(w.ownerId, on))).toMatchObject({ id: lost.id, status: 'failed' });
+    expect(naps).toEqual([]);
   });
 
   it('refills a low purse, keeps an unknown send pending, and the next tick reads that digest before anything else for that owner', async () => {
@@ -1743,6 +1897,8 @@ describe('runJobsTick', () => {
     const w = await world(on);
     await storedMemory(w, 'blob-stored', 54, on);
     const staleOpen = await decision(w, 'open', ago(LIMITS.staleOpenDecisionMs + 1), on);
+    // The other work: a payment still waiting on the chain.
+    await payment(w, await decision(w, 'paid', ago(120_000), on), { signedAt: ago(120_000) }, on);
     const stub = stubChain(on);
     const chain = {
       ...stub.chain,
@@ -1819,20 +1975,107 @@ describe('runJobsTick', () => {
     expect(calls).toEqual([`getBalances:${GAS_ADDRESS}`, `getBalances:${GAS_ADDRESS}`]);
   });
 
+  const visitedAt = async (w: World, on: Database) => one(await on.select({ at: owners.lastTickedAt }).from(owners).where(eq(owners.id, w.ownerId))).at;
+
   it('handles at most LIMITS.jobsOwnersPerTick owners, oldest work first', async () => {
     const on = await freshDb();
-    const ids: string[] = [];
+    const all: World[] = [];
     for (let i = 0; i <= LIMITS.jobsOwnersPerTick; i++) {
-      // Each owner's stale decision is a second newer than the one before.
-      ids.push(await decision(await world(on), 'open', ago(LIMITS.staleOpenDecisionMs + 1_000 * (LIMITS.jobsOwnersPerTick + 1 - i)), on));
+      // Each owner's pending payment was signed a second after the one before.
+      const w = await world(on);
+      const signedAt = ago(120_000 + 1_000 * (LIMITS.jobsOwnersPerTick + 1 - i));
+      await payment(w, await decision(w, 'paid', signedAt, on), { signedAt }, on);
+      all.push(w);
     }
+    const last = all[LIMITS.jobsOwnersPerTick] as World;
     const { chain } = stubChain(on);
-    expect(await tick(on, chain)).toMatchObject({ owners: LIMITS.jobsOwnersPerTick, decisionsExpired: LIMITS.jobsOwnersPerTick, errors: [] });
-    expect(await statusOf(ids[LIMITS.jobsOwnersPerTick] ?? '', on)).toBe('open');
-    expect(await tick(on, chain)).toMatchObject({ owners: 1, decisionsExpired: 1 });
+    expect(await tick(on, chain)).toMatchObject({ owners: LIMITS.jobsOwnersPerTick, errors: [] });
+    expect(await visitedAt(last, on)).toBeNull();
+    for (const w of all.slice(0, LIMITS.jobsOwnersPerTick)) expect(await visitedAt(w, on)).toEqual(NOW);
   });
 
-  const visitedAt = async (w: World, on: Database) => one(await on.select({ at: owners.lastTickedAt }).from(owners).where(eq(owners.id, w.ownerId))).at;
+  it('visits no owner whose only work is an open or asked decision, and still expires those for every owner in the same tick (C28)', async () => {
+    const on = await freshDb();
+    const w = await world(on);
+    const staleOpen = await decision(w, 'open', ago(LIMITS.staleOpenDecisionMs + 1), on);
+    const oldAsked = await decision(w, 'asked', ago(LIMITS.questionTtlMs + 1), on);
+    // Questions from free wallets: each one used to be a visit.
+    for (let i = 0; i < LIMITS.jobsOwnersPerTick; i++) await decision(await world(on), 'asked', NOW, on);
+    const paying = await world(on);
+    await payment(paying, await decision(paying, 'paid', ago(120_000), on), { signedAt: ago(120_000) }, on);
+    const { chain } = stubChain(on);
+    expect(await tick(on, chain)).toMatchObject({ owners: 1, decisionsExpired: 1, questionsClosed: 1, errors: [] });
+    expect([await statusOf(staleOpen, on), await statusOf(oldAsked, on)]).toEqual(['expired', 'expired']);
+    expect([await visitedAt(w, on), await visitedAt(paying, on)]).toEqual([null, NOW]);
+  });
+
+  it("runs an owner's payments, outcomes and refill before its memory steps, so a hung relayer cannot hold them up (C28)", async () => {
+    const on = await freshDb();
+    const w = await funded(on, { memwalAccountId: randomAddress() });
+    await pendingMemory(w, 'On 2026-10-24 the owner approved a hotel search.', ago(60_000), on);
+    const pending = await payment(w, await decision(w, 'paid', ago(120_000), on), { signedAt: ago(120_000) }, on);
+    const owed = await payment(w, await decision(w, 'paid', ago(600_000), on), { settlement: 'verified', delivered: false, signedAt: ago(600_000) }, on);
+    const stub = stubFor(w, 0n, on);
+    let clockMs = NOW.getTime();
+    // The relayer takes the rest of the tick's time budget.
+    const client = relayer({
+      rememberBulk: async (items: unknown[]) => {
+        stub.calls.push('rememberBulk');
+        clockMs += LIMITS.tickTimeBudgetMs;
+        return { job_ids: items.map((_, index) => `job-${index}`), total: items.length, status: 'running' };
+      },
+    });
+    const summary = await runJobsTick({ db: on, chain: stub.chain, masterSecretHex: MASTER, gasKeypair: GAS, now: () => new Date(clockMs), sleep: noSleep });
+    expect(summary).toMatchObject({ owners: 1, outcomesRecorded: 1, refills: 1, memoriesSubmitted: 2, timeBudgetReached: true });
+    const order = (call: string) => stub.calls.indexOf(call);
+    expect(order(`getTransactionResult:${pending.digest}`)).toBeGreaterThanOrEqual(0);
+    expect(order(`getTransactionResult:${pending.digest}`)).toBeLessThan(order(`getBalances:${w.purse}`));
+    expect(order(`getBalances:${w.purse}`)).toBeLessThan(order('rememberBulk'));
+    // The outcome recorded in this visit went out in the same visit's write.
+    expect((await outcomesOf(w.ownerId, on)).map((row) => row.decisionId)).toEqual([owed.decisionId]);
+    expect(client.rememberBulk).toHaveBeenCalledTimes(1);
+  });
+
+  it("fails every owner's pending memory past its age in one statement each tick, an owner without an account included, without visiting it (C33)", async () => {
+    const on = await freshDb();
+    const w = await world(on);
+    await pendingMemory(w, 'On 2026-10-20 the owner approved a hotel search.', ago(LIMITS.memoryWriteMaxAgeMs), on);
+    await pendingMemory(w, 'On 2026-10-21 the owner approved a hotel search.', ago(LIMITS.memoryWriteMaxAgeMs - 1), on);
+    const { chain } = stubChain(on);
+    expect(await tick(on, chain)).toMatchObject({ owners: 0, memoriesFailed: 1, errors: [] });
+    const statuses = (await on.select({ status: memories.status }).from(memories).where(eq(memories.ownerId, w.ownerId)).orderBy(memories.createdAt)).map((row) => row.status);
+    expect(statuses).toEqual(['failed', 'pending']);
+    expect(createMemoryClient).not.toHaveBeenCalled();
+  });
+
+  it("charges each owner's visit to that owner's jobs scope, and the gas wallet and the tick's shared epoch reading to the jobs scope alone (C22, C28)", async () => {
+    const on = await freshDb();
+    const pair = [await world(on), await world(on)];
+    const digests = new Map<string, string>();
+    for (const w of pair) {
+      // Past their window, so each settlement pass asks for the tick's one epoch reading.
+      const row = await payment(w, await decision(w, 'paid', ago(120_000), on), { validUntilEpoch: 99n, signedAt: ago(120_000) }, on);
+      digests.set(row.digest, w.ownerId);
+    }
+    const stub = stubChain(on);
+    const seen: Array<{ call: string; scope: TatumScope | undefined }> = [];
+    const chain = new Proxy(stub.chain, {
+      get(target, property, receiver) {
+        const value: unknown = Reflect.get(target, property, receiver);
+        if (typeof value !== 'function') return value;
+        return (...args: unknown[]) => {
+          seen.push({ call: `${String(property)}:${String(args[0] ?? '')}`, scope: currentTatumScope() });
+          return (value as (...given: unknown[]) => unknown)(...args);
+        };
+      },
+    });
+    // As the jobs route runs it.
+    expect(await withTatumScope({ kind: 'jobs' }, () => tick(on, chain))).toMatchObject({ owners: 2, errors: [] });
+    expect(seen.filter(({ call }) => call.startsWith('getBalances') || call.startsWith('getCurrentEpoch')).map(({ scope }) => scope)).toEqual([{ kind: 'jobs' }, { kind: 'jobs' }]);
+    const reads = seen.filter(({ call }) => call.startsWith('getTransactionResult'));
+    expect(new Set(reads.map(({ call }) => call)).size).toBe(2);
+    for (const { call, scope } of reads) expect(scope).toEqual({ kind: 'jobs', ownerId: digests.get(call.slice('getTransactionResult:'.length)) });
+  });
 
   it('visits the 26th owner within three ticks when 26 owners all have an allowance, which is work that never runs out', { timeout: 120_000 }, async () => {
     const on = await freshDb();
@@ -1885,18 +2128,21 @@ describe('runJobsTick', () => {
     // executeTransaction: a send each round, a digest lookup before each later round, the waits, then a refusal's wait and lookup.
     const send = (LIMITS.tatumRetries + 1) * LIMITS.tatumTimeoutMs + LIMITS.tatumRetries * LIMITS.tatumTimeoutMs + retryWaits + LIMITS.tatumRetryDelayMs + LIMITS.tatumTimeoutMs;
     const units = {
-      // settlePayment with tries 1: the digest, the epoch, then paymentReleaseReads waits and reads.
-      settlementPass: 2 * tatumRead + LIMITS.paymentReleaseReads * (LIMITS.settlementPollIntervalMs + tatumRead),
+      // settlePayment with tries 1: the digest, then the epoch. A release takes a second pass instead
+      // of more reads in this one, so no pass waits or reads again.
+      settlementPass: 2 * tatumRead,
       // Once its row is written a refill always dry-runs, sends and reads back.
       refillSend: tatumRead + send + tatumRead,
       refillRead: LIMITS.settlementPollIntervalMs + tatumRead,
       gasWalletBalances: LIMITS.balanceMaxPages * tatumRead,
       walrusEpoch: 2 * tatumRead,
       blobScanPage: tatumRead,
+      // The tick hands the writer canStart, so core never waits for a delegate key's points before a
+      // call (memory-service.test.ts proves the refusal); the call ceiling is then the whole unit.
       relayerCall: LIMITS.memwalCallTimeoutMs,
     };
     expect(units).toEqual({
-      settlementPass: 174_000,
+      settlementPass: 66_000,
       refillSend: 130_000,
       refillRead: 36_000,
       gasWalletBalances: 165_000,

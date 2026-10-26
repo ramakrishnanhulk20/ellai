@@ -1,7 +1,22 @@
 import { LIMITS } from '@ellai/core/limits';
 import { and, asc, eq, gt, gte, inArray, isNotNull, isNull, lt, lte, notExists, or, sql } from 'drizzle-orm';
 import type { Database } from '../db/client.js';
-import { agents, decisions, memories, owners, refills, sellerSales, sessions, signinNonces, stepUps } from '../db/schema.js';
+import {
+  agents,
+  decisionCitations,
+  decisions,
+  grantUses,
+  grants,
+  memories,
+  owners,
+  payments,
+  questions,
+  refills,
+  sellerSales,
+  sessions,
+  signinNonces,
+  stepUps,
+} from '../db/schema.js';
 import { pruneRateCounterBatch } from '../http/ratelimit.js';
 
 export interface PruneArgs {
@@ -21,6 +36,8 @@ export interface PruneSummary {
   stepUps: number;
   sellerSales: number;
   sessions: number;
+  /** Closed decisions only; the citations, grant uses and questions that went with them are not counted. */
+  decisions: number;
   owners: number;
 }
 
@@ -72,6 +89,34 @@ function emptyOwner(tx: Pick<Database, 'select'>, now: Date) {
 }
 
 /**
+ * A decision that closed without a payment, created more than LIMITS.closedDecisionKeepMs before
+ * `now`: refused, expired or failed (C34). The status test is written exactly as the predicate of
+ * decisions_closed_created_at_idx, so the planner can walk that partial index in created_at order.
+ *
+ * Six foreign keys name a decision (schema.ts, migrations 0000 to 0007). A payment
+ * (payments_decision_same_owner_fk) means money moved or may have, so such a decision is never
+ * closed-without-payment and is kept. A memory (memories_decision_same_owner_fk) is the owner's
+ * own record of an answer or an outcome, so a decision a memory names is kept. A grant
+ * (grants_decision_same_owner_fk) belongs only to a decision its owner answered, which is
+ * 'answered', never closed; one that somehow did would carry another decision's grant use, so it
+ * is kept as well. The other three are this decision's own rows, deleted with it: its citations
+ * (decision_citations_decision_same_owner_fk), its use of an earlier decision's grant
+ * (grant_uses_decision_same_owner_fk; that grant expired LIMITS.grantTtlMs after it was made,
+ * long before the keep time, and decide never takes an expired grant, so the use can never be
+ * spent again) and its question (questions_decision_same_owner_fk).
+ */
+function closedDecision(tx: Pick<Database, 'select'>, now: Date) {
+  const one = { one: sql`1` };
+  return and(
+    sql`${decisions.status} in ('refused', 'expired', 'failed')`,
+    lt(decisions.createdAt, new Date(now.getTime() - LIMITS.closedDecisionKeepMs)),
+    notExists(tx.select(one).from(payments).where(and(eq(payments.decisionId, decisions.id), eq(payments.ownerId, decisions.ownerId)))),
+    notExists(tx.select(one).from(memories).where(and(eq(memories.decisionId, decisions.id), eq(memories.ownerId, decisions.ownerId)))),
+    notExists(tx.select(one).from(grants).where(and(eq(grants.decisionId, decisions.id), eq(grants.ownerId, decisions.ownerId)))),
+  );
+}
+
+/**
  * Deletes rows that can never be used again, in batches of LIMITS.pruneBatch per table, so
  * cleanup keeps ahead of the global caps on anonymous work however many strangers ask for a
  * sign-in or a challenge (C22, C34):
@@ -92,6 +137,13 @@ function emptyOwner(tx: Pick<Database, 'select'>, now: Date) {
  *   so a recheck can only ever close them, and a closed one decides nothing;
  * - sessions that expired more than LIMITS.endedSessionKeepMs before `now`. A revoked session
  *   goes when it expires, since revoked_at has no index to find it by;
+ * - decisions that closed without a payment more than LIMITS.closedDecisionKeepMs ago
+ *   (closedDecision), oldest first through decisions_closed_created_at_idx, in one transaction per
+ *   batch that locks each decision row first (FOR UPDATE SKIP LOCKED), checks it again under the
+ *   lock, then deletes its citations, its grant use and its question before the decision itself,
+ *   since every one of those foreign keys is ON DELETE RESTRICT. Free wallets can make a decision
+ *   on every pay-request, so this is what keeps the table from growing without bound (C34). They
+ *   go before empty owners, whose decisions hold them back;
  * - empty owners (emptyOwner), LIMITS.pruneBatch at a time, oldest first through
  *   owners_created_at_idx, each batch of a call starting where the one before it stopped, with
  *   their ended sessions, in one transaction that locks each owner row first (FOR UPDATE SKIP
@@ -100,8 +152,8 @@ function emptyOwner(tx: Pick<Database, 'select'>, now: Date) {
  *   The lock is what holds: a new session or any other row pointing at the owner must wait for
  *   it, and every such reference is ON DELETE RESTRICT, so a row that slipped past the check
  *   fails the delete and keeps the owner.
- * Each rule but the owners' and the rate counters' (window_start) deletes through the expires_at
- * index, oldest first. Every rule runs
+ * Each rule but the owners', the decisions' (created_at) and the rate counters' (window_start)
+ * deletes through the expires_at index, oldest first. Every rule runs
  * one batch; a rule whose batch came back full runs again, round by round, until each comes back
  * short or LIMITS.pruneTimeSliceMs has passed on `clock` since the first batch, so one busy table
  * cannot starve the others of their first batch. Returns how many rows each table lost, an
@@ -139,7 +191,40 @@ export async function pruneExpiredRows(args: PruneArgs): Promise<PruneSummary> {
       ).length,
     );
 
-  const summary: PruneSummary = { rateCounters: 0, signinNonces: 0, stepUps: 0, sellerSales: 0, sessions: 0, owners: 0 };
+  const summary: PruneSummary = { rateCounters: 0, signinNonces: 0, stepUps: 0, sellerSales: 0, sessions: 0, decisions: 0, owners: 0 };
+
+  const closedDecisions = () =>
+    db.transaction(async (tx) => {
+      const picked = await tx
+        .select({ id: decisions.id })
+        .from(decisions)
+        .where(closedDecision(tx, now))
+        .orderBy(asc(decisions.createdAt))
+        .limit(LIMITS.pruneBatch)
+        .for('update', { skipLocked: true });
+      if (picked.length === 0) return counted(0);
+      const full = picked.length >= LIMITS.pruneBatch;
+      // The pick read rows as they stood when it began; this read starts after the locks are held.
+      const ids = (
+        await tx
+          .select({ id: decisions.id })
+          .from(decisions)
+          .where(
+            and(
+              inArray(
+                decisions.id,
+                picked.map((row) => row.id),
+              ),
+              closedDecision(tx, now),
+            ),
+          )
+      ).map((row) => row.id);
+      if (ids.length === 0) return { deleted: 0, full };
+      await tx.delete(decisionCitations).where(inArray(decisionCitations.decisionId, ids));
+      await tx.delete(grantUses).where(inArray(grantUses.decisionId, ids));
+      await tx.delete(questions).where(inArray(questions.decisionId, ids));
+      return { deleted: (await tx.delete(decisions).where(inArray(decisions.id, ids)).returning({ id: decisions.id })).length, full };
+    });
 
   // Where this call's walk through owners_created_at_idx has reached, so each batch after the
   // first starts past the owners in use that an earlier one already stepped over. A Date holds
@@ -232,6 +317,7 @@ export async function pruneExpiredRows(args: PruneArgs): Promise<PruneSummary> {
           ).length,
         ),
     },
+    { table: 'decisions', run: closedDecisions },
     { table: 'owners', run: emptyOwners },
   ];
 

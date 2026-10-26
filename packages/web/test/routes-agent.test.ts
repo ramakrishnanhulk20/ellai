@@ -5,7 +5,8 @@
 // PaidFetchResult with the seller's answer marked untrusted and nothing of Ellai's sent to the
 // seller; a question, the owner's yes, retryAllowed, one paid retry, and the grant spent or
 // expired; the per-agent and per-owner pay limits and the per-agent decision read limit, each
-// shared by HTTP and MCP, and the one too_many_requests body every limit answers with; a caller's
+// shared by HTTP and MCP, and the one too_many_requests body every limit answers with; the
+// per-client and global pay-request days, over HTTP and MCP, with their day wording; a caller's
 // deadline handed through agentPaidFetch; the routes' time ceilings; bodies the route does not take; one agent never reading
 // another's decision; an unexpected failure as a bare 500; and the MCP handshake, tool list,
 // both tools running the same flow as the HTTP routes, tool failures as fixed JSON, and 405 on
@@ -695,5 +696,73 @@ describe('POST /api/mcp', () => {
     expect(smuggled.isError).toBe(true);
     expect(seller).toHaveBeenCalledTimes(2);
     expect(logged.mock.calls.flat().join(' ')).not.toContain(MARKER);
+  });
+});
+
+describe('the daily pay-request caps (C34)', () => {
+  const DAY_MS = 86_400_000;
+  const RATE_LIMITED_TODAY = { error: 'rate_limited_today', message: 'Too many requests today. Try again tomorrow (days are counted in UTC).' };
+  const SPENT_TODAY = { error: 'chain_unavailable_today', message: "Ellai has used today's budget for reading Sui. Try again tomorrow (days are counted in UTC)." };
+
+  /** Lowers two day caps for the length of `run`, so each is reached in a few calls. */
+  async function withDayCaps(perClient: number, global: number, run: () => Promise<void>): Promise<void> {
+    const limits = LIMITS as unknown as Record<string, number>;
+    const before = { client: limits.agentFetchesPerClientPerDay, global: limits.agentFetchesPerDayGlobal };
+    limits.agentFetchesPerClientPerDay = perClient;
+    limits.agentFetchesPerDayGlobal = global;
+    try {
+      await run();
+    } finally {
+      if (before.client !== undefined) limits.agentFetchesPerClientPerDay = before.client;
+      if (before.global !== undefined) limits.agentFetchesPerDayGlobal = before.global;
+    }
+  }
+
+  async function mcpFetchFrom(ip: string, token: string): Promise<{ isError: boolean; text: string }> {
+    rpcId += 1;
+    const call = { jsonrpc: '2.0', id: rpcId, method: 'tools/call', params: { name: 'paid_fetch', arguments: fetchInput() } };
+    const { result } = (await (await mcpPost(call, { ...bearer(token), 'x-forwarded-for': ip })).json()) as RpcAnswer;
+    const [content] = result?.content ?? [];
+    return { isError: result?.isError === true, text: content?.text ?? '' };
+  }
+
+  it('holds one client to its day across every agent token it holds and every client to the global day, over HTTP and MCP, before any seller is called', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    const error = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    vi.stubEnv('VERCEL', '1');
+    try {
+      // A UTC day no other test counts in.
+      clock = new Date((Math.floor(clock.getTime() / DAY_MS) + 400) * DAY_MS + 60_000);
+      const [w, other] = [await world(), await world()];
+      freeSeller('{}');
+      const httpFrom = (ip: string, token: string) => agentFetch(fetchInput(), { ...bearer(token), 'x-forwarded-for': ip });
+      await withDayCaps(2, 5, async () => {
+        // Two free wallets' tokens from one client share that client's day.
+        expect((await httpFrom('198.51.100.7', w.token)).status).toBe(200);
+        expect((await httpFrom('198.51.100.7', other.token)).status).toBe(200);
+        const over = await httpFrom('198.51.100.7', w.token);
+        expect(over.status).toBe(429);
+        expect(await over.json()).toEqual(RATE_LIMITED_TODAY);
+        expect(await mcpFetchFrom('198.51.100.7', other.token)).toEqual({ isError: true, text: JSON.stringify(RATE_LIMITED_TODAY) });
+        expect(seller).toHaveBeenCalledTimes(2);
+
+        // The client's refusals never reached the global day, so three more clients use up exactly what is left.
+        for (const ip of ['198.51.100.8', '198.51.100.9', '198.51.100.10']) expect((await httpFrom(ip, w.token)).status).toBe(200);
+        const spent = await httpFrom('198.51.100.11', other.token);
+        expect(spent.status).toBe(503);
+        expect(await spent.json()).toEqual(SPENT_TODAY);
+        expect(await mcpFetchFrom('198.51.100.12', w.token)).toEqual({ isError: true, text: JSON.stringify(SPENT_TODAY) });
+        expect(seller).toHaveBeenCalledTimes(5);
+      });
+      const lines = [...warn.mock.calls, ...error.mock.calls].map((call) => call.join(' '));
+      expect(lines.filter((line) => line === '[ellai http] agent_pay_client rate_limited_today')).toHaveLength(2);
+      expect(lines.filter((line) => line === '[ellai http] quota_spent agent-pay:day')).toHaveLength(1);
+
+      // A new UTC day starts both counts over.
+      clock = new Date(clock.getTime() + DAY_MS);
+      expect((await httpFrom('198.51.100.7', w.token)).status).toBe(200);
+    } finally {
+      vi.unstubAllEnvs();
+    }
   });
 });

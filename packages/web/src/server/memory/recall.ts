@@ -1,10 +1,11 @@
+import { LIMITS } from '@ellai/core/limits';
 import { recallSentences } from '@ellai/core/memory';
 import { ownerMemoryClient } from './delegate.js';
 
 // Cosine distance runs from 0 to 2, so this keeps every hit the relayer ranks. The owner's
 // own cutoff is applied by the rules, which also need the full count to tell when the
 // result limit may have cut off a closer hit (C12).
-const NO_CUTOFF = 2;
+const NO_CUTOFF = LIMITS.recallDistanceMax;
 
 /**
  * The recall decide calls for one owner: a search by meaning in `namespace` of the owner's
@@ -12,7 +13,8 @@ const NO_CUTOFF = 2;
  * blob id and distance and never its sentence. Every failure is a rejection, which decide
  * counts as a failed recall and answers by asking (C12): no account (MemoryServiceError
  * NO_ACCOUNT, before any client exists), a bad master secret, and any MemoryError from
- * recallSentences. One client per call, destroyed after it.
+ * recallSentences, which refuses the whole answer when any hit's distance is missing or outside
+ * 0 to LIMITS.recallDistanceMax. One client per call, destroyed after it.
  */
 export function makeRecall(args: {
   owner: { suiAddress: string; memwalAccountId: string | null };

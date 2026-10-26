@@ -2,7 +2,8 @@
 // step only from what the chain shows, and refuses, recording nothing: a failed transaction,
 // another sender's transaction, an allowance whose funder, spender or coin differs or that is
 // over the onboarding maxima, a transaction that created no allowance or two, an account owned
-// by someone else, a delegate list without Ellai's key, and add_delegate before the account.
+// by someone else, a delegate list without Ellai's key, and add_delegate before the account; a new
+// allowance clears the refill wait the one it replaces left.
 // buildOnboardingTx refuses allowance terms outside the maxima and add_delegate before the
 // account, takes owner, purse and account from the owner row, and its summaries hold only
 // validated values. onboardingState follows the row.
@@ -184,6 +185,13 @@ describe('confirmOnboardingTx', () => {
     });
     // Confirming again records the same values.
     expect(await confirm(owner, 'memory_account', chain)).toEqual({ recorded: accountId });
+  });
+
+  it("clears a refill wait left by the allowance it replaces, so the tick reads the new one at once", async () => {
+    const owner = await newOwner({ allowanceId: address(), allowanceCheckedAt: new Date(NOW.getTime() - DAY_MS), refillNotBefore: new Date(NOW.getTime() + DAY_MS) });
+    const replacement = `0x${'e7'.repeat(32)}`;
+    expect(await confirm(owner, 'allowance', stubChain(owner, { created: [{ objectId: replacement, type: ALLOWANCE_TYPE }] }).chain)).toEqual({ recorded: replacement });
+    expect(await reread(owner)).toMatchObject({ allowanceId: replacement, allowanceCheckedAt: NOW, refillNotBefore: null });
   });
 
   it('refuses a failed transaction and another sender, at every step, recording nothing', async () => {

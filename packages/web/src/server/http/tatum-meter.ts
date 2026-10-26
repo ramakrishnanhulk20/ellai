@@ -5,15 +5,20 @@ import type { Database } from '../db/client.js';
 import { consumeShared, consumeWindow } from './ratelimit.js';
 
 /**
- * Who a request to Tatum is charged to. 'jobs' is the scheduled tick and the operator's scripts.
- * 'person' is anything a caller started: an anonymous caller by its client key alone, a
- * signed-in owner or an agent with that owner's id as well.
+ * Who a request to Tatum is charged to. 'jobs' is the scheduled tick and the operator's scripts,
+ * with the owner whose visit the tick is on when it is on one. 'person' is anything a caller
+ * started: an anonymous caller by its client key alone, a signed-in owner or an agent with that
+ * owner's id as well.
  */
-export type TatumScope = { readonly kind: 'jobs' } | { readonly kind: 'person'; readonly clientKey: string; readonly ownerId?: string };
+export type TatumScope =
+  | { readonly kind: 'jobs'; readonly ownerId?: string }
+  | { readonly kind: 'person'; readonly clientKey: string; readonly ownerId?: string };
 
 const CLIENT_DAY_KEY_PREFIX = 'tatum-client-day:';
 const OWNER_DAY_KEY_PREFIX = 'tatum-owner-day:';
+const JOBS_OWNER_DAY_KEY_PREFIX = 'tatum-jobs-owner-day:';
 const PERSON_QUOTA = 'tatum-calls:day';
+const ANONYMOUS_QUOTA = 'tatum-anonymous-calls:day';
 const JOBS_QUOTA = 'tatum-jobs-calls:day';
 
 // Kept on globalThis, as context.ts keeps its shared state: the Next dev server can load this
@@ -29,16 +34,16 @@ function scopes(): AsyncLocalStorage<TatumScope> {
 /**
  * Runs `run` with `scope` as the one every Tatum request it starts is charged to, requests from
  * promises it leaves running included. A scope entered inside another replaces it for that inner
- * run. Returns what `run` returns. Throws Error for a person scope with an empty client key or an
- * empty owner id, which is a server bug.
+ * run. Returns what `run` returns. Throws Error for a person scope with an empty client key, or an
+ * empty owner id in either kind, which is a server bug.
  */
 export function withTatumScope<T>(scope: TatumScope, run: () => T): T {
+  if (scope.ownerId !== undefined && (typeof scope.ownerId !== 'string' || scope.ownerId === '')) throw new Error('an owner id in a scope cannot be empty');
   let fixed: TatumScope;
   if (scope.kind === 'jobs') {
-    fixed = { kind: 'jobs' };
+    fixed = scope.ownerId === undefined ? { kind: 'jobs' } : { kind: 'jobs', ownerId: scope.ownerId };
   } else {
     if (typeof scope.clientKey !== 'string' || scope.clientKey === '') throw new Error('a person scope needs a client key');
-    if (scope.ownerId !== undefined && (typeof scope.ownerId !== 'string' || scope.ownerId === '')) throw new Error('an owner id in a scope cannot be empty');
     fixed = scope.ownerId === undefined ? { kind: 'person', clientKey: scope.clientKey } : { kind: 'person', clientKey: scope.clientKey, ownerId: scope.ownerId };
   }
   return scopes().run(Object.freeze(fixed), run);
@@ -58,22 +63,34 @@ async function sharedTurn(db: Database, quota: string, limit: number, now: Date)
   throw refusal();
 }
 
+// One caller's own day, so its refusal is logged every time, unlike a shared budget's.
+async function ownTurn(db: Database, key: string, limit: number, now: Date, who: string): Promise<void> {
+  if (await consumeWindow(db, key, limit, LIMITS.rateWindowDayMs, now)) return;
+  console.warn(`[ellai tatum] ${who} rate_limited_today`);
+  throw refusal();
+}
+
 /**
  * The beforeRequest hook for createChain: counts each request to Tatum, every page and retry,
  * against the budgets of the scope it runs in, in fixed UTC days (LIMITS.rateWindowDayMs), in
  * `db` (C22, C34).
  * - Outside any scope it refuses, logging the fixed code no_scope: a path that cannot say who it
  *   runs for must not spend anyone's credits.
- * - 'jobs' counts one of LIMITS.tatumCallsJobsPerDay, a budget of its own, so strangers spending
- *   the shared day cannot stop settlement and refills, and the tick spends none of theirs.
+ * - 'jobs' with an owner counts one of LIMITS.tatumCallsJobsPerOwnerPerDay for that owner first,
+ *   so owners whose visits cost reads without paying cannot spend the shared jobs day that every
+ *   other owner's settlement and refills need (C28). Then every 'jobs' request counts one of
+ *   LIMITS.tatumCallsJobsPerDay, a budget of its own, so strangers spending the persons' day cannot
+ *   stop settlement and refills, and the tick spends none of theirs.
  * - 'person' counts one each, in this order, of LIMITS.tatumCallsPerClientPerDay for its client
- *   key, LIMITS.tatumCallsPerOwnerPerDay for its owner when it names one, and
- *   LIMITS.tatumCallsPerDayGlobal shared by every person. It stops at the first one passed, so a
- *   caller past its own limit spends nothing after it.
- * A request over a limit still counts toward that limit. A refusal throws Error with fixed text,
- * which createChain turns into ChainError BUDGET with nothing sent. A client or owner refusal logs
- * a fixed code each time; a shared budget (the persons' or the jobs') logs its name once, at its
- * first refusal in a day. A database failure throws as well, so no request is sent uncounted.
+ *   key; LIMITS.tatumCallsPerOwnerPerDay for its owner when it names one, or, when it names none,
+ *   LIMITS.tatumCallsAnonymousPerDay shared by every caller with no owner, so strangers can never
+ *   take the share owners need to sign; and LIMITS.tatumCallsPerDayGlobal shared by every person.
+ * Each request stops at the first limit passed, so a caller past its own limit spends nothing after
+ * it. A request over a limit still counts toward that limit. A refusal throws Error with fixed text,
+ * which createChain turns into ChainError BUDGET with nothing sent. A client, owner or jobs owner
+ * refusal logs a fixed code each time; a shared budget (the anonymous, the persons' or the jobs')
+ * logs its name once, at its first refusal in a day. A database failure throws as well, so no
+ * request is sent uncounted.
  */
 export function tatumMeter(db: Database, now: () => Date): BeforeTatumRequest {
   return async () => {
@@ -83,18 +100,16 @@ export function tatumMeter(db: Database, now: () => Date): BeforeTatumRequest {
       throw refusal();
     }
     const at = now();
-    if (scope.kind === 'jobs') return sharedTurn(db, JOBS_QUOTA, LIMITS.tatumCallsJobsPerDay, at);
-    if (!(await consumeWindow(db, `${CLIENT_DAY_KEY_PREFIX}${scope.clientKey}`, LIMITS.tatumCallsPerClientPerDay, LIMITS.rateWindowDayMs, at))) {
-      console.warn('[ellai tatum] client rate_limited_today');
-      throw refusal();
-    }
     // Owner ids come out of the database in one case already; lower-casing keeps any other
     // spelling from opening a second count.
     const ownerKey = scope.ownerId?.toLowerCase();
-    if (ownerKey !== undefined && !(await consumeWindow(db, `${OWNER_DAY_KEY_PREFIX}${ownerKey}`, LIMITS.tatumCallsPerOwnerPerDay, LIMITS.rateWindowDayMs, at))) {
-      console.warn('[ellai tatum] owner rate_limited_today');
-      throw refusal();
+    if (scope.kind === 'jobs') {
+      if (ownerKey !== undefined) await ownTurn(db, `${JOBS_OWNER_DAY_KEY_PREFIX}${ownerKey}`, LIMITS.tatumCallsJobsPerOwnerPerDay, at, 'jobs_owner');
+      return sharedTurn(db, JOBS_QUOTA, LIMITS.tatumCallsJobsPerDay, at);
     }
+    await ownTurn(db, `${CLIENT_DAY_KEY_PREFIX}${scope.clientKey}`, LIMITS.tatumCallsPerClientPerDay, at, 'client');
+    if (ownerKey === undefined) await sharedTurn(db, ANONYMOUS_QUOTA, LIMITS.tatumCallsAnonymousPerDay, at);
+    else await ownTurn(db, `${OWNER_DAY_KEY_PREFIX}${ownerKey}`, LIMITS.tatumCallsPerOwnerPerDay, at, 'owner');
     return sharedTurn(db, PERSON_QUOTA, LIMITS.tatumCallsPerDayGlobal, at);
   };
 }

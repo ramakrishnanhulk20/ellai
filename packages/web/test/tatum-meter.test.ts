@@ -1,10 +1,12 @@
 // Covers: tatumMeter as a real core chain's beforeRequest hook, on PGlite, with stand-in GraphQL
-// answers counting what is actually sent and the four day budgets cut small (LIMITS is mocked,
+// answers counting what is actually sent and the six day budgets cut small (LIMITS is mocked,
 // each to its own size) so each is reached in a few requests: a request outside any scope refused
-// with nothing sent; one client's day, one owner's day and the day every person shares each
-// refusing at exactly its own limit with no request sent past it and nothing counted after the
-// first refusal; the jobs budget kept apart, whole after strangers spend the shared day and
-// spending none of it; each shared budget logged once a day; and a new UTC day starting over.
+// with nothing sent; one client's day, one owner's day, the day every caller with no owner shares
+// and the day every person shares each refusing at exactly its own limit with no request sent past
+// it and nothing counted after the first refusal, so strangers spending theirs leave owners able to
+// sign; the jobs budget kept apart, whole after persons spend the shared day and spending none of
+// it, and one owner's jobs share spent leaving the jobs day for every other owner; each shared
+// budget logged once a day; and a new UTC day starting over.
 // Does NOT cover: real Tatum or gRPC (core's chain.test.ts runs the hook on a stand-in gRPC
 // transport), several server instances counting at once (they share the one database, and PGlite
 // serves one connection), or which route enters which scope (routes-scope.test.ts).
@@ -15,13 +17,29 @@ import { type Database, createDb, migrate } from '../src/server/db/client.js';
 import { type TatumScope, tatumMeter, withTatumScope } from '../src/server/http/tatum-meter.js';
 
 // The shared day is larger than one client's and one owner's days together, so a test can show
-// that a request refused by one of those never reached the counts after it.
-const { CLIENT_DAY, OWNER_DAY, PERSONS_DAY, JOBS_DAY } = vi.hoisted(() => ({ CLIENT_DAY: 4, OWNER_DAY: 3, PERSONS_DAY: 8, JOBS_DAY: 5 }));
+// that a request refused by one of those never reached the counts after it. The anonymous day sits
+// inside the persons' day, and one owner's jobs share inside the jobs day, as in LIMITS.
+const { CLIENT_DAY, OWNER_DAY, ANONYMOUS_DAY, PERSONS_DAY, JOBS_DAY, JOBS_OWNER_DAY } = vi.hoisted(() => ({
+  CLIENT_DAY: 4,
+  OWNER_DAY: 3,
+  ANONYMOUS_DAY: 5,
+  PERSONS_DAY: 8,
+  JOBS_DAY: 5,
+  JOBS_OWNER_DAY: 2,
+}));
 
 vi.mock('@ellai/core/limits', async (importOriginal) => {
   const real = await importOriginal<typeof import('@ellai/core/limits')>();
   return {
-    LIMITS: { ...real.LIMITS, tatumCallsPerClientPerDay: CLIENT_DAY, tatumCallsPerOwnerPerDay: OWNER_DAY, tatumCallsPerDayGlobal: PERSONS_DAY, tatumCallsJobsPerDay: JOBS_DAY },
+    LIMITS: {
+      ...real.LIMITS,
+      tatumCallsPerClientPerDay: CLIENT_DAY,
+      tatumCallsPerOwnerPerDay: OWNER_DAY,
+      tatumCallsAnonymousPerDay: ANONYMOUS_DAY,
+      tatumCallsPerDayGlobal: PERSONS_DAY,
+      tatumCallsJobsPerDay: JOBS_DAY,
+      tatumCallsJobsPerOwnerPerDay: JOBS_OWNER_DAY,
+    },
   };
 });
 
@@ -83,7 +101,10 @@ async function request(scope: TatumScope | null): Promise<string> {
 
 const person = (clientKey: string, ownerId?: string): TatumScope => (ownerId === undefined ? { kind: 'person', clientKey } : { kind: 'person', clientKey, ownerId });
 const JOBS: TatumScope = { kind: 'jobs' };
+const jobsFor = (ownerId: string): TatumScope => ({ kind: 'jobs', ownerId });
 const fresh = (label: string) => `${label}-${randomUUID()}`;
+/** A signed-in owner on a client of its own, so only the persons' day is shared with anyone. */
+const someOwner = (): TatumScope => person(fresh('client'), randomUUID());
 
 async function requests(scopes: TatumScope[]): Promise<string[]> {
   const outcomes: string[] = [];
@@ -125,18 +146,31 @@ describe('tatumMeter', () => {
   });
 
   it('stops every person once the shared day is spent, logs that once, and starts over the next UTC day', async () => {
-    const strangers = Array.from({ length: PERSONS_DAY + 2 }, () => person(fresh('client')));
-    expect(await requests(strangers)).toEqual([...Array<string>(PERSONS_DAY).fill('sent'), 'BUDGET', 'BUDGET']);
+    const owners = Array.from({ length: PERSONS_DAY + 2 }, someOwner);
+    expect(await requests(owners)).toEqual([...Array<string>(PERSONS_DAY).fill('sent'), 'BUDGET', 'BUDGET']);
     expect(sent).toBe(PERSONS_DAY);
     expect(logs).toEqual(['[ellai tatum] quota_spent tatum-calls:day']);
+    // A stranger is refused as well.
+    expect(await request(person(fresh('client')))).toBe('BUDGET');
 
     clock = new Date(clock.getTime() + DAY_MS);
     expect(await request(person(fresh('client')))).toBe('sent');
     expect(sent).toBe(PERSONS_DAY + 1);
   });
 
-  it('keeps the jobs budget apart: strangers spending the shared day leave it whole, and the jobs spend none of theirs', async () => {
-    expect(await requests(Array.from({ length: PERSONS_DAY + 1 }, () => person(fresh('client'))))).toEqual([...Array<string>(PERSONS_DAY).fill('sent'), 'BUDGET']);
+  it('holds every caller with no owner to the anonymous day inside the shared one, so strangers using theirs up leave owners able to sign (C22)', async () => {
+    expect(ANONYMOUS_DAY).toBeLessThan(PERSONS_DAY);
+    const strangers = Array.from({ length: ANONYMOUS_DAY + 2 }, () => person(fresh('client')));
+    expect(await requests(strangers)).toEqual([...Array<string>(ANONYMOUS_DAY).fill('sent'), 'BUDGET', 'BUDGET']);
+    expect(logs).toEqual(['[ellai tatum] quota_spent tatum-anonymous-calls:day']);
+    // The refused strangers never reached the shared day: owners have exactly what is left of it.
+    const left = PERSONS_DAY - ANONYMOUS_DAY;
+    expect(await requests(Array.from({ length: left + 1 }, someOwner))).toEqual([...Array<string>(left).fill('sent'), 'BUDGET']);
+    expect(sent).toBe(PERSONS_DAY);
+  });
+
+  it('keeps the jobs budget apart: persons spending the shared day leave it whole, and the jobs spend none of theirs', async () => {
+    expect(await requests(Array.from({ length: PERSONS_DAY + 1 }, someOwner))).toEqual([...Array<string>(PERSONS_DAY).fill('sent'), 'BUDGET']);
     expect(await requests(Array.from({ length: JOBS_DAY + 1 }, () => JOBS))).toEqual([...Array<string>(JOBS_DAY).fill('sent'), 'BUDGET']);
     expect(sent).toBe(PERSONS_DAY + JOBS_DAY);
     expect(logs).toEqual(['[ellai tatum] quota_spent tatum-calls:day', '[ellai tatum] quota_spent tatum-jobs-calls:day']);
@@ -144,7 +178,21 @@ describe('tatumMeter', () => {
     clock = new Date(clock.getTime() + DAY_MS);
     sent = 0;
     expect(await requests(Array.from({ length: JOBS_DAY }, () => JOBS))).toEqual(Array<string>(JOBS_DAY).fill('sent'));
-    expect(await requests(Array.from({ length: PERSONS_DAY }, () => person(fresh('client'))))).toEqual(Array<string>(PERSONS_DAY).fill('sent'));
+    expect(await requests(Array.from({ length: PERSONS_DAY }, someOwner))).toEqual(Array<string>(PERSONS_DAY).fill('sent'));
     expect(sent).toBe(JOBS_DAY + PERSONS_DAY);
+  });
+
+  it("holds the tick's visits to one owner to that owner's jobs share, so one owner using it up leaves the jobs day for every other (C22, C28)", async () => {
+    const greedy = randomUUID();
+    expect(await requests(Array.from({ length: JOBS_OWNER_DAY + 2 }, () => jobsFor(greedy)))).toEqual([...Array<string>(JOBS_OWNER_DAY).fill('sent'), 'BUDGET', 'BUDGET']);
+    expect(logs).toEqual(Array<string>(2).fill('[ellai tatum] jobs_owner rate_limited_today'));
+    // The same owner spelled in capitals is the same share.
+    expect(await request(jobsFor(greedy.toUpperCase()))).toBe('BUDGET');
+    // None of the refusals reached the jobs day: the rest of it is still there for the others.
+    const other = randomUUID();
+    expect(await requests([jobsFor(other), jobsFor(other), JOBS])).toEqual(['sent', 'sent', 'sent']);
+    expect(sent).toBe(JOBS_DAY);
+    expect(await request(jobsFor(randomUUID()))).toBe('BUDGET');
+    expect(logs.at(-1)).toBe('[ellai tatum] quota_spent tatum-jobs-calls:day');
   });
 });

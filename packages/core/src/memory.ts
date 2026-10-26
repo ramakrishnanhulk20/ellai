@@ -685,25 +685,59 @@ function capRelayerResponses(origin: string): void {
   relayerFetchCapped = true;
 }
 
-// Points per delegate client, counted when spent, so one key stays under the relayer's
-// per-minute limit however often the functions below are called on it.
-const relayerSpend = new WeakMap<object, Array<{ at: number; points: number }>>();
+type PointLedger = Array<{ at: number; points: number }>;
 
-async function spendRelayerPoints(client: object, points: number): Promise<void> {
-  if (points > LIMITS.memwalPointsPerMinute) throw new MemoryError('RATE_LIMITED', 'one request costs more relayer points than a minute allows');
-  let ledger = relayerSpend.get(client);
-  if (!ledger) {
-    ledger = [];
-    relayerSpend.set(client, ledger);
+// The relayer counts points per delegate key, and callers make a new client for every call, so
+// points are counted per key: a ledger per client let one visit spend 51 points in a 30-point
+// window. createMemoryClient records each client's key here. A client made any other way, such as
+// a test's stand-in, has no key and is counted on its own.
+const clientDelegateKeys = new WeakMap<object, string>();
+const keySpend = new Map<string, PointLedger>();
+const unkeyedSpend = new WeakMap<object, PointLedger>();
+
+function ledgerOf(client: object): PointLedger {
+  const key = clientDelegateKeys.get(client);
+  const found = key === undefined ? unkeyedSpend.get(client) : keySpend.get(key);
+  if (found) return found;
+  const ledger: PointLedger = [];
+  if (key === undefined) unkeyedSpend.set(client, ledger);
+  else keySpend.set(key, ledger);
+  return ledger;
+}
+
+// A key whose last spend left the window is dropped, so the map holds only keys used in the last
+// minute however many owners the process serves.
+function forgetIdleKeys(now: number): void {
+  for (const [key, ledger] of keySpend) {
+    if ((ledger.at(-1)?.at ?? 0) <= now - LIMITS.memwalPacingWindowMs) keySpend.delete(key);
   }
+}
+
+/** How a relayer call waits for its delegate key's points. */
+export interface RelayerPacing {
+  /**
+   * When false, a call whose key has spent its points for the current window is refused at once
+   * with MemoryError RATE_LIMITED and nothing sent, instead of waiting up to
+   * LIMITS.memwalPacingWindowMs for room: for a caller with a deadline, whose own check before the
+   * call cannot see that wait. True when left out.
+   */
+  waitForPoints?: boolean;
+}
+
+async function spendRelayerPoints(client: object, points: number, pacing: RelayerPacing = {}): Promise<void> {
+  if (points > LIMITS.memwalPointsPerMinute) throw new MemoryError('RATE_LIMITED', 'one request costs more relayer points than a minute allows');
   for (;;) {
     const now = Date.now();
+    forgetIdleKeys(now);
+    // Looked up again on every round: a wait can outlast the window, and the ledger it started on may have been dropped since.
+    const ledger = ledgerOf(client);
     while (ledger.length > 0 && (ledger[0]?.at ?? 0) <= now - LIMITS.memwalPacingWindowMs) ledger.shift();
     const spent = ledger.reduce((sum, entry) => sum + entry.points, 0);
     if (spent + points <= LIMITS.memwalPointsPerMinute) {
       ledger.push({ at: now, points });
       return;
     }
+    if (pacing.waitForPoints === false) throw new MemoryError('RATE_LIMITED', 'this delegate key has spent its relayer points for this minute; nothing was sent');
     await sleep((ledger[0]?.at ?? now) + LIMITS.memwalPacingWindowMs - now);
   }
 }
@@ -858,7 +892,9 @@ async function waitForJobs(client: MemWal, jobIds: string[]): Promise<string[]> 
  * A Walrus Memory client that signs as Ellai's per-owner delegate key on the account.
  * The relayer is MEMWAL_RELAYER_URL, or the hosted Mainnet relayer when that is unset, and
  * must be a bare https origin. Every request has the LIMITS.memwalRequestTimeoutMs ceiling
- * and its response is capped at LIMITS.memwalMaxResponseBytes. Makes no network call.
+ * and its response is capped at LIMITS.memwalMaxResponseBytes. Every client made for one delegate
+ * key in this process spends that key's relayer points together, at most
+ * LIMITS.memwalPointsPerMinute in any LIMITS.memwalPacingWindowMs. Makes no network call.
  * Throws MemoryError: ACCOUNT for an account id that is not a Sui object id, UPSTREAM for
  * a relayer URL that is not a bare https origin.
  */
@@ -883,14 +919,16 @@ export function createMemoryClient(args: { delegate: Ed25519Keypair; accountId: 
   capRelayerResponses(relayer.origin);
   // A private copy of the seed, so client.destroy() can wipe it without touching the keypair.
   const { secretKey } = decodeSuiPrivateKey(args.delegate.getSecretKey());
-  return MemWal.create({ key: Uint8Array.from(secretKey), accountId, serverUrl: relayer.origin, requestTimeoutMs: LIMITS.memwalRequestTimeoutMs });
+  const client = MemWal.create({ key: Uint8Array.from(secretKey), accountId, serverUrl: relayer.origin, requestTimeoutMs: LIMITS.memwalRequestTimeoutMs });
+  clientDelegateKeys.set(client, toHex(args.delegate.getPublicKey().toRawBytes()));
+  return client;
 }
 
 /**
  * Stores each sentence as its own memory in `namespace` with one bulk write, then waits
  * until every job is done, and returns each sentence with its blob id and job id, in order.
- * Spends relayer points through a per-client pace, so it never runs past the relayer's
- * per-minute limit. The write is sent once and never resent: SDK 0.1.8 sends no
+ * Spends relayer points through a pace per delegate key, waiting for room, so it never runs past
+ * the relayer's per-minute limit. The write is sent once and never resent: SDK 0.1.8 sends no
  * idempotency key on bulk writes, so a resend would store every sentence twice.
  *
  * Throws MemoryError: WRITE for no sentences, more than LIMITS.memwalBulkMaxItems, an
@@ -919,19 +957,21 @@ export async function rememberSentences(
 /**
  * Stores each sentence as its own memory in `namespace` with one bulk write and returns the
  * relayer's job ids in sentence order, without waiting for the jobs: read them later with
- * checkJobs. Same checks and the same per-client pace as rememberSentences. The write is
- * sent once and never resent, because SDK 0.1.8 sends no idempotency key on bulk writes and
- * a resend would store every sentence twice.
+ * checkJobs. Same checks and the same per-key pace as rememberSentences, except that with
+ * `pacing.waitForPoints` false a key with no points left is refused rather than waited for. The
+ * write is sent once and never resent, because SDK 0.1.8 sends no idempotency key on bulk writes
+ * and a resend would store every sentence twice.
  *
  * Throws MemoryError: WRITE for no sentences, more than LIMITS.memwalBulkMaxItems, an
  * empty, oversized or repeated sentence, a bad namespace, a relayer refusal, or an accepted
- * write that did not return one distinct job id per sentence; TIMEOUT, DELEGATE,
- * RATE_LIMITED or UPSTREAM from the relayer.
+ * write that did not return one distinct job id per sentence; RATE_LIMITED, with nothing sent,
+ * for a key with no points left when told not to wait; TIMEOUT, DELEGATE, RATE_LIMITED or
+ * UPSTREAM from the relayer.
  */
-export async function submitSentences(client: MemWal, namespace: string, sentences: string[]): Promise<string[]> {
+export async function submitSentences(client: MemWal, namespace: string, sentences: string[], pacing: RelayerPacing = {}): Promise<string[]> {
   const label = checkNamespace(namespace, 'WRITE');
   const texts = checkSentences(sentences);
-  await spendRelayerPoints(client, LIMITS.memwalBulkPoints);
+  await spendRelayerPoints(client, LIMITS.memwalBulkPoints, pacing);
   let accepted: unknown;
   try {
     accepted = await withinCallCeiling(client.rememberBulk(texts.map((text) => ({ text, namespace: label }))));
@@ -943,7 +983,8 @@ export async function submitSentences(client: MemWal, namespace: string, sentenc
 
 /**
  * Reads the state of up to LIMITS.memwalBulkMaxItems bulk write jobs with one status call,
- * spending relayer points through the same per-client pace as every other call here, and
+ * spending relayer points through the same per-key pace as every other call here (refused
+ * rather than waited for when `pacing.waitForPoints` is false), and
  * returns one entry per job id in the order given. 'done' carries the blob id. 'failed'
  * covers a failed job and one the relayer does not know. 'pending' covers every state in
  * which the job is still working. The call is not retried here: the caller decides when to
@@ -952,12 +993,13 @@ export async function submitSentences(client: MemWal, namespace: string, sentenc
  * Throws MemoryError: WRITE for no job ids, more than LIMITS.memwalBulkMaxItems (the
  * relayer refuses more per call), a malformed or repeated job id, or an answer that is not
  * exactly one entry per job asked about, has a finished job without a usable blob id, or
- * names a state this code does not know; TIMEOUT, DELEGATE, RATE_LIMITED or UPSTREAM from
- * the relayer.
+ * names a state this code does not know; RATE_LIMITED, with nothing sent, for a key with no
+ * points left when told not to wait; TIMEOUT, DELEGATE, RATE_LIMITED or UPSTREAM from the relayer.
  */
 export async function checkJobs(
   client: MemWal,
   jobIds: string[],
+  pacing: RelayerPacing = {},
 ): Promise<Array<{ jobId: string; state: 'done' | 'pending' | 'failed'; blobId: string | null }>> {
   if (!Array.isArray(jobIds) || jobIds.length === 0) throw new MemoryError('WRITE', 'give at least one job id');
   if (jobIds.length > LIMITS.memwalBulkMaxItems) {
@@ -969,7 +1011,7 @@ export async function checkJobs(
   const asked = [...jobIds];
   if (new Set(asked).size !== asked.length) throw new MemoryError('WRITE', 'a job id is repeated');
 
-  await spendRelayerPoints(client, LIMITS.memwalRequestPoints);
+  await spendRelayerPoints(client, LIMITS.memwalRequestPoints, pacing);
   let status: unknown;
   try {
     status = await withinCallCeiling(client.getRememberBulkStatus(asked, { timeoutMs: LIMITS.memwalRequestTimeoutMs }));
@@ -1004,12 +1046,13 @@ export async function checkJobs(
 /**
  * Searches `namespace` by meaning and returns the hits closer than `opts.maxDistance`,
  * closest first as the relayer ranks them, or [] when none are. Every hit must carry a
- * numeric distance, or the whole call fails, so a malformed answer can never pass as a
- * match or as "nothing found" (C12).
+ * numeric distance from 0 to LIMITS.recallDistanceMax, the whole range cosine distance can
+ * take, or the whole call fails, so a malformed answer can never pass as a match, as a
+ * closer match than any real one, or as "nothing found" (C12).
  *
  * Throws MemoryError: RECALL for a bad query, namespace, limit or cutoff, a hit without a
- * numeric distance, text or blob id, more hits than asked for, or hits the relayer dropped
- * unread; TIMEOUT, DELEGATE, RATE_LIMITED or UPSTREAM from the relayer.
+ * numeric distance in that range, text or blob id, more hits than asked for, or hits the relayer
+ * dropped unread; TIMEOUT, DELEGATE, RATE_LIMITED or UPSTREAM from the relayer.
  */
 export async function recallSentences(
   client: MemWal,
@@ -1025,8 +1068,8 @@ export async function recallSentences(
     throw new MemoryError('RECALL', `the limit must be a whole number from 1 to ${LIMITS.memwalRecallMaxLimit}`);
   }
   // Cosine distance runs from 0 (same meaning) to 2 (opposite).
-  if (!Number.isFinite(opts.maxDistance) || opts.maxDistance <= 0 || opts.maxDistance > 2) {
-    throw new MemoryError('RECALL', 'the distance cutoff must be above 0 and at most 2');
+  if (!Number.isFinite(opts.maxDistance) || opts.maxDistance <= 0 || opts.maxDistance > LIMITS.recallDistanceMax) {
+    throw new MemoryError('RECALL', `the distance cutoff must be above 0 and at most ${LIMITS.recallDistanceMax}`);
   }
 
   await spendRelayerPoints(client, LIMITS.memwalRequestPoints);
@@ -1050,6 +1093,9 @@ export async function recallSentences(
     const { text, blob_id: blobId, distance, created_at: createdAt } = (typeof hit === 'object' && hit !== null ? hit : {}) as Record<string, unknown>;
     const position = index + 1;
     if (typeof distance !== 'number' || !Number.isFinite(distance)) throw new MemoryError('RECALL', `recall hit ${position} has no numeric distance`);
+    if (distance < 0 || distance > LIMITS.recallDistanceMax) {
+      throw new MemoryError('RECALL', `recall hit ${position} has a distance outside 0 to ${LIMITS.recallDistanceMax}`);
+    }
     if (typeof text !== 'string') throw new MemoryError('RECALL', `recall hit ${position} has no text`);
     if (typeof blobId !== 'string' || !RELAYER_ID_PATTERN.test(blobId)) throw new MemoryError('RECALL', `recall hit ${position} has no usable blob id`);
     if (createdAt !== undefined && (typeof createdAt !== 'string' || !TIMESTAMP_PATTERN.test(createdAt))) {

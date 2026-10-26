@@ -3,14 +3,15 @@ import { type Chain, ChainError } from '@ellai/core/chain';
 import { LIMITS } from '@ellai/core/limits';
 import { MemoryError } from '@ellai/core/memory';
 import type { Ed25519Keypair } from '@mysten/sui/keypairs/ed25519';
-import { and, asc, eq, inArray, isNotNull, isNull, lte, notExists, or, sql } from 'drizzle-orm';
+import { and, asc, eq, isNotNull, isNull, lte, notExists, or, sql } from 'drizzle-orm';
 import { unionAll } from 'drizzle-orm/pg-core';
 import type { Database } from '../db/client.js';
-import { LIVE_DECISION_STATUSES, decisions, memories, owners, payments } from '../db/schema.js';
+import { memories, owners, payments } from '../db/schema.js';
 import { consumeShared } from '../http/ratelimit.js';
+import { withTatumScope } from '../http/tatum-meter.js';
 import { MemoryServiceError, ownerDelegate } from '../memory/delegate.js';
 import { recordOutcome } from '../memory/outcome.js';
-import { confirmMemoryJobs, isKeyRefused, submitPendingMemories } from '../memory/writer.js';
+import { confirmMemoryJobs, failAgedMemories, isKeyRefused, submitPendingMemories } from '../memory/writer.js';
 import { settlePayment } from '../pay/settle.js';
 import { awaitingChainCheck, chainExpiring, confirmBlobsOnChain, expireBlobsOnChain, lackingEndEpoch, walrusEpochForExpiry } from './blobs.js';
 import { expireDecisions } from './expire.js';
@@ -51,7 +52,7 @@ export interface JobsTickSummary {
   decisionsExpired: number;
   questionsClosed: number;
   refills: number;
-  /** Old rate counters, dead sign-in nonces, seller sales, sessions and empty owners deleted by this tick. */
+  /** Old rate counters, dead sign-in nonces and step-ups, seller sales, sessions, closed decisions and empty owners deleted by this tick. */
   rowsPruned: number;
   /** Null when an earlier tick already took this window's one gas wallet read (LIMITS.gasWalletCheckIntervalMs). */
   gasWalletLow: boolean | null;
@@ -89,11 +90,13 @@ function refillMayStart(now: Date) {
  * One reading of the chain's epoch for a whole tick, taken the first time a settlement pass asks,
  * so a backlog of payments past their window costs one epoch read rather than one each (C22). A
  * failed reading is kept as well, and those passes leave their payments pending for the next tick.
+ * It is charged to the jobs day with no owner, since every owner's pass shares it: charged to the
+ * owner whose pass asked first, that owner's spent share would fail it for everyone (C28).
  */
 function oneEpochReading(chain: Chain): () => Promise<bigint> {
   let reading: Promise<bigint> | null = null;
   return () => {
-    reading ??= chain.getCurrentEpoch();
+    reading ??= withTatumScope({ kind: 'jobs' }, () => chain.getCurrentEpoch());
     return reading;
   };
 }
@@ -116,16 +119,18 @@ export function errorCode(error: unknown): string {
 
 /**
  * Owners with work, least recently visited first: never visited before any visited, then the
- * oldest visit, and among equals the oldest work. Work is pending memories (only for an owner
- * with a Walrus Memory account, the only kind the memory step can send), confirmed memories
- * not yet found on chain that confirmBlobsOnChain would check at `now` (awaitingChainCheck),
- * memories found on chain before blob_end_epoch was kept, which its scan fills in (lackingEndEpoch),
- * pending payments, payments owed an outcome memory, open or asked decisions, an allowance whose
- * refill_not_before is unset or past (refillMayStart), dated by when it was checked or, before
- * that, when the owner joined, and, when the tick holds a Walrus epoch reading, memories found
- * on chain whose Blob that epoch has reached (chainExpiring). Ordering by the visit and not by
- * the work is what lets every owner take a turn: an
- * owner with an allowance always has work, so ordering by work alone served the same
+ * oldest visit, and among equals the oldest work. Work is only what needs the chain or the relayer
+ * for this owner: pending memories (only for an owner with a Walrus Memory account, the only kind
+ * the memory step can send), confirmed memories not yet found on chain that confirmBlobsOnChain
+ * would check at `now` (awaitingChainCheck), memories found on chain before blob_end_epoch was
+ * kept, which its scan fills in (lackingEndEpoch), pending payments, payments owed an outcome
+ * memory (the memory the relayer is then sent), an allowance whose refill_not_before is unset or
+ * past (refillMayStart), dated by when it was checked or, before that, when the owner joined,
+ * and, when the tick holds a Walrus epoch reading, memories found on chain whose Blob that epoch
+ * has reached (chainExpiring). Open and asked decisions are not work: expireDecisions closes them
+ * for every owner in one statement, so free sign-ins with a question each cannot push a paying
+ * owner's turn back (C28). Ordering by the visit and not by the work is what lets every owner take
+ * a turn: an owner with an allowance always has work, so ordering by work alone served the same
  * LIMITS.jobsOwnersPerTick owners every tick (C21).
  */
 async function ownersWithWork(db: Database, now: Date, walrusEpoch: number | null): Promise<string[]> {
@@ -155,11 +160,6 @@ async function ownersWithWork(db: Database, now: Date, walrusEpoch: number | nul
     .from(payments)
     .where(owedOutcome(db))
     .groupBy(payments.ownerId);
-  const decisionWork = db
-    .select({ ownerId: decisions.ownerId, at: sql<Date>`min(${decisions.createdAt})`.as('at') })
-    .from(decisions)
-    .where(inArray(decisions.status, LIVE_DECISION_STATUSES))
-    .groupBy(decisions.ownerId);
   const allowanceWork = db
     .select({ ownerId: owners.id, at: sql<Date>`coalesce(${owners.allowanceCheckedAt}, ${owners.createdAt})`.as('at') })
     .from(owners)
@@ -174,7 +174,7 @@ async function ownersWithWork(db: Database, now: Date, walrusEpoch: number | nul
             .where(chainExpiring(walrusEpoch))
             .groupBy(memories.ownerId),
         ];
-  const work = unionAll(memoryWork, blobWork, backfillWork, paymentWork, outcomeWork, decisionWork, allowanceWork, ...expiryWork).as('work');
+  const work = unionAll(memoryWork, blobWork, backfillWork, paymentWork, outcomeWork, allowanceWork, ...expiryWork).as('work');
   const rows = await db
     .select({ ownerId: owners.id })
     .from(work)
@@ -188,11 +188,16 @@ async function ownersWithWork(db: Database, now: Date, walrusEpoch: number | nul
 /**
  * One pass of Ellai's background work, bounded and safe to repeat. Its deadline is
  * LIMITS.tickTimeBudgetMs after it begins, on `now`: past it no owner is started and no step
- * starts a new external call, so the longest unit begun just before it (one settlement pass)
- * still ends inside LIMITS.tickEndByMs, under the route's limit (C21, C28). Database work goes on.
+ * starts a new external call, so the longest unit begun just before it (the gas wallet's balance
+ * pages; jobs.test.ts works out every unit from LIMITS) still ends inside LIMITS.tickEndByMs, under
+ * the route's limit (C21, C28). Database work goes on.
  * First pruneExpiredRows deletes dead rows, old rate counters first, in batches of
  * LIMITS.pruneBatch for at most LIMITS.pruneTimeSliceMs on this tick's clock, before any owner's
- * work (C22, C34). Then, before the deadline, the gas
+ * work (C22, C34). Then expireDecisions closes stale open decisions and unanswered questions past
+ * their time for every owner in one bounded statement, and failAgedMemories fails every owner's
+ * pending memory past its age, whatever the owner's account or key, counted in memoriesFailed;
+ * both run whatever the deadline, since they read nothing outside the database (C28, C33). Then,
+ * before the deadline, the gas
  * wallet's SUI is read, but only by the first tick in each fixed LIMITS.gasWalletCheckIntervalMs
  * window, counted through consumeShared so every instance shares it (C21, C22): below
  * LIMITS.gasWalletLowMist, unreadable or not read sets gasWalletLow, a later tick in the same
@@ -202,23 +207,26 @@ async function ownersWithWork(db: Database, now: Date, walrusEpoch: number | nul
  * Then it handles at most LIMITS.jobsOwnersPerTick owners with work, least recently
  * visited first (ownersWithWork). Each owner's last_ticked_at is set to `now` as its visit
  * starts, so an owner whose visit fails or is cut off goes to the back of the line like any
- * other. Then, in order, each step handed the deadline as `canStart`:
- * 1. memory (only with a Walrus Memory account): submitPendingMemories, then confirmMemoryJobs,
- *    which is skipped when the submit ended with core's DELEGATE refusal, so that code is
- *    recorded once per owner per tick; then, for every owner, confirmBlobsOnChain checks
- *    confirmed memories against the owner's Walrus Blob objects on chain, and expireBlobsOnChain
- *    marks those whose Blob Walrus no longer stores, in a step of its own (C18);
- * 2. payments: every payment still 'pending', oldest first, until the deadline, is read once by settlePayment
+ * other. The visit runs in the Tatum scope { kind: 'jobs', ownerId }, so every request it makes is
+ * charged to that owner's jobs share before the shared jobs day (C22, C28). Then, in order, each
+ * step handed the deadline as `canStart`, the money steps first, so a slow relayer or a hung SEAL
+ * read in the memory steps can never use up the time this owner's payments and refill need (C28):
+ * 1. payments: every payment still 'pending', oldest first, until the deadline, is read once by settlePayment
  *    (tries 1; later ticks are the patience), which checks it against Ellai's own digest (C8)
  *    and counts a failed read past the payment's window in payments.settlement_failed_reads;
  *    every pass in the tick, for every owner, shares one epoch reading (oneEpochReading);
- * 3. outcomes: every 'verified' payment stored as delivered false (never null) whose decision has
+ * 2. outcomes: every 'verified' payment stored as delivered false (never null) whose decision has
  *    no outcome memory yet, oldest first, becomes a delivered=false outcome memory through
- *    recordOutcome, idempotent per decision. That takes in a payment step 2 has just verified
+ *    recordOutcome, idempotent per decision. That takes in a payment step 1 has just verified
  *    and one whose outcome the paid call itself failed to record;
- * 4. expireDecisions: stale open decisions and unanswered questions past their time;
- * 5. refillIfNeeded (only with an allowance, and not before its refill_not_before), waiting with
- *    this tick's `sleep`: C7 and C23 at refill time.
+ * 3. refillIfNeeded (only with an allowance, and not before its refill_not_before), reading this
+ *    tick's clock after its reads: C7 and C23 at refill time. A lost refill is failed only by a
+ *    later tick, so no tick waits on one;
+ * 4. memory (only with a Walrus Memory account): submitPendingMemories, then confirmMemoryJobs,
+ *    which is skipped when the submit ended with core's DELEGATE refusal, so that code is
+ *    recorded once per owner per tick; then, for every owner, confirmBlobsOnChain checks
+ *    confirmed memories against the owner's Walrus Blob objects on chain, and expireBlobsOnChain
+ *    marks those whose Blob Walrus no longer stores, in a step of its own (C18).
  * timeBudgetReached is set when the deadline has passed by the end.
  * Every owner and every step is wrapped: a failure is recorded with the owner, the step and a
  * fixed code from errorCode, and the tick moves on. Never throws for a step's failure; throws
@@ -259,7 +267,17 @@ export async function runJobsTick(args: JobsTickArgs): Promise<JobsTickSummary> 
 
   await step('', 'prune', async () => {
     const pruned = await pruneExpiredRows({ db, now: now(), clock: now });
-    summary.rowsPruned += pruned.rateCounters + pruned.signinNonces + pruned.stepUps + pruned.sellerSales + pruned.sessions + pruned.owners;
+    summary.rowsPruned += pruned.rateCounters + pruned.signinNonces + pruned.stepUps + pruned.sellerSales + pruned.sessions + pruned.decisions + pruned.owners;
+  });
+
+  await step('', 'expire', async () => {
+    const expired = await expireDecisions({ db, now: now() });
+    summary.decisionsExpired += expired.decisionsExpired;
+    summary.questionsClosed += expired.questionsClosed;
+  });
+
+  await step('', 'memory_age', async () => {
+    summary.memoriesFailed += await failAgedMemories({ db, now: now() });
   });
 
   if (canStart()) {
@@ -293,87 +311,85 @@ export async function runJobsTick(args: JobsTickArgs): Promise<JobsTickSummary> 
     await step(ownerId, 'visited', async () => {
       await db.update(owners).set({ lastTickedAt: now() }).where(eq(owners.id, ownerId));
     });
-    await step(ownerId, 'owner', async () => {
-      const [owner] = await db
-        .select({ suiAddress: owners.suiAddress, memwalAccountId: owners.memwalAccountId, allowanceId: owners.allowanceId, refillNotBefore: owners.refillNotBefore })
-        .from(owners)
-        .where(eq(owners.id, ownerId));
-      if (owner === undefined) return;
+    // Every Tatum request of the visit, its steps' own included, is charged to this owner's jobs share (C22, C28).
+    await withTatumScope({ kind: 'jobs', ownerId }, () =>
+      step(ownerId, 'owner', async () => {
+        const [owner] = await db
+          .select({ suiAddress: owners.suiAddress, memwalAccountId: owners.memwalAccountId, allowanceId: owners.allowanceId, refillNotBefore: owners.refillNotBefore })
+          .from(owners)
+          .where(eq(owners.id, ownerId));
+        if (owner === undefined) return;
 
-      if (owner.memwalAccountId !== null) {
-        let keyRefused = false;
-        await step(ownerId, 'memory_submit', async () => {
-          try {
-            summary.memoriesSubmitted += (await submitPendingMemories({ db, ownerId, masterSecretHex, now: now(), canStart })).submitted;
-          } catch (error) {
-            keyRefused = isKeyRefused(error);
-            throw error;
+        await step(ownerId, 'payments', async () => {
+          const pending = await db
+            .select({ id: payments.id })
+            .from(payments)
+            .where(and(eq(payments.ownerId, ownerId), eq(payments.settlement, 'pending')))
+            .orderBy(asc(payments.signedAt), asc(payments.id))
+            .limit(PAYMENTS_PER_OWNER);
+          for (const payment of pending) {
+            // Each settlement pass is a unit of its own, so the deadline is asked between them.
+            if (!canStart()) break;
+            await step(ownerId, 'payment', async () => {
+              const settled = await settlePayment({ db, ownerId, paymentId: payment.id, chain, tries: 1, intervalMs: LIMITS.settlementPollIntervalMs, sleep, now, readEpoch });
+              if (settled === 'verified') summary.paymentsVerified += 1;
+              else if (settled === 'not_landed') summary.paymentsNotLanded += 1;
+              else if (settled === 'mismatch') summary.paymentsMismatched += 1;
+            });
           }
         });
-        // The relayer would refuse the same key again, so the confirm step would only record the code twice.
-        if (!keyRefused) {
-          await step(ownerId, 'memory_confirm', async () => {
-            const confirmed = await confirmMemoryJobs({ db, ownerId, masterSecretHex, now: now(), canStart });
-            summary.memoriesConfirmed += confirmed.confirmed;
-            summary.memoriesFailed += confirmed.failed;
-          });
-        }
-      }
-      await step(ownerId, 'blobs', async () => {
-        summary.memoriesChainConfirmed += (await confirmBlobsOnChain({ db, chain, ownerId, now: now(), canStart })).confirmed;
-      });
-      await step(ownerId, 'blob_expiry', async () => {
-        summary.memoriesChainExpired += (await expireBlobsOnChain({ db, chain, ownerId, now: now(), canStart })).expired;
-      });
 
-      await step(ownerId, 'payments', async () => {
-        const pending = await db
-          .select({ id: payments.id })
-          .from(payments)
-          .where(and(eq(payments.ownerId, ownerId), eq(payments.settlement, 'pending')))
-          .orderBy(asc(payments.signedAt), asc(payments.id))
-          .limit(PAYMENTS_PER_OWNER);
-        for (const payment of pending) {
-          // One settlement pass is the longest unit the tick starts, so the deadline is asked between them.
-          if (!canStart()) break;
-          await step(ownerId, 'payment', async () => {
-            const settled = await settlePayment({ db, ownerId, paymentId: payment.id, chain, tries: 1, intervalMs: LIMITS.settlementPollIntervalMs, sleep, now, readEpoch });
-            if (settled === 'verified') summary.paymentsVerified += 1;
-            else if (settled === 'not_landed') summary.paymentsNotLanded += 1;
-            else if (settled === 'mismatch') summary.paymentsMismatched += 1;
-          });
-        }
-      });
-
-      await step(ownerId, 'outcomes', async () => {
-        const owed = await db
-          .select({ decisionId: payments.decisionId })
-          .from(payments)
-          .where(and(eq(payments.ownerId, ownerId), owedOutcome(db)))
-          .orderBy(asc(payments.signedAt), asc(payments.id))
-          .limit(PAYMENTS_PER_OWNER);
-        if (owed.length === 0) return;
-        const { publicKeyHex } = ownerDelegate(masterSecretHex, owner.suiAddress);
-        for (const payment of owed) {
-          await step(ownerId, 'outcome', async () => {
-            await recordOutcome({ db, ownerId, decisionId: payment.decisionId, delivered: false, delegatePublicKeyHex: publicKeyHex, now: now() });
-            summary.outcomesRecorded += 1;
-          });
-        }
-      });
-
-      await step(ownerId, 'expire', async () => {
-        const expired = await expireDecisions({ db, ownerId, now: now() });
-        summary.decisionsExpired += expired.decisionsExpired;
-        summary.questionsClosed += expired.questionsClosed;
-      });
-
-      if (owner.allowanceId !== null && (owner.refillNotBefore === null || owner.refillNotBefore.getTime() <= now().getTime())) {
-        await step(ownerId, 'refill', async () => {
-          if ((await refillIfNeeded({ db, chain, ownerId, masterSecretHex, gasKeypair, now: now(), sleep, canStart })) === 'refilled') summary.refills += 1;
+        await step(ownerId, 'outcomes', async () => {
+          const owed = await db
+            .select({ decisionId: payments.decisionId })
+            .from(payments)
+            .where(and(eq(payments.ownerId, ownerId), owedOutcome(db)))
+            .orderBy(asc(payments.signedAt), asc(payments.id))
+            .limit(PAYMENTS_PER_OWNER);
+          if (owed.length === 0) return;
+          const { publicKeyHex } = ownerDelegate(masterSecretHex, owner.suiAddress);
+          for (const payment of owed) {
+            await step(ownerId, 'outcome', async () => {
+              await recordOutcome({ db, ownerId, decisionId: payment.decisionId, delivered: false, delegatePublicKeyHex: publicKeyHex, now: now() });
+              summary.outcomesRecorded += 1;
+            });
+          }
         });
-      }
-    });
+
+        if (owner.allowanceId !== null && (owner.refillNotBefore === null || owner.refillNotBefore.getTime() <= now().getTime())) {
+          await step(ownerId, 'refill', async () => {
+            // The tick's own clock, so the day's refill count and sent_at are read under the lock, after the reads before them (C26).
+            if ((await refillIfNeeded({ db, chain, ownerId, masterSecretHex, gasKeypair, now: now(), clock: now, canStart })) === 'refilled') summary.refills += 1;
+          });
+        }
+
+        if (owner.memwalAccountId !== null) {
+          let keyRefused = false;
+          await step(ownerId, 'memory_submit', async () => {
+            try {
+              summary.memoriesSubmitted += (await submitPendingMemories({ db, ownerId, masterSecretHex, now: now(), canStart })).submitted;
+            } catch (error) {
+              keyRefused = isKeyRefused(error);
+              throw error;
+            }
+          });
+          // The relayer would refuse the same key again, so the confirm step would only record the code twice.
+          if (!keyRefused) {
+            await step(ownerId, 'memory_confirm', async () => {
+              const confirmed = await confirmMemoryJobs({ db, ownerId, masterSecretHex, now: now(), canStart });
+              summary.memoriesConfirmed += confirmed.confirmed;
+              summary.memoriesFailed += confirmed.failed;
+            });
+          }
+        }
+        await step(ownerId, 'blobs', async () => {
+          summary.memoriesChainConfirmed += (await confirmBlobsOnChain({ db, chain, ownerId, now: now(), canStart })).confirmed;
+        });
+        await step(ownerId, 'blob_expiry', async () => {
+          summary.memoriesChainExpired += (await expireBlobsOnChain({ db, chain, ownerId, now: now(), canStart })).expired;
+        });
+      }),
+    );
   }
   summary.timeBudgetReached = !canStart();
   return summary;

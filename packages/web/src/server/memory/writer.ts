@@ -1,5 +1,5 @@
 import { LIMITS } from '@ellai/core/limits';
-import { MemoryError, checkJobs, submitSentences } from '@ellai/core/memory';
+import { MemoryError, type RelayerPacing, checkJobs, submitSentences } from '@ellai/core/memory';
 import { type SQL, and, asc, eq, inArray, isNotNull, isNull, lte, or, sql } from 'drizzle-orm';
 import type { Database } from '../db/client.js';
 import { memories, owners } from '../db/schema.js';
@@ -11,11 +11,19 @@ export interface WriterArgs {
   ownerId: string;
   masterSecretHex: string;
   now: Date;
-  /** Asked before each relayer call: false once the jobs tick's deadline has passed. Always true when left out. */
+  /**
+   * Asked before each relayer call: false once the jobs tick's deadline has passed. Always true when
+   * left out. When given, core is also told not to wait for the delegate key's relayer points: that
+   * wait comes after this question and can last LIMITS.memwalPacingWindowMs, so a call it allowed
+   * could otherwise end past the deadline (C21, C28). A key with no points left is then a rate limit
+   * like the relayer's own, and the rows wait for a later pass.
+   */
   canStart?: () => boolean;
 }
 
 type MemoryClient = ReturnType<typeof ownerMemoryClient>['client'];
+
+const pacingFor = (args: WriterArgs): RelayerPacing => ({ waitForPoints: args.canStart === undefined });
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const HTTP_SERVICE_UNAVAILABLE = 503;
@@ -130,7 +138,7 @@ type Attempt =
   /** The relayer answered the write, so it took the rows, but not with one usable job id each, so they cannot be followed. */
   | { kind: 'untrackable' };
 
-async function attemptWrite(client: MemoryClient, watch: ReturnType<typeof watchBulkWrites>, rows: Array<{ sentence: string }>): Promise<Attempt> {
+async function attemptWrite(client: MemoryClient, watch: ReturnType<typeof watchBulkWrites>, rows: Array<{ sentence: string }>, pacing: RelayerPacing): Promise<Attempt> {
   watch.start();
   try {
     return {
@@ -139,6 +147,7 @@ async function attemptWrite(client: MemoryClient, watch: ReturnType<typeof watch
         client,
         MEMORY_NAMESPACE,
         rows.map((row) => row.sentence),
+        pacing,
       ),
     };
   } catch (error) {
@@ -248,6 +257,46 @@ async function claimWrite(db: Database, ours: SQL | undefined, now: Date): Promi
   });
 }
 
+/**
+ * C33 for the rows no pass can reach: marks 'failed', in one statement that reads nothing but the
+ * database, every owner's pending memory created at least LIMITS.memoryWriteMaxAgeMs before `now`,
+ * whatever the owner's account, delegate key or namespace, so a row for an owner who never made
+ * an account, removed Ellai's key, or whose key changed with the master secret still ends. A row
+ * never sent goes once no pass holds its lease (LIMITS.memoryWriteLeaseMs), so a write still on
+ * its way to the relayer keeps the row it could record a job id on. A row already sent goes once
+ * its job is also LIMITS.memoryJobMaxAgeMs past its submitted_at (created_at for a row sent before
+ * that was kept), the age at which confirmMemoryJobs gives up on a job, so a write sent just
+ * before the age limit still gets the time it needs to finish.
+ *
+ * At most LIMITS.pruneBatch rows a call, oldest first; at even one tick an hour that is 24,000 a
+ * day, more than the questions agents can raise in one (LIMITS.agentFetchesPerDayGlobal), so the
+ * rows waiting to fail stay a bounded number. Returns how many it marked. Throws for a time that
+ * is not a date.
+ */
+export async function failAgedMemories(args: { db: Database; now: Date }): Promise<number> {
+  if (!(args.now instanceof Date) || Number.isNaN(args.now.getTime())) throw new MemoryServiceError('BAD_INPUT', 'the current time is not a date');
+  const { db, now } = args;
+  const before = (ms: number) => new Date(now.getTime() - ms);
+  const aged = and(
+    eq(memories.status, 'pending'),
+    lte(memories.createdAt, before(LIMITS.memoryWriteMaxAgeMs)),
+    or(
+      and(isNull(memories.jobId), or(isNull(memories.submittedAt), lte(memories.submittedAt, before(LIMITS.memoryWriteLeaseMs)))),
+      and(
+        isNotNull(memories.jobId),
+        or(lte(memories.submittedAt, before(LIMITS.memoryJobMaxAgeMs)), and(isNull(memories.submittedAt), lte(memories.createdAt, before(LIMITS.memoryJobMaxAgeMs)))),
+      ),
+    ),
+  );
+  const oldest = db.select({ id: memories.id }).from(memories).where(aged).orderBy(asc(memories.createdAt), asc(memories.id)).limit(LIMITS.pruneBatch);
+  const marked = await db
+    .update(memories)
+    .set({ status: 'failed' })
+    .where(and(aged, inArray(memories.id, oldest)))
+    .returning({ id: memories.id });
+  return marked.length;
+}
+
 /** Puts back the submitted_at each row had before this pass leased it, for a write that changed nothing. */
 async function releaseLease(tx: Pick<Database, 'update'>, rows: Claimed[], now: Date): Promise<void> {
   const before = rows.map((row) => sql`when ${row.id}::uuid then ${row.submittedAt === null ? null : row.submittedAt.toISOString()}::timestamptz`);
@@ -272,16 +321,19 @@ async function releaseLease(tx: Pick<Database, 'update'>, rows: Claimed[], now: 
  * was in a write refused as written goes alone, so one row the relayer will never take cannot
  * keep refusing the rest. Rows refused before go first, oldest first, the bulk write ends the
  * pass, and a pass makes at most LIMITS.memoryWritesPerPass writes, what one relayer pacing
- * window holds, so core never pauses a pass to pace it. `canStart` is asked before each write,
- * and once it says no the pass claims and sends nothing more.
+ * window holds. Core counts points per delegate key across every client in the process, so other
+ * calls for the same key in the last window can still leave too few: core then waits for room, or,
+ * with `canStart` given, refuses at once with RATE_LIMITED and nothing sent. `canStart` is asked
+ * before each write, and once it says no the pass claims and sends nothing more.
  *
  * - Accepted: the job ids are stored.
  * - Refused as written (core's WRITE, from its own checks or for the relayer's 4xx): the rows stay
  *   pending with no job id, each spends one of LIMITS.memoryWriteMaxAttempts, a row that reaches
  *   it is 'failed', and the pass goes on to its next write.
  * - A rate limit, an outage or a timeout (core's RATE_LIMITED, UPSTREAM or TIMEOUT: a 429, any
- *   5xx, no answer), or a setup step that failed before the request went out, whatever status it
- *   carries (watchBulkWrites): nothing is spent, the rows stay pending under their lease, and the pass ends.
+ *   5xx, no answer, or the key's points spent), or a setup step that failed before the request went
+ *   out, whatever status it carries (watchBulkWrites): nothing is spent, the rows stay pending under
+ *   their lease, and the pass ends.
  *   A row still unsent LIMITS.memoryWriteMaxAgeMs after created_at is 'failed' (C33). A timeout or
  *   a lost answer may have stored the write; sending it again then leaves an orphan blob.
  * - Answered without one usable job id per row: the relayer took them and they cannot be followed,
@@ -323,7 +375,7 @@ export async function submitPendingMemories(args: WriterArgs): Promise<{ submitt
     for (let write = 0; write < LIMITS.memoryWritesPerPass && canStart(); write++) {
       const { rows, bulk } = await claimWrite(db, ours, now);
       if (rows.length === 0) break;
-      const sent = await attemptWrite(client, watch, rows);
+      const sent = await attemptWrite(client, watch, rows, pacingFor(args));
       let recorded = 0;
       if (sent.kind !== 'transient') {
         recorded = await db.transaction(async (tx) => {
@@ -378,10 +430,11 @@ interface JobReads {
  * read) never reached the relayer, so it is never a refused answer, whatever status it carries.
  * It, and any other failure, leaves every job not yet read 'unread' and is handed back. Reading
  * alone costs one relayer point per job, at most LIMITS.memoryJobConfirmBatch, which fits one
- * pacing window with the first read. `canStart` is asked before every read, and once it says no
- * the jobs not yet read are left 'unread'.
+ * pacing window with the first read; a key whose points other calls have spent waits, or under
+ * `pacing` is refused as a rate limit, which stops the reads like any other failure. `canStart` is
+ * asked before every read, and once it says no the jobs not yet read are left 'unread'.
  */
-async function readJobs(client: MemoryClient, jobIds: string[], canStart: () => boolean, setupFailures: () => number): Promise<JobReads> {
+async function readJobs(client: MemoryClient, jobIds: string[], canStart: () => boolean, setupFailures: () => number, pacing: RelayerPacing): Promise<JobReads> {
   if (!canStart()) return { reads: jobIds.map(() => UNREAD) };
   const stopped = (reads: JobRead[], error: unknown, before: number): JobReads => ({
     reads: [...reads, ...jobIds.slice(reads.length).map(() => UNREAD)],
@@ -390,7 +443,7 @@ async function readJobs(client: MemoryClient, jobIds: string[], canStart: () => 
   });
   let before = setupFailures();
   try {
-    const states = await checkJobs(client, jobIds);
+    const states = await checkJobs(client, jobIds, pacing);
     return { reads: jobIds.map((jobId, index) => readOf(states[index], jobId)) };
   } catch (error) {
     if (setupFailures() > before || !refusedAnswer(error)) return stopped([], error, before);
@@ -400,7 +453,7 @@ async function readJobs(client: MemoryClient, jobIds: string[], canStart: () => 
     if (!canStart()) return { reads: [...reads, ...jobIds.slice(reads.length).map(() => UNREAD)] };
     before = setupFailures();
     try {
-      const [state] = await checkJobs(client, [jobId]);
+      const [state] = await checkJobs(client, [jobId], pacing);
       reads.push(readOf(state, jobId));
     } catch (error) {
       if (setupFailures() > before || !refusedAnswer(error)) return stopped(reads, error, before);
@@ -428,8 +481,9 @@ async function readJobs(client: MemoryClient, jobIds: string[], canStart: () => 
  * Only a confirmed row has a blob id, so only it can be matched to a recall hit. When `canStart`
  * says no before the first read, nothing is read or changed.
  *
- * When the relayer refuses Ellai's delegate key (core's DELEGATE: the owner removed it),
- * nothing is changed and that MemoryError is thrown. A setup step that fails before a read's
+ * When the relayer refuses Ellai's delegate key (core's DELEGATE: the owner removed it), no
+ * answer read before the refusal is used: only rows past the age limit above are failed, and that
+ * MemoryError is thrown once they are (C33). A setup step that fails before a read's
  * request goes out, whatever status it carries, is no answer from the relayer: it fails no job,
  * and like any other MemoryError from a read it is thrown after the rows it does not touch are
  * settled as above.
@@ -459,14 +513,17 @@ export async function confirmMemoryJobs(args: WriterArgs): Promise<{ confirmed: 
       rows.map((row) => row.jobId),
       canStart,
       setupFailures,
+      pacingFor(args),
     );
-    if (isKeyRefused(error) && unsent !== true) throw error;
+    // A refused key says nothing about any job, so only the age limit settles rows then; it still
+    // does, or a key the owner removed would hold these rows pending for good (C33).
+    const keyRefused = isKeyRefused(error) && unsent !== true;
 
     const pastAge = (row: (typeof rows)[number]) => now.getTime() - (row.submittedAt ?? row.createdAt).getTime() >= LIMITS.memoryJobMaxAgeMs;
     const done: Array<{ id: string; blobId: string }> = [];
     const failed: string[] = [];
     rows.forEach((row, index) => {
-      const read = reads[index] ?? UNREAD;
+      const read = keyRefused ? UNREAD : (reads[index] ?? UNREAD);
       if (read.state === 'done') done.push({ id: row.id, blobId: read.blobId });
       else if (read.state === 'failed' || read.state === 'invalid' || pastAge(row)) failed.push(row.id);
     });
