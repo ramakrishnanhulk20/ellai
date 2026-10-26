@@ -296,10 +296,11 @@ export const LIMITS = {
   settlementUnverifiableReads: 6,
   /**
    * The jobs tick's deadline, from its start: past it no owner is started and no step starts a
-   * new external call (C21, C28). The longest single unit that may begin just before it is one
-   * settlement pass at 174 s (a digest read, an epoch read, then paymentReleaseReads waits and
-   * reads, each read three tries of tatumTimeoutMs plus the retry waits), so 100 s plus 174 s
-   * still ends inside tickEndByMs. jobs.test.ts works this out from these numbers.
+   * new external call (C21, C28). The longest single unit that may begin just before it is the
+   * gas wallet's balance pages at about 165 s (balanceMaxPages reads, each three tries of
+   * tatumTimeoutMs plus the retry waits), so 100 s plus 165 s still ends inside tickEndByMs. A
+   * settlement pass is now one digest read and one epoch read, since a release takes two passes.
+   * jobs.test.ts works this out from these numbers.
    */
   tickTimeBudgetMs: 100_000,
   /** The latest a jobs tick may still be working: 20 s under the jobs route's 300 s, left for its last database writes and its reply. */

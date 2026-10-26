@@ -43,6 +43,7 @@ export type HttpErrorCode =
   | 'chain_refused'
   | 'chain_unavailable'
   | 'chain_unavailable_today'
+  | 'busy_today'
   | 'step_up_required'
   | 'step_up_rejected'
   | 'step_up_not_needed'
@@ -74,6 +75,7 @@ const HTTP_ERROR_MESSAGES: Readonly<Record<HttpErrorCode, string>> = {
   chain_unavailable: 'Ellai could not read Sui just now. Try again in a minute.',
   // A shared quota counted over a whole day is spent: Ellai, not the caller, is over its budget.
   chain_unavailable_today: "Ellai has used today's budget for reading Sui. Try again tomorrow (days are counted in UTC).",
+  busy_today: "Ellai has taken all the pay requests it can handle today. Try again tomorrow (days are counted in UTC).",
   step_up_required: 'This change needs a fresh signature from your wallet. Ask for a confirmation message and sign it.',
   // One text for every reason a step-up fails, so the answer says nothing about which check it failed.
   step_up_rejected: 'The wallet confirmation was not accepted. Ask for a new confirmation message and sign it.',

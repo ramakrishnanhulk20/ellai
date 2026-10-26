@@ -702,7 +702,7 @@ describe('POST /api/mcp', () => {
 describe('the daily pay-request caps (C34)', () => {
   const DAY_MS = 86_400_000;
   const RATE_LIMITED_TODAY = { error: 'rate_limited_today', message: 'Too many requests today. Try again tomorrow (days are counted in UTC).' };
-  const SPENT_TODAY = { error: 'chain_unavailable_today', message: "Ellai has used today's budget for reading Sui. Try again tomorrow (days are counted in UTC)." };
+  const SPENT_TODAY = { error: 'busy_today', message: "Ellai has taken all the pay requests it can handle today. Try again tomorrow (days are counted in UTC)." };
 
   /** Lowers two day caps for the length of `run`, so each is reached in a few calls. */
   async function withDayCaps(perClient: number, global: number, run: () => Promise<void>): Promise<void> {

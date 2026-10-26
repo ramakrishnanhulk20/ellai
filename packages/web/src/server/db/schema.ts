@@ -346,6 +346,10 @@ export const memories = pgTable(
     ),
     index('memories_refusal_lookup_idx').on(t.ownerId, t.recipient, t.verdict),
     index('memories_owner_created_at_idx').on(t.ownerId, t.createdAt),
+    // Pruning a closed decision checks whether a memory names it, and every tick ages out pending
+    // memories across all owners; both read through these.
+    index('memories_decision_idx').on(t.decisionId),
+    index('memories_status_created_at_idx').on(t.status, t.createdAt),
     oneOf('memories_kind_known', t.kind, MEMORY_KINDS),
     oneOf('memories_verdict_known', t.verdict, VERDICTS),
     oneOf('memories_status_known', t.status, MEMORY_STATUSES),

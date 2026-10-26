@@ -75,7 +75,7 @@ async function withinLimit(db: Database, key: string, perMinute: number, now: Da
  *   rate_limited_today.
  * - LIMITS.agentFetchesPerDayGlobal for every agent together in that day, so standing decision
  *   rows stay a bounded number however many clients ask. Past it: HttpError 503
- *   chain_unavailable_today, Ellai's own day being spent rather than the caller's.
+ *   busy_today, Ellai's own day being spent rather than the caller's.
  * A request over a limit still counts toward it. Each day refusal logs a fixed code; the shared
  * day logs its name once, at its first refusal in a day.
  */
@@ -91,7 +91,7 @@ export async function limitAgentFetch(db: Database, agent: { ownerId: string; ag
   const turn = await consumeShared(db, AGENT_PAY_QUOTA, LIMITS.agentFetchesPerDayGlobal, LIMITS.rateWindowDayMs, now);
   if (turn.allowed) return;
   if (turn.firstRefusal) console.error(`[ellai http] quota_spent ${AGENT_PAY_QUOTA}`);
-  throw new HttpError(503, 'chain_unavailable_today');
+  throw new HttpError(503, 'busy_today');
 }
 
 /**
