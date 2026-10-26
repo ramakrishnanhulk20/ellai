@@ -475,6 +475,9 @@ export const payments = pgTable(
     // The first tick pass that saw the window closed and the digest missing. A release needs a
     // second such pass well after it, so one lagging read can never free the budget (C4, C27).
     missingSince: at('missing_since'),
+    // When the tick last read this payment's digest, so a payment held back by its seller is read
+    // at most hourly while its window is open (C22).
+    lastReadAt: at('last_read_at'),
   },
   (t) => [
     sameOwner('payments_decision_same_owner_fk', [t.decisionId, t.ownerId], [decisions.id, decisions.ownerId]),
