@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import type { Chain } from '@ellai/core/chain';
+import { type Chain, ChainError } from '@ellai/core/chain';
 import { canonicalSuiAddress } from '@ellai/core/keys';
 import { LIMITS } from '@ellai/core/limits';
 import { DEPLOYMENT_NETWORK } from '@ellai/core/network';
@@ -9,10 +9,10 @@ import { z } from 'zod';
 import type { Database } from '../db/client.js';
 import { rateCounters } from '../db/schema.js';
 import type { ServerEnv } from '../env.js';
-import { consumeShared } from '../http/ratelimit.js';
+import { consumeShared, secondsLeftInWindow } from '../http/ratelimit.js';
 import { SellerError, issueWalletCheckChallenge, timestampOf } from './challenge.js';
 import { sellerDeadline } from './deadline.js';
-import { markDelivered, settleWalletCheckPayment } from './settle.js';
+import { SETTLE_REASONS, type SettleOutcome, markCheckRefusedToday, markDelivered, returnRedelivery, settleWalletCheckPayment } from './settle.js';
 import { type WalletCheck, walletCheck } from './walletcheck.js';
 
 export interface SellerResponse {
@@ -31,6 +31,10 @@ export const HANDLER_MESSAGES = {
   unavailable: 'The seller cannot issue a payment challenge right now. Try again shortly.',
   undelivered:
     'Your payment settled, but the wallet check could not be read. The receipt is in X-PAYMENT-RESPONSE. Send the same X-PAYMENT header again to receive the check.',
+  // Settle's own text, since settle answers every later presentation that day and they must read alike.
+  undeliveredToday: SETTLE_REASONS.deliverBudgetToday,
+  unrecorded:
+    'Your payment settled, but the seller could not record the delivery of the wallet check. The receipt is in X-PAYMENT-RESPONSE. Send the same X-PAYMENT header again after Retry-After to receive the check.',
   internal: 'The seller hit an unexpected error.',
 } as const;
 
@@ -105,6 +109,23 @@ function receipt(digest: string, payer: string): Record<string, string> {
   return { [PAYMENT_RESPONSE_HEADER]: Buffer.from(JSON.stringify(settled), 'utf8').toString('base64') };
 }
 
+/**
+ * The answer for a settled sale whose buyer could not be served for a reason of Ellai's own: 503
+ * with the receipt and Retry-After, the sale left undelivered, and the redelivery turn this
+ * request took, if it took one, given back (returnRedelivery, C29).
+ */
+async function notServed(db: Database, settled: Extract<SettleOutcome, { ok: true }>, message: string, retryAfterSeconds: number): Promise<SellerResponse> {
+  if (settled.redelivery === true) {
+    try {
+      await returnRedelivery(db, settled.digest);
+    } catch {
+      // A database that cannot take the turn back costs the buyer that turn; a 500 would cost them the receipt as well.
+      console.error('[ellai seller] redelivery_not_returned');
+    }
+  }
+  return json(503, { error: message }, { ...receipt(settled.digest, settled.payer), 'Retry-After': String(retryAfterSeconds) });
+}
+
 async function handle(args: Parameters<typeof handleWalletCheck>[0]): Promise<SellerResponse> {
   const { db, chain } = args;
   const clock = args.clock ?? Date.now;
@@ -143,18 +164,38 @@ async function handle(args: Parameters<typeof handleWalletCheck>[0]): Promise<Se
     deadline,
   });
   if (!settled.ok) {
-    return json(settled.status, { error: settled.reason }, settled.retryAfterSeconds === undefined ? {} : { 'Retry-After': String(settled.retryAfterSeconds) });
+    return json(settled.status, { error: settled.reason }, {
+      ...(settled.receipt === undefined ? {} : receipt(settled.receipt.digest, settled.receipt.payer)),
+      ...(settled.retryAfterSeconds === undefined ? {} : { 'Retry-After': String(settled.retryAfterSeconds) }),
+    });
   }
   const paid = receipt(settled.digest, settled.payer);
   let check: WalletCheck;
   try {
     check = await walletCheck({ chain, address, deadline });
-  } catch {
+  } catch (error) {
+    // Ellai's own budget stopped the check, not anything the buyer sent, so the buyer keeps the turn.
+    if (error instanceof ChainError && error.code === 'BUDGET') {
+      try {
+        await markCheckRefusedToday(db, settled.digest, args.now);
+      } catch {
+        // Unmarked, the sale's later presentations today spend the shared recheck day as before; the buyer's answer is the same.
+        console.error('[ellai seller] check_refusal_unmarked');
+      }
+      return notServed(db, settled, HANDLER_MESSAGES.undeliveredToday, secondsLeftInWindow(LIMITS.rateWindowDayMs, args.now));
+    }
     return json(502, { error: HANDLER_MESSAGES.undelivered }, paid);
   }
   const delivered = json(200, check, paid);
   // Marked only with the answer in hand, so a check that failed leaves the sale open to the same bytes (C29).
-  await markDelivered(db, settled.digest, args.now);
+  try {
+    await markDelivered(db, settled.digest, args.now);
+  } catch {
+    // The check is served only once its delivery is recorded, so a sale is delivered once (C29). The
+    // wait is the rest of the sale's recheck window, the soonest the same header is served again.
+    console.error('[ellai seller] delivery_unrecorded');
+    return notServed(db, settled, HANDLER_MESSAGES.unrecorded, secondsLeftInWindow(LIMITS.sellerRecheckIntervalMs, args.now));
+  }
   return delivered;
 }
 
@@ -169,17 +210,43 @@ async function handle(args: Parameters<typeof handleWalletCheck>[0]): Promise<Se
  * within its caller's limit is then counted against every caller together: past
  * LIMITS.sellerChallengesPerMinuteGlobal in one minute it is 429 with Retry-After too (C22).
  * Otherwise it is a fresh 402 challenge from issueWalletCheckChallenge (503 when one cannot be
- * issued). With
- * X-PAYMENT, settleWalletCheckPayment must take the payment (its 402 or 409 otherwise, with
- * Retry-After on a recheck of a waiting sale that came too soon; its 429 past this caller's caps
- * on sends and its 503 past every caller's, both with Retry-After, keyed on the same `callerKey`) before
- * the wallet check is read, waiting with `sleep` between its chain reads when an outcome is
- * unknown; the 200 carries the check as JSON and X-PAYMENT-RESPONSE with the digest, and only
+ * issued). With X-PAYMENT, settleWalletCheckPayment must take the payment before the wallet check
+ * is read, waiting with `sleep` between its chain reads when an outcome is unknown, and its
+ * refusals are passed on as they are, with their Retry-After, its caps on sends keyed on the same
+ * `callerKey`. The 200 carries the check as JSON and X-PAYMENT-RESPONSE with the digest, and only
  * once that answer is built is the sale marked delivered (markDelivered). If the check cannot be
  * read after the payment settled, the answer is 502 with the same receipt and the sale stays
  * undelivered: the same X-PAYMENT header sent again reads the check again with nothing sent or
- * read on chain, within the seller's recheck caps and at most LIMITS.sellerRedeliveriesPerSale
- * times (429 or 503 with Retry-After past them), and a sale already delivered is 409.
+ * read on chain, within the seller's recheck caps, each time spending one of the sale's
+ * LIMITS.sellerRedeliveriesPerSale turns. Two failures that are Ellai's and not the buyer's
+ * answer 503 with the same receipt, leave the sale undelivered and give back the turn the request
+ * took, if it took one (returnRedelivery): a check Ellai's Tatum budget refused (ChainError
+ * BUDGET), with Retry-After to the end of the UTC day, and a delivery that could not be recorded,
+ * with Retry-After to the end of the sale's LIMITS.sellerRecheckIntervalMs window. The second holds
+ * back the check it read, so a sale is served once. The first is also marked for the rest of that
+ * day (markCheckRefusedToday), so settleWalletCheckPayment answers the same 503 to every later
+ * presentation that day with nothing counted or read.
+ *
+ * Every status it answers:
+ * - 200: the check, with the receipt.
+ * - 400: a body that does not name one Sui address, or headers that are not plain text or that
+ *   name X-PAYMENT twice.
+ * - 402: unpaid, a fresh challenge. Paid, a payment settleWalletCheckPayment refuses or cannot
+ *   confirm yet, with Retry-After when a waiting sale's recheck came too soon or past the day's.
+ * - 405: anything but POST, with Allow.
+ * - 409: a challenge already claimed or served, other bytes for a sale that already holds a
+ *   payment, or bytes already presented for another challenge.
+ * - 410: a settled sale with no redelivery turn left (deliverExhausted); final, no Retry-After.
+ * - 429, with Retry-After: past this caller's or every caller's unpaid requests in a minute
+ *   (C22); past this caller's sends in a minute or a day; a settled sale asked for again inside
+ *   its recheck window (deliverSoon).
+ * - 500: anything unexpected, with fixed text.
+ * - 502: the check could not be read after the payment settled, with the receipt; the turn is spent.
+ * - 503: no challenge can be issued, with no Retry-After. With Retry-After: past every caller's
+ *   sends for the day, or a send Ellai's Tatum budget refused with nothing sent; a redelivery past
+ *   the day's rechecks (deliverToday); a check Ellai's Tatum budget refused, then every
+ *   presentation of that sale for the rest of the UTC day, or a delivery that could not be
+ *   recorded, each with the receipt.
  *
  * The request's deadline (sellerDeadline) starts on `clock`, the wall clock when left out, before
  * anything else: no chain read after the send, and no step of the check, begins past its

@@ -12,19 +12,24 @@ import { and, eq, gt, isNull, lt, notExists, sql } from 'drizzle-orm';
 import { alias } from 'drizzle-orm/pg-core';
 import { z } from 'zod';
 import type { Database } from '../db/client.js';
-import { sellerSales } from '../db/schema.js';
+import { rateCounters, sellerSales } from '../db/schema.js';
 import { consumeShared, consumeWindow, secondsLeftInWindow } from '../http/ratelimit.js';
 import { type ChallengeTerms, SellerError, cachedEpoch, readSellerChallengeId, sellerResource, timestampOf } from './challenge.js';
 import { type SellerDeadline, canStartRead, sellerDeadline } from './deadline.js';
 
 export type SettleOutcome =
-  | { ok: true; digest: string; payer: string }
+  /**
+   * `redelivery` is set when this request took one of the sale's redelivery turns (redeliver), so
+   * a caller that cannot serve the buyer for a reason of Ellai's own gives it back (returnRedelivery).
+   */
+  | { ok: true; digest: string; payer: string; redelivery?: true }
   /**
    * `retryAfterSeconds` is set on a recheck that came too soon and on every 429 and 503: whole
    * seconds, at least 1, until the window that turned it away ends, the UTC day for a send
-   * Ellai's Tatum budget refused.
+   * Ellai's Tatum budget refused. `receipt` is set on a refusal of a sale that has settled, so the
+   * answer can carry the buyer's receipt.
    */
-  | { ok: false; status: 402 | 409 | 410 | 429 | 503; reason: string; retryAfterSeconds?: number };
+  | { ok: false; status: 402 | 409 | 410 | 429 | 503; reason: string; retryAfterSeconds?: number; receipt?: { digest: string; payer: string } };
 
 // Every reason is fixed text: nothing from the header, the bytes or the chain is copied in,
 // because a reason goes back to whoever sent the payment and may be logged on the way (C19).
@@ -49,6 +54,8 @@ export const SETTLE_REASONS = {
   deliverSoon: 'this payment has settled; send the same payment again after Retry-After to receive the wallet check',
   deliverToday: "this payment has settled, but this seller has used today's rechecks; send the same payment again tomorrow to receive the wallet check (days are counted in UTC)",
   deliverExhausted: 'this payment has settled, but its wallet check failed on every retry this seller allows for one payment; it will not be tried again',
+  deliverBudgetToday:
+    "this payment has settled, but this seller has used today's budget for reaching Sui and could not read the wallet check; the receipt is in X-PAYMENT-RESPONSE; send the same payment again tomorrow to receive it (days are counted in UTC)",
 } as const;
 
 type Sale = typeof sellerSales.$inferSelect;
@@ -216,13 +223,63 @@ async function dayRefusal(db: Database, now: Date): Promise<number | null> {
 }
 
 /**
+ * Gives back one redelivery turn of the sale that settled with `digest`, for a turn that served
+ * the buyer nothing for a reason of Ellai's own: the recheck day refused it, Ellai's Tatum budget
+ * refused the check, or the delivery could not be recorded (C29). The turn belongs to the sale,
+ * so it is found by the digest only that sale holds. Never takes the count below zero. Throws
+ * only for database failures.
+ */
+export async function returnRedelivery(db: Database, digest: string): Promise<void> {
+  await db
+    .update(sellerSales)
+    .set({ redeliveries: sql`${sellerSales.redeliveries} - 1` })
+    .where(and(eq(sellerSales.digest, digest), gt(sellerSales.redeliveries, 0)));
+}
+
+// Written to rate_counters directly, as the handler's unpaid count is, because the helpers in
+// ratelimit.ts only count: reading a mark through them would set it.
+const CHECK_REFUSED_KEY_PREFIX = 'seller-check-refused:';
+
+/** The one counter row, for the sale that settled with `digest` and the UTC day holding `now`, that marking and reading both use. */
+function checkRefusedRow(digest: string, now: Date): { key: string; windowStart: Date } {
+  const dayMs = LIMITS.rateWindowDayMs;
+  return { key: `${CHECK_REFUSED_KEY_PREFIX}${digest}`, windowStart: new Date(Math.floor(timestampOf(now) / dayMs) * dayMs) };
+}
+
+/**
+ * Counts one refusal of the wallet check, by Ellai's Tatum budget, for the sale that settled with
+ * `digest`, in the fixed UTC day (LIMITS.rateWindowDayMs) holding `now`. From then until that
+ * day ends, the same bytes are answered 503 deliverBudgetToday without spending the sale's
+ * recheck turn, its redeliveries or the recheck day, and with nothing read (C22, C29). The row
+ * outlives its day by LIMITS.rateCounterRetentionMs and is then pruned with every other counter.
+ * Throws SellerError for an invalid `now`, and otherwise only for database failures.
+ */
+export async function markCheckRefusedToday(db: Database, digest: string, now: Date): Promise<void> {
+  await db
+    .insert(rateCounters)
+    .values({ ...checkRefusedRow(digest, now), count: 1 })
+    .onConflictDoUpdate({ target: [rateCounters.key, rateCounters.windowStart], set: { count: sql`${rateCounters.count} + 1` } });
+}
+
+async function checkRefusedToday(db: Database, digest: string, now: Date): Promise<boolean> {
+  const row = checkRefusedRow(digest, now);
+  const found = await db
+    .select({ count: rateCounters.count })
+    .from(rateCounters)
+    .where(and(eq(rateCounters.key, row.key), eq(rateCounters.windowStart, row.windowStart)));
+  return found.length > 0;
+}
+
+/**
  * Hands a settled, undelivered sale back to be served again, at most
  * LIMITS.sellerRedeliveriesPerSale times in its life (C22, C29). The turn is claimed with one
  * UPDATE that adds 1 to the sale's redeliveries only while the sale is settled, undelivered and
  * under that count, so two requests can never both take the last one; then the turn is counted
- * against the recheck day (dayRefusal). A sale with no turn left, or one the day turns away, is
- * 503 deliverToday with the seconds left in the UTC day, and nothing is read on chain. A turn
- * the day refused is given back, since no check was read for it.
+ * against the recheck day (dayRefusal). A sale with no turn left is 410 deliverExhausted, final
+ * and with no Retry-After. One the day turns away is 503 deliverToday with the seconds left in
+ * the UTC day, and its turn is given back (returnRedelivery), since no check was read for it.
+ * Neither reads anything on chain. Otherwise the sale is handed back as settled with
+ * `redelivery` set.
  */
 async function redeliver(db: Database, sale: Sale, digest: string, payer: string, now: Date): Promise<SettleOutcome> {
   const claimed = await db
@@ -243,11 +300,8 @@ async function redeliver(db: Database, sale: Sale, digest: string, payer: string
     return { ok: false, status: 410, reason: SETTLE_REASONS.deliverExhausted };
   }
   const refusedFor = await dayRefusal(db, now);
-  if (refusedFor === null) return { ok: true, digest, payer };
-  await db
-    .update(sellerSales)
-    .set({ redeliveries: sql`${sellerSales.redeliveries} - 1` })
-    .where(and(eq(sellerSales.id, sale.id), gt(sellerSales.redeliveries, 0)));
+  if (refusedFor === null) return { ok: true, digest, payer, redelivery: true };
+  await returnRedelivery(db, digest);
   return { ok: false, status: 503, reason: SETTLE_REASONS.deliverToday, retryAfterSeconds: refusedFor };
 }
 
@@ -391,15 +445,19 @@ async function confirmOnChain(closing: Closing): Promise<SettleOutcome> {
  * no outcome is recorded), or one that settled but whose buyer was never served (delivered_at
  * empty), is picked up again only by a header carrying those same bytes, whose digest it holds
  * (409 for any other), whatever the challenge's expiry, since the payment was taken in time: the
- * bytes and signature are checked again as below, then the sale's own turn is counted, at most
+ * bytes and signature are checked again as below. A settled sale whose check Ellai's Tatum budget
+ * refused earlier in this UTC day (markCheckRefusedToday) is then 503 deliverBudgetToday with
+ * retryAfterSeconds to the end of the day and its receipt, counting nothing and reading nothing.
+ * Otherwise the sale's own turn is counted, at most
  * one per sale in each fixed window of LIMITS.sellerRecheckIntervalMs whoever asks. A waiting
  * sale is then counted against LIMITS.sellerRechecksPerDayGlobal a day across every sale
  * (dayRefusal, whose first refusal logs its fixed name); turned away by either it is 402
  * unconfirmed with retryAfterSeconds and reads nothing; otherwise its digest is read as after an
  * unknown outcome. A settled sale turned away by its own window is 429 deliverSoon with
  * retryAfterSeconds; otherwise redeliver claims one of its LIMITS.sellerRedeliveriesPerSale turns
- * and then counts the day, answering 503 deliverToday with no turn left or past the day, and
- * otherwise hands it back as settled, with nothing read on chain, for the caller to serve again.
+ * and then counts the day, answering 410 deliverExhausted with no turn left and 503 deliverToday
+ * past the day, and otherwise hands it back as settled with `redelivery` set, with nothing read on
+ * chain, for the caller to serve again.
  * A sale already served is 409.
  * Otherwise the sale must still be 'issued' (409) and unexpired
  * (402); the nonce and epoch window are read back out of the id, which also proves the id was
@@ -476,8 +534,13 @@ export async function settleWalletCheckPayment(args: {
   if (awaitingChain(sale) || awaitingDelivery(sale)) {
     const again = await presentedAgain(sale, digest, payment, target);
     if ('refused' in again) return again.refused;
+    // Ahead of every count, so a sale Ellai's budget turned away today spends nothing more, whoever asks.
+    if (awaitingDelivery(sale) && (await checkRefusedToday(db, digest, now))) {
+      const retryAfterSeconds = secondsLeftInWindow(LIMITS.rateWindowDayMs, now);
+      return { ok: false, status: 503, reason: SETTLE_REASONS.deliverBudgetToday, retryAfterSeconds, receipt: { digest, payer: payment.sender } };
+    }
     // Counted only after the bytes check out, so nobody without them can use up the buyer's turn,
-    // and before anything else, so a turn too soon spends none of the sale's life or the day.
+    // and before the sale's life and the day, so a turn too soon spends neither.
     const turn = await consumeShared(db, `${RECHECK_QUOTA_PREFIX}${sale.id}`, 1, LIMITS.sellerRecheckIntervalMs, now);
     if (awaitingDelivery(sale)) {
       if (!turn.allowed) return { ok: false, status: 429, reason: SETTLE_REASONS.deliverSoon, retryAfterSeconds: turn.retryAfterSeconds };

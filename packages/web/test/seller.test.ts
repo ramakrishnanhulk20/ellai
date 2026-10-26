@@ -12,7 +12,10 @@
 // once its epoch window has closed and LIMITS.paymentReleaseReads reads after that all miss; a
 // check that fails after the payment settled is served again to the same bytes alone, under the
 // same recheck caps and at most LIMITS.sellerRedeliveriesPerSale times, without spending the day
-// past that, and delivered once; with a slow chain no read or check step begins past the
+// past that, and delivered once; a check Ellai's Tatum budget refused at any step, the memory
+// account read through core included, or a delivery that could not be recorded, answered 503 with
+// the receipt and the turn given back, and after a budget refusal every presentation that UTC day
+// answered the same with nothing counted or read; with a slow chain no read or check step begins past the
 // seller's deadline and a request cut short leaves its sale waiting or undelivered; a challenge pays once and one payment never pays
 // two challenges; the unpaid rate limit per caller and for every caller together; the caps on
 // sends per caller a minute and a day and for every caller a day, counted only after the offline
@@ -24,7 +27,9 @@
 // its signature.
 // Does NOT cover: the live chain or Tatum (`npm run prove:seller` pays one 0.01 USDC live),
 // core's own challenge, payment and settlement rules or which code its executeTransaction throws
-// when (core's tests; the stand-in chain throws what core promises), zkLogin or multisig payers,
+// when (core's tests; the stand-in chain throws what core promises), how core's gRPC transport
+// turns a refused request into ChainError BUDGET (the stand-in's getObjects throws it as core
+// promises), zkLogin or multisig payers,
 // two connections racing on one claim or on serving one settled sale (PGlite serves one
 // connection at a time), or the HTTP route beyond its duration ceiling (routes-public.test.ts).
 import { randomBytes } from 'node:crypto';
@@ -44,16 +49,23 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vites
 import * as walletCheckRoute from '../src/app/api/sell/wallet-check/route.js';
 import { type Database, createDb, migrate } from '../src/server/db/client.js';
 import { sellerSales } from '../src/server/db/schema.js';
+import { consumeShared } from '../src/server/http/ratelimit.js';
 import { SellerError, issueWalletCheckChallenge, readSellerChallengeId, sellerChallengeId } from '../src/server/seller/challenge.js';
 import { LONGEST_READ_MS, SELLER_END_BY_MS, SELLER_READ_BY_MS, sellerDeadline } from '../src/server/seller/deadline.js';
 import { HANDLER_MESSAGES, type SellerResponse, handleWalletCheck, sellerPayTo } from '../src/server/seller/handler.js';
-import { SETTLE_REASONS, type SettleOutcome, markDelivered, settleWalletCheckPayment } from '../src/server/seller/settle.js';
+import { SETTLE_REASONS, type SettleOutcome, markDelivered, returnRedelivery, settleWalletCheckPayment } from '../src/server/seller/settle.js';
 import { walletCheck } from '../src/server/seller/walletcheck.js';
 
 vi.mock('@ellai/core/memory', async (importOriginal) => ({
   ...(await importOriginal<typeof import('@ellai/core/memory')>()),
   findMemoryAccount: vi.fn(),
 }));
+
+// Wrapped, not replaced, so a test can fail one database write the way an outage would.
+vi.mock('../src/server/seller/settle.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../src/server/seller/settle.js')>();
+  return { ...actual, markDelivered: vi.fn(actual.markDelivered), returnRedelivery: vi.fn(actual.returnRedelivery) };
+});
 
 let handle: Awaited<ReturnType<typeof createDb>>;
 let db: Database;
@@ -929,6 +941,172 @@ describe('settleWalletCheckPayment', () => {
     expect(await settle(other.chain, otherHeader, { now: at(0) })).toEqual(waiting);
     expect(await settle(other.chain, otherHeader, { now: at(perSale + 2 + LIMITS.sellerRechecksPerDayGlobal) })).toEqual(waiting);
     expect(other.calls.reads).toHaveLength(2 * LIMITS.chainReadAfterWriteTries);
+  });
+
+  it("keeps every redelivery turn of a settled sale when Ellai's Tatum budget refuses its check, on the first delivery and five redeliveries on five days in a row, answering 503 with the receipt until the UTC day ends (C29)", async () => {
+    const stub = stubChain();
+    let budgetSpent = true;
+    const chain = {
+      ...stub.chain,
+      getBalances: async (address: string) => {
+        if (budgetSpent) throw new ChainError('BUDGET', 'getBalances refused by the request budget, nothing was sent');
+        return stub.chain.getBalances(address);
+      },
+    } as Chain;
+    // A minute into each of days no other test rechecks in, plus whole recheck windows, since a
+    // refusal holds its sale for the rest of its day.
+    const at = (day: number, window = 0) => new Date(dayAfter(20 + day) + 60_000 + window * LIMITS.sellerRecheckIntervalMs);
+    const payment = asBuyer(await call(chain, { now: at(0) }));
+    const { signed, header } = await pay(payment);
+    const paidCall = (now: Date) => call(chain, { headers: { 'content-type': 'application/json', 'X-PAYMENT': header }, now });
+    const perSale = LIMITS.sellerRedeliveriesPerSale;
+    expect(perSale).toBe(5);
+
+    for (let day = 0; day <= perSale; day++) {
+      const refused = await paidCall(at(day));
+      expect(refused).toMatchObject({ status: 503, headers: { 'Retry-After': String(DAY_MS / 1_000 - 60) } });
+      expect(JSON.parse(refused.body)).toEqual({ error: HANDLER_MESSAGES.undeliveredToday });
+      const receipt = JSON.parse(Buffer.from(refused.headers['X-PAYMENT-RESPONSE'] ?? '', 'base64').toString('utf8'));
+      expect(receipt).toEqual({ success: true, network: 'sui:mainnet', transaction: signed.digest, payer: BUYER });
+      expect(await saleOf(payment.challengeId ?? '')).toMatchObject({ status: 'settled', deliveredAt: null, redeliveries: 0 });
+    }
+
+    // All five turns are still there: four checks that fail for any other reason spend one each, and the fifth delivers.
+    budgetSpent = false;
+    vi.mocked(findMemoryAccount).mockRejectedValue(new Error('the memory account could not be read'));
+    for (let turn = 1; turn < perSale; turn++) expect((await paidCall(at(perSale + 1, turn))).status).toBe(502);
+    expect(await saleOf(payment.challengeId ?? '')).toMatchObject({ deliveredAt: null, redeliveries: perSale - 1 });
+    vi.mocked(findMemoryAccount).mockResolvedValue(null);
+    expect((await paidCall(at(perSale + 1, perSale))).status).toBe(200);
+    expect(await saleOf(payment.challengeId ?? '')).toMatchObject({ deliveredAt: at(perSale + 1, perSale), redeliveries: perSale });
+    expect(stub.calls.executions).toEqual([signed.digest]);
+    expect(stub.calls.reads).toEqual([]);
+  });
+
+  it("answers every later presentation that day of a sale whose check Ellai's Tatum budget refused with the same 503 and receipt, spending none of the recheck day, no turn and no chain call, and serves it the next day (C22, C29)", async () => {
+    const stub = stubChain();
+    let budgetSpent = true;
+    let checks = 0;
+    const chain = {
+      ...stub.chain,
+      getBalances: async (address: string) => {
+        checks += 1;
+        if (budgetSpent) throw new ChainError('BUDGET', 'getBalances refused by the request budget, nothing was sent');
+        return stub.chain.getBalances(address);
+      },
+    } as Chain;
+    // In a day no other test rechecks in.
+    const at = (ms: number) => new Date(dayAfter(10) + ms);
+    const payment = asBuyer(await call(chain, { now: at(0) }));
+    const { signed, header } = await pay(payment);
+    const paidCall = (now: Date) => call(chain, { headers: { 'content-type': 'application/json', 'X-PAYMENT': header }, now });
+    const issuedReceipt = { success: true, network: 'sui:mainnet', transaction: signed.digest, payer: BUYER };
+    const interval = LIMITS.sellerRecheckIntervalMs;
+    expect(LIMITS.sellerRechecksPerDayGlobal).toBe(100);
+
+    expect((await paidCall(at(0))).status).toBe(503);
+    // One a recheck window, each a turn that would otherwise count one of the day's rechecks.
+    for (let window = 1; window <= 100; window++) {
+      const held = await paidCall(at(window * interval));
+      expect(held).toMatchObject({ status: 503, headers: { 'Retry-After': String(DAY_MS / 1_000 - (window * interval) / 1_000) } });
+      expect(JSON.parse(held.body)).toEqual({ error: HANDLER_MESSAGES.undeliveredToday });
+      expect(JSON.parse(Buffer.from(held.headers['X-PAYMENT-RESPONSE'] ?? '', 'base64').toString('utf8'))).toEqual(issuedReceipt);
+    }
+    expect(checks).toBe(1);
+    expect(stub.calls.reads).toEqual([]);
+    expect(await saleOf(payment.challengeId ?? '')).toMatchObject({ status: 'settled', deliveredAt: null, redeliveries: 0 });
+    // Every one of the day's rechecks is still there to be taken in one go.
+    const day = await consumeShared(db, 'seller-rechecks:day', LIMITS.sellerRechecksPerDayGlobal, LIMITS.rateWindowDayMs, at(101 * interval), LIMITS.sellerRechecksPerDayGlobal);
+    expect(day.allowed).toBe(true);
+
+    budgetSpent = false;
+    const nextDay = at(DAY_MS);
+    expect((await paidCall(nextDay)).status).toBe(200);
+    expect(await saleOf(payment.challengeId ?? '')).toMatchObject({ deliveredAt: nextDay, redeliveries: 1 });
+    expect(checks).toBe(2);
+    expect(stub.calls.executions).toEqual([signed.digest]);
+  });
+
+  it("answers a budget refusal in the check's memory account step, which core passes on as ChainError BUDGET, with 503 and the receipt, keeping the redelivery turn (C29)", async () => {
+    const actual = await vi.importActual<typeof import('@ellai/core/memory')>('@ellai/core/memory');
+    vi.mocked(findMemoryAccount).mockImplementation(actual.findMemoryAccount);
+    const stub = stubChain();
+    let accountReads = 0;
+    const chain = {
+      ...stub.chain,
+      grpc: {
+        getObjects: async () => {
+          accountReads += 1;
+          throw new ChainError('BUDGET', 'GetObjects refused by the request budget, nothing was sent');
+        },
+      },
+    } as unknown as Chain;
+    // A minute into each of days no other test rechecks in.
+    const at = (day: number) => new Date(dayAfter(12 + day) + 60_000);
+    const payment = asBuyer(await call(chain, { now: at(0) }));
+    const { signed, header } = await pay(payment);
+    const paidCall = (now: Date) => call(chain, { headers: { 'content-type': 'application/json', 'X-PAYMENT': header }, now });
+
+    // The delivery that comes with the payment, then a redelivery the next day.
+    for (const day of [0, 1]) {
+      const refused = await paidCall(at(day));
+      expect(refused).toMatchObject({ status: 503, headers: { 'Retry-After': String(DAY_MS / 1_000 - 60) } });
+      expect(JSON.parse(refused.body)).toEqual({ error: HANDLER_MESSAGES.undeliveredToday });
+      expect(refused.headers['X-PAYMENT-RESPONSE']).toBeDefined();
+      expect(await saleOf(payment.challengeId ?? '')).toMatchObject({ status: 'settled', deliveredAt: null, redeliveries: 0 });
+    }
+    expect(accountReads).toBe(2);
+    expect(stub.calls.balances).toHaveLength(2);
+
+    vi.mocked(findMemoryAccount).mockResolvedValue(null);
+    expect((await paidCall(at(2))).status).toBe(200);
+    expect(await saleOf(payment.challengeId ?? '')).toMatchObject({ deliveredAt: at(2), redeliveries: 1 });
+    expect(stub.calls.executions).toEqual([signed.digest]);
+  });
+
+  it('holds back a check whose delivery cannot be recorded with 503, the receipt and Retry-After to the end of the recheck window, giving back the turn it took and never answering 500, so the same header delivers later (C29)', async () => {
+    const error = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    const { chain, calls } = stubChain();
+    // A second into each recheck window, in a day no other test rechecks in.
+    const at = (window: number) => new Date(dayAfter(9) + window * LIMITS.sellerRecheckIntervalMs + 1_000);
+    const payment = asBuyer(await call(chain, { now: at(0) }));
+    const { signed, header } = await pay(payment);
+    const saleNow = () => saleOf(payment.challengeId ?? '');
+    const databaseDown = () => new Error('the database connection closed');
+    const heldBack = async (window: number) => {
+      const answer = await call(chain, { headers: { 'content-type': 'application/json', 'X-PAYMENT': header }, now: at(window) });
+      expect(answer).toMatchObject({ status: 503, headers: { 'Retry-After': String(LIMITS.sellerRecheckIntervalMs / 1_000 - 1) } });
+      expect(JSON.parse(answer.body)).toEqual({ error: HANDLER_MESSAGES.unrecorded });
+      const receipt = JSON.parse(Buffer.from(answer.headers['X-PAYMENT-RESPONSE'] ?? '', 'base64').toString('utf8'));
+      expect(receipt).toEqual({ success: true, network: 'sui:mainnet', transaction: signed.digest, payer: BUYER });
+    };
+
+    // The delivery that comes with the payment took no turn, so it has none to give back.
+    vi.mocked(markDelivered).mockRejectedValueOnce(databaseDown());
+    await heldBack(0);
+    expect(await saleNow()).toMatchObject({ status: 'settled', deliveredAt: null, redeliveries: 0 });
+
+    vi.mocked(markDelivered).mockRejectedValueOnce(databaseDown());
+    await heldBack(1);
+    expect(await saleNow()).toMatchObject({ deliveredAt: null, redeliveries: 0 });
+
+    // A database that refuses the give-back as well still gets a 503, and only then is the turn spent.
+    vi.mocked(markDelivered).mockRejectedValueOnce(databaseDown());
+    vi.mocked(returnRedelivery).mockRejectedValueOnce(databaseDown());
+    await heldBack(2);
+    expect(await saleNow()).toMatchObject({ deliveredAt: null, redeliveries: 1 });
+
+    const delivered = await call(chain, { headers: { 'content-type': 'application/json', 'X-PAYMENT': header }, now: at(3) });
+    expect(delivered.status).toBe(200);
+    expect(JSON.parse(delivered.body)).toMatchObject({ address: CHECKED });
+    expect(await saleNow()).toMatchObject({ deliveredAt: at(3), redeliveries: 2 });
+    expect(calls.balances).toHaveLength(4);
+    expect(calls.executions).toEqual([signed.digest]);
+    expect(error.mock.calls.map((line) => line.join(' '))).toEqual([
+      ...Array<string>(3).fill('[ellai seller] delivery_unrecorded'),
+      '[ellai seller] redelivery_not_returned',
+    ]);
+    error.mockRestore();
   });
 
   it('starts no chain read past SELLER_READ_BY_MS when Tatum is slow, so the paid request ends by SELLER_END_BY_MS, and a recheck cut short leaves the sale waiting, never lapsed (C21, C29)', async () => {
