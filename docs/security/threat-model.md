@@ -314,6 +314,10 @@ Each invariant names the risk it closes. Every backend work order carries the in
   - A sign-in nonce is burned before any chain check or shared quota, so a failed attempt cannot be retried on it and one caller cannot spend the shared quota without spending nonces.
   - Shared caps on paid upstream calls are sized to the credit budget. Exhausting one can lock out everyone using that path until the window ends; that is accepted, logged, and bounded per client.
   - IPv6 clients are keyed on their /64, since one host can hold the whole prefix.
+- **C36 (A9, G3, G4). Loosening needs a fresh signature.**
+  - Creating an agent key, raising the per-payment maximum or the daily budget, lowering the approvals needed, raising the distance cutoff, resuming automatic payments, clearing an automatic pause, or turning the public proof page on each needs a signature from the owner's wallet, made within minutes, over a message that names that exact change. The signature works once, for that owner and that change only, and a failed one burns its nonce.
+  - Tightening needs only the session.
+  - Answering questions needs only the session, by Ram's choice: a stolen session can approve what existing agents already asked for, up to the daily budget, and every such payment is in the owner's history.
 - **C35 (A6, G3). Revoke and sign share the owner lock.** Revoking an agent takes the owner row lock that signing takes, so a revoke lands either before a signature, which then refuses, or after it, when that payment is counted and verified like any other.
 
 **1. Primitives over lists**
