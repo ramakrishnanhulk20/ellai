@@ -395,6 +395,10 @@ export const LIMITS = {
   signInRequestsPerMinute: 10,
   /** Sign-in requests every client together may make in a minute, for each step separately (C22). */
   signInRequestsPerMinuteGlobal: 300,
+  /** How long an owner has to sign a step-up message for a loosening change: five minutes, long enough to read it in a wallet (C36). */
+  stepUpTtlMs: 300_000,
+  /** Step-up messages one owner may ask for in an hour; each is a stored row and a possible chain check (C22). */
+  stepUpsPerOwnerPerHour: 20,
   /** Sign-ins one client may complete in a day. Each can create an owner row and a session for any wallet (C22, C34). */
   signInsPerClientPerDay: 30,
   /** Sign-ins every client together may complete in a day, so owner and session rows standing stay small (C34). */
