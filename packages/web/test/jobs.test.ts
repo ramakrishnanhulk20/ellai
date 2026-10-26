@@ -8,20 +8,25 @@
 // window; never signs bytes that are not exactly the refill; keeps an unknown send pending and
 // reads that digest first next time; releases a lost refill only once its epoch window has
 // closed and further reads still miss it, and leaves rows from before that window was kept
-// waiting. pruneExpiredRows deletes only dead anonymous rows, a bounded batch per table.
-// confirmBlobsOnChain marks a memory only when its blob id is among the owner's own Walrus Blob
-// objects. runJobsTick isolates each owner's and each step's failure behind a fixed code,
+// waiting. pruneExpiredRows deletes only dead rows, in batches it repeats until each table comes
+// back short or its time slice ends, faster than the sign-in cap lets strangers add them,
+// day-old owners nothing points at included.
+// confirmBlobsOnChain marks a memory only when its blob id is on one of the owner's own Walrus Blob
+// objects, certified and not past its end epoch by the Walrus epoch (read once an hour), reading
+// in stretches from a stored cursor. refillIfNeeded defers before any read past the deadline and
+// never after its row. runJobsTick isolates each owner's and each step's failure behind a fixed code,
 // settles pending payments and remembers a paid seller stored as delivering nothing exactly once
 // (never one whose delivery is unknown), records an outcome a paid call failed to record,
 // expires, refills with the tick's own sleep, sends and confirms memories and then checks them
 // on chain, prunes, warns on a low gas wallet, takes at most LIMITS.jobsOwnersPerTick owners,
-// least recently visited first, and starts none once its time budget is spent.
+// least recently visited first, stamped as each visit starts, and past its deadline starts no
+// owner and no external call, with the deadline's arithmetic worked out from LIMITS.
 // Does NOT cover: the real Sui chain, Tatum or the relayer (scripts/prove-jobs.ts does those
 // live), whether Sui accepts the refill bytes (packages/proof's prove-pay sent one live, after a
 // dry run of the same shape), two connections racing on the owner lock (PGlite serves one
 // connection), or what schedules the tick.
 import { randomBytes, randomUUID } from 'node:crypto';
-import type { AllowanceReading, Balances, Chain, ExecutionResult, SimulationResult, TransactionResult, WalrusBlob } from '@ellai/core/chain';
+import type { AllowanceReading, Balances, Chain, ExecutionResult, ScannedWalrusBlob, SimulationResult, TransactionResult } from '@ellai/core/chain';
 import { ChainError } from '@ellai/core/chain';
 import { AllowanceError, buildRefill } from '@ellai/core/allowance';
 import { canonicalSuiAddress, derivePurseKeypair } from '@ellai/core/keys';
@@ -36,7 +41,7 @@ import { verifyTransactionSignature } from '@mysten/sui/verify';
 import { and, eq, isNull } from 'drizzle-orm';
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { type Database, createDb, migrate } from '../src/server/db/client.js';
-import { agents, decisions, memories, owners, payments, questions, rateCounters, refills, sellerSales, sessions, signinNonces } from '../src/server/db/schema.js';
+import { agents, decisions, memories, owners, payments, questions, refills, sellerSales, sessions, signinNonces } from '../src/server/db/schema.js';
 import { MEMORY_NAMESPACE } from '../src/server/memory/namespace.js';
 import { ownerDelegate } from '../src/server/memory/delegate.js';
 import { recordOutcome } from '../src/server/memory/outcome.js';
@@ -223,8 +228,10 @@ interface StubState {
   landed: (digest: string) => TransactionResult | null;
   /** The epoch the chain reports now. */
   epoch: bigint;
-  /** Walrus Blob objects by canonical owner address; an address not here holds none. */
-  blobs: Map<string, WalrusBlob[]>;
+  /** Walrus Blob objects by canonical owner address, in listing order; an address not here holds none. */
+  blobs: Map<string, ScannedWalrusBlob[]>;
+  /** The epoch Walrus reports now, counted as Walrus counts, not as Sui does. */
+  walrusEpoch: number;
 }
 
 /**
@@ -246,6 +253,7 @@ function stubChain(on: Database = db) {
     landed: (digest) => (sent.has(digest) ? { status: 'success', balanceChanges: state.changes } : null),
     epoch: 100n,
     blobs: new Map(),
+    walrusEpoch: 45,
   };
   const calls: string[] = [];
   const executions: Array<{ txBytes: Uint8Array; signatures: string[]; rowWritten: boolean }> = [];
@@ -280,9 +288,17 @@ function stubChain(on: Database = db) {
       calls.push(`simulate:${digest}`);
       return state.simulate(digest);
     },
-    listOwnedWalrusBlobs: async (address: string) => {
-      calls.push(`listOwnedWalrusBlobs:${address}`);
-      return state.blobs.get(canonicalSuiAddress(address)) ?? [];
+    getWalrusEpoch: async () => {
+      calls.push('getWalrusEpoch');
+      return state.walrusEpoch;
+    },
+    // Pages of LIMITS.graphqlPageSize, each cursor naming the page after it, as Tatum's do.
+    scanOwnedWalrusBlobs: async (address: string, { after, maxPages }: { after: string | null; maxPages: number }) => {
+      calls.push(`scanOwnedWalrusBlobs:${address}:${after ?? 'start'}`);
+      const all = state.blobs.get(canonicalSuiAddress(address)) ?? [];
+      const from = after === null ? 0 : Number(after.slice('page-'.length)) * LIMITS.graphqlPageSize;
+      const to = Math.min(all.length, from + maxPages * LIMITS.graphqlPageSize);
+      return { blobs: all.slice(from, to), next: to < all.length ? `page-${to / LIMITS.graphqlPageSize}` : null };
     },
     executeTransaction: async (txBytes: Uint8Array, signatures: string[]) => {
       const digest = TransactionDataBuilder.getDigestFromBytes(txBytes);
@@ -649,6 +665,41 @@ describe('refillIfNeeded', () => {
     expect(one(await refillRows(w.ownerId))).toMatchObject({ id: lost.id, status: 'verified', verifiedAt: NOW });
   });
 
+  it("answers 'deferred' with nothing written or sent when canStart says no before any read it needs, and never stops once its row is written", async () => {
+    // One question before each of: the allowance, the purse balance, the epoch, the gas price, and the row.
+    const gates = 5;
+    for (let yes = 0; yes < gates; yes++) {
+      const w = await funded();
+      const { chain, calls, executions } = stubFor(w, LOW);
+      let left = yes;
+      expect(await refillIfNeeded({ db, chain, ownerId: w.ownerId, masterSecretHex: MASTER, gasKeypair: GAS, now: NOW, sleep: noNap, canStart: () => left-- > 0 })).toBe('deferred');
+      expect(calls).toHaveLength(yes);
+      expect(executions).toHaveLength(0);
+      expect(await refillRows(w.ownerId)).toHaveLength(0);
+    }
+    const w = await funded();
+    const { chain, calls } = stubFor(w, LOW);
+    let left = gates;
+    expect(await refillIfNeeded({ db, chain, ownerId: w.ownerId, masterSecretHex: MASTER, gasKeypair: GAS, now: NOW, sleep: noNap, canStart: () => left-- > 0 })).toBe('refilled');
+    expect(calls.map((call) => call.split(':')[0])).toEqual([
+      'getAllowance',
+      'getBalances',
+      'getCurrentEpoch',
+      'getReferenceGasPrice',
+      'simulate',
+      'executeTransaction',
+      'getTransactionResult',
+    ]);
+    expect(one(await refillRows(w.ownerId)).status).toBe('verified');
+
+    // A refill still pending from an earlier call is not even read once the deadline has passed.
+    const lost = await funded();
+    await refillRow(lost, ago(60_000), 'pending');
+    const stub = stubFor(lost, 0n);
+    expect(await refillIfNeeded({ db, chain: stub.chain, ownerId: lost.ownerId, masterSecretHex: MASTER, gasKeypair: GAS, now: NOW, sleep: noNap, canStart: () => false })).toBe('deferred');
+    expect(stub.calls).toEqual([]);
+  });
+
   it('keeps a pending refill written before valid_until_epoch was kept waiting, however late the epoch', async () => {
     const w = await funded();
     const old = await refillRow(w, ago(7 * 86_400_000), 'pending');
@@ -675,7 +726,7 @@ describe('pruneExpiredRows', () => {
     sessions: (await on.select().from(sessions)).length,
   });
 
-  it('deletes only rows that can never be used again: expired nonces, unpaid expired sales and sessions ended over a day ago', async () => {
+  it('deletes only rows that can never be used again: expired nonces, unpaid expired sales, rejected sales long expired and sessions expired over a day ago', async () => {
     const on = await freshDb();
     const w = await world(on);
     await nonce(on, ago(1));
@@ -688,19 +739,42 @@ describe('pruneExpiredRows', () => {
     await sale(on, ago(DAY), { status: 'rejected' });
     // An issued sale holding a digest may have been paid, so it is never pruned as unpaid.
     await sale(on, ago(DAY), { digest: randomDigest() });
+    // Waiting on the chain: kept for its buyer until LIMITS.sellerWaitingSaleKeepMs past its expiry.
+    await sale(on, ago(LIMITS.sellerWaitingSaleKeepMs + 1), { status: 'rejected', digest: randomDigest() });
+    await sale(on, ago(LIMITS.sellerWaitingSaleKeepMs), { status: 'rejected', digest: randomDigest() });
+    // Closed for good: kept as long as a waiting one, then deleted.
+    await sale(on, ago(LIMITS.sellerWaitingSaleKeepMs + 1), { status: 'rejected', digest: randomDigest(), settledAt: ago(DAY) });
+    await sale(on, ago(LIMITS.sellerWaitingSaleKeepMs), { status: 'rejected', settledAt: ago(DAY) });
     await session(on, w, ago(DAY + 1));
+    // Revoked long ago but not yet expired: it goes when it expires, found through expires_at.
     await session(on, w, new Date(NOW.getTime() + DAY), ago(DAY + 1));
     await session(on, w, ago(DAY - 1));
     await session(on, w, new Date(NOW.getTime() + DAY), ago(DAY - 1));
     await session(on, w, new Date(NOW.getTime() + DAY));
 
-    expect(await pruneExpiredRows({ db: on, now: NOW })).toEqual({ signinNonces: 2, sellerSales: 1, sessions: 2 });
-    expect(await kept(on)).toEqual({ signinNonces: 1, sellerSales: 4, sessions: 3 });
+    expect(await pruneExpiredRows({ db: on, now: NOW })).toEqual({ signinNonces: 2, sellerSales: 3, sessions: 1, owners: 0 });
+    expect(await kept(on)).toEqual({ signinNonces: 1, sellerSales: 6, sessions: 4 });
     expect((await on.select({ nonce: signinNonces.nonce }).from(signinNonces)).map((row) => row.nonce)).toEqual([liveNonce]);
-    expect(await pruneExpiredRows({ db: on, now: NOW })).toEqual({ signinNonces: 0, sellerSales: 0, sessions: 0 });
+    expect(await pruneExpiredRows({ db: on, now: NOW })).toEqual({ signinNonces: 0, sellerSales: 0, sessions: 0, owners: 0 });
   });
 
-  it('deletes at most LIMITS.pruneBatch rows per table per call, and the tick runs it once and counts what went', async () => {
+  it('clears more expired nonces and empty owners in one call than the global sign-in cap lets strangers create between two ticks', async () => {
+    // The jobs workflow ticks every 10 minutes (.github/workflows/jobs-tick.yml).
+    const created = LIMITS.signInRequestsPerMinuteGlobal * 10 + 1;
+    expect(created).toBe(3_001);
+    expect(created).toBeGreaterThan(LIMITS.pruneBatch * 3);
+    const on = await freshDb();
+    await on
+      .insert(signinNonces)
+      .values(Array.from({ length: created }, (_, i) => ({ nonce: hex(16), createdAt: ago(DAY), expiresAt: ago(1 + i) })));
+    // Every verified sign-in can leave an owner row behind once its session has ended.
+    await on.insert(owners).values(Array.from({ length: created }, () => ({ suiAddress: randomAddress(), purseAddress: randomAddress(), createdAt: dayOld() })));
+    expect(await pruneExpiredRows({ db: on, now: NOW, clock: () => NOW })).toEqual({ signinNonces: created, sellerSales: 0, sessions: 0, owners: created });
+    expect(await kept(on)).toEqual({ signinNonces: 0, sellerSales: 0, sessions: 0 });
+    expect(await ownerIds(on)).toEqual([]);
+  });
+
+  it('runs one batch per rule, repeats a full one only inside LIMITS.pruneTimeSliceMs, and the tick repeats on its own clock', async () => {
     const on = await freshDb();
     const w = await world(on);
     for (let i = 0; i < 5; i++) {
@@ -708,13 +782,67 @@ describe('pruneExpiredRows', () => {
       await sale(on, ago(DAY + i));
       await session(on, w, ago(2 * DAY + i));
     }
+    let reads = 0;
+    // Every read of this clock is one whole time slice later than the one before.
+    const slow = () => new Date(NOW.getTime() + reads++ * LIMITS.pruneTimeSliceMs);
     await withLimit('pruneBatch', 3, async () => {
-      expect(await pruneExpiredRows({ db: on, now: NOW })).toEqual({ signinNonces: 3, sellerSales: 3, sessions: 3 });
+      expect(await pruneExpiredRows({ db: on, now: NOW, clock: slow })).toEqual({ signinNonces: 3, sellerSales: 3, sessions: 3, owners: 0 });
       expect(await kept(on)).toEqual({ signinNonces: 2, sellerSales: 2, sessions: 2 });
       const { chain } = stubChain(on);
       expect(await tick(on, chain)).toMatchObject({ rowsPruned: 6, errors: [] });
     });
     expect(await kept(on)).toEqual({ signinNonces: 0, sellerSales: 0, sessions: 0 });
+  });
+
+  const dayOld = () => ago(LIMITS.emptyOwnerKeepMs + 1);
+  /** An owner row as sign-in leaves it, with no agent. */
+  async function bareOwner(on: Database, values: Partial<typeof owners.$inferInsert> = {}): Promise<World> {
+    const suiAddress = randomAddress();
+    const row = one(await on.insert(owners).values({ suiAddress, purseAddress: randomAddress(), createdAt: dayOld(), ...values }).returning());
+    return { ownerId: row.id, agentId: '', suiAddress, purse: row.purseAddress };
+  }
+  const ownerIds = async (on: Database) => (await on.select({ id: owners.id }).from(owners)).map((row) => row.id).sort();
+  const sessionsOf = async (on: Database, w: World) => (await on.select().from(sessions).where(eq(sessions.ownerId, w.ownerId))).length;
+
+  it('deletes a day-old owner nothing ever used, with its ended sessions, and keeps every owner something still points at', async () => {
+    const on = await freshDb();
+    const empty = await bareOwner(on);
+    await session(on, empty, ago(1));
+    await session(on, empty, new Date(NOW.getTime() + DAY), ago(60_000));
+    const kept: World[] = [await bareOwner(on, { createdAt: ago(LIMITS.emptyOwnerKeepMs) })];
+    kept.push(await bareOwner(on, { allowanceId: randomAddress() }));
+    kept.push(await bareOwner(on, { memwalAccountId: randomAddress() }));
+    kept.push(await bareOwner(on, { delegateRegisteredAt: ago(DAY) }));
+    const withAgent = await world(on, { createdAt: dayOld() });
+    const withDecision = await world(on, { createdAt: dayOld() });
+    await decision(withDecision, 'expired', ago(DAY), on);
+    const withPayment = await world(on, { createdAt: dayOld() });
+    await payment(withPayment, await decision(withPayment, 'paid', ago(DAY), on), {}, on);
+    const withMemory = await bareOwner(on);
+    await pendingMemory(withMemory, 'On 2026-10-23 the owner approved a hotel search.', ago(DAY), on);
+    const signedIn = await bareOwner(on);
+    await session(on, signedIn, new Date(NOW.getTime() + 1));
+    await session(on, signedIn, ago(1));
+    kept.push(withAgent, withDecision, withPayment, withMemory, signedIn);
+
+    expect(await pruneExpiredRows({ db: on, now: NOW })).toEqual({ signinNonces: 0, sellerSales: 0, sessions: 2, owners: 1 });
+    expect(await ownerIds(on)).toEqual(kept.map((w) => w.ownerId).sort());
+    expect([await sessionsOf(on, empty), await sessionsOf(on, signedIn)]).toEqual([0, 2]);
+    expect(await pruneExpiredRows({ db: on, now: NOW })).toMatchObject({ owners: 0 });
+  });
+
+  it('repeats a full batch of empty owners only inside LIMITS.pruneTimeSliceMs, like every other rule, and the tick counts them', async () => {
+    const on = await freshDb();
+    for (let i = 0; i < 3; i++) await bareOwner(on);
+    let reads = 0;
+    const slow = () => new Date(NOW.getTime() + reads++ * LIMITS.pruneTimeSliceMs);
+    await withLimit('pruneBatch', 2, async () => {
+      expect(await pruneExpiredRows({ db: on, now: NOW, clock: slow })).toMatchObject({ owners: 2 });
+      expect(await ownerIds(on)).toHaveLength(1);
+      const { chain } = stubChain(on);
+      expect(await tick(on, chain)).toMatchObject({ rowsPruned: 1, owners: 0, errors: [] });
+    });
+    expect(await ownerIds(on)).toEqual([]);
   });
 });
 
@@ -765,7 +893,16 @@ async function pendingMemory(w: World, sentence: string, createdAt: Date, on: Da
 
 const outcomesOf = (ownerId: string, on: Database) => on.select().from(memories).where(and(eq(memories.ownerId, ownerId), eq(memories.kind, 'outcome')));
 
-const blob = (blobId: string): WalrusBlob => ({ objectId: randomAddress(), blobId, registeredEpoch: 1_000, endEpoch: 1_100, deletable: false });
+// The epochs a Walrus Memory blob carried on Walrus Mainnet: registered 39, certified 41, kept until 54.
+const blob = (blobId: string, change: Partial<ScannedWalrusBlob> = {}): ScannedWalrusBlob => ({
+  objectId: randomAddress(),
+  blobId,
+  registeredEpoch: 39,
+  certifiedEpoch: 41,
+  endEpoch: 54,
+  deletable: true,
+  ...change,
+});
 
 /** A memory Walrus Memory reported done with this blob id, not yet checked on chain. */
 async function confirmedMemory(w: World, blobId: string, confirmedAt: Date, on: Database): Promise<string> {
@@ -808,14 +945,15 @@ describe('confirmBlobsOnChain', () => {
     state.blobs.set(w.suiAddress, [blob('blob-found'), blob('blob-elsewhere')]);
 
     expect(await confirmBlobsOnChain({ db: on, chain, ownerId: w.ownerId, now: NOW })).toEqual({ checked: 2, confirmed: 1 });
-    expect(calls).toEqual([`listOwnedWalrusBlobs:${w.suiAddress}`]);
+    expect(calls).toEqual(['getWalrusEpoch', `scanOwnedWalrusBlobs:${w.suiAddress}:start`]);
     expect([await chainConfirmedAt(found, on), await chainConfirmedAt(missing, on), await chainConfirmedAt(elsewhere, on)]).toEqual([NOW, null, null]);
 
     calls.length = 0;
     expect(await confirmBlobsOnChain({ db: on, chain, ownerId: other.ownerId, now: NOW })).toEqual({ checked: 1, confirmed: 0 });
     const empty = await world(on);
     expect(await confirmBlobsOnChain({ db: on, chain, ownerId: empty.ownerId, now: NOW })).toEqual({ checked: 0, confirmed: 0 });
-    expect(calls).toEqual([`listOwnedWalrusBlobs:${other.suiAddress}`]);
+    // The Walrus epoch read for the first owner still stands, so only the scan goes out.
+    expect(calls).toEqual([`scanOwnedWalrusBlobs:${other.suiAddress}:start`]);
     await expect(confirmBlobsOnChain({ db: on, chain, ownerId: 'not-a-uuid', now: NOW })).rejects.toThrow('the owner id is not a uuid');
   });
 
@@ -827,7 +965,7 @@ describe('confirmBlobsOnChain', () => {
     const oldest = await confirmedMemory(w, 'blob-oldest', ago(LIMITS.blobChainCheckMaxAgeMs), on);
     const tooOld = await confirmedMemory(w, 'blob-too-old', ago(LIMITS.blobChainCheckMaxAgeMs + 1), on);
     const { chain, state, calls } = stubChain(on);
-    state.blobs.set(w.suiAddress, ['blob-too-new', 'blob-newest', 'blob-oldest', 'blob-too-old'].map(blob));
+    state.blobs.set(w.suiAddress, ['blob-too-new', 'blob-newest', 'blob-oldest', 'blob-too-old'].map((id) => blob(id)));
     const at = async () => Promise.all([tooNew, newest, oldest, tooOld].map((id) => chainConfirmedAt(id, on)));
 
     expect(await confirmBlobsOnChain({ db: on, chain, ownerId: w.ownerId, now: NOW })).toEqual({ checked: 2, confirmed: 2 });
@@ -857,6 +995,99 @@ describe('confirmBlobsOnChain', () => {
       expect(await confirmBlobsOnChain({ db: on, chain, ownerId: w.ownerId, now: NOW })).toEqual({ checked: 1, confirmed: 1 });
     });
   });
+
+  const cursorOf = async (w: World, on: Database) => one(await on.select({ cursor: owners.blobScanCursor }).from(owners).where(eq(owners.id, w.ownerId))).cursor;
+  const scans = (calls: string[]) => calls.filter((call) => call.startsWith('scanOwnedWalrusBlobs'));
+
+  it('confirms a memory on page 25 of an owner holding 1,250 Blob objects on its second call, resuming where the first stopped', async () => {
+    expect(LIMITS.blobScanPagesPerTick * LIMITS.graphqlPageSize).toBe(1_000);
+    const on = await freshDb();
+    const w = await world(on);
+    const held = Array.from({ length: 25 * LIMITS.graphqlPageSize }, (_, i) => blob(`blob-${i}`));
+    const target = `blob-${24 * LIMITS.graphqlPageSize + 7}`;
+    const memory = await confirmedMemory(w, target, ago(120_000), on);
+    const { chain, state, calls } = stubChain(on);
+    state.blobs.set(w.suiAddress, held);
+
+    expect(await confirmBlobsOnChain({ db: on, chain, ownerId: w.ownerId, now: NOW })).toEqual({ checked: 1, confirmed: 0 });
+    expect(scans(calls)).toHaveLength(LIMITS.blobScanPagesPerTick);
+    expect(await cursorOf(w, on)).toBe(`page-${LIMITS.blobScanPagesPerTick}`);
+
+    calls.length = 0;
+    const second = new Date(NOW.getTime() + 600_000);
+    expect(await confirmBlobsOnChain({ db: on, chain, ownerId: w.ownerId, now: second })).toEqual({ checked: 1, confirmed: 1 });
+    expect(scans(calls)).toEqual([20, 21, 22, 23, 24].map((page) => `scanOwnedWalrusBlobs:${w.suiAddress}:page-${page}`));
+    expect(await chainConfirmedAt(memory, on)).toEqual(second);
+    // The listing ended, so the next scan starts from the top.
+    expect(await cursorOf(w, on)).toBeNull();
+  });
+
+  it('confirms only a certified blob whose end epoch is past the current Walrus epoch: end 54 confirms at 45, never at 54', async () => {
+    const on = await freshDb();
+    const atFortyFive = await world(on);
+    const live = await confirmedMemory(atFortyFive, 'blob-live', ago(120_000), on);
+    const uncertified = await confirmedMemory(atFortyFive, 'blob-uncertified', ago(120_000), on);
+    const early = stubChain(on);
+    early.state.blobs.set(atFortyFive.suiAddress, [blob('blob-live'), blob('blob-uncertified', { certifiedEpoch: null })]);
+    expect(early.state.walrusEpoch).toBe(45);
+    expect(await confirmBlobsOnChain({ db: on, chain: early.chain, ownerId: atFortyFive.ownerId, now: NOW })).toEqual({ checked: 2, confirmed: 1 });
+    expect([await chainConfirmedAt(live, on), await chainConfirmedAt(uncertified, on)]).toEqual([NOW, null]);
+
+    const atFiftyFour = await world(on);
+    const ended = await confirmedMemory(atFiftyFour, 'blob-ended', ago(120_000), on);
+    const late = stubChain(on);
+    late.state.walrusEpoch = 54;
+    late.state.blobs.set(atFiftyFour.suiAddress, [blob('blob-ended')]);
+    expect(await confirmBlobsOnChain({ db: on, chain: late.chain, ownerId: atFiftyFour.ownerId, now: NOW })).toEqual({ checked: 1, confirmed: 0 });
+    expect(await chainConfirmedAt(ended, on)).toBeNull();
+    expect(await confirmBlobsOnChain({ db: on, chain: early.chain, ownerId: atFortyFive.ownerId, now: NOW })).toEqual({ checked: 1, confirmed: 0 });
+  });
+
+  it('reads the Walrus epoch at most once per LIMITS.walrusEpochCacheMs for one chain client', async () => {
+    expect(LIMITS.walrusEpochCacheMs).toBe(3_600_000);
+    const on = await freshDb();
+    const w = await world(on);
+    await confirmedMemory(w, 'blob-not-there', ago(120_000), on);
+    const { chain, calls } = stubChain(on);
+    const at = (ms: number) => confirmBlobsOnChain({ db: on, chain, ownerId: w.ownerId, now: new Date(NOW.getTime() + ms) });
+    await at(0);
+    await at(LIMITS.walrusEpochCacheMs - 1);
+    expect(calls.filter((call) => call === 'getWalrusEpoch')).toHaveLength(1);
+    await at(LIMITS.walrusEpochCacheMs);
+    expect(calls.filter((call) => call === 'getWalrusEpoch')).toHaveLength(2);
+    expect(scans(calls)).toHaveLength(3);
+  });
+
+  it('starts no read once canStart says no and resumes there; a failure keeps what was found, and one that will not clear starts over', async () => {
+    const on = await freshDb();
+    const w = await world(on);
+    const onPageOne = await confirmedMemory(w, 'blob-0', ago(120_000), on);
+    await confirmedMemory(w, 'blob-not-there', ago(120_000), on);
+    const { chain, state, calls } = stubChain(on);
+    state.blobs.set(w.suiAddress, Array.from({ length: 3 * LIMITS.graphqlPageSize }, (_, i) => blob(`blob-${i}`)));
+
+    // Yes to the epoch read and one page, then no.
+    let yes = 2;
+    expect(await confirmBlobsOnChain({ db: on, chain, ownerId: w.ownerId, now: NOW, canStart: () => yes-- > 0 })).toEqual({ checked: 2, confirmed: 1 });
+    expect(scans(calls)).toHaveLength(1);
+    expect(await cursorOf(w, on)).toBe('page-1');
+    expect(await chainConfirmedAt(onPageOne, on)).toEqual(NOW);
+    expect(await confirmBlobsOnChain({ db: on, chain, ownerId: w.ownerId, now: NOW, canStart: () => false })).toEqual({ checked: 0, confirmed: 0 });
+    expect(scans(calls)).toHaveLength(1);
+
+    const failing = (retryable: boolean) =>
+      ({
+        ...chain,
+        scanOwnedWalrusBlobs: async (address: string, opts: { after: string | null; maxPages: number }) => {
+          if (opts.after === 'page-2') throw new ChainError(retryable ? 'UPSTREAM' : 'BAD_RESPONSE', 'Tatum scanOwnedWalrusBlobs: refused', retryable);
+          return chain.scanOwnedWalrusBlobs(address, opts);
+        },
+      }) as Chain;
+    await expect(confirmBlobsOnChain({ db: on, chain: failing(true), ownerId: w.ownerId, now: NOW })).rejects.toMatchObject({ code: 'UPSTREAM' });
+    expect(await cursorOf(w, on)).toBe('page-2');
+    await expect(confirmBlobsOnChain({ db: on, chain: failing(false), ownerId: w.ownerId, now: NOW })).rejects.toMatchObject({ code: 'BAD_RESPONSE' });
+    expect(await cursorOf(w, on)).toBeNull();
+  });
 });
 
 describe('runJobsTick', () => {
@@ -882,10 +1113,11 @@ describe('runJobsTick', () => {
     } as Chain;
 
     const summary = await tick(on, chain);
+    // The gas wallet is read first, before any owner, so a busy tick cannot crowd it out.
     expect(summary.errors).toEqual([
+      { ownerId: '', step: 'gas_wallet', code: 'UNEXPECTED' },
       { ownerId: first.ownerId, step: 'memory_submit', code: 'MEMORY_RATE_LIMITED' },
       { ownerId: first.ownerId, step: 'refill', code: 'CHAIN_UPSTREAM' },
-      { ownerId: '', step: 'gas_wallet', code: 'UNEXPECTED' },
     ]);
     expect(summary).toMatchObject({ owners: 2, decisionsExpired: 1, questionsClosed: 1, refills: 1, gasWalletLow: true });
     expect([await statusOf(staleOpen, on), await statusOf(oldAsked, on), await statusOf(freshOpen, on)]).toEqual(['expired', 'expired', 'open']);
@@ -935,7 +1167,7 @@ describe('runJobsTick', () => {
     expect([readsOf(notYet.digest), readsOf(failedSeller.digest)]).toEqual([2, 1]);
   });
 
-  it("counts a payment's failed settlement reads on the tick's own clock, not the wall clock", async () => {
+  it("counts a payment's failed settlement reads on the payment row itself, one per tick", async () => {
     const on = await freshDb();
     const w = await world(on);
     const unreadable = await payment(w, await decision(w, 'paid', ago(120_000), on), { validUntilEpoch: 99n }, on);
@@ -946,14 +1178,12 @@ describe('runJobsTick', () => {
         throw new ChainError('UPSTREAM', 'Tatum getTransactionResult: gateway error', true);
       },
     } as Chain;
-    // Years from the wall clock, so a count filed under the wall clock's day cannot pass.
-    const clock = new Date('2031-01-01T12:00:00Z');
-    const tickAt = () => runJobsTick({ db: on, chain, masterSecretHex: MASTER, gasKeypair: GAS, now: () => clock, sleep: noSleep });
-    const counters = () => on.select().from(rateCounters).where(eq(rateCounters.key, `settlement-unreadable:${unreadable.id}`));
+    const failedReads = async () =>
+      one(await on.select({ count: payments.settlementFailedReads }).from(payments).where(eq(payments.id, unreadable.id))).count;
 
-    expect(await tickAt()).toMatchObject({ owners: 1, paymentsMismatched: 0, errors: [] });
-    expect(await tickAt()).toMatchObject({ owners: 1, errors: [] });
-    expect(await counters()).toEqual([{ key: `settlement-unreadable:${unreadable.id}`, windowStart: new Date('2031-01-01T00:00:00Z'), count: 2 }]);
+    expect(await tick(on, chain)).toMatchObject({ owners: 1, paymentsMismatched: 0, errors: [] });
+    expect(await tick(on, chain)).toMatchObject({ owners: 1, errors: [] });
+    expect(await failedReads()).toBe(2);
   });
 
   it('records the outcome a paid call failed to record for a verified payment that delivered nothing, exactly once across two ticks', async () => {
@@ -1000,7 +1230,7 @@ describe('runJobsTick', () => {
     expect(one(await refillRows(w.ownerId, on))).toMatchObject({ id: lost.id, status: 'failed' });
   });
 
-  it('refills a low purse, keeps an unknown send pending, and the next tick reads that digest before anything else', async () => {
+  it('refills a low purse, keeps an unknown send pending, and the next tick reads that digest before anything else for that owner', async () => {
     const on = await freshDb();
     const w = await funded(on);
     const stub = stubFor(w, 0n, on);
@@ -1016,7 +1246,7 @@ describe('runJobsTick', () => {
     stub.state.landed = (digest) => (digest === row.digest ? { status: 'success', balanceChanges: refillChanges(w) } : null);
     stub.state.balances.set(w.purse, { usdcAddressBalance: REFILL });
     expect(await tick(on, stub.chain)).toMatchObject({ owners: 1, refills: 0, errors: [] });
-    expect(stub.calls[0]).toBe(`getTransactionResult:${row.digest}`);
+    expect(stub.calls.slice(0, 2)).toEqual([`getBalances:${GAS_ADDRESS}`, `getTransactionResult:${row.digest}`]);
     expect(one(await refillRows(w.ownerId, on)).status).toBe('verified');
     expect(stub.executions).toHaveLength(1);
   });
@@ -1035,7 +1265,7 @@ describe('runJobsTick', () => {
     const { chain, state, calls } = stubChain(on);
     const minutesOn = (minutes: number) =>
       runJobsTick({ db: on, chain, masterSecretHex: MASTER, gasKeypair: GAS, now: () => new Date(NOW.getTime() + minutes * 60_000), sleep: noSleep });
-    const listings = () => calls.filter((call) => call.startsWith('listOwnedWalrusBlobs')).length;
+    const listings = () => calls.filter((call) => call.startsWith('scanOwnedWalrusBlobs')).length;
     expect(await minutesOn(0)).toMatchObject({ owners: 1, memoriesSubmitted: 1, memoriesConfirmed: 0, memoriesFailed: 0, errors: [] });
     done = true;
     expect(await minutesOn(1)).toMatchObject({ owners: 1, memoriesSubmitted: 0, memoriesConfirmed: 1, memoriesChainConfirmed: 0, errors: [] });
@@ -1090,11 +1320,11 @@ describe('runJobsTick', () => {
     const { chain, state, calls } = stubChain(on);
     state.blobs.set(w.suiAddress, [blob('blob-old')]);
     expect(await tick(on, chain)).toMatchObject({ owners: 0, memoriesChainConfirmed: 0, errors: [] });
-    expect(calls.filter((call) => call.startsWith('listOwnedWalrusBlobs'))).toEqual([]);
+    expect(calls.filter((call) => call.startsWith('scanOwnedWalrusBlobs') || call === 'getWalrusEpoch')).toEqual([]);
     expect(await chainConfirmedAt(old, on)).toBeNull();
   });
 
-  it('records a failing blob listing as the owner\'s blobs step and still runs the owner\'s other steps', async () => {
+  it('records a failing blob scan as the owner\'s blobs step and still runs the owner\'s other steps', async () => {
     const on = await freshDb();
     const w = await world(on);
     await confirmedMemory(w, 'blob-a', ago(60_000), on);
@@ -1102,11 +1332,11 @@ describe('runJobsTick', () => {
     const stub = stubChain(on);
     const chain = {
       ...stub.chain,
-      listOwnedWalrusBlobs: async () => {
-        throw new ChainError('LIMIT_EXCEEDED', 'Tatum listOwnedWalrusBlobs: more than 1000 blobs, refusing a partial list');
+      scanOwnedWalrusBlobs: async () => {
+        throw new ChainError('UPSTREAM', 'Tatum scanOwnedWalrusBlobs: gateway error', true);
       },
     } as Chain;
-    expect(await tick(on, chain)).toMatchObject({ owners: 1, decisionsExpired: 1, errors: [{ ownerId: w.ownerId, step: 'blobs', code: 'CHAIN_LIMIT_EXCEEDED' }] });
+    expect(await tick(on, chain)).toMatchObject({ owners: 1, decisionsExpired: 1, errors: [{ ownerId: w.ownerId, step: 'blobs', code: 'CHAIN_UPSTREAM' }] });
     expect(await statusOf(staleOpen, on)).toBe('expired');
   });
 
@@ -1191,5 +1421,60 @@ describe('runJobsTick', () => {
     expect(await Promise.all(all.map((w) => visitedAt(w, on).then((at) => at !== null)))).toEqual([true, true, false, false]);
     expect(await tickNow()).toMatchObject({ owners: 2, timeBudgetReached: true, errors: [] });
     expect(await Promise.all(all.map((w) => visitedAt(w, on).then((at) => at !== null)))).toEqual([true, true, true, true]);
+  });
+
+  it('lets the longest unit it may start just before its deadline end inside LIMITS.tickEndByMs, worked out from LIMITS', () => {
+    const retryWaits = Array.from({ length: LIMITS.tatumRetries }, (_, i) => LIMITS.tatumRetryDelayMs * 2 ** i).reduce((a, b) => a + b, 0);
+    // core's bounded(): every try waits out tatumTimeoutMs, with the retry waits between.
+    const tatumRead = (LIMITS.tatumRetries + 1) * LIMITS.tatumTimeoutMs + retryWaits;
+    // executeTransaction: a send each round, a digest lookup before each later round, the waits, then a refusal's wait and lookup.
+    const send = (LIMITS.tatumRetries + 1) * LIMITS.tatumTimeoutMs + LIMITS.tatumRetries * LIMITS.tatumTimeoutMs + retryWaits + LIMITS.tatumRetryDelayMs + LIMITS.tatumTimeoutMs;
+    const units = {
+      // settlePayment with tries 1: the digest, the epoch, then paymentReleaseReads waits and reads.
+      settlementPass: 2 * tatumRead + LIMITS.paymentReleaseReads * (LIMITS.settlementPollIntervalMs + tatumRead),
+      // Once its row is written a refill always dry-runs, sends and reads back.
+      refillSend: tatumRead + send + tatumRead,
+      refillRead: LIMITS.settlementPollIntervalMs + tatumRead,
+      gasWalletBalances: LIMITS.balanceMaxPages * tatumRead,
+      walrusEpoch: 2 * tatumRead,
+      blobScanPage: tatumRead,
+      relayerCall: LIMITS.memwalCallTimeoutMs,
+    };
+    expect(units).toEqual({
+      settlementPass: 174_000,
+      refillSend: 130_000,
+      refillRead: 36_000,
+      gasWalletBalances: 165_000,
+      walrusEpoch: 66_000,
+      blobScanPage: 33_000,
+      relayerCall: 120_000,
+    });
+    const slowest = Math.max(...Object.values(units));
+    expect(LIMITS.tickTimeBudgetMs + slowest).toBeLessThanOrEqual(LIMITS.tickEndByMs);
+    expect(LIMITS.tickEndByMs).toBeLessThanOrEqual(LIMITS.slowRouteMaxDurationS * 1_000 - 20_000);
+  });
+
+  it('past its deadline starts no owner, no further payment read and no refill, and stamps each visit as it starts', async () => {
+    const on = await freshDb();
+    const first = await funded(on, { allowanceCheckedAt: ago(120_000) });
+    const second = await funded(on, { allowanceCheckedAt: ago(60_000) });
+    const read = await payment(first, await decision(first, 'paid', ago(120_000), on), { signedAt: ago(120_000) }, on);
+    const unread = await payment(first, await decision(first, 'paid', ago(60_000), on), { signedAt: ago(60_000) }, on);
+    const stub = stubFor(first, LOW, on);
+    let clockMs = NOW.getTime();
+    // The first settlement read takes the clock to the deadline.
+    const chain = {
+      ...stub.chain,
+      getTransactionResult: async (digest: string) => {
+        clockMs = NOW.getTime() + LIMITS.tickTimeBudgetMs;
+        return stub.chain.getTransactionResult(digest);
+      },
+    } as Chain;
+    const summary = await runJobsTick({ db: on, chain, masterSecretHex: MASTER, gasKeypair: GAS, now: () => new Date(clockMs), sleep: noSleep });
+
+    expect(summary).toMatchObject({ owners: 1, refills: 0, timeBudgetReached: true, errors: [] });
+    expect(stub.calls).toEqual([`getBalances:${GAS_ADDRESS}`, `getTransactionResult:${read.digest}`, 'getCurrentEpoch']);
+    expect(stub.calls).not.toContain(`getTransactionResult:${unread.digest}`);
+    expect([await visitedAt(first, on), await visitedAt(second, on)]).toEqual([NOW, null]);
   });
 });

@@ -7,8 +7,11 @@
 // and refusal rules and getAllowance's shape checks and rate window. Then, after a third fresh minute: a
 // real third-party USDC allowance read with its terms, an app-bound one refused, and a
 // wrongly signed transaction refused by the network.
-// Does NOT cover: a paid key's rate limits, the Walrus blob listing (the probe script
-// and the scratch cross-check exercise it), paging past one page, an owner that
+// Offline too, against stand-in GraphQL pages: scanOwnedWalrusBlobs reading one bounded stretch,
+// handing back where the next starts, and its refusals; getWalrusEpoch against the shapes Tatum
+// returned for Walrus Mainnet, and its refusals.
+// Does NOT cover: a paid key's rate limits, the Walrus blob listing or scan against the live
+// gateway (the probe script and the scratch cross-check exercise the listing), an owner that
 // actually holds USDC, a failed transaction's status read from chain (none is pinned
 // here), a dry run that executes and fails (probe:pay shows the refusal path), or a
 // transaction that lands through executeTransaction (prove:pay sends real ones).
@@ -23,7 +26,7 @@ import { Ed25519Keypair } from '@mysten/sui/keypairs/ed25519';
 import { Transaction, TransactionDataBuilder } from '@mysten/sui/transactions';
 import { normalizeSuiAddress, toBase58, toBase64 } from '@mysten/sui/utils';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
-import { ChainError, createChain } from '../src/chain.js';
+import { ChainError, WALRUS_BLOB_TYPE, WALRUS_SYSTEM_OBJECT_ID, createChain } from '../src/chain.js';
 import { LIMITS } from '../src/limits.js';
 import { USDC_TYPE_MAINNET } from '../src/usdc.js';
 
@@ -340,6 +343,191 @@ describe('executeTransaction retry and refusal rules, against stand-in gateway a
       otherDigest.local.close();
       exhausted.local.close();
     }
+  });
+});
+
+// A Walrus Blob object as Sui GraphQL returned them for a Walrus Memory owner on 2026-10-20
+// (reference/walrus-memory/live-checks/blobs-molong.json), numbered so each is its own.
+function blobNode(n: number, change: (json: any) => void = () => undefined) {
+  const id = normalizeSuiAddress(`0x${n.toString(16)}`);
+  const json = {
+    id,
+    registered_epoch: 39,
+    blob_id: String(19_990_686_123_865_857_633n + BigInt(n)),
+    size: '358',
+    encoding_type: 1,
+    certified_epoch: 41,
+    storage: { id: normalizeSuiAddress(`0x${(n + 1_000).toString(16)}`), start_epoch: 39, end_epoch: 54, storage_size: '66034000' },
+    deletable: true,
+  };
+  change(json);
+  return { address: id, contents: { type: { repr: WALRUS_BLOB_TYPE }, json } };
+}
+
+const blobPage = (nodes: unknown[], endCursor: string | null, hasNextPage = endCursor !== null) => ({
+  data: { address: { objects: { pageInfo: { hasNextPage, endCursor }, nodes } } },
+});
+
+/** Answers each GraphQL request with the next page in turn, and records the cursor each one asked from. */
+async function withPages<T>(pages: unknown[], run: (asked: Array<string | null>) => Promise<T>): Promise<T> {
+  const asked: Array<string | null> = [];
+  vi.stubGlobal('fetch', async (_url: unknown, init?: RequestInit) => {
+    const { variables } = JSON.parse(String(init?.body)) as { variables: { after: string | null } };
+    asked.push(variables.after);
+    const page = pages[asked.length - 1] ?? { data: null };
+    return new Response(JSON.stringify(page), { status: 200, headers: { 'content-type': 'application/json' } });
+  });
+  try {
+    return await run(asked);
+  } finally {
+    vi.unstubAllGlobals();
+  }
+}
+
+describe('scanOwnedWalrusBlobs, against stand-in GraphQL pages', () => {
+  const holder = normalizeSuiAddress(`0x${'4c'.repeat(32)}`);
+
+  it('reads at most maxPages pages from the cursor given, with each blob certified epoch, and says where the next stretch starts', async () => {
+    const pages = [blobPage([blobNode(1), blobNode(2)], 'cursor-1'), blobPage([blobNode(3, (json) => (json.certified_epoch = null))], 'cursor-2')];
+    const first = await withPages(pages, async (asked) => {
+      const scan = await chain.scanOwnedWalrusBlobs(holder, { after: null, maxPages: 2 });
+      expect(asked).toEqual([null, 'cursor-1']);
+      return scan;
+    });
+    expect(first.next).toBe('cursor-2');
+    expect(first.blobs.map((blob) => [blob.certifiedEpoch, blob.endEpoch, blob.registeredEpoch, blob.deletable])).toEqual([
+      [41, 54, 39, true],
+      [41, 54, 39, true],
+      [null, 54, 39, true],
+    ]);
+    // Blob ids come out in the listing's own form, the form the relayer reports and blobs.ts compares.
+    const listed = await withPages([blobPage([blobNode(1), blobNode(2), blobNode(3)], null)], () => chain.listOwnedWalrusBlobs(holder));
+    expect(first.blobs.map(({ objectId, blobId }) => ({ objectId, blobId }))).toEqual(listed.map(({ objectId, blobId }) => ({ objectId, blobId })));
+
+    const last = await withPages([blobPage([blobNode(4)], null)], async (asked) => {
+      const scan = await chain.scanOwnedWalrusBlobs(holder, { after: 'cursor-2', maxPages: 2 });
+      expect(asked).toEqual(['cursor-2']);
+      return scan;
+    });
+    expect(last).toMatchObject({ next: null, blobs: [{ objectId: normalizeSuiAddress('0x4'), certifiedEpoch: 41 }] });
+  });
+
+  it('never reads more than LIMITS.graphqlMaxPages pages in one stretch, where the list would refuse', async () => {
+    const pages = Array.from({ length: LIMITS.graphqlMaxPages + 1 }, (_, i) => blobPage([blobNode(i + 1)], `cursor-${i + 1}`));
+    const scan = await withPages(pages, async (asked) => {
+      const result = await chain.scanOwnedWalrusBlobs(holder, { after: null, maxPages: LIMITS.graphqlMaxPages });
+      expect(asked).toHaveLength(LIMITS.graphqlMaxPages);
+      return result;
+    });
+    expect(scan.blobs).toHaveLength(LIMITS.graphqlMaxPages);
+    expect(scan.next).toBe(`cursor-${LIMITS.graphqlMaxPages}`);
+    const listed = await withPages(pages, () => failureOf(chain.listOwnedWalrusBlobs(holder)));
+    expect(listed.code).toBe('LIMIT_EXCEEDED');
+  });
+
+  it('refuses a bad owner, page count or cursor without asking Tatum', async () => {
+    const refused = await withPages([], async (asked) => {
+      const calls = [
+        chain.scanOwnedWalrusBlobs('', { after: null, maxPages: 1 }),
+        chain.scanOwnedWalrusBlobs(holder, { after: null, maxPages: 0 }),
+        chain.scanOwnedWalrusBlobs(holder, { after: null, maxPages: LIMITS.graphqlMaxPages + 1 }),
+        chain.scanOwnedWalrusBlobs(holder, { after: null, maxPages: 1.5 }),
+        chain.scanOwnedWalrusBlobs(holder, { after: '', maxPages: 1 }),
+        chain.scanOwnedWalrusBlobs(holder, { after: 'c'.repeat(LIMITS.graphqlCursorMaxChars + 1), maxPages: 1 }),
+      ];
+      const failures = await Promise.all(calls.map(failureOf));
+      expect(asked).toEqual([]);
+      return failures;
+    });
+    for (const failure of refused) expect(failure.code).toBe('INVALID_INPUT');
+  });
+
+  it('refuses a page that leaves out certified_epoch, promises a page without a usable cursor, or holds another type', async () => {
+    const pages: Array<[string, unknown]> = [
+      ['no certified_epoch', blobPage([blobNode(1, (json) => delete json.certified_epoch)], null)],
+      ['a next page with no cursor', blobPage([blobNode(1)], null, true)],
+      ['a cursor longer than Ellai keeps', blobPage([blobNode(1)], 'c'.repeat(LIMITS.graphqlCursorMaxChars + 1))],
+      ['an object that is not a Blob', blobPage([{ ...blobNode(1), contents: { ...blobNode(1).contents, type: { repr: '0x2::coin::Coin<0x2::sui::SUI>' } } }], null)],
+    ];
+    for (const [what, page] of pages) {
+      const failure = await withPages([page, blobPage([], null)], () => failureOf(chain.scanOwnedWalrusBlobs(holder, { after: null, maxPages: 2 })));
+      expect(failure.code, what).toBe('BAD_RESPONSE');
+    }
+  });
+});
+
+// What Tatum GraphQL returned for Walrus Mainnet on 2026-10-26 (scratchpad/walrus-epoch-proof.mts,
+// its one live run): the System object at version 3, and the inner state field that version
+// names, trimmed to the fields getWalrusEpoch reads, with committee.epoch 42.
+const WALRUS_STATE_ID = '0x0b2d4076d3a0b82a632144e835cd972527b185bda9d55011a9cc38fe557a475d';
+const WALRUS_STATE_TYPE =
+  '0x0000000000000000000000000000000000000000000000000000000000000002::dynamic_field::Field<u64,0xfdc88f7d7cf30afab2f82e8380d11ee8f70efb90e863d1de8616fae1bb09ea77::system_state_inner::SystemStateInnerV1>';
+
+function walrusAnswers(change: (system: any, state: any) => void = () => undefined): unknown[] {
+  const system = {
+    address: WALRUS_SYSTEM_OBJECT_ID,
+    asMoveObject: {
+      contents: {
+        type: { repr: '0xfdc88f7d7cf30afab2f82e8380d11ee8f70efb90e863d1de8616fae1bb09ea77::system::System' },
+        json: { id: WALRUS_SYSTEM_OBJECT_ID, version: '3', package_id: `0x${'98'.repeat(32)}`, new_package_id: null },
+      },
+    },
+  };
+  const state = {
+    address: WALRUS_STATE_ID,
+    asMoveObject: {
+      contents: {
+        type: { repr: WALRUS_STATE_TYPE },
+        json: { id: WALRUS_STATE_ID, name: '3', value: { committee: { members: [], n_shards: 1000, epoch: 42 }, total_capacity_size: '1' } },
+      },
+    },
+  };
+  change(system, state);
+  return [{ data: { object: system } }, { data: { object: state } }];
+}
+
+/** Answers each GraphQL request in turn and records the object id each one asked for. */
+async function withObjects<T>(answers: unknown[], run: (asked: string[]) => Promise<T>): Promise<T> {
+  const asked: string[] = [];
+  vi.stubGlobal('fetch', async (_url: unknown, init?: RequestInit) => {
+    asked.push((JSON.parse(String(init?.body)) as { variables: { id: string } }).variables.id);
+    return new Response(JSON.stringify(answers[asked.length - 1] ?? { data: { object: null } }), { status: 200, headers: { 'content-type': 'application/json' } });
+  });
+  try {
+    return await run(asked);
+  } finally {
+    vi.unstubAllGlobals();
+  }
+}
+
+describe('getWalrusEpoch, against the shapes Tatum returned', () => {
+  it('reads the System object, then the inner state field its version names, and returns committee.epoch', async () => {
+    const epoch = await withObjects(walrusAnswers(), async (asked) => {
+      const read = await chain.getWalrusEpoch();
+      // The field id is derived from the System id and the version, never taken from an answer.
+      expect(asked).toEqual([WALRUS_SYSTEM_OBJECT_ID, WALRUS_STATE_ID]);
+      return read;
+    });
+    expect(epoch).toBe(42);
+  });
+
+  it('refuses another type, another version, another object or a missing epoch', async () => {
+    const refusals: Array<[string, (system: any, state: any) => void]> = [
+      ['a System of another package', (system) => (system.asMoveObject.contents.type.repr = '0x2::coin::Coin<0x2::sui::SUI>')],
+      ['a System with no version', (system) => delete system.asMoveObject.contents.json.version],
+      ['a field holding another type', (_, state) => (state.asMoveObject.contents.type.repr = WALRUS_STATE_TYPE.replace('system_state_inner', 'staking_inner'))],
+      ['a field under another package', (_, state) => (state.asMoveObject.contents.type.repr = WALRUS_STATE_TYPE.replace('0xfdc88f7d', '0xaaaaaaaa'))],
+      ['a field keyed by another version', (_, state) => (state.asMoveObject.contents.json.name = '2')],
+      ['a field whose contents name another object', (_, state) => (state.asMoveObject.contents.json.id = `0x${'77'.repeat(32)}`)],
+      ['no committee epoch', (_, state) => delete state.asMoveObject.contents.json.value.committee.epoch],
+      ['an epoch that is not a whole number', (_, state) => (state.asMoveObject.contents.json.value.committee.epoch = 4.5)],
+    ];
+    for (const [what, change] of refusals) {
+      const failure = await withObjects(walrusAnswers(change), () => failureOf(chain.getWalrusEpoch()));
+      expect(failure.code, what).toBe('BAD_RESPONSE');
+    }
+    const missing = await withObjects([{ data: { object: null } }], () => failureOf(chain.getWalrusEpoch()));
+    expect(missing.code).toBe('NOT_FOUND');
   });
 });
 

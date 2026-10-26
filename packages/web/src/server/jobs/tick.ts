@@ -48,10 +48,10 @@ export interface JobsTickSummary {
   decisionsExpired: number;
   questionsClosed: number;
   refills: number;
-  /** Expired sign-in nonces, unpaid seller sales and ended sessions deleted by this tick. */
+  /** Dead sign-in nonces, seller sales, sessions and empty owners deleted by this tick. */
   rowsPruned: number;
   gasWalletLow: boolean;
-  /** True when the tick stopped starting owners because LIMITS.tickTimeBudgetMs had passed. */
+  /** True when the tick's deadline (LIMITS.tickTimeBudgetMs) had passed by its end, so some owner or step may not have started. */
   timeBudgetReached: boolean;
   errors: JobsTickError[];
 }
@@ -144,18 +144,24 @@ async function ownersWithWork(db: Database, now: Date): Promise<string[]> {
 }
 
 /**
- * One pass of Ellai's background work, bounded and safe to repeat. First pruneExpiredRows
- * deletes at most LIMITS.pruneBatch expired rows per table (C22). Then it handles at most
- * LIMITS.jobsOwnersPerTick owners with work, least recently visited first (ownersWithWork), and
- * starts no owner once LIMITS.tickTimeBudgetMs has passed on `now` since the tick began, which
- * sets timeBudgetReached. For each owner, in order:
+ * One pass of Ellai's background work, bounded and safe to repeat. Its deadline is
+ * LIMITS.tickTimeBudgetMs after it begins, on `now`: past it no owner is started and no step
+ * starts a new external call, so the longest unit begun just before it (one settlement pass)
+ * still ends inside LIMITS.tickEndByMs, under the route's limit (C21, C28). Database work goes on.
+ * First pruneExpiredRows deletes dead rows in batches of LIMITS.pruneBatch for at most
+ * LIMITS.pruneTimeSliceMs on this tick's clock (C22, C34). Then, before the deadline, the gas
+ * wallet's SUI is read once: below LIMITS.gasWalletLowMist, unreadable or not read sets
+ * gasWalletLow. Then it handles at most LIMITS.jobsOwnersPerTick owners with work, least recently
+ * visited first (ownersWithWork). Each owner's last_ticked_at is set to `now` as its visit
+ * starts, so an owner whose visit fails or is cut off goes to the back of the line like any
+ * other. Then, in order, each step handed the deadline as `canStart`:
  * 1. memory (only with a Walrus Memory account): submitPendingMemories, then confirmMemoryJobs,
  *    which is skipped when the submit ended with core's DELEGATE refusal, so that code is
  *    recorded once per owner per tick; then, for every owner, confirmBlobsOnChain checks
  *    confirmed memories against the owner's Walrus Blob objects on chain (C18);
- * 2. payments: every payment still 'pending', oldest first, is read once by settlePayment
+ * 2. payments: every payment still 'pending', oldest first, until the deadline, is read once by settlePayment
  *    (tries 1; later ticks are the patience), which checks it against Ellai's own digest (C8)
- *    and counts its failed reads on this tick's `now`;
+ *    and counts a failed read past the payment's window in payments.settlement_failed_reads;
  * 3. outcomes: every 'verified' payment stored as delivered false (never null) whose decision has
  *    no outcome memory yet, oldest first, becomes a delivered=false outcome memory through
  *    recordOutcome, idempotent per decision. That takes in a payment step 2 has just verified
@@ -163,10 +169,7 @@ async function ownersWithWork(db: Database, now: Date): Promise<string[]> {
  * 4. expireDecisions: stale open decisions and unanswered questions past their time;
  * 5. refillIfNeeded (only with an allowance), waiting with this tick's `sleep`: C7 and C23 at
  *    refill time.
- * Then the owner's last_ticked_at is set to `now`, whatever the steps did, so a failing owner
- * goes to the back of the line like any other.
- * Then the gas wallet's SUI is read once; below LIMITS.gasWalletLowMist, or unreadable, sets
- * gasWalletLow.
+ * timeBudgetReached is set when the deadline has passed by the end.
  * Every owner and every step is wrapped: a failure is recorded with the owner, the step and a
  * fixed code from errorCode, and the tick moves on. Never throws for a step's failure; throws
  * only when the owner list itself cannot be read.
@@ -199,18 +202,31 @@ export async function runJobsTick(args: JobsTickArgs): Promise<JobsTickSummary> 
     }
   };
   const startedMs = now().getTime();
+  const deadlineMs = startedMs + LIMITS.tickTimeBudgetMs;
+  const canStart = () => now().getTime() < deadlineMs;
 
   await step('', 'prune', async () => {
-    const pruned = await pruneExpiredRows({ db, now: now() });
-    summary.rowsPruned += pruned.signinNonces + pruned.sellerSales + pruned.sessions;
+    const pruned = await pruneExpiredRows({ db, now: now(), clock: now });
+    summary.rowsPruned += pruned.signinNonces + pruned.sellerSales + pruned.sessions + pruned.owners;
   });
 
-  for (const ownerId of await ownersWithWork(db, new Date(startedMs))) {
-    if (now().getTime() - startedMs >= LIMITS.tickTimeBudgetMs) {
-      summary.timeBudgetReached = true;
-      break;
+  if (canStart()) {
+    try {
+      const { suiTotal } = await chain.getBalances(gasKeypair.toSuiAddress());
+      summary.gasWalletLow = suiTotal < BigInt(LIMITS.gasWalletLowMist);
+    } catch (error) {
+      // Left true: a gas wallet that cannot be read is treated as one that needs looking at.
+      summary.errors.push({ ownerId: '', step: 'gas_wallet', code: errorCode(error) });
     }
+  }
+
+  for (const ownerId of await ownersWithWork(db, new Date(startedMs))) {
+    if (!canStart()) break;
     summary.owners += 1;
+    // Stamped first, so a visit the deadline or the route limit cuts off still sends this owner to the back of the line.
+    await step(ownerId, 'visited', async () => {
+      await db.update(owners).set({ lastTickedAt: now() }).where(eq(owners.id, ownerId));
+    });
     await step(ownerId, 'owner', async () => {
       const [owner] = await db
         .select({ suiAddress: owners.suiAddress, memwalAccountId: owners.memwalAccountId, allowanceId: owners.allowanceId })
@@ -222,7 +238,7 @@ export async function runJobsTick(args: JobsTickArgs): Promise<JobsTickSummary> 
         let keyRefused = false;
         await step(ownerId, 'memory_submit', async () => {
           try {
-            summary.memoriesSubmitted += (await submitPendingMemories({ db, ownerId, masterSecretHex, now: now() })).submitted;
+            summary.memoriesSubmitted += (await submitPendingMemories({ db, ownerId, masterSecretHex, now: now(), canStart })).submitted;
           } catch (error) {
             keyRefused = isKeyRefused(error);
             throw error;
@@ -231,14 +247,14 @@ export async function runJobsTick(args: JobsTickArgs): Promise<JobsTickSummary> 
         // The relayer would refuse the same key again, so the confirm step would only record the code twice.
         if (!keyRefused) {
           await step(ownerId, 'memory_confirm', async () => {
-            const confirmed = await confirmMemoryJobs({ db, ownerId, masterSecretHex, now: now() });
+            const confirmed = await confirmMemoryJobs({ db, ownerId, masterSecretHex, now: now(), canStart });
             summary.memoriesConfirmed += confirmed.confirmed;
             summary.memoriesFailed += confirmed.failed;
           });
         }
       }
       await step(ownerId, 'blobs', async () => {
-        summary.memoriesChainConfirmed += (await confirmBlobsOnChain({ db, chain, ownerId, now: now() })).confirmed;
+        summary.memoriesChainConfirmed += (await confirmBlobsOnChain({ db, chain, ownerId, now: now(), canStart })).confirmed;
       });
 
       await step(ownerId, 'payments', async () => {
@@ -249,6 +265,8 @@ export async function runJobsTick(args: JobsTickArgs): Promise<JobsTickSummary> 
           .orderBy(asc(payments.signedAt), asc(payments.id))
           .limit(PAYMENTS_PER_OWNER);
         for (const payment of pending) {
+          // One settlement pass is the longest unit the tick starts, so the deadline is asked between them.
+          if (!canStart()) break;
           await step(ownerId, 'payment', async () => {
             const settled = await settlePayment({ db, ownerId, paymentId: payment.id, chain, tries: 1, intervalMs: LIMITS.settlementPollIntervalMs, sleep, now });
             if (settled === 'verified') summary.paymentsVerified += 1;
@@ -283,21 +301,11 @@ export async function runJobsTick(args: JobsTickArgs): Promise<JobsTickSummary> 
 
       if (owner.allowanceId !== null) {
         await step(ownerId, 'refill', async () => {
-          if ((await refillIfNeeded({ db, chain, ownerId, masterSecretHex, gasKeypair, now: now(), sleep })) === 'refilled') summary.refills += 1;
+          if ((await refillIfNeeded({ db, chain, ownerId, masterSecretHex, gasKeypair, now: now(), sleep, canStart })) === 'refilled') summary.refills += 1;
         });
       }
     });
-    await step(ownerId, 'visited', async () => {
-      await db.update(owners).set({ lastTickedAt: now() }).where(eq(owners.id, ownerId));
-    });
   }
-
-  try {
-    const { suiTotal } = await chain.getBalances(gasKeypair.toSuiAddress());
-    summary.gasWalletLow = suiTotal < BigInt(LIMITS.gasWalletLowMist);
-  } catch (error) {
-    // Left true: a gas wallet that cannot be read is treated as one that needs looking at.
-    summary.errors.push({ ownerId: '', step: 'gas_wallet', code: errorCode(error) });
-  }
+  summary.timeBudgetReached = !canStart();
   return summary;
 }

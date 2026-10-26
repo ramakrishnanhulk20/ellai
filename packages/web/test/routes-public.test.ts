@@ -14,7 +14,7 @@
 // GitHub schedule that calls the tick, or several server instances each keeping their own
 // proof cache (each one still reads at most once per window).
 import { randomBytes } from 'node:crypto';
-import { type Chain, ChainError, type ExecutionResult, type WalrusBlob } from '@ellai/core/chain';
+import { type Chain, ChainError, type ExecutionResult, type ScannedWalrusBlob } from '@ellai/core/chain';
 import { ChallengeError, parseChallenge } from '@ellai/core/challenge';
 import { canonicalSuiAddress } from '@ellai/core/keys';
 import { LIMITS } from '@ellai/core/limits';
@@ -479,10 +479,17 @@ describe('GET /api/public/proof', () => {
     const w = await proofOwner();
     const confirmedAt = at(60_000);
     const blobId = (await proofMemory(w, 'owner_decision', 'confirmed', confirmedAt, null)) ?? '';
+    // One page of the owner's Blob objects, with the epochs a Walrus Memory blob carried on Mainnet, at Walrus epoch 45.
     const listing = (ids: string[]) =>
       ({
-        listOwnedWalrusBlobs: async (owner: string): Promise<WalrusBlob[]> =>
-          owner === w.suiAddress ? ids.map((id) => ({ objectId: canonicalSuiAddress(`0x${hex(32)}`), blobId: id, registeredEpoch: 1, endEpoch: 2, deletable: false })) : [],
+        getWalrusEpoch: async () => 45,
+        scanOwnedWalrusBlobs: async (owner: string): Promise<{ blobs: ScannedWalrusBlob[]; next: null }> => ({
+          blobs:
+            owner === w.suiAddress
+              ? ids.map((id) => ({ objectId: canonicalSuiAddress(`0x${hex(32)}`), blobId: id, registeredEpoch: 39, certifiedEpoch: 41, endEpoch: 54, deletable: true }))
+              : [],
+          next: null,
+        }),
       }) as unknown as Chain;
 
     const before = await proof();

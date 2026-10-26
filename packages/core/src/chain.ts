@@ -4,6 +4,7 @@ import { SuiGraphQLClient } from '@mysten/sui/graphql';
 import { GrpcTypes, SuiGrpcClient } from '@mysten/sui/grpc';
 import { TransactionDataBuilder } from '@mysten/sui/transactions';
 import {
+  deriveDynamicFieldID,
   fromBase64,
   isValidStructTag,
   isValidSuiAddress,
@@ -29,6 +30,18 @@ const SUI_TYPE = normalizeStructTag(SUI_TYPE_ARG);
 export const WALRUS_BLOB_TYPE = normalizeStructTag(
   '0xfdc88f7d7cf30afab2f82e8380d11ee8f70efb90e863d1de8616fae1bb09ea77::blob::Blob',
 );
+
+/**
+ * Walrus Mainnet's shared System object, from @mysten/walrus MAINNET_WALRUS_PACKAGE_CONFIG. Its
+ * inner state, a dynamic field keyed by the object's version, holds the committee and so the
+ * current Walrus epoch, which is what a Blob's end_epoch is counted in, not Sui's.
+ */
+export const WALRUS_SYSTEM_OBJECT_ID = normalizeSuiAddress('0x2134d52768ea07e8c43570ef975eb3e4c27a39fa6396bef985b5abc58d03ddd2');
+// A Move type keeps the address of the package that first defined it, the same for Blob and System.
+const WALRUS_PACKAGE = parseStructTag(WALRUS_BLOB_TYPE).address;
+const WALRUS_SYSTEM_TYPE = normalizeStructTag(`${WALRUS_PACKAGE}::system::System`);
+const WALRUS_STATE_MODULE = 'system_state_inner';
+const WALRUS_STATE_NAME = /^SystemStateInnerV[0-9]+$/;
 
 const { ExecutionError_ExecutionErrorKind: ExecutionErrorKind, SimulateTransactionRequest_TransactionChecks: SimulationChecks } =
   GrpcTypes;
@@ -203,6 +216,17 @@ export interface WalrusBlob {
   deletable: boolean;
 }
 
+export interface ScannedWalrusBlob extends WalrusBlob {
+  /** The Walrus epoch the blob was certified in, or null while it is not certified and so not yet readable from Walrus. */
+  certifiedEpoch: number | null;
+}
+
+export interface WalrusBlobScan {
+  blobs: ScannedWalrusBlob[];
+  /** Where the next stretch starts, or null when this one reached the end of the listing. */
+  next: string | null;
+}
+
 export interface Chain {
   /** True when an API key is sent with every request; false for the anonymous gateway. */
   readonly usesApiKey: boolean;
@@ -217,6 +241,14 @@ export interface Chain {
   getCurrentEpoch(): Promise<bigint>;
   simulate(txBytes: Uint8Array): Promise<SimulationResult>;
   listOwnedWalrusBlobs(owner: string): Promise<WalrusBlob[]>;
+  /**
+   * One stretch of the owner's Walrus Blob objects: at most `maxPages` pages, from `after`, or
+   * from the start when it is null. Anyone can send Blob objects to an address, so a caller
+   * that must get through them all carries `next` to its next call instead of one long read.
+   */
+  scanOwnedWalrusBlobs(owner: string, opts: { after: string | null; maxPages: number }): Promise<WalrusBlobScan>;
+  /** The epoch Walrus Mainnet is in now, the one a Blob's end_epoch counts in. Not Sui's epoch. */
+  getWalrusEpoch(): Promise<number>;
   executeTransaction(txBytes: Uint8Array, signatures: string[]): Promise<ExecutionResult>;
   getAllowance(objectId: string): Promise<AllowanceReading>;
   /** Closes the gRPC channel so a script can exit. */
@@ -421,6 +453,34 @@ const blobPageSchema = z.object({
   }),
 });
 
+// Its own schema, so the list function reads exactly what it always has. certified_epoch must be
+// present, as a number or null: a page without it cannot say whether a blob is readable.
+const blobScanPageSchema = z.object({
+  address: z.object({
+    objects: z.object({
+      pageInfo: z.object({ hasNextPage: z.boolean(), endCursor: z.string().nullable() }),
+      nodes: z
+        .array(
+          z.object({
+            address: z.string(),
+            contents: z.object({
+              type: z.object({ repr: z.string() }),
+              json: z.object({
+                id: z.string(),
+                blob_id: z.string().regex(/^(0|[1-9]\d*)$/),
+                registered_epoch: epoch,
+                certified_epoch: epoch.nullable(),
+                storage: z.object({ end_epoch: epoch }),
+                deletable: z.boolean(),
+              }),
+            }),
+          }),
+        )
+        .max(LIMITS.graphqlPageSize),
+    }),
+  }),
+});
+
 const BLOBS_QUERY = `
   query EllaiOwnedWalrusBlobs($owner: SuiAddress!, $type: String!, $first: Int!, $after: String) {
     address(address: $owner) {
@@ -513,6 +573,32 @@ const allowanceObjectSchema = z.strictObject({
     })
     .nullable(),
 });
+
+const moveObjectSchema = z.object({
+  object: z
+    .object({
+      address: z.string(),
+      asMoveObject: z.object({ contents: z.object({ type: z.object({ repr: z.string() }), json: z.unknown() }) }).nullable(),
+    })
+    .nullable(),
+});
+
+// Not strict: these objects carry many fields Ellai does not read, and only the ones below decide anything.
+const walrusSystemSchema = z.object({ id: z.string(), version: z.string().max(U256_MAX_DIGITS).regex(/^(0|[1-9]\d*)$/) });
+const walrusStateFieldSchema = z.object({
+  id: z.string(),
+  name: z.string().max(U256_MAX_DIGITS).regex(/^(0|[1-9]\d*)$/),
+  value: z.object({ committee: z.object({ epoch }) }),
+});
+
+const MOVE_OBJECT_QUERY = `
+  query EllaiMoveObject($id: SuiAddress!) {
+    object(address: $id) {
+      address
+      asMoveObject { contents { type { repr } json } }
+    }
+  }
+`;
 
 const ALLOWANCE_QUERY = `
   query EllaiAllowance($id: SuiAddress!) {
@@ -825,6 +911,127 @@ export function createChain(opts: { apiKey?: string }): Chain {
     );
   }
 
+  /**
+   * Reads at most `maxPages` pages of LIMITS.graphqlPageSize Walrus Blob objects owned by
+   * `owner`, through Tatum GraphQL, starting at the cursor `after` (null for the first page), with
+   * the same checks per object as listOwnedWalrusBlobs plus certified_epoch. Each page has the
+   * usual timeout and retries; a stretch is never more than LIMITS.graphqlMaxPages pages. `next`
+   * is the cursor after the last page read, or null once the listing has no more pages, so a
+   * stretch that ends exactly at the end of the listing says so.
+   * Throws ChainError: INVALID_INPUT for a malformed owner, `maxPages` outside 1 to
+   * LIMITS.graphqlMaxPages, or a cursor that is empty or over LIMITS.graphqlCursorMaxChars;
+   * BAD_RESPONSE for a page of the wrong shape, a next page promised without a cursor or with one
+   * over that length; UPSTREAM for GraphQL errors; or any transport code.
+   */
+  async function scanOwnedWalrusBlobs(owner: string, opts: { after: string | null; maxPages: number }): Promise<WalrusBlobScan> {
+    const ownerAddress = inputAddress(owner);
+    const { maxPages } = opts;
+    if (!Number.isSafeInteger(maxPages) || maxPages < 1 || maxPages > LIMITS.graphqlMaxPages) {
+      throw new ChainError('INVALID_INPUT', `maxPages must be a whole number from 1 to ${LIMITS.graphqlMaxPages}`);
+    }
+    let after = opts.after;
+    if (after !== null && (typeof after !== 'string' || after.length === 0 || after.length > LIMITS.graphqlCursorMaxChars)) {
+      throw new ChainError('INVALID_INPUT', `a page cursor is 1 to ${LIMITS.graphqlCursorMaxChars} characters`);
+    }
+    const blobs: ScannedWalrusBlob[] = [];
+
+    for (let page = 0; page < maxPages; page++) {
+      const variables: Record<string, unknown> = {
+        owner: ownerAddress,
+        type: WALRUS_BLOB_TYPE,
+        first: LIMITS.graphqlPageSize,
+        after,
+      };
+      const result = await bounded('scanOwnedWalrusBlobs', (signal) =>
+        graphql.query({ query: BLOBS_QUERY, variables, signal }),
+      );
+      if (result.errors?.length) {
+        throw new ChainError('UPSTREAM', `Tatum scanOwnedWalrusBlobs: GraphQL returned ${result.errors.length} error(s)`);
+      }
+      const parsed = blobScanPageSchema.safeParse(result.data);
+      if (!parsed.success) throw badResponse('Walrus blob page has the wrong shape');
+      const { nodes, pageInfo } = parsed.data.address.objects;
+
+      for (const node of nodes) {
+        const objectId = chainAddress(node.address, 'blob object id');
+        if (chainAddress(node.contents.json.id, 'blob id field') !== objectId) {
+          throw badResponse('blob object id does not match its contents');
+        }
+        if (chainStructTag(node.contents.type.repr, 'blob type') !== WALRUS_BLOB_TYPE) {
+          throw badResponse('an object that is not a Walrus Blob passed the type filter');
+        }
+        blobs.push({
+          objectId,
+          blobId: walrusBlobId(node.contents.json.blob_id),
+          registeredEpoch: node.contents.json.registered_epoch,
+          certifiedEpoch: node.contents.json.certified_epoch,
+          endEpoch: node.contents.json.storage.end_epoch,
+          deletable: node.contents.json.deletable,
+        });
+      }
+
+      if (!pageInfo.hasNextPage) return { blobs, next: null };
+      if (!pageInfo.endCursor) throw badResponse('next page promised without a cursor');
+      if (pageInfo.endCursor.length > LIMITS.graphqlCursorMaxChars) throw badResponse('the page cursor is longer than Ellai keeps');
+      after = pageInfo.endCursor;
+    }
+    return { blobs, next: after };
+  }
+
+  /** One Move object read through Tatum GraphQL, its type normalised and its contents not yet checked. */
+  async function readMoveObject(operation: string, id: string): Promise<{ type: string; json: unknown }> {
+    const result = await bounded(operation, (signal) => graphql.query({ query: MOVE_OBJECT_QUERY, variables: { id }, signal }));
+    if (result.errors?.length) throw new ChainError('UPSTREAM', `Tatum ${operation}: GraphQL returned ${result.errors.length} error(s)`);
+    const parsed = moveObjectSchema.safeParse(result.data);
+    if (!parsed.success) throw badResponse(`${operation} object has the wrong shape`);
+    const object = parsed.data.object;
+    if (object === null) throw new ChainError('NOT_FOUND', `Tatum ${operation}: object ${id} was not found on Sui mainnet`);
+    if (chainAddress(object.address, 'object id') !== id) throw badResponse('the object returned is not the one asked for');
+    if (object.asMoveObject === null) throw badResponse(`${operation} object is not a Move object`);
+    return { type: chainStructTag(object.asMoveObject.contents.type.repr, `${operation} object type`), json: object.asMoveObject.contents.json };
+  }
+
+  /**
+   * Reads the current Walrus epoch the way Walrus's own client does: the System object's version,
+   * then the dynamic field that version names, whose value's committee.epoch is the epoch. Two
+   * GraphQL requests, each with the usual timeout and retries. Every object id, type and the
+   * field's name are checked against what was asked for, so another object cannot stand in.
+   * Throws ChainError: NOT_FOUND, BAD_RESPONSE for any other shape or type, UPSTREAM for GraphQL
+   * errors, or any transport code.
+   */
+  async function getWalrusEpoch(): Promise<number> {
+    const system = await readMoveObject('getWalrusEpoch', WALRUS_SYSTEM_OBJECT_ID);
+    if (system.type !== WALRUS_SYSTEM_TYPE) throw badResponse('the Walrus system object has another type');
+    const fields = walrusSystemSchema.safeParse(system.json);
+    if (!fields.success || chainAddress(fields.data.id, 'Walrus system id field') !== WALRUS_SYSTEM_OBJECT_ID) {
+      throw badResponse('the Walrus system object has an unknown shape');
+    }
+    const version = unsignedAtMost(fields.data.version, U64_MAX, 'the Walrus system version');
+
+    const fieldId = deriveDynamicFieldID(WALRUS_SYSTEM_OBJECT_ID, 'u64', bcs.u64().serialize(version).toBytes());
+    const state = await readMoveObject('getWalrusEpoch', fieldId);
+    const field = parseStructTag(state.type);
+    const [key, inner] = field.typeParams;
+    if (
+      field.address !== FRAMEWORK_ADDRESS ||
+      field.module !== 'dynamic_field' ||
+      field.name !== 'Field' ||
+      field.typeParams.length !== 2 ||
+      key !== 'u64' ||
+      typeof inner !== 'object' ||
+      inner.address !== WALRUS_PACKAGE ||
+      inner.module !== WALRUS_STATE_MODULE ||
+      !WALRUS_STATE_NAME.test(inner.name)
+    ) {
+      throw badResponse('the Walrus system state is not of the type expected');
+    }
+    const contents = walrusStateFieldSchema.safeParse(state.json);
+    if (!contents.success || chainAddress(contents.data.id, 'Walrus state id field') !== fieldId || BigInt(contents.data.name) !== version) {
+      throw badResponse('the Walrus system state has an unknown shape');
+    }
+    return contents.data.value.committee.epoch;
+  }
+
   /** One read of a digest's outcome, no retries. Null while the chain has no such transaction. */
   async function landedResult(digest: string): Promise<ExecutionResult | null> {
     try {
@@ -998,6 +1205,8 @@ export function createChain(opts: { apiKey?: string }): Chain {
     getCurrentEpoch,
     simulate,
     listOwnedWalrusBlobs,
+    scanOwnedWalrusBlobs,
+    getWalrusEpoch,
     executeTransaction,
     getAllowance,
     close: () => transport.close(),

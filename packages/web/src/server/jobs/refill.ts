@@ -23,13 +23,20 @@ export interface RefillJobArgs {
   now: Date;
   /** Waits between the reads that confirm a lost refill. A real timer when not given. */
   sleep?: (ms: number) => Promise<void>;
+  /**
+   * Asked before each chain read up to the moment the refill row is written: false once the jobs
+   * tick's deadline has passed, and the call then answers 'deferred'. Always true when left out.
+   */
+  canStart?: () => boolean;
 }
 
 /**
  * 'resolved_pending': a refill pending from an earlier call was found landed in this call, and
  * this call stops there, so the next refill is decided on a balance read made after it landed.
+ * 'deferred': the tick's deadline came before a read this call needed, so it stopped with nothing
+ * built or sent.
  */
-export type RefillOutcome = 'refilled' | 'not_needed' | 'skipped_pending' | 'resolved_pending' | 'refused';
+export type RefillOutcome = 'refilled' | 'not_needed' | 'skipped_pending' | 'resolved_pending' | 'refused' | 'deferred';
 
 export type RefillErrorCode = 'FAILED' | 'MISMATCH' | 'DRY_RUN_FAILED';
 
@@ -254,7 +261,8 @@ async function resolvePending(
   parties: Parties,
   now: Date,
   sleep: (ms: number) => Promise<void>,
-): Promise<'blocked' | 'verified' | 'clear'> {
+  canStart: () => boolean,
+): Promise<'blocked' | 'verified' | 'clear' | 'deferred'> {
   const [pending] = await db
     .select({ id: refills.id, digest: refills.digest, amountAtomic: refills.amountAtomic, validUntilEpoch: refills.validUntilEpoch })
     .from(refills)
@@ -262,10 +270,14 @@ async function resolvePending(
     .orderBy(asc(refills.sentAt), asc(refills.id))
     .limit(1);
   if (pending === undefined) return 'clear';
+  if (!canStart()) return 'deferred';
   const landed = await readLanded(chain, pending.digest);
   if (landed !== null) return (await recordLanded(db, pending, landed, parties, now)) === 'verified' ? 'verified' : 'clear';
-  if (pending.validUntilEpoch === null || (await chain.getCurrentEpoch()) <= pending.validUntilEpoch) return 'blocked';
+  if (pending.validUntilEpoch === null) return 'blocked';
+  if (!canStart()) return 'deferred';
+  if ((await chain.getCurrentEpoch()) <= pending.validUntilEpoch) return 'blocked';
   for (let read = 0; read < LIMITS.paymentReleaseReads; read++) {
+    if (!canStart()) return 'deferred';
     await sleep(LIMITS.settlementPollIntervalMs);
     const late = await readLanded(chain, pending.digest);
     if (late !== null) return (await recordLanded(db, pending, late, parties, now)) === 'verified' ? 'verified' : 'clear';
@@ -307,6 +319,12 @@ async function resolvePending(
  *    readable yet stays 'pending' for the next call. Either way 'refilled'. An unknown send
  *    outcome stays 'pending' and the ChainError is thrown.
  *
+ * `canStart` is asked before every chain read in steps 1 to 3 and once more before step 4; when
+ * it says no the call answers 'deferred' with nothing built, written or sent. Steps 5 and 6 are
+ * never cut short, since bytes whose row is written but which were never sent would hold up
+ * refills until their epoch window closed and still count toward the day's refills. Together
+ * they take at most three bounded Tatum calls.
+ *
  * Throws for an owner id that is not a uuid or a time that is not a date; ChainError from
  * the reads; AllowanceError from the build; RefillError MISMATCH when a refill landed and
  * moved anything but the refill.
@@ -316,6 +334,7 @@ export async function refillIfNeeded(args: RefillJobArgs): Promise<RefillOutcome
   if (!(args.now instanceof Date) || Number.isNaN(args.now.getTime())) throw new Error('the current time is not a date');
   const { db, chain, gasKeypair, now } = args;
   const sleep = args.sleep ?? timerSleep;
+  const canStart = args.canStart ?? (() => true);
   const ownerId = args.ownerId.toLowerCase();
 
   const owner = await readOwner(db, ownerId, false);
@@ -326,7 +345,8 @@ export async function refillIfNeeded(args: RefillJobArgs): Promise<RefillOutcome
     funder: canonicalSuiAddress(owner.suiAddress),
     gasOwner: canonicalSuiAddress(gasKeypair.toSuiAddress()),
   };
-  const earlier = await resolvePending(db, chain, ownerId, parties, now, sleep);
+  const earlier = await resolvePending(db, chain, ownerId, parties, now, sleep, canStart);
+  if (earlier === 'deferred') return 'deferred';
   if (earlier === 'blocked') return 'skipped_pending';
   // Tatum's nodes can still report the purse without a refill that just landed, so the next
   // refill waits for a later call.
@@ -334,6 +354,7 @@ export async function refillIfNeeded(args: RefillJobArgs): Promise<RefillOutcome
 
   const purse = derivePurseKeypair(args.masterSecretHex, owner.suiAddress);
   if (!sameAddress(purse.toSuiAddress(), owner.purseAddress)) return 'refused';
+  if (!canStart()) return 'deferred';
   let allowance: AllowanceReading;
   try {
     allowance = await chain.getAllowance(allowanceId);
@@ -344,6 +365,7 @@ export async function refillIfNeeded(args: RefillJobArgs): Promise<RefillOutcome
   }
   if (!allowanceServes(allowance, owner, now)) return 'refused';
 
+  if (!canStart()) return 'deferred';
   const purseReadAtomic = (await chain.getBalances(owner.purseAddress)).usdcAddressBalance;
   // The same checks run again under the lock below. This pass only saves two chain reads when
   // no refill can happen now; a payment signed before the lock can only lower the ledger, and
@@ -351,13 +373,18 @@ export async function refillIfNeeded(args: RefillJobArgs): Promise<RefillOutcome
   const early = await refillLedger(db, ownerId, now);
   if (early.pending) return 'skipped_pending';
   if (!refillDecision({ purseUsdcAtomic: purseForDecision(purseReadAtomic, early), refillsInWindow: early.inWindow }).refill) return 'not_needed';
+  if (!canStart()) return 'deferred';
+  const epoch = await chain.getCurrentEpoch();
+  if (!canStart()) return 'deferred';
   const facts: RefillFacts = {
-    epoch: await chain.getCurrentEpoch(),
+    epoch,
     referenceGasPrice: await chain.getReferenceGasPrice(),
     nonce: randomInt(0, U32_LIMIT),
     allowanceInitialSharedVersion: allowance.initialSharedVersion,
   };
 
+  // The last point to stop: once the row is written, the dry run, the send and the read back always run.
+  if (!canStart()) return 'deferred';
   const prepared = await db.transaction(async (tx) => {
     const locked = await readOwner(tx, ownerId, true);
     if (

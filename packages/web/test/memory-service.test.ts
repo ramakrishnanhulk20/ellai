@@ -1,11 +1,15 @@
 // Covers: the memory service on PGlite against a stand-in relayer client. submitPendingMemories
 // claims only this owner's pending, unsent rows written by the derived delegate in Ellai's
-// namespace, sends them once, never resubmits a row with a job id, counts every attempt, sends a
-// row from a refused write alone so another row still goes, fails a row at the attempt ceiling,
-// marks rows failed when the write may have been stored, counts and fails nothing on a refused
-// delegate key, and holds back a repeated sentence; confirmMemoryJobs maps done, failed and
+// namespace, sends them once, never resubmits a row with a job id, counts only refusals about the
+// rows, keeps rows pending through rate limits, outages and timeouts until the age ceiling, sends
+// a row from a refused write alone so another row still goes, fails a row at the attempt ceiling,
+// marks rows failed when the relayer took them without usable job ids, counts and fails nothing
+// on a refused delegate key, and holds back a repeated sentence; confirmMemoryJobs maps done, failed and
 // pending, fails one malformed or clashing job alone, fails a job past the age ceiling, and
-// changes nothing on a refused delegate key; both refuse an owner without an account;
+// changes nothing on a refused delegate key; neither holds a transaction across a relayer call,
+// so a pass leased elsewhere is skipped and a lease that ran out is taken again; both start no
+// call once canStart says no, every relayer call ends at the call ceiling, and both refuse an
+// owner without an account;
 // makeRecall rejects for such an owner so decide asks (C12) and returns no sentence text;
 // recordOutcome is idempotent per decision and owner-scoped; ownerDelegate's key form.
 // Does NOT cover: the live relayer, its job timing or its search ranking (proven only by
@@ -135,7 +139,11 @@ const accepted = async (items: unknown[]) => {
   sends += 1;
   return { job_ids: items.map((_, index) => `job-${sends}-${index}`), total: items.length, status: 'running' };
 };
-const writer = (owner: Owner) => ({ db, ownerId: owner.id, masterSecretHex: MASTER, now: NOW });
+const writer = (owner: Owner, now: Date = NOW) => ({ db, ownerId: owner.id, masterSecretHex: MASTER, now });
+// The jobs workflow ticks every 10 minutes, so a tick's pass comes this long after the last one.
+const TICK_MS = 600_000;
+const tickOn = (ticks: number) => new Date(NOW.getTime() + ticks * TICK_MS);
+const refusedWith = (status: number) => () => Promise.reject(Object.assign(new Error('refused'), { status }));
 
 function payment(): CanonicalPayment {
   return {
@@ -207,7 +215,7 @@ describe('submitPendingMemories', () => {
     const jobIds = [(await row(first)).jobId, (await row(second)).jobId];
     expect(jobIds[0]).toMatch(/^job-/);
     expect(new Set(jobIds).size).toBe(2);
-    for (const id of [first, second]) expect(await row(id)).toMatchObject({ status: 'pending', submitAttempts: 1, submittedAt: NOW });
+    for (const id of [first, second]) expect(await row(id)).toMatchObject({ status: 'pending', submitAttempts: 0, submittedAt: NOW });
     for (const id of [otherWriter, otherNamespace, elsewhere]) expect((await row(id)).jobId).toBeNull();
 
     expect(await submitPendingMemories(writer(owner))).toEqual({ submitted: 0 });
@@ -224,26 +232,56 @@ describe('submitPendingMemories', () => {
     expect(client.rememberBulk).toHaveBeenCalledTimes(2);
   });
 
-  it('counts a refused write against its rows and leaves them pending with no job id, so a later pass sends them', async () => {
-    for (const [status, code] of [
-      [429, 'RATE_LIMITED'],
-      [400, 'WRITE'],
-      [503, 'UPSTREAM'],
+  it('counts only a refusal about the rows against them; a rate limit or an outage leaves them pending and unspent for a later pass', async () => {
+    for (const [status, code, spent, laterWrites] of [
+      [429, 'RATE_LIMITED', 0, 1],
+      [503, 'UPSTREAM', 0, 1],
+      // Refused as written, so each row goes alone next time.
+      [400, 'WRITE', 1, 2],
     ] as const) {
       const owner = await newOwner();
       const ids = [await pendingMemory(owner), await pendingMemory(owner)];
-      const client = relayer({ rememberBulk: () => Promise.reject(Object.assign(new Error('refused'), { status })) });
+      const client = relayer({ rememberBulk: refusedWith(status) });
       await expect(submitPendingMemories(writer(owner))).rejects.toMatchObject({ name: 'MemoryError', code });
       expect(client.rememberBulk).toHaveBeenCalledTimes(1);
-      for (const id of ids) expect(await row(id)).toMatchObject({ status: 'pending', jobId: null, submitAttempts: 1, submittedAt: NOW });
-      relayer({ rememberBulk: accepted });
-      expect(await submitPendingMemories(writer(owner))).toEqual({ submitted: 2 });
-      for (const id of ids) expect(await row(id)).toMatchObject({ status: 'pending', jobId: expect.stringMatching(/^job-/), submitAttempts: 2 });
+      for (const id of ids) expect(await row(id)).toMatchObject({ status: 'pending', jobId: null, submitAttempts: spent, submittedAt: NOW });
+      const later = relayer({ rememberBulk: accepted });
+      expect(await submitPendingMemories(writer(owner, tickOn(1)))).toEqual({ submitted: 2 });
+      expect(later.rememberBulk).toHaveBeenCalledTimes(laterWrites);
+      for (const id of ids) expect(await row(id)).toMatchObject({ status: 'pending', jobId: expect.stringMatching(/^job-/), submitAttempts: spent });
     }
   });
 
+  it("keeps the owner's yes pending through five rate-limited passes and writes it on the sixth", async () => {
+    const owner = await newOwner();
+    const yes = await pendingMemory(owner);
+    const busy = relayer({ rememberBulk: refusedWith(429) });
+    for (let pass = 0; pass < 5; pass++) {
+      await expect(submitPendingMemories(writer(owner, tickOn(pass)))).rejects.toMatchObject({ name: 'MemoryError', code: 'RATE_LIMITED' });
+      expect(await row(yes)).toMatchObject({ status: 'pending', jobId: null, submitAttempts: 0 });
+    }
+    expect(busy.rememberBulk).toHaveBeenCalledTimes(5);
+    expect(LIMITS.memoryWriteMaxAttempts).toBe(5);
+    relayer({ rememberBulk: accepted });
+    expect(await submitPendingMemories(writer(owner, tickOn(5)))).toEqual({ submitted: 1 });
+    expect(await row(yes)).toMatchObject({ status: 'pending', jobId: expect.stringMatching(/^job-/), submitAttempts: 0 });
+  });
+
+  it('fails a row still unsent LIMITS.memoryWriteMaxAgeMs after it was created, without sending it, and sends one a millisecond younger', async () => {
+    expect(LIMITS.memoryWriteMaxAgeMs).toBe(3 * 86_400_000);
+    const owner = await newOwner();
+    const old = await pendingMemory(owner, { createdAt: new Date(NOW.getTime() - LIMITS.memoryWriteMaxAgeMs) });
+    const young = await pendingMemory(owner, { createdAt: new Date(NOW.getTime() - LIMITS.memoryWriteMaxAgeMs + 1) });
+    const client = relayer({ rememberBulk: accepted });
+    expect(await submitPendingMemories(writer(owner))).toEqual({ submitted: 1 });
+    expect(await row(old)).toMatchObject({ status: 'failed', jobId: null });
+    expect(await row(young)).toMatchObject({ status: 'pending', jobId: expect.stringMatching(/^job-/) });
+    const texts = client.rememberBulk.mock.calls.map((call) => (call[0] as unknown as Array<{ text: string }>).map((item) => item.text));
+    expect(texts).toEqual([[(await row(young)).sentence]]);
+  });
+
   it('sends each row of a refused write alone on the next pass, so row B is written while row A is refused again', async () => {
-    // A pass makes no more writes than one relayer pacing window holds, so core never sleeps with rows locked.
+    // A pass makes no more writes than one relayer pacing window holds, so core never has to pause it.
     expect(LIMITS.memoryWritesPerPass * LIMITS.memwalBulkPoints).toBeLessThanOrEqual(LIMITS.memwalPointsPerMinute);
     expect(LIMITS.memoryWritesPerPass).toBe(3);
     const owner = await newOwner();
@@ -259,12 +297,12 @@ describe('submitPendingMemories', () => {
 
     const c = await pendingMemory(owner);
     const client = relayer({ rememberBulk: refusesA as Method });
-    expect(await submitPendingMemories(writer(owner))).toEqual({ submitted: 2 });
+    expect(await submitPendingMemories(writer(owner, tickOn(1)))).toEqual({ submitted: 2 });
     const texts = client.rememberBulk.mock.calls.map((call) => (call[0] as unknown as Array<{ text: string }>).map((item) => item.text));
     expect(texts).toEqual([[bad], [(await row(b)).sentence], [(await row(c)).sentence]]);
     expect(await row(a)).toMatchObject({ status: 'pending', jobId: null, submitAttempts: 2 });
-    expect(await row(b)).toMatchObject({ status: 'pending', jobId: expect.stringMatching(/^job-/), submitAttempts: 2 });
-    expect(await row(c)).toMatchObject({ status: 'pending', jobId: expect.stringMatching(/^job-/), submitAttempts: 1 });
+    expect(await row(b)).toMatchObject({ status: 'pending', jobId: expect.stringMatching(/^job-/), submitAttempts: 1 });
+    expect(await row(c)).toMatchObject({ status: 'pending', jobId: expect.stringMatching(/^job-/), submitAttempts: 0 });
   });
 
   it('marks a row failed once it reaches LIMITS.memoryWriteMaxAttempts, and never sends it again', async () => {
@@ -272,10 +310,10 @@ describe('submitPendingMemories', () => {
     const id = await pendingMemory(owner);
     const client = relayer({ rememberBulk: () => Promise.reject(Object.assign(new Error('bad item'), { status: 422 })) });
     for (let attempt = 1; attempt <= LIMITS.memoryWriteMaxAttempts; attempt++) {
-      await expect(submitPendingMemories(writer(owner))).rejects.toMatchObject({ name: 'MemoryError', code: 'WRITE' });
+      await expect(submitPendingMemories(writer(owner, tickOn(attempt)))).rejects.toMatchObject({ name: 'MemoryError', code: 'WRITE' });
       expect(await row(id)).toMatchObject({ status: attempt < LIMITS.memoryWriteMaxAttempts ? 'pending' : 'failed', submitAttempts: attempt });
     }
-    expect(await submitPendingMemories(writer(owner))).toEqual({ submitted: 0 });
+    expect(await submitPendingMemories(writer(owner, tickOn(LIMITS.memoryWriteMaxAttempts + 1)))).toEqual({ submitted: 0 });
     expect(client.rememberBulk).toHaveBeenCalledTimes(LIMITS.memoryWriteMaxAttempts);
   });
 
@@ -292,26 +330,36 @@ describe('submitPendingMemories', () => {
     for (const id of fresh) expect(await row(id)).toMatchObject({ status: 'pending', jobId: null, submitAttempts: 0, submittedAt: null });
   });
 
-  it('marks rows failed, and never sends them again, when the write may have reached the relayer', async () => {
-    const timeout = Object.assign(new Error('deadline'), { name: 'MemWalRequestTimeout' });
-    const maybeStored: Method[] = [
-      () => Promise.reject(timeout),
-      () => Promise.reject(Object.assign(new Error('internal'), { status: 500 })),
-      () => Promise.reject(new TypeError('fetch failed')),
-      async () => ({ job_ids: ['only-one'], total: 1, status: 'running' }),
+  it('spends nothing on a timeout, no answer or a server error, and sends those rows again on a later pass', async () => {
+    const noAnswer: Array<[Method, string]> = [
+      [() => Promise.reject(Object.assign(new Error('deadline'), { name: 'MemWalRequestTimeout' })), 'TIMEOUT'],
+      [() => Promise.reject(Object.assign(new Error('gateway timeout'), { status: 504 })), 'TIMEOUT'],
+      [() => Promise.reject(Object.assign(new Error('internal'), { status: 500 })), 'UPSTREAM'],
+      [() => Promise.reject(new TypeError('fetch failed')), 'UPSTREAM'],
     ];
-    for (const rememberBulk of maybeStored) {
+    for (const [rememberBulk, code] of noAnswer) {
       const owner = await newOwner();
       const ids = [await pendingMemory(owner), await pendingMemory(owner)];
       relayer({ rememberBulk });
-      const error = await submitPendingMemories(writer(owner)).catch((reason: unknown) => reason);
-      expect(error).toBeInstanceOf(MemoryServiceError);
-      expect((error as MemoryServiceError).code).toBe('SEND_UNCERTAIN');
-      for (const id of ids) expect(await row(id)).toMatchObject({ status: 'failed', jobId: null, submitAttempts: 1, submittedAt: NOW });
+      await expect(submitPendingMemories(writer(owner))).rejects.toMatchObject({ name: 'MemoryError', code });
+      for (const id of ids) expect(await row(id)).toMatchObject({ status: 'pending', jobId: null, submitAttempts: 0, submittedAt: NOW });
       const again = relayer({ rememberBulk: accepted });
-      expect(await submitPendingMemories(writer(owner))).toEqual({ submitted: 0 });
-      expect(again.rememberBulk).not.toHaveBeenCalled();
+      expect(await submitPendingMemories(writer(owner, tickOn(1)))).toEqual({ submitted: 2 });
+      expect(again.rememberBulk).toHaveBeenCalledTimes(1);
     }
+  });
+
+  it('marks rows failed, and never sends them again, when the relayer took the write without usable job ids', async () => {
+    const owner = await newOwner();
+    const ids = [await pendingMemory(owner), await pendingMemory(owner)];
+    relayer({ rememberBulk: async () => ({ job_ids: ['only-one'], total: 1, status: 'running' }) });
+    const error = await submitPendingMemories(writer(owner)).catch((reason: unknown) => reason);
+    expect(error).toBeInstanceOf(MemoryServiceError);
+    expect((error as MemoryServiceError).code).toBe('SEND_UNCERTAIN');
+    for (const id of ids) expect(await row(id)).toMatchObject({ status: 'failed', jobId: null, submitAttempts: 0, submittedAt: NOW });
+    const again = relayer({ rememberBulk: accepted });
+    expect(await submitPendingMemories(writer(owner, tickOn(1)))).toEqual({ submitted: 0 });
+    expect(again.rememberBulk).not.toHaveBeenCalled();
   });
 
   it('holds a repeated sentence back for a later pass instead of failing the whole batch', async () => {
@@ -326,6 +374,74 @@ describe('submitPendingMemories', () => {
     expect(await submitPendingMemories(writer(owner))).toEqual({ submitted: 1 });
     expect((await row(repeat)).jobId).not.toBeNull();
     expect(client.rememberBulk).toHaveBeenCalledTimes(2);
+  });
+
+  /** A relayer whose first bulk write waits at a gate the test opens; every other write is accepted at once. */
+  function gatedRelayer() {
+    let entered = (): void => undefined;
+    let open = (): void => undefined;
+    const inRelayer = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    const gate = new Promise<void>((resolve) => {
+      open = resolve;
+    });
+    let writes = 0;
+    const client = relayer({
+      rememberBulk: (async (items: unknown[]) => {
+        writes += 1;
+        if (writes === 1) {
+          entered();
+          await gate;
+        }
+        return accepted(items);
+      }) as Method,
+    });
+    const texts = () => client.rememberBulk.mock.calls.map((call) => (call[0] as unknown as Array<{ text: string }>).map((item) => item.text));
+    return { inRelayer, open, texts };
+  }
+
+  it('holds no transaction across a relayer call: a pass run while another waits on the relayer skips its leased row and sends its own', async () => {
+    // Past the jobs route's own limit, so the pass that took a row has finished or died first; under one tick.
+    expect(LIMITS.memoryWriteLeaseMs).toBeGreaterThan(LIMITS.slowRouteMaxDurationS * 1_000);
+    expect(LIMITS.memoryWriteLeaseMs).toBeGreaterThan(4 * LIMITS.memwalRequestTimeoutMs);
+    expect(LIMITS.memoryWriteLeaseMs).toBeLessThan(TICK_MS);
+    const owner = await newOwner();
+    const first = await pendingMemory(owner);
+    const relay = gatedRelayer();
+    const waiting = submitPendingMemories(writer(owner));
+    await relay.inRelayer;
+    expect(await row(first)).toMatchObject({ status: 'pending', jobId: null, submittedAt: NOW });
+
+    // PGlite serves one connection, so a transaction the waiting pass held open would stall this one until the test timed out.
+    const second = await pendingMemory(owner);
+    expect(await submitPendingMemories(writer(owner, new Date(NOW.getTime() + LIMITS.memoryWriteLeaseMs - 1)))).toEqual({ submitted: 1 });
+    expect((await row(first)).jobId).toBeNull();
+
+    relay.open();
+    expect(await waiting).toEqual({ submitted: 1 });
+    expect(relay.texts()).toEqual([[(await row(first)).sentence], [(await row(second)).sentence]]);
+    const jobIds = [(await row(first)).jobId, (await row(second)).jobId];
+    expect(jobIds.every((id) => typeof id === 'string' && id.startsWith('job-'))).toBe(true);
+    expect(new Set(jobIds).size).toBe(2);
+  });
+
+  it('sends a row again once its lease has passed without a job id, and the first pass answering late changes nothing', async () => {
+    const owner = await newOwner();
+    const lost = await pendingMemory(owner);
+    const relay = gatedRelayer();
+    const stalled = submitPendingMemories(writer(owner));
+    await relay.inRelayer;
+
+    expect(await submitPendingMemories(writer(owner, new Date(NOW.getTime() + LIMITS.memoryWriteLeaseMs)))).toEqual({ submitted: 1 });
+    const kept = (await row(lost)).jobId;
+    expect(kept).toMatch(/^job-/);
+
+    // The stalled write was stored too; its job id is on no row, so its blob is an orphan nothing counts (C9).
+    relay.open();
+    expect(await stalled).toEqual({ submitted: 0 });
+    expect(await row(lost)).toMatchObject({ status: 'pending', jobId: kept });
+    expect(relay.texts()).toEqual([[(await row(lost)).sentence], [(await row(lost)).sentence]]);
   });
 });
 
@@ -429,6 +545,78 @@ describe('confirmMemoryJobs', () => {
     relayer({ getRememberBulkStatus: () => Promise.reject(Object.assign(new Error('unauthorized'), { status: 401 })) });
     await expect(confirmMemoryJobs(writer(owner))).rejects.toMatchObject({ name: 'MemoryError', code: 'DELEGATE' });
     for (const id of [old, done]) expect(await row(id)).toMatchObject({ status: 'pending', blobId: null });
+  });
+});
+
+/** Lowers one limit for the length of `run`, so a ceiling of minutes can be reached in milliseconds. */
+async function withLimit(name: keyof typeof LIMITS, value: number, run: () => Promise<void>): Promise<void> {
+  const limits = LIMITS as unknown as Record<string, number>;
+  const before = limits[name];
+  limits[name] = value;
+  try {
+    await run();
+  } finally {
+    if (before !== undefined) limits[name] = before;
+  }
+}
+
+const never = () => new Promise<never>(() => undefined);
+
+describe('the tick deadline and the relayer call ceiling', () => {
+  it('ends a relayer call that never answers at LIMITS.memwalCallTimeoutMs as a TIMEOUT that spends nothing, for writes and status reads', async () => {
+    expect(LIMITS.memwalCallTimeoutMs).toBe(4 * LIMITS.memwalRequestTimeoutMs);
+    const owner = await newOwner();
+    const unsentRow = await pendingMemory(owner);
+    const sentRow = await pendingMemory(owner, { jobId: 'job-hung', submittedAt: NOW });
+    relayer({ rememberBulk: never, getRememberBulkStatus: never });
+    await withLimit('memwalCallTimeoutMs', 50, async () => {
+      await expect(submitPendingMemories(writer(owner))).rejects.toMatchObject({ name: 'MemoryError', code: 'TIMEOUT' });
+      await expect(confirmMemoryJobs(writer(owner))).rejects.toMatchObject({ name: 'MemoryError', code: 'TIMEOUT' });
+    });
+    expect(await row(unsentRow)).toMatchObject({ status: 'pending', jobId: null, submitAttempts: 0 });
+    expect(await row(sentRow)).toMatchObject({ status: 'pending', jobId: 'job-hung', blobId: null });
+  });
+
+  it('starts no relayer call, and claims no row, once canStart says no', async () => {
+    const owner = await newOwner();
+    const unsentRow = await pendingMemory(owner);
+    await pendingMemory(owner, { jobId: 'job-waiting', submittedAt: NOW });
+    const client = relayer();
+    expect(await submitPendingMemories({ ...writer(owner), canStart: () => false })).toEqual({ submitted: 0 });
+    expect(await confirmMemoryJobs({ ...writer(owner), canStart: () => false })).toEqual({ confirmed: 0, failed: 0, pending: 1 });
+    expect(client.rememberBulk).not.toHaveBeenCalled();
+    expect(client.getRememberBulkStatus).not.toHaveBeenCalled();
+    expect(await row(unsentRow)).toMatchObject({ status: 'pending', submittedAt: null });
+  });
+
+  it('holds no transaction while a confirm pass waits on the relayer, so a write pass for the same owner still runs', async () => {
+    const owner = await newOwner();
+    const sentRow = await pendingMemory(owner, { jobId: 'job-slow', submittedAt: NOW });
+    const unsentRow = await pendingMemory(owner);
+    let entered = (): void => undefined;
+    let open = (): void => undefined;
+    const inRelayer = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    const gate = new Promise<void>((resolve) => {
+      open = resolve;
+    });
+    relayer({
+      rememberBulk: accepted,
+      getRememberBulkStatus: (async () => {
+        entered();
+        await gate;
+        return { results: [{ job_id: 'job-slow', status: 'done', blob_id: 'blob-slow' }] };
+      }) as Method,
+    });
+    const confirming = confirmMemoryJobs(writer(owner));
+    await inRelayer;
+    // PGlite serves one connection, so a transaction the confirm pass held open would stall this write.
+    expect(await submitPendingMemories(writer(owner))).toEqual({ submitted: 1 });
+    open();
+    expect(await confirming).toEqual({ confirmed: 1, failed: 0, pending: 0 });
+    expect(await row(sentRow)).toMatchObject({ status: 'confirmed', blobId: 'blob-slow' });
+    expect((await row(unsentRow)).jobId).toMatch(/^job-/);
   });
 });
 

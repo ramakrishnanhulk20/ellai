@@ -713,6 +713,27 @@ function httpStatusOf(error: unknown): number | null {
   return typeof status === 'number' && Number.isInteger(status) && status >= 100 && status <= 599 ? status : null;
 }
 
+/**
+ * Bounds one whole SDK call at LIMITS.memwalCallTimeoutMs (C21): each request inside it has its
+ * own deadline, but the steps before a request (the version check, the config, a SEAL session
+ * whose read of Sui has none) can add up past any one of them. The SDK takes no signal for a whole
+ * call, so a call past the ceiling is not stopped, only no longer waited for: it runs on unwatched
+ * until its own steps end, and its later failure is swallowed so it cannot surface unhandled. A
+ * client destroyed meanwhile refuses to sign anything it had not yet signed; a request it had
+ * already signed can still be sent, so an abandoned write may reach the relayer after all.
+ */
+function withinCallCeiling<T>(call: Promise<T>): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  const ceiling = new Promise<never>((_, reject) => {
+    timer = setTimeout(
+      () => reject(new MemoryError('TIMEOUT', `the relayer call did not finish within ${LIMITS.memwalCallTimeoutMs} ms`)),
+      LIMITS.memwalCallTimeoutMs,
+    );
+  });
+  call.catch(() => undefined);
+  return Promise.race([call, ceiling]).finally(() => clearTimeout(timer));
+}
+
 function relayerFailure(error: unknown, code: 'WRITE' | 'RECALL'): MemoryError {
   if (error instanceof MemoryError) return error;
   const { name, cause } = (typeof error === 'object' && error !== null ? error : {}) as { name?: unknown; cause?: unknown };
@@ -799,7 +820,7 @@ async function waitForJobs(client: MemWal, jobIds: string[]): Promise<string[]> 
     await spendRelayerPoints(client, LIMITS.memwalRequestPoints);
     let status: unknown;
     try {
-      status = await client.getRememberBulkStatus(pending, { timeoutMs: Math.min(LIMITS.memwalRequestTimeoutMs, remaining) });
+      status = await withinCallCeiling(client.getRememberBulkStatus(pending, { timeoutMs: Math.min(LIMITS.memwalRequestTimeoutMs, remaining) }));
     } catch (error) {
       const failure = relayerFailure(error, 'WRITE');
       if (failure.code === 'RATE_LIMITED') {
@@ -886,7 +907,7 @@ export async function rememberSentences(
   await spendRelayerPoints(client, LIMITS.memwalBulkPoints);
   let accepted: unknown;
   try {
-    accepted = await client.rememberBulk(texts.map((text) => ({ text, namespace: label })));
+    accepted = await withinCallCeiling(client.rememberBulk(texts.map((text) => ({ text, namespace: label }))));
   } catch (error) {
     throw relayerFailure(error, 'WRITE');
   }
@@ -913,7 +934,7 @@ export async function submitSentences(client: MemWal, namespace: string, sentenc
   await spendRelayerPoints(client, LIMITS.memwalBulkPoints);
   let accepted: unknown;
   try {
-    accepted = await client.rememberBulk(texts.map((text) => ({ text, namespace: label })));
+    accepted = await withinCallCeiling(client.rememberBulk(texts.map((text) => ({ text, namespace: label }))));
   } catch (error) {
     throw relayerFailure(error, 'WRITE');
   }
@@ -951,7 +972,7 @@ export async function checkJobs(
   await spendRelayerPoints(client, LIMITS.memwalRequestPoints);
   let status: unknown;
   try {
-    status = await client.getRememberBulkStatus(asked, { timeoutMs: LIMITS.memwalRequestTimeoutMs });
+    status = await withinCallCeiling(client.getRememberBulkStatus(asked, { timeoutMs: LIMITS.memwalRequestTimeoutMs }));
   } catch (error) {
     throw relayerFailure(error, 'WRITE');
   }
@@ -1014,7 +1035,7 @@ export async function recallSentences(
     // maxDistance is applied below, not by the SDK: 0.1.8 filters with
     // `distance < maxDistance`, which silently drops a hit whose distance is missing,
     // the very hit that must fail the call.
-    result = await client.recall({ query, limit: opts.limit, namespace: label });
+    result = await withinCallCeiling(client.recall({ query, limit: opts.limit, namespace: label }));
   } catch (error) {
     throw relayerFailure(error, 'RECALL');
   }

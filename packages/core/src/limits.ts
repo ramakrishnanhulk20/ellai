@@ -13,6 +13,11 @@ export const LIMITS = {
   graphqlPageSize: 50,
   /** Pages read before giving up, so a hostile or huge owner cannot keep us looping. */
   graphqlMaxPages: 20,
+  /**
+   * Longest GraphQL page cursor taken in or handed back. Sui's are base64 well under this, and
+   * the web app keeps the blob scan's in owners.blob_scan_cursor, which holds 512 characters.
+   */
+  graphqlCursorMaxChars: 512,
   /** Coin types per gRPC ListBalances page. The service caps this at 1000. */
   balancePageSize: 1_000,
   /** ListBalances pages read before giving up on finding USDC and SUI. */
@@ -124,6 +129,13 @@ export const LIMITS = {
   memwalMaxDelegateKeys: 20,
   /** Ceiling on one relayer request. The SDK's own recall deadline is 15 seconds and stays below it. */
   memwalRequestTimeoutMs: 30_000,
+  /**
+   * Ceiling on one whole SDK call to the relayer (C21). Before its request the SDK may check the
+   * relayer's version, then its health, and fetch its config, each up to memwalRequestTimeoutMs,
+   * and build a SEAL session whose read of Sui has no limit of its own. Four requests at the
+   * request ceiling is the slowest call that is still working.
+   */
+  memwalCallTimeoutMs: 120_000,
   /** Largest relayer response body read. Ellai's sentences are at most 4 KiB, so 20 recall hits fit with room. */
   memwalMaxResponseBytes: 2_097_152,
   /** Most sentences in one bulk write. The SDK and the relayer refuse more. */
@@ -258,10 +270,16 @@ export const LIMITS = {
   slowRouteMaxDurationS: 300,
   /** Failed settlement reads tolerated after a payment's window closes before it is treated as unverifiable and the owner paused (C8). */
   settlementUnverifiableReads: 6,
-  /** How long signed payment material may land on chain, when the network accepts a timestamp bound on a gasless send. */
-  paymentMaterialTtlMs: 120_000,
-  /** Time one jobs tick may spend before it stops starting new owners, under the route's 300 s limit. */
-  tickTimeBudgetMs: 240_000,
+  /**
+   * The jobs tick's deadline, from its start: past it no owner is started and no step starts a
+   * new external call (C21, C28). The longest single unit that may begin just before it is one
+   * settlement pass at 174 s (a digest read, an epoch read, then paymentReleaseReads waits and
+   * reads, each read three tries of tatumTimeoutMs plus the retry waits), so 100 s plus 174 s
+   * still ends inside tickEndByMs. jobs.test.ts works this out from these numbers.
+   */
+  tickTimeBudgetMs: 100_000,
+  /** The latest a jobs tick may still be working: 20 s under the jobs route's 300 s, left for its last database writes and its reply. */
+  tickEndByMs: 280_000,
   /** Submit attempts a pending memory gets before it is marked failed. */
   memoryWriteMaxAttempts: 5,
   /** A memory write job still not done after this long is marked failed: six hours. */
@@ -276,10 +294,32 @@ export const LIMITS = {
   blobChainCheckMaxAgeMs: 259_200_000,
   /** How long after Walrus Memory confirms a memory before its blob is first looked for, since a blob that new may not be listed yet. */
   blobChainCheckMinAgeMs: 60_000,
-  /** Expired rows deleted per table per tick. */
+  /** Expired rows deleted per table in one delete; prune repeats it until a batch comes back short. */
   pruneBatch: 1_000,
-  /** How long the seller reuses one current-epoch read for its challenges. */
-  epochCacheMs: 60_000,
+  /**
+   * Longest one tick spends pruning, so cleanup cannot eat the owners' time budget. At pruneBatch
+   * rows a delete this still outpaces every global cap on anonymous rows (C22, C34).
+   */
+  pruneTimeSliceMs: 5_000,
+  /** How long a seller sale still waiting on the chain is kept for its buyer to present again: 30 days. */
+  sellerWaitingSaleKeepMs: 2_592_000_000,
+  /** How long an owner row with nothing but expired sessions is kept: a day. Sign-in creates one for any wallet. */
+  emptyOwnerKeepMs: 86_400_000,
+  /**
+   * How long a memory may wait on refusals that are not about it (rate limits, an outage) before
+   * it is marked failed: three days. Only refusals about the rows spend memoryWriteMaxAttempts (C33).
+   */
+  memoryWriteMaxAgeMs: 259_200_000,
+  /** GraphQL pages of an owner's Walrus Blob objects read per tick; the next tick resumes where this one stopped. */
+  blobScanPagesPerTick: 20,
+  /** How long one read of the current Walrus epoch is reused in a process: an hour, since a Walrus Mainnet epoch lasts about two weeks. */
+  walrusEpochCacheMs: 3_600_000,
+  /**
+   * How long the seller reuses one current-epoch read for its challenges: an hour. A challenge
+   * names the window [E, E + 1], and a reading under an epoch's length old (about a day on
+   * mainnet) means the chain is in E or E + 1, so the window is still open when issued.
+   */
+  epochCacheMs: 3_600_000,
   /**
    * The fixed window in which one sale waiting on the chain may be read again, at most once:
    * each recheck costs up to chainReadAfterWriteTries Tatum reads, and anyone holding the bytes
@@ -290,8 +330,17 @@ export const LIMITS = {
   sellerChallengesPerMinuteGlobal: 300,
   /** zkLogin sign-in checks against the chain per minute across every caller (C22). */
   zkLoginChecksPerMinute: 30,
-  /** zkLogin sign-in checks against the chain per day across every caller (C22). */
-  zkLoginChecksPerDay: 2_000,
+  /**
+   * zkLogin sign-in checks against the chain per day across every caller (C22). Each is a paid
+   * Tatum read from a lifetime credit pool, so this is sized to the credit budget, not to demand.
+   */
+  zkLoginChecksPerDay: 300,
+  /** zkLogin sign-in checks against the chain per minute from one client, so one caller cannot take the shared quota alone (C34). */
+  zkLoginChecksPerClientPerMinute: 3,
+  /** zkLogin sign-in checks against the chain per day from one client, so one caller cannot spend the shared day quota alone; it takes LIMITS.zkLoginChecksPerDay / 20 clients (C34). */
+  zkLoginChecksPerClientPerDay: 20,
+  /** zkLogin members a multisig sign-in may carry; each costs its own chain check. */
+  zkLoginMembersMax: 2,
   /** The fixed window every count above named per minute is measured over (C22). */
   rateWindowMinuteMs: 60_000,
   /** The fixed window every count above named per hour is measured over (C22). */
@@ -365,12 +414,6 @@ export const LIMITS = {
   purseRefillWindowMs: 86_400_000,
   /** The allowance's on-chain rate window: its daily limit is what the purse may draw in one fixed day. */
   allowancePeriodMs: 86_400_000,
-  /**
-   * The fixed window a payment's failed settlement reads are counted in, shorter than
-   * rateCounterRetentionMs so pruning never deletes a count in use; a count cut by a window
-   * boundary starts again, which can delay the verdict but never hasten it.
-   */
-  settlementUnreadableWindowMs: 86_400_000,
   /** How long an ended session row is kept, so a sign-out or a revoke can still be looked into. */
   endedSessionKeepMs: 86_400_000,
   /** A paid request ends at least this long before its call's deadline, so storing what the seller did and answering still fit. */
@@ -384,6 +427,16 @@ export const LIMITS = {
    * is waiting on the page and a second failure in a row is reported rather than waited out.
    */
   agentModelRetries: 1,
-  /** Bulk writes one memory pass makes: what memwalPointsPerMinute holds at memwalBulkPoints each, since a pass holds its rows locked while core paces. */
+  /** Bulk writes one memory pass makes: what memwalPointsPerMinute holds at memwalBulkPoints each, so core never has to pause a pass to pace it. */
   memoryWritesPerPass: 3,
+  /**
+   * How long a memory handed to the relayer stays claimed by that pass, counted from the pass's
+   * start, before another pass may send it: six minutes (C33). One SDK bulk write on a fresh
+   * client can make four relayer requests (version, health, config, the write) at
+   * memwalRequestTimeoutMs each plus a SEAL key read of Sui that has no limit of its own, so the
+   * only hard bound on a pass is its route's slowRouteMaxDurationS (the jobs route's 300 s). Past
+   * that the pass has recorded its job ids or been killed. Under the 10-minute jobs tick, so a
+   * row a rate limit turned away goes again at the next tick.
+   */
+  memoryWriteLeaseMs: 360_000,
 } as const;

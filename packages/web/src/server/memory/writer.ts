@@ -1,6 +1,6 @@
 import { LIMITS } from '@ellai/core/limits';
 import { MemoryError, checkJobs, submitSentences } from '@ellai/core/memory';
-import { type SQL, and, asc, eq, inArray, isNotNull, isNull, sql } from 'drizzle-orm';
+import { type SQL, and, asc, eq, inArray, isNotNull, isNull, lte, or, sql } from 'drizzle-orm';
 import type { Database } from '../db/client.js';
 import { memories, owners } from '../db/schema.js';
 import { MemoryServiceError, ownerMemoryClient } from './delegate.js';
@@ -11,6 +11,8 @@ export interface WriterArgs {
   ownerId: string;
   masterSecretHex: string;
   now: Date;
+  /** Asked before each relayer call: false once the jobs tick's deadline has passed. Always true when left out. */
+  canStart?: () => boolean;
 }
 
 type MemoryClient = ReturnType<typeof ownerMemoryClient>['client'];
@@ -45,23 +47,25 @@ async function ownerClient(db: Database, ownerId: string, masterSecretHex: strin
   return ownerMemoryClient(owner, masterSecretHex);
 }
 
-type SendState = 'not_sent' | 'refused' | 'maybe_stored';
+type SendState = 'not_sent' | 'sending' | 'refused' | 'answered';
 
 /**
- * Watches each bulk write made on this client, from `start` to the next `start`. From the
- * moment the SDK call starts the relayer may store the sentences, unless it answers with a
- * status that it only ever gives before creating a job: any 4xx (validation, auth, rate limit)
- * or a 503 (writes paused, or the auth layer unable to reach Sui), per remember_bulk in
- * services/server/src/routes/remember.rs. A 500, 502 or 504, a timeout, a dropped connection
- * or an accepted write with unusable job ids may all have stored something.
+ * Watches each bulk write made on this client, from `start` to the next `start`. 'refused' is
+ * an answer the relayer only ever gives before creating a job: any 4xx (validation, auth, rate
+ * limit) or a 503 (writes paused, or the auth layer unable to reach Sui), per remember_bulk in
+ * services/server/src/routes/remember.rs. 'answered' is a 2xx: the relayer took the write.
+ * 'sending' left is no answer at all, a 500, 502 or 504, or a timeout, any of which may or may
+ * not have stored something.
  */
 function watchBulkWrites(client: MemoryClient): { start: () => void; state: () => SendState } {
   let state: SendState = 'not_sent';
   const send = client.rememberBulk.bind(client);
   client.rememberBulk = async (items) => {
-    state = 'maybe_stored';
+    state = 'sending';
     try {
-      return await send(items);
+      const accepted = await send(items);
+      state = 'answered';
+      return accepted;
     } catch (error) {
       const status = typeof error === 'object' && error !== null ? (error as { status?: unknown }).status : undefined;
       if (typeof status === 'number' && ((status >= 400 && status < 500) || status === HTTP_SERVICE_UNAVAILABLE)) state = 'refused';
@@ -78,11 +82,18 @@ function watchBulkWrites(client: MemoryClient): { start: () => void; state: () =
 
 type Attempt =
   | { kind: 'accepted'; jobIds: string[] }
-  /** Nothing was stored. `aboutTheRows` when core or the relayer refused what was sent (core's WRITE), not the moment. */
-  | { kind: 'refused'; error: unknown; aboutTheRows: boolean }
+  /** Nothing was stored, because what was sent was refused: core's WRITE, from its own checks or for the relayer's 4xx. */
+  | { kind: 'refused_rows'; error: MemoryError }
+  /**
+   * Nothing about the rows: a rate limit, an outage or a timeout. The relayer may have stored a
+   * write that timed out or got no answer; sending it again can leave an orphan blob, which no
+   * row names and so never counts (C9), where failing it would throw the owner's answer away.
+   */
+  | { kind: 'transient'; error: unknown }
   /** The relayer refused Ellai's delegate key (core's DELEGATE, for a 401 or 403): the owner removed it from the account. */
   | { kind: 'key_refused'; error: MemoryError }
-  | { kind: 'uncertain' };
+  /** The relayer answered the write, so it took the rows, but not with one usable job id each, so they cannot be followed. */
+  | { kind: 'untrackable' };
 
 async function attemptWrite(client: MemoryClient, watch: ReturnType<typeof watchBulkWrites>, rows: Array<{ sentence: string }>): Promise<Attempt> {
   watch.start();
@@ -96,39 +107,42 @@ async function attemptWrite(client: MemoryClient, watch: ReturnType<typeof watch
       ),
     };
   } catch (error) {
-    if (watch.state() === 'maybe_stored') return { kind: 'uncertain' };
+    if (watch.state() === 'answered') return { kind: 'untrackable' };
     if (isKeyRefused(error)) return { kind: 'key_refused', error };
-    return { kind: 'refused', error, aboutTheRows: error instanceof MemoryError && error.code === 'WRITE' };
+    // Core gives WRITE only for its own checks or a 4xx, so 'sending' with WRITE cannot happen; it is excluded so it could never fail a row.
+    if (error instanceof MemoryError && error.code === 'WRITE' && watch.state() !== 'sending') return { kind: 'refused_rows', error };
+    return { kind: 'transient', error };
   }
 }
 
 const unsent = (ids: string[]) => and(inArray(memories.id, ids), eq(memories.status, 'pending'), isNull(memories.jobId));
 
 /**
- * Every attempt counts against its rows, except one the relayer refused at the key: that says
- * nothing about the rows, and counting it would fail them while the owner has Ellai's key off.
+ * Only a refusal about the rows spends one of their LIMITS.memoryWriteMaxAttempts (C33): a rate
+ * limit, an outage or a timeout says nothing about them, changes nothing here, and the age
+ * ceiling bounds it. A refused delegate key is not recorded either; its caller releases the lease.
+ * Returns how many accepted rows took their job id: none when another pass got there first.
  */
-async function recordAttempt(tx: Pick<Database, 'update'>, rows: Array<{ id: string }>, sent: Attempt, now: Date): Promise<void> {
-  if (sent.kind === 'key_refused') return;
+async function recordAttempt(tx: Pick<Database, 'update'>, rows: Array<{ id: string }>, sent: Attempt): Promise<number> {
   const ids = rows.map((row) => row.id);
-  const counted = { submitAttempts: sql`${memories.submitAttempts} + 1`, submittedAt: now };
   if (sent.kind === 'accepted') {
-    await tx
+    const recorded = await tx
       .update(memories)
-      .set({ ...counted, jobId: perRow(rows.map((row, index) => ({ id: row.id, value: sent.jobIds[index] ?? '' }))) })
-      .where(unsent(ids));
-  } else if (sent.kind === 'uncertain') {
-    await tx
-      .update(memories)
-      .set({ ...counted, status: 'failed' })
-      .where(unsent(ids));
-  } else {
+      .set({ jobId: perRow(rows.map((row, index) => ({ id: row.id, value: sent.jobIds[index] ?? '' }))) })
+      .where(unsent(ids))
+      .returning({ id: memories.id });
+    return recorded.length;
+  }
+  if (sent.kind === 'untrackable') {
+    await tx.update(memories).set({ status: 'failed' }).where(unsent(ids));
+  } else if (sent.kind === 'refused_rows') {
     const ceiling = sql`case when ${memories.submitAttempts} + 1 >= ${LIMITS.memoryWriteMaxAttempts} then 'failed' else ${memories.status} end`;
     await tx
       .update(memories)
-      .set({ ...counted, status: ceiling })
+      .set({ submitAttempts: sql`${memories.submitAttempts} + 1`, status: ceiling })
       .where(unsent(ids));
   }
+  return 0;
 }
 
 /** `case id when ... then ... end` for a one-statement update of a value that differs per row. */
@@ -152,38 +166,100 @@ function firstOfEachSentence<T extends { sentence: string }>(rows: T[]): T[] {
   });
 }
 
+type Claimed = { id: string; sentence: string; submitAttempts: number; submittedAt: Date | null };
+
 /**
- * Sends the owner's pending memories to Walrus Memory: in one transaction, claims up to
- * LIMITS.pendingMemoryWriteBatch rows of this owner that are pending, have no job id, sit in
- * MEMORY_NAMESPACE and were recorded with this owner's derived delegate as their writer, oldest
- * first, with SELECT ... FOR UPDATE SKIP LOCKED so two passes never claim one row; sends their
- * sentences signed by that same delegate on the owner's own account; and stores each job id on
- * its row. A row with a job id is never claimed again, because the relayer has no idempotency
- * on SDK 0.1.8's bulk writes.
+ * The rows of this pass's next write, claimed in one short transaction that commits before the
+ * relayer is called, so no lock is ever held across a relayer call. Fails, unsent, every row past
+ * LIMITS.memoryWriteMaxAgeMs since created_at and every candidate already at the attempt ceiling;
+ * then takes the oldest free row tried before, alone, or else every free untried row up to
+ * LIMITS.pendingMemoryWriteBatch, one copy of each sentence. A row is free when no pass handed it
+ * to the relayer within LIMITS.memoryWriteLeaseMs before `now`, and taking it sets its
+ * submitted_at to `now`: that is the lease, and it is what keeps a concurrent pass off it.
+ */
+async function claimWrite(db: Database, ours: SQL | undefined, now: Date): Promise<{ rows: Claimed[]; bulk: boolean }> {
+  return db.transaction(async (tx) => {
+    const free = and(ours, or(isNull(memories.submittedAt), lte(memories.submittedAt, new Date(now.getTime() - LIMITS.memoryWriteLeaseMs))));
+    await tx
+      .update(memories)
+      .set({ status: 'failed' })
+      .where(and(free, lte(memories.createdAt, new Date(now.getTime() - LIMITS.memoryWriteMaxAgeMs))));
+    const candidates = await tx
+      .select({ id: memories.id, sentence: memories.sentence, submitAttempts: memories.submitAttempts, submittedAt: memories.submittedAt })
+      .from(memories)
+      .where(free)
+      .orderBy(asc(memories.createdAt), asc(memories.id))
+      .limit(LIMITS.pendingMemoryWriteBatch)
+      .for('update', { skipLocked: true });
+    const spent = candidates.filter((row) => row.submitAttempts >= LIMITS.memoryWriteMaxAttempts);
+    if (spent.length > 0) {
+      await tx
+        .update(memories)
+        .set({ status: 'failed' })
+        .where(unsent(spent.map((row) => row.id)));
+    }
+    const live = candidates.filter((row) => row.submitAttempts < LIMITS.memoryWriteMaxAttempts);
+    const tried = live.find((row) => row.submitAttempts > 0);
+    const rows = tried === undefined ? firstOfEachSentence(live) : [tried];
+    if (rows.length > 0) {
+      await tx
+        .update(memories)
+        .set({ submittedAt: now })
+        .where(unsent(rows.map((row) => row.id)));
+    }
+    return { rows, bulk: tried === undefined };
+  });
+}
+
+/** Puts back the submitted_at each row had before this pass leased it, for a write that changed nothing. */
+async function releaseLease(tx: Pick<Database, 'update'>, rows: Claimed[], now: Date): Promise<void> {
+  const before = rows.map((row) => sql`when ${row.id}::uuid then ${row.submittedAt === null ? null : row.submittedAt.toISOString()}::timestamptz`);
+  await tx
+    .update(memories)
+    .set({ submittedAt: sql`case ${memories.id} ${sql.join(before, sql` `)} end` })
+    .where(and(unsent(rows.map((row) => row.id)), eq(memories.submittedAt, now)));
+}
+
+/**
+ * Sends the owner's pending memories to Walrus Memory: rows of this owner that are pending, have
+ * no job id, sit in MEMORY_NAMESPACE and were recorded with this owner's derived delegate as their
+ * writer, oldest first, signed by that same delegate on the owner's own account. Each write
+ * claims its rows in a short committed transaction (claimWrite: SELECT ... FOR UPDATE SKIP
+ * LOCKED, then submitted_at set to `now` as a lease of LIMITS.memoryWriteLeaseMs), calls the
+ * relayer with no transaction open, and records the outcome in a new short transaction. A row
+ * with a job id is never claimed again, because the relayer has no idempotency on SDK 0.1.8's
+ * bulk writes; the record only touches rows still pending with no job id, so a late record can
+ * never overwrite another pass's.
  *
- * A row that has never been tried goes in one bulk write with the other untried rows. A row
- * that was in a refused write goes alone, so one row the relayer will never take cannot keep
- * refusing the rest. Rows tried before go first, oldest first, and a pass makes at most
- * LIMITS.memoryWritesPerPass writes, what one relayer pacing window holds: core paces each
- * client by sleeping, and the pass holds its rows locked while it writes. Every attempt adds one to submit_attempts
- * and sets submitted_at to `now`.
+ * A row that has never been refused goes in one bulk write with the other such rows. A row that
+ * was in a write refused as written goes alone, so one row the relayer will never take cannot
+ * keep refusing the rest. Rows refused before go first, oldest first, the bulk write ends the
+ * pass, and a pass makes at most LIMITS.memoryWritesPerPass writes, what one relayer pacing
+ * window holds, so core never pauses a pass to pace it. `canStart` is asked before each write,
+ * and once it says no the pass claims and sends nothing more.
  *
  * - Accepted: the job ids are stored.
- * - Refused before it can have stored anything (refused before sending, or a relayer answer
- *   it gives only before creating jobs): the rows stay pending with no job id, and a row whose
- *   attempt reaches LIMITS.memoryWriteMaxAttempts is marked 'failed'. The pass goes on to the
- *   next write only when the refusal was about what was sent (core's WRITE); a rate limit or
- *   a 503 ends it. When nothing was accepted, the MemoryError from core is thrown.
- * - May have stored something (a timeout after sending, a 5xx other than 503, a dropped
- *   connection, an unusable acceptance): the rows are marked 'failed' rather than risk a
- *   second copy, the pass ends, and MemoryServiceError SEND_UNCERTAIN is thrown.
- * - Refused at the delegate key (core's DELEGATE, a 401 or 403: the owner removed Ellai's
- *   key): nothing is counted or failed, the pass ends, and that MemoryError is thrown, which
- *   the jobs tick records as MEMORY_DELEGATE.
- * Whatever is thrown, everything before it in the pass is committed first. A row already at
- * the attempt ceiling when claimed is marked 'failed' and not sent. A failed refusal still
- * blocks its recipient, because the refusal check reads the database whatever the memory's
- * status (C11).
+ * - Refused as written (core's WRITE, from its own checks or for the relayer's 4xx): the rows stay
+ *   pending with no job id, each spends one of LIMITS.memoryWriteMaxAttempts, a row that reaches
+ *   it is 'failed', and the pass goes on to its next write.
+ * - A rate limit, an outage or a timeout (core's RATE_LIMITED, UPSTREAM or TIMEOUT: a 429, any
+ *   5xx, no answer): nothing is spent, the rows stay pending under their lease, and the pass ends.
+ *   A row still unsent LIMITS.memoryWriteMaxAgeMs after created_at is 'failed' (C33). A timeout or
+ *   a lost answer may have stored the write; sending it again then leaves an orphan blob.
+ * - Answered without one usable job id per row: the relayer took them and they cannot be followed,
+ *   so they are 'failed' rather than sent twice, the pass ends, and MemoryServiceError
+ *   SEND_UNCERTAIN is thrown.
+ * - Refused at the delegate key (core's DELEGATE, a 401 or 403: the owner removed Ellai's key):
+ *   nothing is counted or failed, the lease is released, the pass ends, and that MemoryError is
+ *   thrown, which the jobs tick records as MEMORY_DELEGATE.
+ * When nothing was accepted, the last MemoryError from core is thrown. Whatever is thrown, every
+ * write before it is recorded first. A failed refusal still blocks its recipient, because the
+ * refusal check reads the database whatever the memory's status (C11).
+ *
+ * A write the relayer accepted whose job ids were never recorded (the function was killed after
+ * the answer, or the record failed) keeps its lease and no job id, so once the lease has passed a
+ * later pass sends it again. The first copy is then an orphan blob that no row names: decide maps
+ * recall hits to Ellai's rows by blob id, so it never counts (C9), and only takes a recall slot.
  *
  * Throws MemoryServiceError: BAD_INPUT, OWNER, NO_ACCOUNT (before touching any row),
  * SEND_UNCERTAIN; MemoryError from core.
@@ -193,62 +269,49 @@ export async function submitPendingMemories(args: WriterArgs): Promise<{ submitt
   const { db, now } = args;
   const { client, publicKeyHex } = await ownerClient(db, ownerId, args.masterSecretHex);
   const watch = watchBulkWrites(client);
+  const canStart = args.canStart ?? (() => true);
+  const ours = and(
+    eq(memories.ownerId, ownerId),
+    eq(memories.status, 'pending'),
+    isNull(memories.jobId),
+    eq(memories.namespace, MEMORY_NAMESPACE),
+    eq(memories.writerPublicKey, publicKeyHex),
+  );
+  let submitted = 0;
+  let untrackable = 0;
+  let refusal: { error: unknown } | undefined;
+  let keyRefused: MemoryError | undefined;
   try {
-    const pass = await db.transaction(async (tx) => {
-      const claimed = await tx
-        .select({ id: memories.id, sentence: memories.sentence, submitAttempts: memories.submitAttempts })
-        .from(memories)
-        .where(
-          and(
-            eq(memories.ownerId, ownerId),
-            eq(memories.status, 'pending'),
-            isNull(memories.jobId),
-            eq(memories.namespace, MEMORY_NAMESPACE),
-            eq(memories.writerPublicKey, publicKeyHex),
-          ),
-        )
-        .orderBy(asc(memories.createdAt), asc(memories.id))
-        .limit(LIMITS.pendingMemoryWriteBatch)
-        .for('update', { skipLocked: true });
-      const spent = claimed.filter((row) => row.submitAttempts >= LIMITS.memoryWriteMaxAttempts);
-      if (spent.length > 0) {
-        await tx
-          .update(memories)
-          .set({ status: 'failed' })
-          .where(unsent(spent.map((row) => row.id)));
+    for (let write = 0; write < LIMITS.memoryWritesPerPass && canStart(); write++) {
+      const { rows, bulk } = await claimWrite(db, ours, now);
+      if (rows.length === 0) break;
+      const sent = await attemptWrite(client, watch, rows);
+      let recorded = 0;
+      if (sent.kind !== 'transient') {
+        recorded = await db.transaction(async (tx) => {
+          if (sent.kind !== 'key_refused') return recordAttempt(tx, rows, sent);
+          await releaseLease(tx, rows, now);
+          return 0;
+        });
       }
-      const live = claimed.filter((row) => row.submitAttempts < LIMITS.memoryWriteMaxAttempts);
-      const writes = [...live.filter((row) => row.submitAttempts > 0).map((row) => [row]), firstOfEachSentence(live.filter((row) => row.submitAttempts === 0))]
-        .filter((rows) => rows.length > 0)
-        .slice(0, LIMITS.memoryWritesPerPass);
-
-      let submitted = 0;
-      let uncertain = 0;
-      let refusal: { error: unknown } | undefined;
-      let keyRefused: MemoryError | undefined;
-      for (const rows of writes) {
-        const sent = await attemptWrite(client, watch, rows);
-        await recordAttempt(tx, rows, sent, now);
-        if (sent.kind === 'accepted') submitted += rows.length;
-        else if (sent.kind === 'uncertain') uncertain += rows.length;
-        else if (sent.kind === 'key_refused') keyRefused = sent.error;
-        else refusal = { error: sent.error };
-        if (sent.kind !== 'accepted' && !(sent.kind === 'refused' && sent.aboutTheRows)) break;
-      }
-      return { submitted, uncertain, refusal, keyRefused };
-    });
-    if (pass.keyRefused !== undefined) throw pass.keyRefused;
-    if (pass.uncertain > 0) {
-      throw new MemoryServiceError(
-        'SEND_UNCERTAIN',
-        `the bulk write may have reached the relayer, so ${pass.uncertain} memories were marked failed rather than sent twice`,
-      );
+      if (sent.kind === 'accepted') submitted += recorded;
+      else if (sent.kind === 'untrackable') untrackable += rows.length;
+      else if (sent.kind === 'key_refused') keyRefused = sent.error;
+      else refusal = { error: sent.error };
+      if (bulk || (sent.kind !== 'accepted' && sent.kind !== 'refused_rows')) break;
     }
-    if (pass.submitted === 0 && pass.refusal !== undefined) throw pass.refusal.error;
-    return { submitted: pass.submitted };
   } finally {
     client.destroy();
   }
+  if (keyRefused !== undefined) throw keyRefused;
+  if (untrackable > 0) {
+    throw new MemoryServiceError(
+      'SEND_UNCERTAIN',
+      `the relayer took a bulk write without usable job ids, so ${untrackable} memories were marked failed rather than sent twice`,
+    );
+  }
+  if (submitted === 0 && refusal !== undefined) throw refusal.error;
+  return { submitted };
 }
 
 type JobRead = { state: 'done'; blobId: string } | { state: 'failed' | 'pending' | 'invalid' | 'unread' };
@@ -268,9 +331,11 @@ const refusedAnswer = (error: unknown) => error instanceof MemoryError && error.
  * refusal each job is read on its own, and a job whose own answer still fails is 'invalid'
  * instead of holding up the others. Any other failure leaves every job not yet read 'unread'
  * and is handed back. Reading alone costs one relayer point per job, at most
- * LIMITS.memoryJobConfirmBatch, which fits one pacing window with the first read.
+ * LIMITS.memoryJobConfirmBatch, which fits one pacing window with the first read. `canStart` is
+ * asked before every read, and once it says no the jobs not yet read are left 'unread'.
  */
-async function readJobs(client: MemoryClient, jobIds: string[]): Promise<{ reads: JobRead[]; error?: unknown }> {
+async function readJobs(client: MemoryClient, jobIds: string[], canStart: () => boolean): Promise<{ reads: JobRead[]; error?: unknown }> {
+  if (!canStart()) return { reads: jobIds.map(() => UNREAD) };
   try {
     const states = await checkJobs(client, jobIds);
     return { reads: jobIds.map((jobId, index) => readOf(states[index], jobId)) };
@@ -279,6 +344,7 @@ async function readJobs(client: MemoryClient, jobIds: string[]): Promise<{ reads
   }
   const reads: JobRead[] = [];
   for (const jobId of jobIds) {
+    if (!canStart()) return { reads: [...reads, ...jobIds.slice(reads.length).map(() => UNREAD)] };
     try {
       const [state] = await checkJobs(client, [jobId]);
       reads.push(readOf(state, jobId));
@@ -291,10 +357,12 @@ async function readJobs(client: MemoryClient, jobIds: string[]): Promise<{ reads
 }
 
 /**
- * Confirms the owner's sent memories: in one transaction, claims up to
- * LIMITS.memoryJobConfirmBatch rows (the relayer's limit of job ids per status call) of this
- * owner that are pending and have a job id, oldest first, with FOR UPDATE SKIP LOCKED, and
- * reads them with one checkJobs call, or one per job when core refuses that answer.
+ * Confirms the owner's sent memories: reads, without locking, up to LIMITS.memoryJobConfirmBatch
+ * rows (the relayer's limit of job ids per status call) of this owner that are pending and have a
+ * job id, oldest first; reads their jobs with one checkJobs call, or one per job when core refuses
+ * that answer, with no transaction open, asking `canStart` before each read; then settles the rows
+ * in one short transaction. A job id never changes once stored, and every write there touches only
+ * rows still pending, so a pass that ran meanwhile can only make this one's write a no-op.
  *
  * - A done job sets the row's blob id, status 'confirmed' and confirmed_at `now`, unless its
  *   blob id is already on a row or another job in the answer reports it too: then the row is
@@ -303,7 +371,8 @@ async function readJobs(client: MemoryClient, jobIds: string[]): Promise<{ reads
  *   a usable blob id), sets status 'failed' on that row only.
  * - A job still working, or one not read, stays as it is until LIMITS.memoryJobMaxAgeMs after
  *   its submitted_at (created_at for a row sent before that was kept), then is 'failed'.
- * Only a confirmed row has a blob id, so only it can be matched to a recall hit.
+ * Only a confirmed row has a blob id, so only it can be matched to a recall hit. When `canStart`
+ * says no before the first read, nothing is read or changed.
  *
  * When the relayer refuses Ellai's delegate key (core's DELEGATE: the owner removed it),
  * nothing is changed and that MemoryError is thrown. Any other MemoryError from a read is
@@ -315,34 +384,36 @@ async function readJobs(client: MemoryClient, jobIds: string[]): Promise<{ reads
 export async function confirmMemoryJobs(args: WriterArgs): Promise<{ confirmed: number; failed: number; pending: number }> {
   const { ownerId } = checkArgs(args);
   const { db, now } = args;
+  const canStart = args.canStart ?? (() => true);
   const { client } = await ownerClient(db, ownerId, args.masterSecretHex);
   try {
-    const pass = await db.transaction(async (tx) => {
-      const sent = await tx
-        .select({ id: memories.id, jobId: memories.jobId, submittedAt: memories.submittedAt, createdAt: memories.createdAt })
-        .from(memories)
-        .where(and(eq(memories.ownerId, ownerId), eq(memories.status, 'pending'), isNotNull(memories.jobId)))
-        .orderBy(asc(memories.createdAt), asc(memories.id))
-        .limit(LIMITS.memoryJobConfirmBatch)
-        .for('update', { skipLocked: true });
-      const rows = sent.flatMap((row) => (row.jobId === null ? [] : [{ ...row, jobId: row.jobId }]));
-      if (rows.length === 0) return { counts: { confirmed: 0, failed: 0, pending: 0 } };
+    const sent = await db
+      .select({ id: memories.id, jobId: memories.jobId, submittedAt: memories.submittedAt, createdAt: memories.createdAt })
+      .from(memories)
+      .where(and(eq(memories.ownerId, ownerId), eq(memories.status, 'pending'), isNotNull(memories.jobId)))
+      .orderBy(asc(memories.createdAt), asc(memories.id))
+      .limit(LIMITS.memoryJobConfirmBatch);
+    const rows = sent.flatMap((row) => (row.jobId === null ? [] : [{ ...row, jobId: row.jobId }]));
+    if (rows.length === 0) return { confirmed: 0, failed: 0, pending: 0 };
+    if (!canStart()) return { confirmed: 0, failed: 0, pending: rows.length };
 
-      const { reads, error } = await readJobs(
-        client,
-        rows.map((row) => row.jobId),
-      );
-      if (isKeyRefused(error)) throw error;
+    const { reads, error } = await readJobs(
+      client,
+      rows.map((row) => row.jobId),
+      canStart,
+    );
+    if (isKeyRefused(error)) throw error;
 
-      const pastAge = (row: (typeof rows)[number]) => now.getTime() - (row.submittedAt ?? row.createdAt).getTime() >= LIMITS.memoryJobMaxAgeMs;
-      const done: Array<{ id: string; blobId: string }> = [];
-      const failed: string[] = [];
-      rows.forEach((row, index) => {
-        const read = reads[index] ?? UNREAD;
-        if (read.state === 'done') done.push({ id: row.id, blobId: read.blobId });
-        else if (read.state === 'failed' || read.state === 'invalid' || pastAge(row)) failed.push(row.id);
-      });
+    const pastAge = (row: (typeof rows)[number]) => now.getTime() - (row.submittedAt ?? row.createdAt).getTime() >= LIMITS.memoryJobMaxAgeMs;
+    const done: Array<{ id: string; blobId: string }> = [];
+    const failed: string[] = [];
+    rows.forEach((row, index) => {
+      const read = reads[index] ?? UNREAD;
+      if (read.state === 'done') done.push({ id: row.id, blobId: read.blobId });
+      else if (read.state === 'failed' || read.state === 'invalid' || pastAge(row)) failed.push(row.id);
+    });
 
+    const counts = await db.transaction(async (tx) => {
       const reported = new Map<string, number>();
       for (const job of done) reported.set(job.blobId, (reported.get(job.blobId) ?? 0) + 1);
       const held =
@@ -359,7 +430,7 @@ export async function confirmMemoryJobs(args: WriterArgs): Promise<{ confirmed: 
               );
       const taken = new Set(held.map((row) => row.blobId));
       const confirmed = done.filter((job) => !taken.has(job.blobId) && reported.get(job.blobId) === 1);
-      for (const job of done) if (!confirmed.includes(job)) failed.push(job.id);
+      const refused = [...failed, ...done.filter((job) => !confirmed.includes(job)).map((job) => job.id)];
 
       const unconfirmed = (ids: string[]) => and(inArray(memories.id, ids), eq(memories.status, 'pending'), isNotNull(memories.jobId));
       if (confirmed.length > 0) {
@@ -368,11 +439,11 @@ export async function confirmMemoryJobs(args: WriterArgs): Promise<{ confirmed: 
           .set({ blobId: perRow(confirmed.map((job) => ({ id: job.id, value: job.blobId }))), status: 'confirmed', confirmedAt: now })
           .where(unconfirmed(confirmed.map((job) => job.id)));
       }
-      if (failed.length > 0) await tx.update(memories).set({ status: 'failed' }).where(unconfirmed(failed));
-      return { counts: { confirmed: confirmed.length, failed: failed.length, pending: rows.length - confirmed.length - failed.length }, error };
+      if (refused.length > 0) await tx.update(memories).set({ status: 'failed' }).where(unconfirmed(refused));
+      return { confirmed: confirmed.length, failed: refused.length, pending: rows.length - confirmed.length - refused.length };
     });
-    if (pass.error !== undefined) throw pass.error;
-    return pass.counts;
+    if (error !== undefined) throw error;
+    return counts;
   } finally {
     client.destroy();
   }
