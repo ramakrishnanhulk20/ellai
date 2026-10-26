@@ -74,6 +74,8 @@ interface EpochReading {
 interface EpochCache {
   latest: EpochReading | null;
   reading: Promise<EpochReading> | null;
+  /** The caller's clock when the last read that failed started, or null once a read succeeds. */
+  failedAtMs: number | null;
 }
 
 // Kept on globalThis, as the server context keeps its chain, because the Next server can load
@@ -86,22 +88,28 @@ function epochCacheOf(chain: Chain): EpochCache {
   const caches = holder[EPOCH_CACHES_KEY];
   let cache = caches.get(chain);
   if (cache === undefined) {
-    cache = { latest: null, reading: null };
+    cache = { latest: null, reading: null, failedAtMs: null };
     caches.set(chain, cache);
   }
   return cache;
 }
 
 async function readEpoch(chain: Chain, cache: EpochCache, startedAtMs: number): Promise<EpochReading> {
-  const epoch = await chain.getCurrentEpoch();
-  if (typeof epoch !== 'bigint' || epoch < 0n || epoch > EPOCH_MAX) throw new SellerError('the current epoch does not fit a challenge id');
-  // Epochs only go up, so a lower answer comes from a node still short of a boundary that an
-  // earlier read had already passed. A window started there may have closed, and the older
-  // reading is past its age limit, so neither is used.
-  if (cache.latest !== null && epoch < cache.latest.epoch) throw new SellerError('the chain answered an epoch older than one already read');
-  const reading = { epoch, readAtMs: startedAtMs };
-  cache.latest = reading;
-  return reading;
+  try {
+    const epoch = await chain.getCurrentEpoch();
+    if (typeof epoch !== 'bigint' || epoch < 0n || epoch > EPOCH_MAX) throw new SellerError('the current epoch does not fit a challenge id');
+    // Epochs only go up, so a lower answer comes from a node still short of a boundary that an
+    // earlier read had already passed. A window started there may have closed, and the older
+    // reading is past its age limit, so neither is used.
+    if (cache.latest !== null && epoch < cache.latest.epoch) throw new SellerError('the chain answered an epoch older than one already read');
+    const reading = { epoch, readAtMs: startedAtMs };
+    cache.latest = reading;
+    cache.failedAtMs = null;
+    return reading;
+  } catch (error) {
+    cache.failedAtMs = startedAtMs;
+    throw error;
+  }
 }
 
 /**
@@ -112,6 +120,9 @@ async function readEpoch(chain: Chain, cache: EpochCache, startedAtMs: number): 
  * the next epoch, and a Sui Mainnet epoch lasts about a day, so a reading an hour old or younger
  * names the epoch the chain is in or the one just before, and the window is open when issued,
  * with most of a day left in it. That holds only while the cache stays well under one epoch.
+ * A read that fails is remembered too: for LIMITS.epochFailureCacheMs from when it started, and
+ * at any earlier clock, no new read is started and the call throws SellerError at once, so an
+ * outage costs one read per that window however many challenges are asked for (C22).
  * Throws ChainError when the read fails and SellerError when it answers an epoch that does
  * not fit or that is lower than one already read; an expired reading is never fallen back on.
  */
@@ -120,6 +131,10 @@ async function challengeEpoch(chain: Chain, nowMs: number): Promise<bigint> {
   const latest = cache.latest;
   if (latest !== null && nowMs >= latest.readAtMs && nowMs - latest.readAtMs < LIMITS.epochCacheMs) return latest.epoch;
   if (cache.reading === null) {
+    // Any clock earlier than the failure counts as inside its window, so a clock that steps back cannot start reads.
+    if (cache.failedAtMs !== null && nowMs < cache.failedAtMs + LIMITS.epochFailureCacheMs) {
+      throw new SellerError('the last epoch read failed moments ago, so the chain is not read again yet');
+    }
     const reading = readEpoch(chain, cache, nowMs).finally(() => {
       if (cache.reading === reading) cache.reading = null;
     });
@@ -264,8 +279,9 @@ function payableAddress(value: string): string {
  * The current epoch comes from challengeEpoch's cache, so the chain is read at most once per
  * LIMITS.epochCacheMs however many challenges are issued. Throws SellerError for a resource
  * URL sellerResource refuses, a pay-to address that is not a payable Sui address, an invalid
- * `now`, an epoch past 2^32 - 1 or lower than one already read, or an id that is already
- * stored; throws ChainError when the epoch cannot be read.
+ * `now`, an epoch past 2^32 - 1 or lower than one already read, an epoch read that failed less
+ * than LIMITS.epochFailureCacheMs ago, or an id that is already stored; throws ChainError when
+ * the epoch cannot be read.
  */
 export async function issueWalletCheckChallenge(args: {
   db: Database;

@@ -351,11 +351,14 @@ export const LIMITS = {
    */
   sellerRecheckIntervalMs: 30_000,
   /**
-   * Rechecks of waiting sales a day across every sale together (C22). Each costs up to 7 gRPC calls
-   * and anyone holding a waiting sale's bytes may ask once every LIMITS.sellerRecheckIntervalMs, so
-   * this holds all of them to at most 700 calls a day.
+   * Rechecks of waiting sales and redeliveries of paid, undelivered checks a day across every sale
+   * together (C22). A recheck costs up to 10 gRPC calls and a redelivery about 3 (up to 25 for an
+   * address with many blobs), and anyone holding a sale's bytes may ask once every
+   * LIMITS.sellerRecheckIntervalMs, so this holds all of them to about 2,500 calls a day at worst.
    */
   sellerRechecksPerDayGlobal: 100,
+  /** Redeliveries one paid sale may ask for in its lifetime, so one address whose check keeps failing cannot spend the day's rechecks for every buyer (C22, C29). */
+  sellerRedeliveriesPerSale: 5,
   /** Unpaid seller challenges issued per minute across every caller (C22). */
   sellerChallengesPerMinuteGlobal: 300,
   /**

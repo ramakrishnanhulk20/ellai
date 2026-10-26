@@ -4,24 +4,31 @@
 // unknown, expired, already-claimed or other-resource challenge, and for a header that is not
 // the t2000 shape; bytes paying another recipient or amount or carrying an extra command, and a
 // signature that is not the sender's, are refused after the claim and never executed; a
-// settlement mismatch or failure is refused and closed; an unknown execution outcome is read
-// back by its digest and settled if it landed, and otherwise left open to the same bytes alone,
+// settlement mismatch or failure is refused and closed; every other execution failure, whatever
+// its code or type, but core's two never-sent codes, is an unknown outcome read back by its
+// digest and settled if it landed, and otherwise left open to the same bytes alone,
 // so a retry delivers; that retry is read at most once per recheck window, rechecks of every sale
-// together at most LIMITS.sellerRechecksPerDayGlobal times a day, and the sale is
-// closed for good once its epoch window has closed and a final read misses; a challenge pays once and one payment never pays
+// together at most LIMITS.sellerRechecksPerDayGlobal times a day, and the sale is closed for good
+// once its epoch window has closed and LIMITS.paymentReleaseReads reads after that all miss; a
+// check that fails after the payment settled is served again to the same bytes alone, under the
+// same recheck caps and at most LIMITS.sellerRedeliveriesPerSale times, without spending the day
+// past that, and delivered once; with a slow chain no read or check step begins past the
+// seller's deadline and a request cut short leaves its sale waiting or undelivered; a challenge pays once and one payment never pays
 // two challenges; the unpaid rate limit per caller and for every caller together; the caps on
 // sends per caller a minute and a day and for every caller a day, counted only after the offline
 // checks and never reaching the chain past them; a send Ellai's Tatum budget refused closed as
 // never sent, with 503 until the UTC day ends, while a refusal after the send keeps its sale
-// waiting; one epoch
-// read per cache window; the wallet check summary and its blob cap; the pay-to
-// fallback; and no response ever carries the payment header, its bytes or its signature.
+// waiting; one epoch read per cache window, and during an outage one per
+// LIMITS.epochFailureCacheMs; the wallet check summary and its blob cap; the pay-to fallback;
+// the route's duration ceiling; and no response ever carries the payment header, its bytes or
+// its signature.
 // Does NOT cover: the live chain or Tatum (`npm run prove:seller` pays one 0.01 USDC live),
-// core's own challenge, payment and settlement rules (core's tests), zkLogin or multisig payers,
-// two connections racing on one claim (PGlite serves one connection at a time), or the HTTP
-// route that will call this handler.
+// core's own challenge, payment and settlement rules or which code its executeTransaction throws
+// when (core's tests; the stand-in chain throws what core promises), zkLogin or multisig payers,
+// two connections racing on one claim or on serving one settled sale (PGlite serves one
+// connection at a time), or the HTTP route beyond its duration ceiling (routes-public.test.ts).
 import { randomBytes } from 'node:crypto';
-import { type BalanceChange, type Chain, ChainError, type ExecutionResult, type TransactionResult, type WalrusBlob } from '@ellai/core/chain';
+import { type BalanceChange, type Chain, ChainError, type ChainErrorCode, type ExecutionResult, type TransactionResult, type WalrusBlob } from '@ellai/core/chain';
 import { type CanonicalPayment, parseChallenge } from '@ellai/core/challenge';
 import { canonicalSuiAddress } from '@ellai/core/keys';
 import { LIMITS } from '@ellai/core/limits';
@@ -34,11 +41,13 @@ import { Transaction, TransactionDataBuilder } from '@mysten/sui/transactions';
 import { toBase64 } from '@mysten/sui/utils';
 import { eq } from 'drizzle-orm';
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
+import * as walletCheckRoute from '../src/app/api/sell/wallet-check/route.js';
 import { type Database, createDb, migrate } from '../src/server/db/client.js';
 import { sellerSales } from '../src/server/db/schema.js';
 import { SellerError, issueWalletCheckChallenge, readSellerChallengeId, sellerChallengeId } from '../src/server/seller/challenge.js';
+import { LONGEST_READ_MS, SELLER_END_BY_MS, SELLER_READ_BY_MS, sellerDeadline } from '../src/server/seller/deadline.js';
 import { HANDLER_MESSAGES, type SellerResponse, handleWalletCheck, sellerPayTo } from '../src/server/seller/handler.js';
-import { SETTLE_REASONS, type SettleOutcome, settleWalletCheckPayment } from '../src/server/seller/settle.js';
+import { SETTLE_REASONS, type SettleOutcome, markDelivered, settleWalletCheckPayment } from '../src/server/seller/settle.js';
 import { walletCheck } from '../src/server/seller/walletcheck.js';
 
 vi.mock('@ellai/core/memory', async (importOriginal) => ({
@@ -225,7 +234,17 @@ function settle(chain: Chain, paymentHeaderValue: string, options: { resourceUrl
   });
 }
 
-function call(chain: Chain, options: { method?: string; headers?: Record<string, string>; body?: string; callerKey?: string; now?: Date } = {}) {
+interface CallOptions {
+  method?: string;
+  headers?: Record<string, string>;
+  body?: string;
+  callerKey?: string;
+  now?: Date;
+  clock?: () => number;
+  sleep?: (ms: number) => Promise<void>;
+}
+
+function call(chain: Chain, options: CallOptions = {}) {
   return handleWalletCheck({
     db,
     chain,
@@ -236,8 +255,39 @@ function call(chain: Chain, options: { method?: string; headers?: Record<string,
     payTo: PAY_TO,
     callerKey: options.callerKey ?? `caller-${randomBytes(8).toString('hex')}`,
     now: options.now ?? NOW,
-    sleep: noWait,
+    sleep: options.sleep ?? noWait,
+    ...(options.clock === undefined ? {} : { clock: options.clock }),
   });
+}
+
+type SlowCall = 'execute' | 'read' | 'epoch' | 'balances';
+
+/**
+ * stubChain on a clock of its own: each send and read moves it on by its entry in `delays`, and
+ * `sleep` moves it too, so a slow Tatum costs no real time. `starts` holds the time each call began.
+ */
+function slowChain(delays: Record<SlowCall, number>, overrides: Partial<ChainState> = {}) {
+  const stub = stubChain(overrides);
+  const time = { ms: 0 };
+  const starts: number[] = [];
+  const slow =
+    <A extends unknown[], R>(kind: SlowCall, run: (...args: A) => Promise<R>) =>
+    async (...args: A): Promise<R> => {
+      starts.push(time.ms);
+      time.ms += delays[kind];
+      return run(...args);
+    };
+  const chain = {
+    ...stub.chain,
+    executeTransaction: slow('execute', stub.chain.executeTransaction),
+    getTransactionResult: slow('read', stub.chain.getTransactionResult),
+    getCurrentEpoch: slow('epoch', stub.chain.getCurrentEpoch),
+    getBalances: slow('balances', stub.chain.getBalances),
+  } as Chain;
+  const sleep = async (ms: number) => {
+    time.ms += ms;
+  };
+  return { ...stub, chain, time, starts, clock: () => time.ms, sleep };
 }
 
 describe('issueWalletCheckChallenge', () => {
@@ -308,18 +358,20 @@ describe('issueWalletCheckChallenge', () => {
     expect(await epochOf(at(LIMITS.epochCacheMs))).toBe(EPOCH + 1n);
     expect(calls.epochs).toBe(2);
 
-    // A node still short of the boundary the last read passed, then a read that fails: the
-    // expired reading is not fallen back on, and nothing is stored.
+    // A node still short of the boundary the last read passed, then, once that failure is no
+    // longer remembered, a read that fails: the expired reading is not fallen back on, and
+    // nothing is stored.
     const before = await saleCount();
+    const failed = 2 * LIMITS.epochCacheMs;
     state.epoch = EPOCH;
-    await expect(issue(chain, RESOURCE, at(2 * LIMITS.epochCacheMs))).rejects.toThrow(SellerError);
+    await expect(issue(chain, RESOURCE, at(failed))).rejects.toThrow(SellerError);
     state.epoch = new ChainError('TIMEOUT', 'timed out', true);
-    await expect(issue(chain, RESOURCE, at(2 * LIMITS.epochCacheMs + 1))).rejects.toThrow(ChainError);
+    await expect(issue(chain, RESOURCE, at(failed + LIMITS.epochFailureCacheMs))).rejects.toThrow(ChainError);
     expect(await saleCount()).toBe(before);
     expect(calls.epochs).toBe(4);
 
     state.epoch = EPOCH + 1n;
-    expect(await epochOf(at(2 * LIMITS.epochCacheMs + 2))).toBe(EPOCH + 1n);
+    expect(await epochOf(at(failed + 2 * LIMITS.epochFailureCacheMs))).toBe(EPOCH + 1n);
     // A clock that reads earlier than the cached read cannot make that read look younger.
     expect(await epochOf(at(LIMITS.epochCacheMs))).toBe(EPOCH + 1n);
     expect(calls.epochs).toBe(6);
@@ -327,13 +379,15 @@ describe('issueWalletCheckChallenge', () => {
 });
 
 describe('settleWalletCheckPayment', () => {
-  it('takes the exact payment once: executed through the chain, verified, recorded as settled, and refused when presented again', async () => {
+  it('takes the exact payment once: executed through the chain, verified, recorded as settled but not yet delivered, and refused when presented again once delivered', async () => {
     const { chain, calls } = stubChain();
     const issued = await issue(chain);
     const { signed, header } = await pay(asBuyer(issued));
 
     expect(await settle(chain, header)).toEqual({ ok: true, digest: signed.digest, payer: BUYER });
-    expect(await saleOf(issued.challengeId)).toMatchObject({ status: 'settled', digest: signed.digest, payer: BUYER, settledAt: NOW });
+    expect(await saleOf(issued.challengeId)).toMatchObject({ status: 'settled', digest: signed.digest, payer: BUYER, settledAt: NOW, deliveredAt: null });
+    await markDelivered(db, signed.digest, NOW);
+    expect((await saleOf(issued.challengeId)).deliveredAt).toEqual(NOW);
     expect(await settle(chain, header)).toEqual({ ok: false, status: 409, reason: SETTLE_REASONS.used });
     expect(calls.executions).toEqual([signed.digest]);
   });
@@ -429,6 +483,29 @@ describe('settleWalletCheckPayment', () => {
       expect(await settle(chain, header)).toEqual({ ok: false, status: 409, reason: SETTLE_REASONS.used });
       expect(calls.executions).toEqual([signed.digest]);
       expect(calls.reads).toEqual([]);
+    }
+  });
+
+  it('keeps the sale waiting on every execution failure but the two core throws only when nothing was sent, whatever its code, retry flag or type (C29)', async () => {
+    const mayHaveLanded = ['NOT_FOUND', 'TIMEOUT', 'RATE_LIMITED', 'UNAUTHORIZED', 'UPSTREAM', 'BAD_RESPONSE', 'LIMIT_EXCEEDED'] as const;
+    // Stops compiling when core adds a code this test does not place.
+    const everyCodePlaced: [Exclude<ChainErrorCode, (typeof mayHaveLanded)[number] | 'INVALID_INPUT' | 'BUDGET'>] extends [never] ? true : false = true;
+    expect(everyCodePlaced).toBe(true);
+    const failures: Error[] = [
+      ...mayHaveLanded.flatMap((code) => [true, false].map((retryable) => new ChainError(code, `Tatum executeTransaction: ${code}; the transaction may have landed`, retryable))),
+      new Error('the connection closed'),
+    ];
+    for (const failure of failures) {
+      const { chain, calls } = stubChain({
+        execute: () => {
+          throw failure;
+        },
+      });
+      const issued = await issue(chain);
+      const { signed, header } = await pay(asBuyer(issued));
+      expect(await settle(chain, header)).toEqual({ ok: false, status: 402, reason: SETTLE_REASONS.unconfirmed });
+      expect(await saleOf(issued.challengeId)).toMatchObject({ status: 'rejected', digest: signed.digest, settledAt: null });
+      expect(calls.reads).toEqual(Array<string>(LIMITS.chainReadAfterWriteTries).fill(signed.digest));
     }
   });
 
@@ -529,7 +606,7 @@ describe('settleWalletCheckPayment', () => {
     expect(calls.executions).toHaveLength(1);
   });
 
-  it('closes a waiting sale for good once the epoch is past its window and a final read is NOT_FOUND, and never reads it again (C21)', async () => {
+  it('closes a waiting sale for good once the epoch is past its window and LIMITS.paymentReleaseReads reads after that are all NOT_FOUND, and never reads it again (C21)', async () => {
     const { chain, state, calls } = stubChain({ execute: executionUnknown });
     const payment = asBuyer(await call(chain));
     const { signed, header } = await pay(payment);
@@ -556,12 +633,34 @@ describe('settleWalletCheckPayment', () => {
     expect(await saleOf(payment.challengeId ?? '')).toMatchObject({ status: 'rejected', digest: signed.digest, settledAt: null });
 
     state.read = () => null;
+    waits.length = 0;
     expect(await recheck(step(3))).toEqual({ ok: false, status: 402, reason: SETTLE_REASONS.lapsed });
-    expect(calls.reads).toHaveLength(4 * tries + 2);
+    const closedAfter = 4 * tries + 1 + LIMITS.paymentReleaseReads;
+    expect(calls.reads).toHaveLength(closedAfter);
+    expect(waits.slice(tries - 1)).toEqual(Array<number>(LIMITS.paymentReleaseReads - 1).fill(LIMITS.settlementPollIntervalMs));
     expect(await saleOf(payment.challengeId ?? '')).toMatchObject({ status: 'rejected', digest: signed.digest, settledAt: step(3) });
 
     expect(await recheck(step(4))).toEqual({ ok: false, status: 409, reason: SETTLE_REASONS.used });
-    expect(calls.reads).toHaveLength(4 * tries + 2);
+    expect(calls.reads).toHaveLength(closedAfter);
+    expect(calls.executions).toEqual([signed.digest]);
+  });
+
+  it('never closes a waiting sale on fewer than LIMITS.paymentReleaseReads misses after its window: a payment found on the last of them settles (C29)', async () => {
+    const { chain, state, calls } = stubChain({ execute: executionUnknown });
+    const payment = asBuyer(await call(chain));
+    const { signed, header } = await pay(payment);
+    const tries = LIMITS.chainReadAfterWriteTries;
+    expect(await settle(chain, header)).toEqual({ ok: false, status: 402, reason: SETTLE_REASONS.unconfirmed });
+    expect(LIMITS.paymentReleaseReads).toBeGreaterThan(1);
+
+    // The window has closed, and a lagging node misses the payment on every read but the last one after that.
+    state.epoch = EPOCH + 2n;
+    const lastRead = 2 * tries + LIMITS.paymentReleaseReads;
+    state.read = () => (calls.reads.length < lastRead ? null : landed(Buffer.from(signed.txBytesBase64, 'base64')));
+    const later = new Date(NOW.getTime() + LIMITS.epochCacheMs);
+    expect(await settle(chain, header, { now: later })).toEqual({ ok: true, digest: signed.digest, payer: BUYER });
+    expect(calls.reads).toHaveLength(lastRead);
+    expect(await saleOf(payment.challengeId ?? '')).toMatchObject({ status: 'settled', digest: signed.digest, settledAt: later });
     expect(calls.executions).toEqual([signed.digest]);
   });
 
@@ -678,7 +777,7 @@ describe('settleWalletCheckPayment', () => {
     warn.mockRestore();
   });
 
-  it('rechecks waiting sales at most LIMITS.sellerRechecksPerDayGlobal times a day across every sale, answering the next as still waiting with Retry-After and no chain read (C22)', async () => {
+  it('rechecks waiting sales at most LIMITS.sellerRechecksPerDayGlobal times a day across every sale, answering the next as still waiting with Retry-After and no chain read, and a settled sale asking to be served again with 503 (C22)', async () => {
     const error = vi.spyOn(console, 'error').mockImplementation(() => undefined);
     const { chain, calls } = stubChain({ execute: executionUnknown });
     const at = (ms: number) => new Date(dayAfter(4) + ms);
@@ -705,6 +804,22 @@ describe('settleWalletCheckPayment', () => {
     expect(await settle(chain, headers[1] ?? '', { now: at(nextMs) })).toMatchObject({ ...waiting, retryAfterSeconds: (DAY_MS - nextMs) / 1_000 });
     expect(calls.reads.length - readsBefore).toBe(100 * LIMITS.chainReadAfterWriteTries);
     expect(calls.executions).toHaveLength(2);
+
+    // A sale that settled but was never served shares the same day.
+    const served = stubChain();
+    const settledSale = await issue(served.chain, RESOURCE, at(2_000));
+    const { header: settledHeader } = await pay(asBuyer(settledSale));
+    expect(await settle(served.chain, settledHeader, { now: at(2_000) })).toMatchObject({ ok: true });
+    expect(await settle(served.chain, settledHeader, { now: at(nextMs) })).toEqual({
+      ok: false,
+      status: 503,
+      reason: SETTLE_REASONS.deliverToday,
+      retryAfterSeconds: (DAY_MS - nextMs) / 1_000,
+    });
+    // The turn the day turned away is given back, since no check was read for it.
+    expect(await saleOf(settledSale.challengeId)).toMatchObject({ status: 'settled', deliveredAt: null, redeliveries: 0 });
+    expect(served.calls.executions).toHaveLength(1);
+    expect(served.calls.reads).toEqual([]);
     expect(error.mock.calls.map((line) => line.join(' '))).toEqual(['[ellai seller] quota_spent seller-rechecks:day']);
     error.mockRestore();
   });
@@ -770,6 +885,94 @@ describe('settleWalletCheckPayment', () => {
     expect(await saleOf(waiting.challengeId)).toMatchObject({ status: 'rejected', digest: sent.signed.digest, settledAt: null });
     expect(afterSend.calls.reads).toEqual(Array<string>(LIMITS.chainReadAfterWriteTries).fill(sent.signed.digest));
   });
+
+  it('serves a settled sale again at most LIMITS.sellerRedeliveriesPerSale times however often its check fails, then answers 410 for good with nothing read and none of the recheck day spent (C22, C29)', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    vi.mocked(findMemoryAccount).mockRejectedValue(new Error('the memory account could not be read'));
+    const { chain, calls } = stubChain();
+    // One recheck window apart, in a day no other test rechecks in.
+    const at = (window: number) => new Date(dayAfter(7) + window * LIMITS.sellerRecheckIntervalMs);
+    const payment = asBuyer(await call(chain, { now: at(0) }));
+    const { header } = await pay(payment);
+    const paidCall = (now: Date) => call(chain, { headers: { 'content-type': 'application/json', 'X-PAYMENT': header }, now });
+    const perSale = LIMITS.sellerRedeliveriesPerSale;
+    expect([perSale, LIMITS.sellerRechecksPerDayGlobal]).toEqual([5, 100]);
+
+    // The answer that came with the payment, then every turn the sale has.
+    const statuses: number[] = [];
+    for (let window = 0; window <= perSale; window++) statuses.push((await paidCall(at(window))).status);
+    expect(statuses).toEqual(Array<number>(1 + perSale).fill(502));
+    expect(calls.balances).toHaveLength(1 + perSale);
+    expect(await saleOf(payment.challengeId ?? '')).toMatchObject({ status: 'settled', deliveredAt: null, redeliveries: perSale });
+
+    const spent = await paidCall(at(perSale + 1));
+    expect(spent.status).toBe(410);
+    expect(spent.headers['Retry-After']).toBeUndefined();
+    expect(JSON.parse(spent.body)).toEqual({ error: SETTLE_REASONS.deliverExhausted });
+    // As many more tries as the day holds, each in a window of its own.
+    for (let window = perSale + 2; window < perSale + 2 + LIMITS.sellerRechecksPerDayGlobal; window++) {
+      expect((await paidCall(at(window))).status).toBe(410);
+    }
+    expect(calls.balances).toHaveLength(1 + perSale);
+    expect(calls.executions).toHaveLength(1);
+    expect(calls.reads).toEqual([]);
+    expect(await saleOf(payment.challengeId ?? '')).toMatchObject({ redeliveries: perSale });
+    expect(warn.mock.calls.map((line) => line.join(' '))).toEqual(
+      Array<string>(1 + LIMITS.sellerRechecksPerDayGlobal).fill('[ellai seller] redelivery_limited seller-redeliveries:sale'),
+    );
+    warn.mockRestore();
+
+    // Had those tries spent the day, this buyer's waiting sale would be turned away unread.
+    const other = stubChain({ execute: executionUnknown });
+    const { header: otherHeader } = await pay(asBuyer(await issue(other.chain, RESOURCE, at(0))));
+    const waiting = { ok: false, status: 402, reason: SETTLE_REASONS.unconfirmed };
+    expect(await settle(other.chain, otherHeader, { now: at(0) })).toEqual(waiting);
+    expect(await settle(other.chain, otherHeader, { now: at(perSale + 2 + LIMITS.sellerRechecksPerDayGlobal) })).toEqual(waiting);
+    expect(other.calls.reads).toHaveLength(2 * LIMITS.chainReadAfterWriteTries);
+  });
+
+  it('starts no chain read past SELLER_READ_BY_MS when Tatum is slow, so the paid request ends by SELLER_END_BY_MS, and a recheck cut short leaves the sale waiting, never lapsed (C21, C29)', async () => {
+    // Every read as slow as core lets one be; a send slower still, as its rounds of retries can be.
+    const delays = { execute: 120_000, read: LONGEST_READ_MS, epoch: LONGEST_READ_MS, balances: LONGEST_READ_MS };
+    const slow = slowChain(delays, { execute: executionUnknown });
+    const payment = asBuyer(await call(slow.chain));
+    const { signed, header } = await pay(payment);
+    const paidCall = (now: Date) => call(slow.chain, { headers: { 'content-type': 'application/json', 'X-PAYMENT': header }, now, clock: slow.clock, sleep: slow.sleep });
+    const startedRequest = () => {
+      slow.time.ms = 0;
+      slow.starts.length = 0;
+    };
+    const unconfirmed = { error: SETTLE_REASONS.unconfirmed };
+
+    startedRequest();
+    const first = await paidCall(NOW);
+    expect(JSON.parse(first.body)).toEqual(unconfirmed);
+    // The send, then reads 33 s long and 3 s apart until the next would begin past the deadline.
+    expect(slow.starts).toEqual([0, 120_000, 156_000, 192_000, 228_000]);
+    expect(slow.starts.every((ms) => ms < SELLER_READ_BY_MS)).toBe(true);
+    expect(slow.time.ms).toBeLessThanOrEqual(SELLER_END_BY_MS);
+    expect(slow.calls.reads).toHaveLength(4);
+
+    // Past its window, the reads after the window are cut short too: one miss never closes the sale.
+    slow.state.epoch = EPOCH + 2n;
+    startedRequest();
+    const later = new Date(NOW.getTime() + LIMITS.epochCacheMs);
+    expect(JSON.parse((await paidCall(later)).body)).toEqual(unconfirmed);
+    const tries = LIMITS.chainReadAfterWriteTries;
+    const outcomeReads = Array.from({ length: tries }, (_, i) => i * (LONGEST_READ_MS + LIMITS.chainReadAfterWriteDelayMs));
+    const epochRead = tries * LONGEST_READ_MS + (tries - 1) * LIMITS.chainReadAfterWriteDelayMs;
+    expect(slow.starts).toEqual([...outcomeReads, epochRead, epochRead + LONGEST_READ_MS]);
+    expect(slow.starts.every((ms) => ms < SELLER_READ_BY_MS)).toBe(true);
+    expect(slow.time.ms).toBeLessThanOrEqual(SELLER_END_BY_MS);
+    expect(await saleOf(payment.challengeId ?? '')).toMatchObject({ status: 'rejected', digest: signed.digest, settledAt: null });
+
+    // The same header, once the chain shows the payment, settles and delivers.
+    slow.state.read = () => landed(Buffer.from(signed.txBytesBase64, 'base64'));
+    startedRequest();
+    const delivered = await paidCall(new Date(later.getTime() + LIMITS.sellerRecheckIntervalMs));
+    expect(delivered.status).toBe(200);
+    expect(slow.calls.executions).toEqual([signed.digest]);
+  });
 });
 
 describe('handleWalletCheck', () => {
@@ -796,6 +999,96 @@ describe('handleWalletCheck', () => {
     expect(Number.isNaN(Date.parse(check.checkedAt))).toBe(false);
     expect(calls.balances).toEqual([CHECKED]);
     expect(vi.mocked(findMemoryAccount)).toHaveBeenCalledWith(chain, CHECKED);
+  });
+
+  const paidReceipt = (answer: SellerResponse) => JSON.parse(Buffer.from(answer.headers['X-PAYMENT-RESPONSE'] ?? '', 'base64').toString('utf8'));
+
+  it('delivers once to the same header after a check that failed once the payment settled, refusing other bytes for that sale and the same header once delivered (C29)', async () => {
+    const { chain, calls } = stubChain();
+    const at = (ms: number) => new Date(NOW.getTime() + ms);
+    const payment = asBuyer(await call(chain));
+    const { signed, header } = await pay(payment);
+    const paidCall = (now: Date, value = header) => call(chain, { headers: { 'content-type': 'application/json', 'X-PAYMENT': value }, now });
+    const issuedReceipt = { success: true, network: 'sui:mainnet', transaction: signed.digest, payer: BUYER };
+
+    vi.mocked(findMemoryAccount).mockRejectedValueOnce(new Error('the memory account could not be read'));
+    const failed = await paidCall(at(0));
+    expect(failed.status).toBe(502);
+    expect(JSON.parse(failed.body)).toEqual({ error: HANDLER_MESSAGES.undelivered });
+    expect(paidReceipt(failed)).toEqual(issuedReceipt);
+    expect(await saleOf(payment.challengeId ?? '')).toMatchObject({ status: 'settled', digest: signed.digest, settledAt: at(0), deliveredAt: null });
+
+    // Other bytes for the settled sale, well formed and signed, are refused and spend none of its turn.
+    const other = await pay(payment, Ed25519Keypair.generate());
+    const refused = await paidCall(at(1_000), other.header);
+    expect(refused.status).toBe(409);
+    expect(JSON.parse(refused.body)).toEqual({ error: SETTLE_REASONS.used });
+
+    const delivered = await paidCall(at(1_000));
+    expect(delivered.status).toBe(200);
+    expect(JSON.parse(delivered.body)).toMatchObject({ address: CHECKED, sui: '1.5 SUI', usdcAddressBalance: '0.05 USDC' });
+    expect(paidReceipt(delivered)).toEqual(issuedReceipt);
+    expect(await saleOf(payment.challengeId ?? '')).toMatchObject({ status: 'settled', settledAt: at(0), deliveredAt: at(1_000) });
+
+    const again = await paidCall(at(LIMITS.sellerRecheckIntervalMs));
+    expect(again.status).toBe(409);
+    expect(JSON.parse(again.body)).toEqual({ error: SETTLE_REASONS.used });
+    expect(calls.executions).toEqual([signed.digest]);
+    expect(calls.reads).toEqual([]);
+    expect(calls.balances).toEqual([CHECKED, CHECKED]);
+  });
+
+  it('serves a settled sale again at most once per LIMITS.sellerRecheckIntervalMs window, answering one too soon with 429 and Retry-After and no check read (C22, C29)', async () => {
+    const { chain, calls } = stubChain();
+    const at = (ms: number) => new Date(NOW.getTime() + ms);
+    const { header } = await pay(asBuyer(await call(chain)));
+    const paidCall = (now: Date) => call(chain, { headers: { 'content-type': 'application/json', 'X-PAYMENT': header }, now });
+    expect(NOW.getTime() % LIMITS.sellerRecheckIntervalMs).toBe(0);
+
+    vi.mocked(findMemoryAccount).mockRejectedValueOnce(new Error('the memory account could not be read'));
+    vi.mocked(findMemoryAccount).mockRejectedValueOnce(new Error('the memory account could not be read'));
+    expect((await paidCall(at(0))).status).toBe(502);
+    expect((await paidCall(at(1_000))).status).toBe(502);
+    const tooSoon = await paidCall(at(2_000));
+    expect(tooSoon).toMatchObject({ status: 429, headers: { 'Retry-After': '28' } });
+    expect(JSON.parse(tooSoon.body)).toEqual({ error: SETTLE_REASONS.deliverSoon });
+    expect(calls.balances).toHaveLength(2);
+
+    expect((await paidCall(at(LIMITS.sellerRecheckIntervalMs))).status).toBe(200);
+    expect(calls.balances).toHaveLength(3);
+    expect(calls.executions).toHaveLength(1);
+  });
+
+  it('starts no step of the check past SELLER_READ_BY_MS, for the delivery that comes with the payment and for one asked for again, leaving the sale undelivered for the same header (C21, C29)', async () => {
+    const delays = { execute: SELLER_READ_BY_MS - 1, read: 0, epoch: 0, balances: LONGEST_READ_MS };
+    const slow = slowChain(delays);
+    const payment = asBuyer(await call(slow.chain));
+    const { header } = await pay(payment);
+    const at = (ms: number) => new Date(NOW.getTime() + ms);
+    const paidCall = (now: Date) => {
+      slow.time.ms = 0;
+      return call(slow.chain, { headers: { 'content-type': 'application/json', 'X-PAYMENT': header }, now, clock: slow.clock, sleep: slow.sleep });
+    };
+
+    // A send that ends just before the deadline: the balance read still begins, the memory account read does not.
+    const first = await paidCall(at(0));
+    expect(first.status).toBe(502);
+    expect(JSON.parse(first.body)).toEqual({ error: HANDLER_MESSAGES.undelivered });
+    expect(slow.calls.balances).toHaveLength(1);
+    expect(vi.mocked(findMemoryAccount)).not.toHaveBeenCalled();
+    expect(slow.time.ms).toBeLessThanOrEqual(SELLER_END_BY_MS);
+
+    // Asked for again, a balance read that runs past the deadline stops the check the same way.
+    delays.balances = SELLER_READ_BY_MS;
+    expect((await paidCall(at(LIMITS.sellerRecheckIntervalMs))).status).toBe(502);
+    expect(slow.calls.balances).toHaveLength(2);
+    expect(vi.mocked(findMemoryAccount)).not.toHaveBeenCalled();
+    expect(await saleOf(payment.challengeId ?? '')).toMatchObject({ status: 'settled', deliveredAt: null, redeliveries: 1 });
+
+    delays.balances = LONGEST_READ_MS;
+    expect((await paidCall(at(2 * LIMITS.sellerRecheckIntervalMs))).status).toBe(200);
+    expect(await saleOf(payment.challengeId ?? '')).toMatchObject({ deliveredAt: at(2 * LIMITS.sellerRecheckIntervalMs), redeliveries: 2 });
+    expect(slow.calls.executions).toHaveLength(1);
   });
 
   it('answers 405 to anything but POST and 400 to a body without one Sui address, before counting or reading the chain', async () => {
@@ -859,6 +1152,30 @@ describe('handleWalletCheck', () => {
     expect(calls.epochs).toBe(2);
   });
 
+  it('answers 300 unpaid challenges during an outage with 503 from one epoch read per LIMITS.epochFailureCacheMs, storing nothing (C22)', async () => {
+    const { chain, state, calls } = stubChain({ epoch: new ChainError('UPSTREAM', 'Tatum getEpoch: gateway error', true) });
+    // Half a minute into a minute no other test counts in, so all 300 fit one shared minute and
+    // the next failure window falls in the next minute.
+    const start = NOW.getTime() + 6 * 3_600_000 + 30_000;
+    const at = (ms: number) => new Date(start + ms);
+    const spacing = LIMITS.epochFailureCacheMs / 300;
+    const before = await saleCount();
+
+    const answers: SellerResponse[] = [];
+    for (let i = 0; i < 300; i++) answers.push(await call(chain, { callerKey: `outage-caller-${i}`, now: at(i * spacing) }));
+    expect(answers.map((answer) => answer.status)).toEqual(Array<number>(300).fill(503));
+    expect(JSON.parse(answers[299]?.body ?? '{}')).toEqual({ error: HANDLER_MESSAGES.unavailable });
+    expect(calls.epochs).toBe(1);
+    expect(await saleCount()).toBe(before);
+
+    // The next window reads once more, and a chain that answers again is used at once.
+    expect((await call(chain, { callerKey: 'outage-next-window', now: at(LIMITS.epochFailureCacheMs) })).status).toBe(503);
+    expect(calls.epochs).toBe(2);
+    state.epoch = EPOCH;
+    expect((await call(chain, { callerKey: 'outage-over', now: at(2 * LIMITS.epochFailureCacheMs) })).status).toBe(402);
+    expect(calls.epochs).toBe(3);
+  });
+
   it('never puts the payment header, its bytes or its signature in any response, whatever the outcome (C19)', async () => {
     const MARKER = 'LEAKMARKER';
     const { chain } = stubChain();
@@ -898,7 +1215,8 @@ describe('handleWalletCheck', () => {
 describe('walletCheck', () => {
   it('summarises an address through the chain with exact decimal amounts, and caps the blob count at the page limits of the blob reader', async () => {
     const { chain, calls } = stubChain({ blobs: 2 });
-    expect(await walletCheck({ chain, address: CHECKED.toUpperCase().replace('0X', '0x') })).toMatchObject({
+    const deadline = sellerDeadline(Date.now(), Date.now);
+    expect(await walletCheck({ chain, address: CHECKED.toUpperCase().replace('0X', '0x'), deadline })).toMatchObject({
       address: CHECKED,
       sui: '1.5 SUI',
       usdcAddressBalance: '0.05 USDC',
@@ -908,9 +1226,48 @@ describe('walletCheck', () => {
     });
     expect(calls.blobs).toEqual([CHECKED]);
     const capped = stubChain({ blobs: 'too many' });
-    expect((await walletCheck({ chain: capped.chain, address: CHECKED })).walrusBlobs).toBe(LIMITS.graphqlMaxPages * LIMITS.graphqlPageSize);
-    await expect(walletCheck({ chain, address: '0xnope' })).rejects.toThrow();
+    expect((await walletCheck({ chain: capped.chain, address: CHECKED, deadline })).walrusBlobs).toBe(LIMITS.graphqlMaxPages * LIMITS.graphqlPageSize);
+    await expect(walletCheck({ chain, address: '0xnope', deadline })).rejects.toThrow();
     expect(calls.balances).toEqual([CHECKED]);
+  });
+
+  it('cuts off a check still waiting on the chain at the end-by time, and starts no step after it (C21)', async () => {
+    const { chain, calls } = stubChain();
+    let answer: () => void = () => undefined;
+    const hanging = {
+      ...chain,
+      getBalances: (address: string) => {
+        calls.balances.push(address);
+        return new Promise((resolve) => {
+          answer = () => resolve({ usdcAddressBalance: 0n, usdcCoinBalance: 0n, suiTotal: 0n });
+        });
+      },
+    } as Chain;
+    const startMs = Date.now();
+    const deadline = { clock: Date.now, readByMs: startMs + 10, endByMs: startMs + 30 };
+
+    await expect(walletCheck({ chain: hanging, address: CHECKED, deadline })).rejects.toMatchObject({ name: 'ChainError', code: 'TIMEOUT' });
+    // The read that was cut off answers late; the check behind it starts nothing more.
+    answer();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(calls.balances).toEqual([CHECKED]);
+    expect(vi.mocked(findMemoryAccount)).not.toHaveBeenCalled();
+    expect(calls.blobs).toEqual([]);
+  });
+});
+
+describe('the wallet check route', () => {
+  it('asks for the ceiling in LIMITS.slowRouteMaxDurationS, since a paid request can wait on the send, the reads after it and the check', () => {
+    expect(walletCheckRoute.maxDuration).toBe(LIMITS.slowRouteMaxDurationS);
+  });
+
+  it('lets the slowest read begun just before the seller deadline end with LIMITS.paidRequestMarginMs still left under that ceiling (C21)', () => {
+    // Core's bounded read: three tries of tatumTimeoutMs, with waits of 1 and 2 retry delays between.
+    expect(LIMITS.tatumRetries).toBe(2);
+    expect(LONGEST_READ_MS).toBe(3 * LIMITS.tatumTimeoutMs + 3 * LIMITS.tatumRetryDelayMs);
+    expect(SELLER_READ_BY_MS + LONGEST_READ_MS).toBe(SELLER_END_BY_MS);
+    expect(SELLER_END_BY_MS + LIMITS.paidRequestMarginMs).toBe(walletCheckRoute.maxDuration * 1_000);
+    expect(SELLER_READ_BY_MS).toBeGreaterThan(0);
   });
 });
 

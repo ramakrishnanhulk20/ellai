@@ -7,6 +7,12 @@ import { HANDLER_MESSAGES, handleWalletCheck, sellerPayTo } from '../../../../se
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
+// Seconds this route may run, so the ceiling is Ellai's choice and not the platform's default: a
+// paid request can wait on core's send, the digest reads after an unknown outcome and then the
+// wallet check, all inside the seller's own deadline (seller/deadline.ts), which ends
+// LIMITS.paidRequestMarginMs before this. Next.js reads this export without running the module,
+// so it is written as the literal value of LIMITS.slowRouteMaxDurationS, and a test holds the two equal.
+export const maxDuration = 300;
 
 const RESOURCE_PATH = '/api/sell/wallet-check';
 
@@ -31,8 +37,9 @@ function sellerResponse(status: number, headers: Record<string, string>, body: s
  * Ellai's own paid service, sold over x402: POST { address } for a 0.01 USDC summary of that
  * Sui address. A public seller route: no session, no agent token. Without X-PAYMENT the answer
  * is a 402 challenge (429 past LIMITS.sellerChallengesPerMinute for the caller's verified
- * address, C22); with one, the payment is settled before the check is read (see
- * handleWalletCheck), and its bytes reach Tatum only within the caps on sends counted on that
+ * address, C22); with one, the payment is settled before the check is read, and a payment that
+ * settled but whose check could not be read is served again to the same header (see
+ * handleWalletCheck, C29). Its bytes reach Tatum only within the caps on sends counted on that
  * same address: 429 past LIMITS.sellerExecutesPerClientPerMinute or
  * LIMITS.sellerExecutesPerClientPerDay, 503 past LIMITS.sellerExecutesPerDayGlobal for every
  * caller, each with Retry-After (C22). The challenge is bound to APP_ORIGIN plus this path, never to the Host
@@ -56,6 +63,7 @@ export const POST = scoped('anyone', async (request: Request): Promise<Response>
         payTo,
         callerKey: clientKey(request),
         now: ctx.now(),
+        clock: () => ctx.now().getTime(),
       });
       return sellerResponse(answer.status, answer.headers, answer.body);
     }),

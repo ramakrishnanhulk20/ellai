@@ -11,8 +11,9 @@ import { rateCounters } from '../db/schema.js';
 import type { ServerEnv } from '../env.js';
 import { consumeShared } from '../http/ratelimit.js';
 import { SellerError, issueWalletCheckChallenge, timestampOf } from './challenge.js';
-import { settleWalletCheckPayment } from './settle.js';
-import { walletCheck } from './walletcheck.js';
+import { sellerDeadline } from './deadline.js';
+import { markDelivered, settleWalletCheckPayment } from './settle.js';
+import { type WalletCheck, walletCheck } from './walletcheck.js';
 
 export interface SellerResponse {
   status: number;
@@ -28,7 +29,8 @@ export const HANDLER_MESSAGES = {
   rate: 'Too many unpaid requests from this caller. Try again in a minute.',
   busy: 'This seller is issuing too many payment challenges right now. Try again in a minute.',
   unavailable: 'The seller cannot issue a payment challenge right now. Try again shortly.',
-  undelivered: 'Your payment settled, but the wallet check could not be read. The receipt is in X-PAYMENT-RESPONSE.',
+  undelivered:
+    'Your payment settled, but the wallet check could not be read. The receipt is in X-PAYMENT-RESPONSE. Send the same X-PAYMENT header again to receive the check.',
   internal: 'The seller hit an unexpected error.',
 } as const;
 
@@ -105,6 +107,9 @@ function receipt(digest: string, payer: string): Record<string, string> {
 
 async function handle(args: Parameters<typeof handleWalletCheck>[0]): Promise<SellerResponse> {
   const { db, chain } = args;
+  const clock = args.clock ?? Date.now;
+  // Taken before anything else, so every limit counts from when the request arrived.
+  const deadline = sellerDeadline(clock(), clock);
   if (args.method !== 'POST') return json(405, { error: HANDLER_MESSAGES.method }, { Allow: 'POST' });
   const nowMs = timestampOf(args.now);
   const payment = paymentHeaderOf(args.headers);
@@ -127,16 +132,30 @@ async function handle(args: Parameters<typeof handleWalletCheck>[0]): Promise<Se
     }
   }
 
-  const settled = await settleWalletCheckPayment({ db, chain, paymentHeader: payment.value, resourceUrl: args.url, callerKey: args.callerKey, now: args.now, sleep: args.sleep });
+  const settled = await settleWalletCheckPayment({
+    db,
+    chain,
+    paymentHeader: payment.value,
+    resourceUrl: args.url,
+    callerKey: args.callerKey,
+    now: args.now,
+    sleep: args.sleep,
+    deadline,
+  });
   if (!settled.ok) {
     return json(settled.status, { error: settled.reason }, settled.retryAfterSeconds === undefined ? {} : { 'Retry-After': String(settled.retryAfterSeconds) });
   }
   const paid = receipt(settled.digest, settled.payer);
+  let check: WalletCheck;
   try {
-    return json(200, await walletCheck({ chain, address }), paid);
+    check = await walletCheck({ chain, address, deadline });
   } catch {
     return json(502, { error: HANDLER_MESSAGES.undelivered }, paid);
   }
+  const delivered = json(200, check, paid);
+  // Marked only with the answer in hand, so a check that failed leaves the sale open to the same bytes (C29).
+  await markDelivered(db, settled.digest, args.now);
+  return delivered;
 }
 
 /**
@@ -155,8 +174,19 @@ async function handle(args: Parameters<typeof handleWalletCheck>[0]): Promise<Se
  * Retry-After on a recheck of a waiting sale that came too soon; its 429 past this caller's caps
  * on sends and its 503 past every caller's, both with Retry-After, keyed on the same `callerKey`) before
  * the wallet check is read, waiting with `sleep` between its chain reads when an outcome is
- * unknown; the 200 carries the check as JSON and X-PAYMENT-RESPONSE with the digest. If the
- * check cannot be read after the payment settled, the answer is 502 with the same receipt.
+ * unknown; the 200 carries the check as JSON and X-PAYMENT-RESPONSE with the digest, and only
+ * once that answer is built is the sale marked delivered (markDelivered). If the check cannot be
+ * read after the payment settled, the answer is 502 with the same receipt and the sale stays
+ * undelivered: the same X-PAYMENT header sent again reads the check again with nothing sent or
+ * read on chain, within the seller's recheck caps and at most LIMITS.sellerRedeliveriesPerSale
+ * times (429 or 503 with Retry-After past them), and a sale already delivered is 409.
+ *
+ * The request's deadline (sellerDeadline) starts on `clock`, the wall clock when left out, before
+ * anything else: no chain read after the send, and no step of the check, begins past its
+ * readByMs, and the check is cut off at its endByMs, so the request ends inside the route's
+ * LIMITS.slowRouteMaxDurationS with LIMITS.paidRequestMarginMs left to answer. A settlement cut
+ * short leaves its sale waiting (402) and a check cut short leaves it undelivered (502), each for
+ * the same header to pick up again.
  *
  * No response ever carries the X-PAYMENT value, its bytes or its signature, and every error
  * body is fixed text (C19). Never throws: anything unexpected is a 500 with fixed text.
@@ -172,6 +202,7 @@ export async function handleWalletCheck(args: {
   callerKey: string;
   now: Date;
   sleep?: (ms: number) => Promise<void>;
+  clock?: () => number;
 }): Promise<SellerResponse> {
   try {
     return await handle(args);
