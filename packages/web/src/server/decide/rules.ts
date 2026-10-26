@@ -34,7 +34,8 @@ export type RecallResult = { kind: 'failed' } | { kind: 'hits'; cutOffAt: number
 
 /**
  * A payment to this recipient with no delivery on record, or one that did not match on chain,
- * signed no earlier than the last question about this recipient that the owner said yes to.
+ * whose outcome Ellai recorded no earlier than the last question about this recipient that the
+ * owner said yes to (C32).
  */
 export interface BadOutcome {
   paymentId: string;
@@ -86,14 +87,26 @@ function result(outcome: RuleResult['outcome'], rule: DecisionRule, reason: stri
   return { outcome, rule, reason, citedMemoryIds: cite(citedMemoryIds) };
 }
 
-// Worded from the latest payment's own record, so the owner is never told a seller returned
-// nothing while its answer is still unknown.
-function badOutcomeReason(sellerHost: string, latest: BadOutcome): string {
+// decide.ts orders its bad-payment lookup by the same ranking, so its row limit can never drop
+// the payment the reason is worded from.
+function severity(bad: BadOutcome): number {
+  if (bad.settlement === 'mismatch') return 0;
+  return bad.delivered === false ? 1 : 2;
+}
+
+function worstFirst(a: BadOutcome, b: BadOutcome): number {
+  return severity(a) - severity(b) || b.signedAt.getTime() - a.signedAt.getTime();
+}
+
+// Worded from the worst payment's own record, so the owner hears the worst that happened and is
+// never told a seller failed while its answer is still unknown. It says no "last time", since
+// the worst payment need not be the latest.
+function badOutcomeReason(sellerHost: string, worst: BadOutcome): string {
   const seller = hostLabel(sellerHost, true);
-  const paid = formatUsdc(latest.amountAtomic);
-  if (latest.settlement === 'mismatch') return `${seller} was paid ${paid} USDC last time and the payment did not match what was agreed.`;
-  if (latest.delivered === false) return `${seller} took ${paid} USDC last time and returned nothing.`;
-  return `${seller} took ${paid} USDC last time and Ellai has not seen it deliver yet.`;
+  const paid = formatUsdc(worst.amountAtomic);
+  if (worst.settlement === 'mismatch') return `${seller} was paid ${paid} USDC and the payment did not match what was agreed.`;
+  if (worst.delivered === false) return `${seller} took ${paid} USDC and did not deliver.`;
+  return `${seller} took ${paid} USDC and Ellai has not seen it deliver yet.`;
 }
 
 // The queue cap turns an ask into a refusal and leaves approvals and refusals alone (C22).
@@ -133,15 +146,17 @@ export function rulesBeforeRecall(facts: Omit<DecideFacts, 'recall'>): RuleResul
   if (facts.refusalMemoryIds.length > 0) {
     return result('refused', 'refused_recipient', `You refused payments to ${host} before.`, facts.refusalMemoryIds);
   }
-  if (facts.badOutcomes.length > 0) {
-    const latest = facts.badOutcomes.reduce((a, b) => (b.signedAt > a.signedAt ? b : a));
+  // Cited worst first, so the citation cap can only drop the memories of milder payments.
+  const bad = [...facts.badOutcomes].sort(worstFirst);
+  const [worst] = bad;
+  if (worst !== undefined) {
     return capAsk(
       facts,
       result(
         'asked',
         'bad_outcome',
-        badOutcomeReason(facts.sellerHost, latest),
-        facts.badOutcomes.flatMap((bad) => bad.outcomeMemoryIds),
+        badOutcomeReason(facts.sellerHost, worst),
+        bad.flatMap((payment) => payment.outcomeMemoryIds),
       ),
     );
   }

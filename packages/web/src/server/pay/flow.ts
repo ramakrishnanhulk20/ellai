@@ -261,7 +261,8 @@ async function closeDecision(db: Database, ownerId: string, decisionId: string, 
  * 9. The paid request is the same request plus the payment header, with step 7's wait measured
  *    again after signing and never below LIMITS.netTimeoutMinMs. Its status, or null when it
  *    never answered, is stored with the payment, and so is delivered: true for a 2xx answer,
- *    false for any other answer or none. delivered stays null only when that write fails.
+ *    false for any other answer or none, with outcome_at set to the time of that write (C32).
+ *    delivered stays null only when that write fails.
  * 10. settlePayment reads the chain by Ellai's digest, up to LIMITS.settlementInlineTries times
  *    (C8). No read starts once the deadline has passed, and no wait runs past it; the payment
  *    is then reported 'pending', and the jobs tick reads it again.
@@ -386,7 +387,7 @@ export async function paidFetch(args: PaidFetchArgs): Promise<PaidFetchResult> {
   const storedDelivered = await afterPayment('seller_status', async () => {
     const written = await db
       .update(payments)
-      .set({ sellerStatus: answer?.status ?? null, delivered })
+      .set({ sellerStatus: answer?.status ?? null, delivered, outcomeAt: deps.now() })
       .where(and(eq(payments.id, paymentRow.id), eq(payments.ownerId, ownerId)))
       .returning({ id: payments.id });
     return written.length === 1 ? delivered : undefined;

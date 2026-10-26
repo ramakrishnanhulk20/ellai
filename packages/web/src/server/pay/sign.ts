@@ -153,8 +153,9 @@ function decidedThis(decision: typeof decisions.$inferSelect, payment: Canonical
  * address: if it does not, the owner's auto_paused_reason is set to PURSE_KEY_MISMATCH, that
  * is committed, and the answer is 'not_open'. Then core's signPayment builds, checks and signs the plain USDC send (its
  * EXPIRED and WRONG_EPOCH become 'expired' and 'wrong_epoch'), the payments row is written
- * with the digest of the signed bytes and the challenge's maxEpoch as valid_until_epoch, and
- * the decision becomes 'paid'. Nothing is sent anywhere.
+ * with the digest of the signed bytes, the challenge's maxEpoch as valid_until_epoch and `now`
+ * as both signed_at and outcome_at (C32), and the decision becomes 'paid'. Nothing is sent
+ * anywhere.
  *
  * Throws ChainError from the two reads, and PaymentError for a payment core cannot build
  * (UNSUPPORTED_DIALECT, BUILD_FAILED, MISMATCH); either way nothing is written.
@@ -259,6 +260,7 @@ export async function signForDecision(args: SignArgs): Promise<SignResult> {
       digest: signed.digest,
       txBytesBase64: signed.txBytesBase64,
       signedAt: now,
+      outcomeAt: now,
       validUntilEpoch,
     });
     await tx.update(decisions).set({ status: 'paid' }).where(and(thisDecision, eq(decisions.status, 'open')));

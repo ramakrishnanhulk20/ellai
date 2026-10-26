@@ -1,8 +1,10 @@
 // Covers: the fixed rules on their own (order, what counts as an approval, the question cap,
 // fail-closed recall) with fast-check properties for the three outcomes that must never be
-// "approved"; then decide on PGlite: reuse of a live decision, pending refusals, one-time
-// grants, the agent and purpose checks, which recall hits may count, bad outcomes, the
-// daily budget (the 24-hour window and pending payments however old) and the question cap.
+// "approved"; then decide on PGlite: reuse of a live decision, pending refusals and refusals
+// under any namespace label, one-time grants, the agent and purpose checks, which recall hits
+// may count, bad outcomes (worded from the worst, cleared only by a yes to a question asked
+// after the outcome was recorded), the daily budget (the 24-hour window and pending payments
+// however old) and the question cap.
 // Does NOT cover: the live Walrus relayer or its ranking (recall is a stub everywhere here),
 // the pay flow that moves an approved decision on, any HTTP or MCP route, or two connections
 // blocking on the owner row lock. PGlite serves one connection and runs one transaction at a
@@ -208,19 +210,36 @@ describe('applyRules', () => {
     const older = badOutcome([], 20_000n, new Date('2026-10-23T08:00:00Z'));
     const decided = applyRules(facts({ badOutcomes: [badOutcome([memory]), older], recall: hits([approval(), approval()]) }));
     expect(decided).toMatchObject({ outcome: 'asked', rule: 'bad_outcome', citedMemoryIds: [memory] });
-    expect(decided.reason).toBe('hotels.example took 0.010000 USDC last time and returned nothing.');
+    expect(decided.reason).toBe('hotels.example took 0.010000 USDC and did not deliver.');
     expect(applyRules(facts({ badOutcomes: [badOutcome()] }))).toMatchObject({ rule: 'bad_outcome', citedMemoryIds: [] });
   });
 
-  it("words a bad outcome from the latest payment's record, never claiming nothing came back while the answer is unknown", () => {
+  it("words a bad outcome from the payment's own record, never claiming the seller failed while its answer is unknown", () => {
     const reasonFor = (record: Pick<BadOutcome, 'delivered' | 'settlement'>) =>
       applyRules(facts({ badOutcomes: [badOutcome([], 10_000n, undefined, record)], recall: hits([approval(), approval()]) })).reason;
-    expect(reasonFor({ delivered: null, settlement: 'pending' })).toBe('hotels.example took 0.010000 USDC last time and Ellai has not seen it deliver yet.');
-    expect(reasonFor({ delivered: null, settlement: 'verified' })).toBe('hotels.example took 0.010000 USDC last time and Ellai has not seen it deliver yet.');
-    expect(reasonFor({ delivered: false, settlement: 'pending' })).toBe('hotels.example took 0.010000 USDC last time and returned nothing.');
+    expect(reasonFor({ delivered: null, settlement: 'pending' })).toBe('hotels.example took 0.010000 USDC and Ellai has not seen it deliver yet.');
+    expect(reasonFor({ delivered: null, settlement: 'verified' })).toBe('hotels.example took 0.010000 USDC and Ellai has not seen it deliver yet.');
+    expect(reasonFor({ delivered: false, settlement: 'pending' })).toBe('hotels.example took 0.010000 USDC and did not deliver.');
     expect(reasonFor({ delivered: true, settlement: 'mismatch' })).toBe(
-      'hotels.example was paid 0.010000 USDC last time and the payment did not match what was agreed.',
+      'hotels.example was paid 0.010000 USDC and the payment did not match what was agreed.',
     );
+  });
+
+  it('words a bad outcome from the worst payment, a mismatch then no delivery then an unknown one, newest within a kind, and cites them all worst first', () => {
+    const [m0, m1, m2, m3] = [randomUUID(), randomUUID(), randomUUID(), randomUUID()];
+    const failed = badOutcome([m0], 20_000n, new Date('2026-10-23T08:00:00Z'), { delivered: false, settlement: 'verified' });
+    const newerUnknown = badOutcome([m1], 10_000n, new Date('2026-10-24T08:00:00Z'), { delivered: null, settlement: 'pending' });
+    const decided = applyRules(facts({ badOutcomes: [newerUnknown, failed] }));
+    expect(decided).toMatchObject({ outcome: 'asked', rule: 'bad_outcome', citedMemoryIds: [m0, m1] });
+    expect(decided.reason).toBe('hotels.example took 0.020000 USDC and did not deliver.');
+
+    const newerFailed = badOutcome([m2], 40_000n, new Date('2026-10-23T09:00:00Z'), { delivered: false, settlement: 'pending' });
+    expect(applyRules(facts({ badOutcomes: [failed, newerUnknown, newerFailed] })).reason).toBe('hotels.example took 0.040000 USDC and did not deliver.');
+
+    const oldMismatch = badOutcome([m3], 30_000n, new Date('2026-10-01T08:00:00Z'), { delivered: true, settlement: 'mismatch' });
+    const worst = applyRules(facts({ badOutcomes: [newerUnknown, failed, newerFailed, oldMismatch] }));
+    expect(worst.reason).toBe('hotels.example was paid 0.030000 USDC and the payment did not match what was agreed.');
+    expect(worst.citedMemoryIds).toEqual([m3, m2, m0, m1]);
   });
 
   it('refuses an ask when the queue is full, and never blocks an approval or a refusal', () => {
@@ -482,6 +501,8 @@ describe('decide', () => {
       digest: randomBytes(32).toString('base64url'),
       txBytesBase64: 'AA==',
       signedAt,
+      // As signing stamps it; a test that records a later outcome overrides it.
+      outcomeAt: signedAt,
       validUntilEpoch: 900n,
       ...overrides,
     } satisfies typeof payments.$inferInsert;
@@ -557,6 +578,19 @@ describe('decide', () => {
     expect(await db.select().from(decisionCitations).where(eq(decisionCitations.decisionId, result.decisionId))).toEqual([
       { decisionId: result.decisionId, memoryId, ownerId: w.ownerId },
     ]);
+  });
+
+  it("refuses on this owner's refusal recorded under another namespace label, and never on another owner's (C11)", async () => {
+    const w = await world();
+    const elsewhere = await approvalMemory(w, { verdict: 'refuse', namespace: 'ellai-demo-v1' });
+    const pair = [await approvalMemory(w), await approvalMemory(w)];
+    const recall = vi.fn(recallOf(pair));
+    expect(await run(w, { recall })).toMatchObject({ outcome: 'refused', rule: 'refused_recipient', citedMemoryIds: [elsewhere.id] });
+    expect(recall).not.toHaveBeenCalled();
+
+    const x = await world();
+    await approvalMemory(w, { verdict: 'refuse' });
+    expect(await run(x, { recall: recallOf([await approvalMemory(x), await approvalMemory(x)]) })).toMatchObject({ outcome: 'approved', rule: 'learned' });
   });
 
   it("turns the owner's yes into exactly one approval, and the next retry asks again", async () => {
@@ -724,7 +758,7 @@ describe('decide', () => {
 
     const noMemoryYet = await run(w, { recall: recallOf(pair), purpose: `${PURPOSE} 1` });
     expect(noMemoryYet).toMatchObject({ outcome: 'asked', rule: 'bad_outcome', citedMemoryIds: [] });
-    expect(noMemoryYet.reason).toBe('hotels.example took 0.010000 USDC last time and returned nothing.');
+    expect(noMemoryYet.reason).toBe('hotels.example took 0.010000 USDC and did not deliver.');
 
     const outcome = one(
       await db
@@ -758,7 +792,7 @@ describe('decide', () => {
     expect(await withPayment({ settlement: 'pending' })).toMatchObject({
       outcome: 'asked',
       rule: 'bad_outcome',
-      reason: 'hotels.example took 0.010000 USDC last time and Ellai has not seen it deliver yet.',
+      reason: 'hotels.example took 0.010000 USDC and Ellai has not seen it deliver yet.',
     });
     expect((await withPayment({ settlement: 'verified' })).rule).toBe('bad_outcome');
     expect((await withPayment({ settlement: 'mismatch', delivered: true })).rule).toBe('bad_outcome');
@@ -787,6 +821,33 @@ describe('decide', () => {
     // A yes to the question that showed the bad outcome is what restarts the window.
     await ownerAnswer(w, stale.decisionId, 'approve', NOW);
     expect((await run(w, { recall: recallOf(pair), now: new Date(NOW.getTime() + 60_000) })).rule).toBe('grant');
+  });
+
+  it('clears a bad payment only at a yes to a question created strictly after its outcome was recorded, however long before that it was signed (C32)', async () => {
+    const ago = (ms: number) => new Date(NOW.getTime() - ms);
+    const recorded = ago(1_800_000);
+    const ruleWithYesAskedAt = async (askedAt: Date) => {
+      const w = await world();
+      const pair = [await approvalMemory(w, { createdAt: ago(10_800_000) }), await approvalMemory(w, { createdAt: ago(10_800_000) })];
+      await signedPayment(w, 10_000n, ago(7_200_000), { settlement: 'verified', delivered: false, outcomeAt: recorded });
+      await approvalMemory(w, { decisionId: (await questionAt(w, askedAt)).id, createdAt: NOW });
+      return (await run(w, { recall: recallOf(pair) })).rule;
+    };
+    expect(await ruleWithYesAskedAt(ago(3_600_000))).toBe('bad_outcome');
+    expect(await ruleWithYesAskedAt(recorded)).toBe('bad_outcome');
+    expect(await ruleWithYesAskedAt(new Date(recorded.getTime() + 1))).toBe('learned');
+  });
+
+  it("asks in the worst bad payment's words even when newer payments of unknown delivery would fill the lookup", async () => {
+    const w = await world();
+    const pair = [await approvalMemory(w), await approvalMemory(w)];
+    await signedPayment(w, 30_000n, new Date(NOW.getTime() - 7_200_000), { settlement: 'verified', delivered: false });
+    for (let i = 0; i < LIMITS.decideMaxCitedMemories; i++) await signedPayment(w, 10_000n, new Date(NOW.getTime() - 3_600_000 + i * 1_000));
+    expect(await run(w, { recall: recallOf(pair) })).toMatchObject({
+      outcome: 'asked',
+      rule: 'bad_outcome',
+      reason: 'hotels.example took 0.030000 USDC and did not deliver.',
+    });
   });
 
   const hoursAgo = (hours: number) => new Date(NOW.getTime() - hours * 3_600_000);

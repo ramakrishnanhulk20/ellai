@@ -13,7 +13,9 @@
 // outcome, a status write, settlement read or outcome memory that fails after payment and still
 // leaves 'paid', a settlement mismatch pausing the owner, a settlement checked against the purse
 // that signed it, reads that keep failing after the window closed marking the payment
-// unverifiable and pausing the owner, the release of a payment that never landed, the call's
+// unverifiable and pausing the owner however many days apart they come, outcome_at stamped by
+// every writer on its own clock and a yes to a question asked before an outcome was recorded
+// clearing nothing, the release of a payment that never landed, the call's
 // deadline (the paid request's wait cut to it, nothing signed when too little time is left,
 // settlement reads stopped at it), six-decimal amounts in reasons, and reasons that never carry
 // agent or seller text.
@@ -37,6 +39,7 @@ import { and, eq } from 'drizzle-orm';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { type Database, createDb, migrate } from '../src/server/db/client.js';
 import { agents, decisions, memories, owners, payments, questions } from '../src/server/db/schema.js';
+import { answerQuestion } from '../src/server/decide/answer.js';
 import { type Recall, decide } from '../src/server/decide/decide.js';
 import { ownerDelegate } from '../src/server/memory/delegate.js';
 import { MEMORY_NAMESPACE } from '../src/server/memory/namespace.js';
@@ -757,6 +760,94 @@ describe('paidFetch', () => {
     expect(paidCalls(fetch)).toHaveLength(1);
   });
 
+  it("keeps asking after a yes to a question asked before the seller's failure was recorded, and a yes asked after it clears it (C32)", async () => {
+    const w = await world();
+    const { recallFor } = await approvals(w);
+    let clock = NOW.getTime();
+    const now = () => new Date(clock);
+    let reached: () => void = () => undefined;
+    const atSeller = new Promise<void>((resolve) => {
+      reached = resolve;
+    });
+    let release: () => void = () => undefined;
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const slowThenFails = seller(async (url) => {
+      reached();
+      await held;
+      return response(url, 500, 'internal error');
+    });
+    const yes = (decisionId: string | null) => {
+      if (decisionId === null) throw new Error('expected a decision');
+      return answerQuestion({ db, ownerId: w.ownerId, decisionId, answer: 'approve', reason: null, delegatePublicKeyHex: w.delegate, namespace: MEMORY_NAMESPACE, now: now() });
+    };
+
+    // t1: approved from the two past answers and signed, with the seller yet to answer.
+    const first = run(w, { fetch: slowThenFails, recallFor, now });
+    await atSeller;
+    expect(one(await paymentRows(w.ownerId))).toMatchObject({ delivered: null, signedAt: NOW, outcomeAt: NOW });
+
+    // t2: B asks because the delivery is unknown, and the owner says yes.
+    clock += 5_000;
+    const b = await run(w, { recallFor, now, purpose: `${PURPOSE} B` });
+    expect(b).toMatchObject({ outcome: 'asked', rule: 'bad_outcome' });
+    await yes(b.decisionId);
+
+    // t3: the seller's failure is recorded only now, after B was asked.
+    clock += 5_000;
+    const failedAt = now();
+    release();
+    expect((await first).payment?.settlement).toBe('verified');
+    expect(one(await paymentRows(w.ownerId))).toMatchObject({ delivered: false, signedAt: NOW, outcomeAt: failedAt });
+    const outcome = one(await outcomeRows(w.ownerId));
+
+    // t4: the yes to B never showed the owner this failure, so C asks again.
+    clock += 5_000;
+    const c = await run(w, { recallFor, now, purpose: `${PURPOSE} C` });
+    expect(c).toMatchObject({ outcome: 'asked', rule: 'bad_outcome', citedMemories: [{ memoryId: outcome.id, blobId: null }] });
+
+    await yes(c.decisionId);
+    clock += 5_000;
+    expect(await run(w, { recallFor, now, purpose: `${PURPOSE} E` })).toMatchObject({ outcome: 'paid', rule: 'grant' });
+  });
+
+  it("stamps outcome_at at signing and at every delivery or settlement write, and verified_at and released_at, on that writer's clock (C32)", async () => {
+    const at = (ms: number) => new Date(NOW.getTime() + ms);
+    const signedOnly = async (chain: (w: World) => Chain) => {
+      const w = await world();
+      const { recall } = await approvals(w);
+      const direct = await approvedDecision(w, recall, 'signed directly');
+      expect(await signForDecision({ db, ownerId: w.ownerId, ...direct, masterSecretHex: MASTER, chain: stubChain(w).chain, now: () => at(1_000) })).toHaveProperty('signed');
+      const row = one(await paymentRows(w.ownerId));
+      expect(row).toMatchObject({ signedAt: at(1_000), outcomeAt: at(1_000) });
+      return { w, row, settle: (when: Date) => settlePayment({ db, ownerId: w.ownerId, paymentId: row.id, chain: chain(w), tries: 1, intervalMs: 5, sleep: noSleep, now: () => when }) };
+    };
+
+    const verified = await signedOnly((w) => stubChain(w).chain);
+    expect(await verified.settle(at(60_000))).toBe('verified');
+    expect(one(await paymentRows(verified.w.ownerId))).toMatchObject({ outcomeAt: at(60_000), verifiedAt: at(60_000) });
+
+    const mismatched = await signedOnly((w) => stubChain(w, { landed: () => settled(w.purse, OTHER_RECIPIENT, PRICE) }).chain);
+    expect(await mismatched.settle(at(120_000))).toBe('mismatch');
+    expect(one(await paymentRows(mismatched.w.ownerId))).toMatchObject({ outcomeAt: at(120_000) });
+
+    const lost = await signedOnly((w) => stubChain(w, { epoch: 102n, landed: () => null }).chain);
+    expect(await lost.settle(at(180_000))).toBe('not_landed');
+    expect(one(await paymentRows(lost.w.ownerId))).toMatchObject({ outcomeAt: at(180_000), releasedAt: at(180_000) });
+
+    // The paid answer comes a second after signing, and the settlement stays pending, so only the status write stamps it.
+    const w = await world();
+    let clock = NOW.getTime();
+    const answersLater = seller((url, init) => {
+      clock += 1_000;
+      return ok(url, init);
+    });
+    const paid = await run(w, { fetch: answersLater, chain: stubChain(w, { landed: () => null }).chain, recallFor: (await approvals(w)).recallFor, now: () => new Date(clock) });
+    expect(paid.payment?.settlement).toBe('pending');
+    expect(one(await paymentRows(w.ownerId))).toMatchObject({ delivered: true, signedAt: NOW, outcomeAt: at(1_000) });
+  });
+
   it('still reports paid with its payment when a status write, the settlement read or the outcome memory fails after payment', async () => {
     const error = vi.spyOn(console, 'error').mockImplementation(() => undefined);
     const failure = () => new Error(`the database went away ${hex(4)}`);
@@ -913,6 +1004,37 @@ describe('paidFetch', () => {
     expect(await run(w, { fetch, chain, recallFor, purpose: 'try again' })).toMatchObject({ outcome: 'refused', rule: 'paused', payment: null });
     expect(paidCalls(fetch)).toHaveLength(0);
     expect(await paymentRows(w.ownerId)).toHaveLength(1);
+  });
+
+  it('counts failed passes on the payment row however many days apart they come, so six over three days mark it unverifiable and pause the owner (C8, C21)', async () => {
+    const w = await world();
+    const { recallFor } = await approvals(w);
+    const { chain, state } = stubChain(w, { landed: () => null });
+    expect((await run(w, { chain, recallFor })).payment?.settlement).toBe('pending');
+    const row = one(await paymentRows(w.ownerId));
+    state.epoch = 102n;
+    const unreadable = {
+      ...chain,
+      getTransactionResult: async () => {
+        throw new ChainError('UPSTREAM', 'gateway error (HTTP 502)', true);
+      },
+    } as Chain;
+    const passes = LIMITS.settlementUnverifiableReads;
+    const dayMs = 86_400_000;
+    // A fixed clock moved a day at a time: two passes a day, so no single day holds them all.
+    const clockAt = (pass: number) => new Date(NOW.getTime() + dayMs * (1 + Math.floor((pass * 3) / passes)));
+    expect(new Set(Array.from({ length: passes }, (_, pass) => clockAt(pass).toISOString().slice(0, 10))).size).toBe(3);
+
+    for (let pass = 0; pass < passes; pass++) {
+      const at = clockAt(pass);
+      const settled = await settlePayment({ db, ownerId: w.ownerId, paymentId: row.id, chain: unreadable, tries: 1, intervalMs: 5, sleep: noSleep, now: () => at });
+      expect(settled).toBe(pass < passes - 1 ? 'pending' : 'mismatch');
+      expect(one(await paymentRows(w.ownerId)).settlementFailedReads).toBe(pass + 1);
+    }
+    expect(one(await paymentRows(w.ownerId))).toMatchObject({ settlement: 'mismatch', mismatchReason: UNVERIFIABLE, outcomeAt: clockAt(passes - 1) });
+    expect((await ownerRow(w.ownerId)).autoPausedReason).toBe(SETTLEMENT_UNVERIFIABLE);
+    expect(await settlePayment({ db, ownerId: w.ownerId, paymentId: row.id, chain: unreadable, tries: 1, intervalMs: 5, sleep: noSleep })).toBe('mismatch');
+    expect(one(await paymentRows(w.ownerId)).settlementFailedReads).toBe(passes);
   });
 
   it('cuts the paid request to end 10 s before the deadline, measured again after signing', async () => {

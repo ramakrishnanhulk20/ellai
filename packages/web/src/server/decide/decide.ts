@@ -207,8 +207,9 @@ const ownedHere = (r: Request) => and(eq(memories.ownerId, r.ownerId), eq(memori
 
 async function badOutcomes(q: Queryable, r: Request): Promise<BadOutcome[]> {
   // The window restarts only at a yes that would itself count toward learning, and it restarts
-  // at the time that yes's question was asked, not answered: a question asked before a bad
-  // payment never showed it to the owner, so a late yes to it clears nothing.
+  // at the time that yes's question was asked, not answered. A question asked before Ellai
+  // recorded a payment's outcome (outcome_at) never showed it to the owner, so a yes to it
+  // clears nothing, however long before the question the payment was signed (C32).
   const [lastAskedYes] = await q
     .select({ at: decisions.createdAt })
     .from(memories)
@@ -245,10 +246,12 @@ async function badOutcomes(q: Queryable, r: Request): Promise<BadOutcome[]> {
           eq(payments.settlement, 'mismatch'),
           and(inArray(payments.settlement, ['verified', 'pending']), isNull(payments.releasedAt), sql`${payments.delivered} is not true`),
         ),
-        lastAskedYes === undefined ? undefined : gte(payments.signedAt, lastAskedYes.at),
+        lastAskedYes === undefined ? undefined : gte(payments.outcomeAt, lastAskedYes.at),
       ),
     )
-    .orderBy(desc(payments.signedAt))
+    // rules.ts's ranking, worst first and then newest, so the limit can never leave out the
+    // payment the reason is worded from.
+    .orderBy(sql`case when ${payments.settlement} = 'mismatch' then 0 when ${payments.delivered} is false then 1 else 2 end`, desc(payments.signedAt))
     .limit(LIMITS.decideMaxCitedMemories);
   if (bad.length === 0) return [];
   const outcomes = await q
@@ -256,20 +259,15 @@ async function badOutcomes(q: Queryable, r: Request): Promise<BadOutcome[]> {
     .from(memories)
     .where(and(ownedHere(r), eq(memories.kind, 'outcome'), inArray(memories.decisionId, bad.map((p) => p.decisionId))))
     .limit(LIMITS.decideMaxCitedMemories);
-  return bad.flatMap((p) =>
-    p.settlement === 'not_landed'
-      ? []
-      : [
-          {
-            paymentId: p.id,
-            amountAtomic: p.amountAtomic,
-            signedAt: p.signedAt,
-            delivered: p.delivered,
-            settlement: p.settlement,
-            outcomeMemoryIds: outcomes.filter((o) => o.decisionId === p.decisionId).map((o) => o.id),
-          },
-        ],
-  );
+  return bad.map((p) => ({
+    paymentId: p.id,
+    amountAtomic: p.amountAtomic,
+    signedAt: p.signedAt,
+    delivered: p.delivered,
+    // The where clause above admits only mismatch, verified and pending.
+    settlement: p.settlement as BadOutcome['settlement'],
+    outcomeMemoryIds: outcomes.filter((o) => o.decisionId === p.decisionId).map((o) => o.id),
+  }));
 }
 
 async function gatherFacts(q: Queryable, r: Request, settings: OwnerSettings, maxPending: number): Promise<Omit<DecideFacts, 'recall'>> {
@@ -278,10 +276,14 @@ async function gatherFacts(q: Queryable, r: Request, settings: OwnerSettings, ma
   const held = await heldOrSpentAtomic(q, r.ownerId, r.now);
 
   // Any status: an answer binds from the moment it is recorded, before its Walrus write lands (C11, C12).
+  // Keyed on the owner and the recipient only: a namespace label is public and authenticates
+  // nothing (C19), so a refusal recorded under any label still refuses.
   const refusals = await q
     .select({ id: memories.id })
     .from(memories)
-    .where(and(ownedHere(r), eq(memories.kind, 'owner_decision'), eq(memories.verdict, 'refuse'), eq(memories.recipient, payment.recipient)))
+    .where(
+      and(eq(memories.ownerId, r.ownerId), eq(memories.kind, 'owner_decision'), eq(memories.verdict, 'refuse'), eq(memories.recipient, payment.recipient)),
+    )
     .orderBy(desc(memories.createdAt))
     .limit(LIMITS.decideMaxCitedMemories);
 

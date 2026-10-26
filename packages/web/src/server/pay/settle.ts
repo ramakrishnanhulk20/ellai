@@ -4,7 +4,7 @@ import { LIMITS } from '@ellai/core/limits';
 import { verifySettlement } from '@ellai/core/payment';
 import { and, eq, sql } from 'drizzle-orm';
 import type { Database } from '../db/client.js';
-import { decisions, owners, payments, rateCounters } from '../db/schema.js';
+import { decisions, owners, payments } from '../db/schema.js';
 import type { Settlement } from './result.js';
 
 export interface SettleArgs {
@@ -16,7 +16,7 @@ export interface SettleArgs {
   tries: number;
   intervalMs: number;
   sleep: (ms: number) => Promise<void>;
-  /** The clock failed reads are counted against; the wall clock when left out. */
+  /** The clock every settlement write is stamped with; the wall clock when left out. */
   now?: () => Date;
 }
 
@@ -33,9 +33,6 @@ export const SETTLEMENT_UNVERIFIABLE = 'settlement_unverifiable';
 export const UNVERIFIABLE = 'unverifiable';
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-// payments has no column for the count, so it lives in the shared counter table under its own
-// prefix, which no other counter's key starts with.
-const UNREADABLE_KEY_PREFIX = 'settlement-unreadable:';
 
 type Read = { kind: 'landed'; result: TransactionResult } | { kind: 'missing' } | { kind: 'unknown' };
 
@@ -53,20 +50,6 @@ async function stored(db: Database, ownerId: string, paymentId: string): Promise
     .from(payments)
     .where(and(eq(payments.id, paymentId), eq(payments.ownerId, ownerId)));
   return row?.settlement ?? 'pending';
-}
-
-/** Counts one more pass whose read failed for this payment, in one atomic upsert, and returns the count so far. */
-async function countFailedRead(db: Database, paymentId: string, now: Date): Promise<number> {
-  if (!(now instanceof Date) || Number.isNaN(now.getTime())) throw new Error('the current time is not a date');
-  const windowMs = LIMITS.settlementUnreadableWindowMs;
-  const windowStart = new Date(Math.floor(now.getTime() / windowMs) * windowMs);
-  const [counter] = await db
-    .insert(rateCounters)
-    .values({ key: `${UNREADABLE_KEY_PREFIX}${paymentId}`, windowStart, count: 1 })
-    .onConflictDoUpdate({ target: [rateCounters.key, rateCounters.windowStart], set: { count: sql`${rateCounters.count} + 1` } })
-    .returning({ count: rateCounters.count });
-  if (counter === undefined) throw new Error('the failed read counter returned no row');
-  return counter.count;
 }
 
 /**
@@ -89,8 +72,11 @@ async function countFailedRead(db: Database, paymentId: string, now: Date): Prom
  * mismatch_reason UNVERIFIABLE and, in the same transaction, sets the owner's
  * auto_paused_reason to SETTLEMENT_UNVERIFIABLE, so decide refuses every later payment until the
  * owner reviews it (C8, C21). Until then it stays 'pending' and counts against the budget. The
- * count is kept per payment in fixed windows of LIMITS.settlementUnreadableWindowMs, so passes
- * that fail on either side of a window boundary are counted again from one.
+ * count is payments.settlement_failed_reads, raised by one atomic UPDATE from 'pending' only, and
+ * it never resets, so the ceiling is reached however far apart the passes come.
+ *
+ * Every write of a settlement sets outcome_at to `now()` in the same UPDATE, so an owner's yes
+ * clears it only from a question asked after Ellai learned it (C32).
  *
  * A payment already past 'pending' is returned as it is. Writes only from 'pending', so two
  * passes never overwrite each other. Throws for an unknown payment or tries out of range.
@@ -137,12 +123,23 @@ export async function settlePayment(args: SettleArgs): Promise<Settlement> {
     resource: null,
   };
   const stillPending = and(eq(payments.id, paymentId), eq(payments.ownerId, ownerId), eq(payments.settlement, 'pending'));
+  // Read at each write, after the chain reads it records, so outcome_at is never earlier than
+  // the fact it dates (C26, C32).
+  const stamp = (): Date => {
+    const at = now();
+    if (!(at instanceof Date) || Number.isNaN(at.getTime())) throw new Error('the current time is not a date');
+    return at;
+  };
 
   // The owner row is locked first, in the order every other writer takes it.
   const mismatch = async (reason: string, pauseReason: string): Promise<Settlement> => {
     const marked = await db.transaction(async (tx) => {
       await tx.select({ id: owners.id }).from(owners).where(eq(owners.id, ownerId)).for('update');
-      const done = await tx.update(payments).set({ settlement: 'mismatch', mismatchReason: reason }).where(stillPending).returning({ id: payments.id });
+      const done = await tx
+        .update(payments)
+        .set({ settlement: 'mismatch', mismatchReason: reason, outcomeAt: stamp() })
+        .where(stillPending)
+        .returning({ id: payments.id });
       if (done.length === 0) return false;
       await tx.update(owners).set({ autoPausedReason: pauseReason }).where(eq(owners.id, ownerId));
       return true;
@@ -153,7 +150,12 @@ export async function settlePayment(args: SettleArgs): Promise<Settlement> {
   const judge = async (result: TransactionResult): Promise<Settlement> => {
     const verdict = verifySettlement(result, approved, purseAddress);
     if (verdict.verified) {
-      const done = await db.update(payments).set({ settlement: 'verified', verifiedAt: new Date() }).where(stillPending).returning({ id: payments.id });
+      const at = stamp();
+      const done = await db
+        .update(payments)
+        .set({ settlement: 'verified', verifiedAt: at, outcomeAt: at })
+        .where(stillPending)
+        .returning({ id: payments.id });
       return done.length > 0 ? 'verified' : stored(db, ownerId, paymentId);
     }
     return mismatch(verdict.reason, SETTLEMENT_MISMATCH);
@@ -161,8 +163,16 @@ export async function settlePayment(args: SettleArgs): Promise<Settlement> {
 
   // Called only once the window has closed, when the bytes can no longer land, so waiting
   // longer would leave the payment pending, and holding the budget, with nothing left to learn.
+  // The count lives on the payment's own row and has no time window, because with many owners
+  // the tick can come back to this one less often than any window would allow (C8, C21).
   const unreadable = async (): Promise<Settlement> => {
-    if ((await countFailedRead(db, paymentId, now())) < LIMITS.settlementUnverifiableReads) return 'pending';
+    const [counted] = await db
+      .update(payments)
+      .set({ settlementFailedReads: sql`${payments.settlementFailedReads} + 1` })
+      .where(stillPending)
+      .returning({ failedReads: payments.settlementFailedReads });
+    if (counted === undefined) return stored(db, ownerId, paymentId);
+    if (counted.failedReads < LIMITS.settlementUnverifiableReads) return 'pending';
     return mismatch(UNVERIFIABLE, SETTLEMENT_UNVERIFIABLE);
   };
 
@@ -190,9 +200,10 @@ export async function settlePayment(args: SettleArgs): Promise<Settlement> {
     if (seen.kind === 'unknown') return unreadable();
     if (seen.kind === 'landed') return judge(seen.result);
   }
+  const releasedAt = stamp();
   const released = await db
     .update(payments)
-    .set({ settlement: 'not_landed', releasedAt: new Date() })
+    .set({ settlement: 'not_landed', releasedAt, outcomeAt: releasedAt })
     .where(stillPending)
     .returning({ id: payments.id });
   return released.length > 0 ? 'not_landed' : stored(db, ownerId, paymentId);
