@@ -50,6 +50,13 @@
       "when": 1793005468084,
       "tag": "0006_lonely_leper_queen",
       "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "7",
+      "when": 1793008683440,
+      "tag": "0007_tiresome_stingray",
+      "breakpoints": true
     }
   ]
 }

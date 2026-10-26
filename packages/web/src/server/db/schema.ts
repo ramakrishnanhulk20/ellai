@@ -130,6 +130,8 @@ export const owners = pgTable(
     distanceCutoff: real('distance_cutoff').notNull().default(0.5),
     paused: boolean('paused').notNull().default(false),
     autoPausedReason: text('auto_paused_reason'),
+    // When the current automatic pause was set, so a signed clear covers only a pause the owner could have seen.
+    autoPausedAt: at('auto_paused_at'),
     // The proof page names an owner's payments only with their say, since each digest leads to their wallet.
     publicProof: boolean('public_proof').notNull().default(false),
     // The jobs tick visits owners least recently visited first, so no owner waits behind the earliest ones.
@@ -273,6 +275,11 @@ export const decisions = pgTable(
     // The owner's history pages read newest first from a time, so a page costs an index range,
     // not a pass over every decision the owner ever had.
     index('decisions_owner_created_at_idx').on(t.ownerId, t.createdAt),
+    // Closed decisions without a payment are pruned by age across all owners. Partial, so an
+    // owner's own history still reads through the owner index.
+    index('decisions_closed_created_at_idx')
+      .on(t.createdAt)
+      .where(sql`${t.status} in ('refused', 'expired', 'failed')`),
     // A retry of a request that is still open or asked must find the first decision,
     // never start a second one that could be paid as well (C5). Once the first has
     // reached any other status, the same request may be decided afresh.
@@ -461,6 +468,9 @@ export const payments = pgTable(
     // Separate settlement passes whose read failed after the window closed; kept on the row so
     // the count outlives however long the tick takes to come back to this owner (C8, C21).
     settlementFailedReads: integer('settlement_failed_reads').notNull().default(0),
+    // The first tick pass that saw the window closed and the digest missing. A release needs a
+    // second such pass well after it, so one lagging read can never free the budget (C4, C27).
+    missingSince: at('missing_since'),
   },
   (t) => [
     sameOwner('payments_decision_same_owner_fk', [t.decisionId, t.ownerId], [decisions.id, decisions.ownerId]),
@@ -510,6 +520,8 @@ export const sellerSales = pgTable(
     expiresAt: at('expires_at').notNull(),
     digest: text('digest').unique(),
     settledAt: at('settled_at'),
+    // Set when the buyer was served; a settled sale without it may be served again to the same bytes (C29).
+    deliveredAt: at('delivered_at'),
     status: text('status', { enum: SALE_STATUSES }).notNull().default('issued'),
   },
   (t) => [
