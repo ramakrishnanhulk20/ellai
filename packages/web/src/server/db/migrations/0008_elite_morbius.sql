@@ -1,0 +1,1 @@
+ALTER TABLE "seller_sales" ADD COLUMN "redeliveries" integer DEFAULT 0 NOT NULL;

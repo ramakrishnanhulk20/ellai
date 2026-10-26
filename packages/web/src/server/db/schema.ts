@@ -522,6 +522,8 @@ export const sellerSales = pgTable(
     settledAt: at('settled_at'),
     // Set when the buyer was served; a settled sale without it may be served again to the same bytes (C29).
     deliveredAt: at('delivered_at'),
+    // Redeliveries of a paid, undelivered check, counted on the row so the lifetime cap is exact and never pruned (C29).
+    redeliveries: integer('redeliveries').notNull().default(0),
     status: text('status', { enum: SALE_STATUSES }).notNull().default('issued'),
   },
   (t) => [
