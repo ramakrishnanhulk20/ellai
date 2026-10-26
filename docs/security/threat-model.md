@@ -176,7 +176,8 @@ Each invariant names the risk it closes. Every backend work order carries the in
   - In any 24-hour span, the total signed never exceeds the daily budget, and no single payment exceeds the hard limit.
   - The check and the debit are one atomic step, taken at the moment of signing, and they count everything signed, not only what has settled.
   - The step repeats when an owner's approval is turned into a signature.
-  - A signed payment is released from the budget only after its validity window has closed and the chain shows it did not land.
+  - A signed payment is released from the budget only after its validity window has closed and the chain shows it did not land, on two separate passes at least 30 minutes apart, so one lagging read can never free the budget. A paid call's own inline check never releases. Refills follow the same rule.
+  - A transaction that landed but failed on chain moved no USDC, so it is released without pausing the owner.
 - **C5 (A4, G3). One decision, at most one payment.**
   - Polls, retries and idempotent replays return the identical stored material, never a fresh signature.
   - A stored result comes back only when the full canonical request matches. A reused key with any difference is refused.
@@ -212,9 +213,11 @@ Each invariant names the risk it closes. Every backend work order carries the in
   - The decision, recipient, amount, owner and time that a rule uses come from Ellai's structured record for that memory, never from parsing the sentence that search returned.
   - Search decides which records are relevant. It cannot change what a record says.
   - "At or above this amount" compares integers.
+  - The distance cutoff decides which past answers an honest agent's request resembles. It is not a defence against a hostile agent, which can repeat the purpose text of requests the owner approved. What bounds a hostile agent is the rest of the rule: only recipients the owner approved, at or below the approved amount, within the daily budget, and a new agent key needs the owner's wallet signature (C36).
 - **C11 (A5, G2). A refusal always wins.**
   - A past owner refusal for the canonical recipient blocks automatic approval regardless of purpose text, distance cutoff, top-K cut-off, index lag, memory expiry, or how many approvals exist.
   - The refusal check is therefore an exact lookup by recipient in Ellai's own store, not a similarity search.
+  - It runs again under the owner lock at signing, so a refusal answered between deciding and signing still wins.
   - The lookup keys on the owner and the canonical recipient, never on a namespace label.
 - **C12 (A10). No answer means ask.**
   - The outcome is "ask", or "refuse" when a hard limit applies, never "approve", if a search:
@@ -296,7 +299,8 @@ Each invariant names the risk it closes. Every backend work order carries the in
   - Any count toward a verdict (failed settlement reads, write attempts) lives on the row it judges, so it outlives however long the rotation takes.
 - **C29 (A1, G1). Ellai's own seller never closes a sale on an unknown outcome.**
   - When it cannot tell whether the buyer's bytes landed, it reads their digest, settles and delivers if the chain shows the payment, and lets the same payment resume.
-  - It rejects only on a definite refusal or a mismatch. Rechecks are limited per sale, and a sale whose window closed without the payment is closed for good.
+  - It rejects only on a definite refusal or a mismatch. A refusal after an earlier send is never definite. Rechecks are limited per sale, and a sale whose window closed without the payment is closed for good only after repeated misses.
+  - Settling and delivering are recorded apart: a buyer whose payment settled but whose check failed is served again for the same payment, up to a fixed number of times, then told plainly it will not be tried again.
 - **C30 (A3, A11). The gas wallet signs only after a successful dry run.** A refill is simulated first and sent only when the dry run succeeds and moves exactly the refill, and only when the allowance's current window still has room for it.
 - **C31 (A2). Repeated JSON keys are refused.** A challenge body or header copy that repeats a key at any level is refused, since parsers disagree on which copy wins.
 - **C32 (A5, G2). A bad outcome makes Ellai ask from the moment it happens.**
@@ -311,13 +315,16 @@ Each invariant names the risk it closes. Every backend work order carries the in
   - Anonymous work (sign-in nonces, zkLogin checks, seller challenges) is capped across all callers as well as per client, and its rows are pruned on a schedule.
   - Cleanup outpaces the caps: every table anonymous callers can fill loses at least as many rows a day as the caps let in, through an indexed key, within a time slice of its own.
   - Caps bound arrivals, so rows standing are a cap times how long each row is kept. That product fits the database plan for every such table, per-client rate counters included, and sign-ins have daily caps because each can create an owner row.
+  - Free wallets can own agents, so agent pay-requests have per-client and global daily caps, and decisions that closed without a payment are pruned after 30 days: at most about 600,000 stand.
+  - Callers with no owner and each owner's background work have budgets of their own inside the shared ones, so strangers cannot spend what owners need to pay, and one owner's background reads cannot starve another's.
   - A sign-in nonce is burned before any chain check or shared quota, so a failed attempt cannot be retried on it and one caller cannot spend the shared quota without spending nonces.
   - Shared caps on paid upstream calls are sized to the credit budget. Exhausting one can lock out everyone using that path until the window ends; that is accepted, logged, and bounded per client.
   - IPv6 clients are keyed on their /64, since one host can hold the whole prefix.
 - **C36 (A9, G3, G4). Loosening needs a fresh signature.**
   - Creating an agent key, raising the per-payment maximum or the daily budget, lowering the approvals needed, raising the distance cutoff, resuming automatic payments, clearing an automatic pause, or turning the public proof page on each needs a signature from the owner's wallet, made within minutes, over a message that names that exact change. The signature works once, for that owner and that change only, and a failed one burns its nonce.
   - Tightening needs only the session.
-  - Answering questions needs only the session, by Ram's choice: a stolen session can approve what existing agents already asked for, up to the daily budget, and every such payment is in the owner's history.
+  - Answering questions and starting a built-in agent task need only the session, by Ram's choice: a stolen session can approve what agents ask for and run the built-in agent, which buys only from its catalog, up to the daily budget. It cannot pay anyone outside the catalog or past the budget, every payment is in the owner's history, and the owner can end every session at once or pause.
+  - A stolen session cannot use up the owner's step-up or agent-create allowance: each is counted per session as well as per owner.
 - **C35 (A6, G3). Revoke and sign share the owner lock.** Revoking an agent takes the owner row lock that signing takes, so a revoke lands either before a signature, which then refuses, or after it, when that payment is counted and verified like any other.
 
 **1. Primitives over lists**
@@ -382,6 +389,7 @@ Each invariant names the risk it closes. Every backend work order carries the in
 - stop an approved agent spending badly within its limits
 - stop a replay of a landed payment's header: its bytes and signature are public on chain, so anyone can present them to the seller, a property of x402 bearer payments
 - stop a caller that is not a browser with Origin checks; they stop cross-site browser requests only
+- check a zkLogin proof without Tatum: sign-in and step-up trust Tatum's answer on a zkLogin signature, as every chain fact Ellai uses comes through Tatum
 - survive a full server compromise beyond what the chain bounds; how much that is depends on the option (below)
 
 ## Option-sensitive risks
