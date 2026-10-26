@@ -18,6 +18,7 @@ const MAX_PAYMENT = BigInt(LIMITS.maxPaymentAtomic);
 const MAX_DAILY_BUDGET = BigInt(LIMITS.onboardingDailyLimitMaxAtomic);
 const NONCE_PATTERN = new RegExp(`^[0-9a-f]{${LIMITS.signinNonceBytes * 2}}$`);
 const STEP_UP_KEY_PREFIX = 'owner-step-up:';
+const STEP_UP_SESSION_KEY_PREFIX = 'owner-step-up-session:';
 // A label cannot start a line of its own in the message, where it could pass for another setting.
 const LINE_BREAKS = /[\r\n\v\f\u0085\p{Zl}\p{Zp}]/gu;
 
@@ -98,6 +99,34 @@ export interface OwnerSettings {
   approvalsNeeded: number;
   distanceCutoff: number;
   publicProof: boolean;
+}
+
+/**
+ * An automatic pause as the owner row holds it: auto_paused_reason, and auto_paused_at, the time
+ * it was set. A step-up that clears one names both (C36, C8), so a pause set after the owner read
+ * the message is never cleared by it. Both are null when no pause is set; auto_paused_at is null
+ * too for a pause set before the column existed.
+ */
+export interface AutoPause {
+  reason: string | null;
+  at: Date | null;
+}
+
+/** The pause columns of the owner row, for a read that a step-up or a signed clear is checked against. */
+export const OWNER_AUTO_PAUSE = { autoPausedReason: owners.autoPausedReason, autoPausedAt: owners.autoPausedAt };
+
+/** The pause a row read through OWNER_AUTO_PAUSE holds. */
+export function autoPauseOf(row: { autoPausedReason: string | null; autoPausedAt: Date | null }): AutoPause {
+  return { reason: row.autoPausedReason, at: row.autoPausedAt };
+}
+
+/** Whether two reads of the owner row show the same pause: the same reason, set at the same millisecond, or no pause in both. */
+export function sameAutoPause(a: AutoPause, b: AutoPause): boolean {
+  return a.reason === b.reason && (a.at?.getTime() ?? null) === (b.at?.getTime() ?? null);
+}
+
+function clearsAutoPause(request: StepUpRequest): boolean {
+  return request.action === 'loosen_settings' && request.change.clearAutoPause === true;
 }
 
 function checkNow(now: Date): Date {
@@ -187,10 +216,17 @@ function canonicalJson(value: unknown): string {
 
 /**
  * The SHA-256, in lowercase hex, of the canonical JSON of { ownerId, action, change }, so it names
- * exactly one change for one owner.
+ * exactly one change for one owner. A settings change that clears the automatic pause adds
+ * pause: { reason, at }, `pause` with its time as an ISO string, so it names the one pause it
+ * clears as well. Throws Error when such a change comes without `pause`, which is a server bug.
  */
-export function stepUpChangeHash(ownerId: string, request: StepUpRequest): string {
-  return createHash('sha256').update(canonicalJson({ ownerId, action: request.action, change: request.change }), 'utf8').digest('hex');
+export function stepUpChangeHash(ownerId: string, request: StepUpRequest, pause?: AutoPause): string {
+  const named: Record<string, unknown> = { ownerId, action: request.action, change: request.change };
+  if (clearsAutoPause(request)) {
+    if (pause === undefined) throw new Error('A step-up that clears the automatic pause must name the pause');
+    named.pause = { reason: pause.reason, at: pause.at === null ? null : pause.at.toISOString() };
+  }
+  return createHash('sha256').update(canonicalJson(named), 'utf8').digest('hex');
 }
 
 // Exact to the atomic unit, with trailing zeros dropped down to cents: 2000000 reads 2.00, 15000 reads 0.015.
@@ -198,9 +234,16 @@ function usdcText(atomic: bigint): string {
   return formatUsdc(atomic).replace(/(\.\d{2}\d*?)0+$/, '$1');
 }
 
+// The pause a clear names, so the owner signs for the pause on screen and no other.
+function pauseText(pause: AutoPause): string {
+  if (pause.reason === null) return 'none is set';
+  const reason = `"${pause.reason.replace(LINE_BREAKS, '')}"`;
+  return pause.at === null ? reason : `${reason}, set ${pause.at.toISOString()}`;
+}
+
 // One line per field the change holds, always in this order, whatever order the body sent them in.
-function changeLines(request: StepUpRequest): string[] {
-  if (request.action === 'create_agent') return [`Create agent key: ${request.change.label.replace(LINE_BREAKS, '')}`];
+function changeLines(request: StepUpRequest, pause: AutoPause): string[] {
+  if (request.action === 'create_agent') return [`Create agent key named "${request.change.label.replace(LINE_BREAKS, '')}"`];
   const change = request.change;
   const lines: string[] = [];
   if (change.perPaymentMaxAtomic !== undefined) lines.push(`Per-payment maximum: ${usdcText(change.perPaymentMaxAtomic)} USDC`);
@@ -208,7 +251,7 @@ function changeLines(request: StepUpRequest): string[] {
   if (change.approvalsNeeded !== undefined) lines.push(`Approvals needed: ${change.approvalsNeeded}`);
   if (change.distanceCutoff !== undefined) lines.push(`Distance cutoff: ${change.distanceCutoff}`);
   if (change.paused !== undefined) lines.push(`Automatic payments: ${change.paused ? 'paused' : 'resumed'}`);
-  if (change.clearAutoPause !== undefined) lines.push('Clear automatic pause: yes');
+  if (change.clearAutoPause !== undefined) lines.push(`Clear automatic pause: ${pauseText(pause)}`);
   if (change.publicProof !== undefined) lines.push(`Public proof page: ${change.publicProof ? 'on' : 'off'}`);
   return lines;
 }
@@ -222,12 +265,19 @@ function hostOf(appOrigin: string): string {
 }
 
 /**
- * Counts one step-up request against this owner's LIMITS.stepUpsPerOwnerPerHour, in the fixed hour
- * that holds `now` (C22). The key is the owner the session named, never anything the caller sends,
- * and a request over the limit still counts. Throws HttpError 429 too_many_step_ups beyond it.
+ * Counts one step-up request in the fixed hour that holds `now`, first against the session's
+ * LIMITS.stepUpsPerSessionPerHour and then against this owner's LIMITS.stepUpsPerOwnerPerHour
+ * (C22, C36), so one session, a stolen one included, can never use up the owner's hour. Both
+ * keys come from the session requireOwner found, never from anything the caller sends. A request
+ * over a limit still counts toward it, and one over the session's limit is not counted against
+ * the owner's. Throws HttpError 429 too_many_step_ups beyond either.
  */
-export async function limitStepUps(db: Database, ownerId: string, now: Date): Promise<void> {
-  if (!(await consumeWindow(db, `${STEP_UP_KEY_PREFIX}${ownerId}`, LIMITS.stepUpsPerOwnerPerHour, LIMITS.rateWindowHourMs, checkNow(now)))) {
+export async function limitStepUps(db: Database, owner: { ownerId: string; sessionId: string }, now: Date): Promise<void> {
+  const at = checkNow(now);
+  if (
+    !(await consumeWindow(db, `${STEP_UP_SESSION_KEY_PREFIX}${owner.sessionId}`, LIMITS.stepUpsPerSessionPerHour, LIMITS.rateWindowHourMs, at)) ||
+    !(await consumeWindow(db, `${STEP_UP_KEY_PREFIX}${owner.ownerId}`, LIMITS.stepUpsPerOwnerPerHour, LIMITS.rateWindowHourMs, at))
+  ) {
     throw new HttpError(429, 'too_many_step_ups');
   }
 }
@@ -238,8 +288,10 @@ export async function limitStepUps(db: Database, ownerId: string, now: Date): Pr
  * per field of the change in a fixed order and in words with units, the nonce (128 random bits)
  * and both times. It expires LIMITS.stepUpTtlMs after `now`. The row keeps the exact message and
  * stepUpChangeHash of the change, so the signature can authorise that change once and nothing else.
- * The change is checked as the route that applies it checks it: a label by agentLabel, a settings
- * change by settingsBoundsProblem against the owner's row and then settingsLoosen.
+ * A change that clears the automatic pause names the pause the owner row holds now, its reason and
+ * the time it was set, in the message line and in the hash, so the signature clears that pause
+ * only. The change is checked as the route that applies it checks it: a label by agentLabel, a
+ * settings change by settingsBoundsProblem against the owner's row and then settingsLoosen.
  * Throws AgentError BAD_INPUT for a bad label; HttpError 400 out_of_bounds for a setting outside
  * its bounds, 400 step_up_not_needed for a settings change that loosens nothing, 401 signed_out
  * when the owner row is gone. Throws Error for a `now` that is not a date or an app origin that
@@ -250,7 +302,7 @@ export async function issueStepUp(args: { db: Database; ownerId: string; appOrig
   const host = hostOf(args.appOrigin);
   const request = normalised(args.request);
   const [owner] = await args.db
-    .select({ suiAddress: owners.suiAddress, ...OWNER_SETTINGS })
+    .select({ suiAddress: owners.suiAddress, ...OWNER_SETTINGS, ...OWNER_AUTO_PAUSE })
     .from(owners)
     .where(eq(owners.id, args.ownerId));
   if (owner === undefined) throw new HttpError(401, 'signed_out');
@@ -259,6 +311,7 @@ export async function issueStepUp(args: { db: Database; ownerId: string; appOrig
     if (problem !== null) throw new HttpError(400, 'out_of_bounds', problem);
     if (!settingsLoosen(owner, request.change)) throw new HttpError(400, 'step_up_not_needed');
   }
+  const pause = autoPauseOf(owner);
 
   const nonce = randomBytes(LIMITS.signinNonceBytes).toString('hex');
   const expiresAt = new Date(now.getTime() + LIMITS.stepUpTtlMs);
@@ -266,14 +319,14 @@ export async function issueStepUp(args: { db: Database; ownerId: string; appOrig
     `${host} asks you to confirm a change to your Ellai account.`,
     '',
     `Account: ${canonicalSuiAddress(owner.suiAddress)}`,
-    ...changeLines(request),
+    ...changeLines(request, pause),
     '',
     `Nonce: ${nonce}`,
     `Issued At: ${now.toISOString()}`,
     `Expiration Time: ${expiresAt.toISOString()}`,
   ].join('\n');
   if (Array.from(message).length > TEXT_CAPS.stepUpMessage) throw new Error('The step-up message is longer than its column holds');
-  await args.db.insert(stepUps).values({ nonce, ownerId: args.ownerId, action: request.action, changeHash: stepUpChangeHash(args.ownerId, request), message, createdAt: now, expiresAt });
+  await args.db.insert(stepUps).values({ nonce, ownerId: args.ownerId, action: request.action, changeHash: stepUpChangeHash(args.ownerId, request, pause), message, createdAt: now, expiresAt });
   return { nonce, message, expiresAt };
 }
 
@@ -281,37 +334,57 @@ function rejected(): never {
   throw new HttpError(401, 'step_up_rejected');
 }
 
+// A pause that is gone, or was set after the step-up was issued, cannot be the one it names.
+function pauseChangedSince(pause: AutoPause, issuedAt: Date): boolean {
+  return pause.reason === null || (pause.at !== null && pause.at.getTime() > issuedAt.getTime());
+}
+
 /**
  * Spends a step-up on exactly this change for this owner, or refuses it (C14, C36). In order:
- * 1. The owner's address is read; a missing row is HttpError 401 signed_out and spends nothing.
+ * 1. The owner's address and automatic pause are read; a missing row is HttpError 401 signed_out
+ *    and spends nothing.
  * 2. The nonce is claimed by one conditional update that only this owner's unused, unexpired
  *    step-up can pass. It commits on its own, before the signature is checked, because a zkLogin
  *    check sends a Tatum request whose meter writes on this same connection, which an open
  *    transaction on PGlite would block. From here the nonce is spent whatever follows, so a
  *    replay or a race finds it used. Another owner's step-up is never touched.
- * 3. The claimed row must name this action and stepUpChangeHash of this change.
+ * 3. The claimed row must name this action and stepUpChangeHash of this change, for a change that
+ *    clears the automatic pause with the pause read in 1.
  * 4. The signature must recover, over the stored message, to the owner's address through
  *    sign-in's own check (zkLoginChecksOf, recoveredAddress): offline for Ed25519, Secp256k1,
  *    Secp256r1 and multisig, through `zkLoginClient` for zkLogin, inside the caller's Tatum scope.
  * Every refusal in 2 to 4 is HttpError 401 step_up_rejected with one fixed text, whatever the
- * reason, and leaves a claimed nonce used. Throws SignInError CHAIN_UNAVAILABLE (503) when Sui
- * cannot be read for a zkLogin proof, and HttpError 503 chain_unavailable_today when the Tatum
- * budget refuses that check; the nonce stays used. Returns only when the change may be applied.
+ * reason, and leaves a claimed nonce used, with one exception: a change that clears the automatic
+ * pause whose hash fails in 3 while the pause is gone or was set after the step-up was issued is
+ * HttpError 409 pause_changed, since the owner signed for a pause that is no longer the one set.
+ * Throws SignInError CHAIN_UNAVAILABLE (503) when Sui cannot be read for a zkLogin proof, and
+ * HttpError 503 chain_unavailable_today when the Tatum budget refuses that check; the nonce stays
+ * used. Returns, only when the change may be applied, the pause read in 1:
+ * for a change that clears it, the pause the owner signed for, which the caller must find
+ * unchanged under the owner row lock before it clears anything (sameAutoPause).
  */
-export async function claimStepUp(args: { db: Database; ownerId: string; request: StepUpRequest; proof: StepUpProof; zkLoginClient: ClientWithCoreApi; now: Date }): Promise<void> {
+export async function claimStepUp(args: { db: Database; ownerId: string; request: StepUpRequest; proof: StepUpProof; zkLoginClient: ClientWithCoreApi; now: Date }): Promise<AutoPause> {
   const now = checkNow(args.now);
   const request = normalised(args.request);
-  const changeHash = stepUpChangeHash(args.ownerId, request);
-  const [owner] = await args.db.select({ suiAddress: owners.suiAddress }).from(owners).where(eq(owners.id, args.ownerId));
+  const [owner] = await args.db
+    .select({ suiAddress: owners.suiAddress, ...OWNER_AUTO_PAUSE })
+    .from(owners)
+    .where(eq(owners.id, args.ownerId));
   if (owner === undefined) throw new HttpError(401, 'signed_out');
   const address = canonicalSuiAddress(owner.suiAddress);
+  const pause = autoPauseOf(owner);
+  const changeHash = stepUpChangeHash(args.ownerId, request, pause);
 
   const [claimed] = await args.db
     .update(stepUps)
     .set({ usedAt: now })
     .where(and(eq(stepUps.nonce, args.proof.nonce), eq(stepUps.ownerId, args.ownerId), isNull(stepUps.usedAt), gt(stepUps.expiresAt, now)))
-    .returning({ action: stepUps.action, changeHash: stepUps.changeHash, message: stepUps.message });
-  if (claimed === undefined || claimed.action !== request.action || claimed.changeHash !== changeHash) rejected();
+    .returning({ action: stepUps.action, changeHash: stepUps.changeHash, message: stepUps.message, createdAt: stepUps.createdAt });
+  if (claimed === undefined || claimed.action !== request.action) rejected();
+  if (claimed.changeHash !== changeHash) {
+    if (clearsAutoPause(request) && pauseChangedSince(pause, claimed.createdAt)) throw new HttpError(409, 'pause_changed');
+    rejected();
+  }
 
   let signer: string;
   try {
@@ -322,4 +395,5 @@ export async function claimStepUp(args: { db: Database; ownerId: string; request
     throw error;
   }
   if (signer !== address) rejected();
+  return pause;
 }

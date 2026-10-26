@@ -2,6 +2,7 @@ import { LIMITS } from '@ellai/core/limits';
 import { and, asc, count, eq, isNull } from 'drizzle-orm';
 import type { Database } from '../db/client.js';
 import { AGENT_KINDS, TEXT_CAPS, agents, owners } from '../db/schema.js';
+import { hasQuoteMark } from '../decide/sentences.js';
 import { AGENT_TOKEN_PREFIX, hashBearerToken, isBearerToken, newBearerToken } from './tokens.js';
 
 export type AgentErrorCode = 'BAD_INPUT' | 'NOT_FOUND' | 'TOO_MANY_AGENTS';
@@ -30,6 +31,14 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 // Format characters (bidi overrides, zero-width joiners) and line or paragraph separators too: a
 // label is shown in the wallet message the owner signs, and these can make it read as other text.
 const CONTROL_CHARACTER = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u;
+// A wallet wraps a long line, so a label padded with blanks could push text onto what looks like
+// a line of its own. This refuses every space separator but the plain space, every
+// Default_Ignorable_Code_Point (the Hangul fillers U+115F, U+1160, U+3164 and U+FFA0, the
+// Mongolian vowel separator, variation selectors and the like), and the blank Braille pattern
+// U+2800, which draws nothing but is an ordinary symbol. Not covered: a visible character that a
+// given font happens to draw as blank.
+const HIDDEN_SPACE = /(?! )\p{Zs}|[\p{Default_Ignorable_Code_Point}\u2800]/u;
+const SPACE_RUN = / {2,}/g;
 
 function bad(message: string): never {
   throw new AgentError('BAD_INPUT', message);
@@ -45,24 +54,36 @@ function checkNow(now: Date): Date {
   return now;
 }
 
-/** Trimmed, 1 to TEXT_CAPS.agentLabel code points, no control or format characters. Throws AgentError BAD_INPUT. */
+/**
+ * A label as it is stored and shown in the step-up message: trimmed, each run of spaces made one,
+ * 1 to TEXT_CAPS.agentLabel code points. Refused once trimmed: control and format characters, any
+ * space separator but the plain space, invisible filler letters (HIDDEN_SPACE), and any quote mark
+ * but an apostrophe (hasQuoteMark), since the message quotes the label in double quotes and a mark
+ * that reads as one could end the quote early.
+ * Applying it to its own result changes nothing. Throws AgentError BAD_INPUT.
+ */
 export function checkLabel(label: unknown): string {
   if (typeof label !== 'string') bad('the label must be text');
   const trimmed = label.trim();
-  // Counted in code points, as Postgres counts the column cap.
-  const length = Array.from(trimmed).length;
-  if (length === 0 || length > TEXT_CAPS.agentLabel) bad(`the label must be 1 to ${TEXT_CAPS.agentLabel} characters`);
   if (CONTROL_CHARACTER.test(trimmed)) bad('the label must not contain control characters');
-  return trimmed;
+  if (HIDDEN_SPACE.test(trimmed)) bad('the label must not contain blank characters other than the plain space');
+  if (hasQuoteMark(trimmed)) bad('the label must not contain quote marks other than an apostrophe');
+  const cleaned = trimmed.replace(SPACE_RUN, ' ');
+  // Counted in code points, as Postgres counts the column cap.
+  const length = Array.from(cleaned).length;
+  if (length === 0 || length > TEXT_CAPS.agentLabel) bad(`the label must be 1 to ${TEXT_CAPS.agentLabel} characters`);
+  return cleaned;
 }
 
 /**
  * Creates an agent for an owner and its bearer token (C13). Only the token's hash and its
  * display prefix are stored; the token itself is returned here once and can never be read
- * back. The label is trimmed and must be 1 to TEXT_CAPS.agentLabel characters with no
- * control characters. An owner holds at most LIMITS.agentsPerOwnerMax external agents that are
- * not revoked: the count and the insert run in one transaction holding the owner row FOR
- * UPDATE, so two creates at once can never both take the last place. The built-in agent is not
+ * back. The label is read by checkLabel: trimmed, each run of spaces made one, 1 to
+ * TEXT_CAPS.agentLabel characters, with no control characters, no blank but the plain space, no
+ * invisible filler and no quote mark but an apostrophe. An owner holds at most
+ * LIMITS.agentsPerOwnerMax external agents that are not revoked: the count and the insert run in
+ * one transaction holding the owner row FOR UPDATE, so two creates at once can never both take
+ * the last place. The built-in agent is not
  * counted, so an owner at the cap can still run it; the agents_one_live_builtin_per_owner index
  * holds each owner to one live built-in agent.
  * Throws AgentError: BAD_INPUT, NOT_FOUND (no such owner), TOO_MANY_AGENTS (the owner already

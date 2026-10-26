@@ -12,14 +12,16 @@ export const dynamic = 'force-dynamic';
  * takes it; { nonce, message, expiresAt } out. The wallet signs the message as a Sui personal
  * message, and the route that applies the change takes { nonce, signature } as its stepUp, once,
  * within LIMITS.stepUpTtlMs, for exactly that change (issueStepUp, claimStepUp). Each call counts
- * toward the owner's LIMITS.stepUpsPerOwnerPerHour before the body is read (C22). The owner comes
+ * toward the session's LIMITS.stepUpsPerSessionPerHour and then the owner's
+ * LIMITS.stepUpsPerOwnerPerHour before the body is read (limitStepUps; C22, C36). The owner comes
  * from the session alone (C13) and the request must come from the app (C14). 403 cross_origin,
  * 401 signed_out, 429 too_many_step_ups, 400 for a bad body or label, 400 out_of_bounds for a
  * setting outside its bounds, 400 step_up_not_needed for a settings change that loosens nothing.
  */
-export const POST = scoped('owner', async (request, ctx, { ownerId }): Promise<Response> => {
+export const POST = scoped('owner', async (request, ctx, owner): Promise<Response> => {
+  const { ownerId } = owner;
   const now = ctx.now();
-  await limitStepUps(ctx.db, ownerId, now);
+  await limitStepUps(ctx.db, owner, now);
   const asked = await readJson(request, stepUpRequest, STEP_UP_REQUEST_MAX_BYTES);
   return jsonResponse(await issueStepUp({ db: ctx.db, ownerId, appOrigin: ctx.env.APP_ORIGIN, request: asked, now }));
 });

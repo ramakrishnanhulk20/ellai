@@ -68,6 +68,22 @@ export async function endSession(args: { db: Database; token: string | undefined
 }
 
 /**
+ * Ends every live session of one owner, the one asking included, by setting revoked_at to `now`
+ * on each that is neither revoked nor expired, so a copied session token stops working however
+ * many there are (C13, C14). Sessions already ended keep the time they ended at. Returns how
+ * many were ended. Throws Error if `now` is not a date.
+ */
+export async function endOwnerSessions(args: { db: Database; ownerId: string; now: Date }): Promise<number> {
+  const now = checkNow(args.now);
+  const ended = await args.db
+    .update(sessions)
+    .set({ revokedAt: now })
+    .where(and(eq(sessions.ownerId, args.ownerId), isNull(sessions.revokedAt), gt(sessions.expiresAt, now)))
+    .returning({ id: sessions.id });
+  return ended.length;
+}
+
+/**
  * The Set-Cookie value that carries a session token: HttpOnly, SameSite=Strict, Path=/, no
  * Domain, Max-Age counted from the current clock to `expiresAt` (0 once it has passed), and
  * Secure under the name SECURE_SESSION_COOKIE_NAME unless `secure` is exactly false, which only

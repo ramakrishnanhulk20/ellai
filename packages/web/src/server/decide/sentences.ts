@@ -10,9 +10,26 @@ const PLAIN_HOST = /^[a-z0-9.-]{1,253}$/;
 // Control and format characters (bidi overrides, zero-width marks) and line or paragraph
 // separators could split a sentence or reorder it on screen.
 const UNSAFE_CHARACTERS = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu;
-// Every opening and closing quote mark, not only the straight one, so quoted text can never
-// look as if it closed its own quotes.
-const QUOTE_MARKS = /["\p{Pi}\p{Pf}]/gu;
+// Every character with the Unicode Quotation_Mark property but the two apostrophes, U+0027 and
+// U+2019, which cannot pass for the double quote these sentences wrap text in, and the ones that
+// read as a quote mark without the property, both before NFKC and in the forms NFKC leaves: grave
+// and acute accents and their modifier letters, modifier primes, apostrophes and turned commas,
+// the double acute, double grave and double vertical line that NFKC leaves over a space, Armenian
+// and N'Ko apostrophes, Hebrew geresh and gershayim, the Vedic nihshvasa, primes (NFKC folds a
+// double prime into two), the dingbat quote ornaments, turned and reversed commas, the ditto
+// mark, the saltillo and the fullwidth grave. Not covered: a letter or symbol that looks like a
+// quote only in some font, or a run of apostrophes, which ordinary text needs.
+const QUOTE_MARKS =
+  /(?![\u0027\u2019])[\p{Quotation_Mark}\u0060\u00B4\u02B9-\u02BD\u02C8\u02CA\u02CB\u02DD\u02EE\u02F4-\u02F6\u030B\u030E\u030F\u055A\u059C-\u059E\u05F3\u05F4\u07F4\u07F5\u1CD3\u2032-\u2037\u2057\u275B-\u2760\u2E32\u2E41\u3003\uA78B\uA78C\uFF40\u{1F676}-\u{1F678}]/gu;
+
+/**
+ * Whether text holds a quote mark other than an apostrophe, or a character that reads as one, as
+ * quoted() removes them, checked as written and after NFKC so a compatibility form cannot slip
+ * past.
+ */
+export function hasQuoteMark(text: string): boolean {
+  return text.search(QUOTE_MARKS) !== -1 || text.normalize('NFKC').search(QUOTE_MARKS) !== -1;
+}
 
 /** Atomic USDC as a decimal with all six places, for example 10000n as '0.010000'. Throws RangeError below zero. */
 export function formatUsdc(atomic: bigint): string {
@@ -30,8 +47,10 @@ export function hostLabel(host: string, startOfSentence = false): string {
 
 /**
  * Agent or owner text made safe to sit inside an Ellai sentence: look-alike forms folded,
- * control, format and line-break characters turned into spaces, every quote mark removed,
- * runs of space collapsed, cut to `maxChars` characters, then wrapped in double quotes.
+ * control, format and line-break characters turned into spaces, every quote mark but the two
+ * apostrophes and every character that reads as one removed (QUOTE_MARKS), runs of space
+ * collapsed, cut to `maxChars` characters, then wrapped in double quotes, so the text can never
+ * seem to close its quotes and start a sentence of its own.
  */
 export function quoted(text: string | null, maxChars: number): string {
   const cleaned = (text ?? '')

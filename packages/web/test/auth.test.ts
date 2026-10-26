@@ -12,7 +12,9 @@
 // (503 chain_unavailable_today), counted only once the signature holds and before any owner row;
 // an owner row pruned between the sign-in steps made again under a key-share lock;
 // the owner row and its derived purse; sessions, their cookie (named __Host-ellai_session
-// whenever it is Secure, and read under that name only) and their end; agent tokens,
+// whenever it is Secure, and read under that name only), their end, and ending every live one of
+// an owner at once; labels with runs of spaces made one and blank fillers or quote marks but
+// apostrophes refused; agent tokens,
 // their display prefixes, the cap on live external agents per owner (never counting the one
 // built-in agent), and their revocation behind the owner's row lock; that one
 // kind of token never works as the other or as a record id;
@@ -44,8 +46,8 @@ import { computeZkLoginAddressFromSeed, getZkLoginSignature } from '@mysten/sui/
 import { eq } from 'drizzle-orm';
 import { drizzle as drizzlePglite } from 'drizzle-orm/pglite';
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
-import { AgentError, authenticateAgent, createAgentToken, listAgents, revokeAgent } from '../src/server/auth/agents.js';
-import { endSession, readSessionCookie, resolveSession, sessionCookie } from '../src/server/auth/sessions.js';
+import { AgentError, authenticateAgent, checkLabel, createAgentToken, listAgents, revokeAgent } from '../src/server/auth/agents.js';
+import { endOwnerSessions, endSession, readSessionCookie, resolveSession, sessionCookie } from '../src/server/auth/sessions.js';
 import {
   SIGN_IN_CLIENT_DAY,
   SIGN_IN_SHARED_DAY,
@@ -834,6 +836,34 @@ describe('sessions', () => {
     expect(one(await db.select().from(sessions).where(eq(sessions.ownerId, result.ownerId))).revokedAt).toEqual(later(5_000));
   });
 
+  it("ends every live session of one owner at once, leaving an ended or expired one as it was and another owner's open", async () => {
+    const signer = Ed25519Keypair.generate();
+    const first = await signIn(signer);
+    const second = await signIn(signer);
+    const ended = await signIn(signer);
+    const expired = await signIn(signer);
+    const other = await signIn();
+    expect(new Set([first.ownerId, second.ownerId, ended.ownerId, expired.ownerId])).toEqual(new Set([first.ownerId]));
+    const hashOf = (token: string) => hashBearerToken(token, SECRET) ?? '';
+    await endSession({ db, token: ended.sessionToken, sessionSecretHex: SECRET, now: later(1_000) });
+    await db.update(sessions).set({ expiresAt: later(2_000) }).where(eq(sessions.tokenHash, hashOf(expired.sessionToken)));
+
+    expect(await endOwnerSessions({ db, ownerId: first.ownerId, now: later(5_000) })).toBe(2);
+    for (const token of [first.sessionToken, second.sessionToken, ended.sessionToken, expired.sessionToken]) {
+      expect(await resolveSession({ db, token, sessionSecretHex: SECRET, now: later(5_000) })).toBeNull();
+    }
+    const revokedAt = async (token: string) => one(await db.select({ revokedAt: sessions.revokedAt }).from(sessions).where(eq(sessions.tokenHash, hashOf(token)))).revokedAt;
+    expect([await revokedAt(first.sessionToken), await revokedAt(second.sessionToken), await revokedAt(ended.sessionToken), await revokedAt(expired.sessionToken)]).toEqual([
+      later(5_000),
+      later(5_000),
+      later(1_000),
+      null,
+    ]);
+    expect(await resolveSession({ db, token: other.sessionToken, sessionSecretHex: SECRET, now: later(5_000) })).toEqual({ ownerId: other.ownerId, sessionId: expect.any(String) });
+    expect(await endOwnerSessions({ db, ownerId: first.ownerId, now: later(6_000) })).toBe(0);
+    await expect(endOwnerSessions({ db, ownerId: first.ownerId, now: new Date(Number.NaN) })).rejects.toThrow('The current time is not a date');
+  });
+
   it('refuses a malformed or wrong-kind token without touching the database', async () => {
     const session = newBearerToken(SESSION_TOKEN_PREFIX, SECRET).token;
     const agent = newBearerToken(AGENT_TOKEN_PREFIX, SECRET).token;
@@ -941,6 +971,27 @@ describe('agents', () => {
     await expect(createAgent('not-a-uuid')).rejects.toMatchObject({ code: 'BAD_INPUT' });
     await expect(createAgent('00000000-0000-4000-8000-000000000000')).rejects.toThrow(new AgentError('NOT_FOUND', 'there is no such owner'));
     expect(await listAgents({ db, ownerId })).toEqual([]);
+  });
+
+  it('makes each run of spaces one, and refuses every other blank, invisible filler and quote mark but an apostrophe, so a label can neither pad a wallet line nor end its quote', async () => {
+    const ch = (...codePoints: number[]) => String.fromCodePoint(...codePoints);
+    expect(checkLabel('  Trip   planner  two ')).toBe('Trip planner two');
+    expect(checkLabel(checkLabel('  Trip   planner  two '))).toBe('Trip planner two');
+    for (const fine of ['Caf' + ch(0xe9) + ' bot', "Ram's bot", `Ram${ch(0x2019)}s bot`, ch(0x1f600).repeat(3), 'Agent-2 (travel)', ch(0x0928, 0x092e, 0x0938, 0x094d, 0x0924, 0x0947)]) {
+      expect(checkLabel(fine)).toBe(fine);
+    }
+    const blanks = [0xa0, 0x1680, 0x2000, 0x2003, 0x200a, 0x202f, 0x205f, 0x3000];
+    const fillers = [0x115f, 0x1160, 0x3164, 0xffa0, 0x2800, 0x180e, 0x034f, 0xfe0f, 0xe0041];
+    const quotes = [0x22, 0x201c, 0x201d, 0x201e, 0x2033, 0x2036, 0x02ba, 0x02ee, 0x05f4, 0x3003, 0x301e, 0xff02, 0x2e42, 0x02dd];
+    for (const codePoint of [...blanks, ...fillers, ...quotes]) {
+      const label = `Bot${ch(codePoint).repeat(20)}Daily budget: 5.00 USDC`;
+      expect(() => checkLabel(label), codePoint.toString(16)).toThrow(AgentError);
+    }
+    expect(() => checkLabel(`Bot${ch(0x3164)}`)).toThrow(new AgentError('BAD_INPUT', 'the label must not contain blank characters other than the plain space'));
+    expect(() => checkLabel('Bot" and "x')).toThrow(new AgentError('BAD_INPUT', 'the label must not contain quote marks other than an apostrophe'));
+    const { ownerId } = await signIn();
+    await createAgent(ownerId, ' Trip   planner ');
+    expect((await listAgents({ db, ownerId })).map((agent) => agent.label)).toEqual(['Trip planner']);
   });
 
   it('refuses the 21st live external agent, even in a race, never counts the built-in agent, and makes room when one is revoked', async () => {

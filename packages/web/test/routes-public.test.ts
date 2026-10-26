@@ -4,7 +4,9 @@
 // without the exact secret, with its own Bearer challenge, and run with it, its summary in fixed codes only, and old rate
 // counters pruned; the public proof listing only verified payments and memories found on chain
 // and not since expired there,
-// only for owners who opted in and with totals over those owners only, with no sentence,
+// only for owners who opted in and with totals over those owners only (a learned approval
+// counted once its payment is verified, a question only for an owner the page shows), a seller
+// host only as the sentences write it, with no sentence,
 // purpose, label or owner address, at most 20 of each, read from the
 // database at most once per cache window however many requests come, and its last good copy
 // or a 503 when a refresh fails; and the fixed status, code and wording toErrorResponse gives
@@ -392,8 +394,14 @@ describe('GET /api/public/proof', () => {
     return row?.id ?? '';
   }
 
-  async function proofPayment(w: Party, settlement: 'verified' | 'pending' | 'mismatch' | 'not_landed', signedAt: Date, amountAtomic = 10_000n): Promise<string> {
-    const decisionId = await proofDecision(w, { amountAtomic });
+  async function proofPayment(
+    w: Party,
+    settlement: 'verified' | 'pending' | 'mismatch' | 'not_landed',
+    signedAt: Date,
+    amountAtomic = 10_000n,
+    decision: Partial<typeof decisions.$inferInsert> = {},
+  ): Promise<string> {
+    const decisionId = await proofDecision(w, { amountAtomic, ...decision });
     const digest = toBase58(randomBytes(32));
     await proofDb.db.insert(payments).values({
       decisionId,
@@ -463,7 +471,7 @@ describe('GET /api/public/proof', () => {
     const { response, text, body } = await proof();
     expect(response.status).toBe(200);
     expect(body).toEqual({
-      totals: { verifiedPayments: 2, verifiedUsdcAtomic: '35000', confirmedOwnerAnswers: 1, approvedByLearning: 5, askedDecisions: 2 },
+      totals: { verifiedPayments: 2, verifiedUsdcAtomic: '35000', confirmedOwnerAnswers: 1, approvedByLearning: 2, askedDecisions: 2 },
       payments: [
         { digest: newer, amountAtomic: '25000', sellerHost: 'hotels.example', signedAt: at(60_000).toISOString(), explorerUrl: `https://suiscan.xyz/mainnet/tx/${newer}` },
         { digest: older, amountAtomic: '10000', sellerHost: 'hotels.example', signedAt: at(120_000).toISOString(), explorerUrl: `https://suiscan.xyz/mainnet/tx/${older}` },
@@ -534,6 +542,32 @@ describe('GET /api/public/proof', () => {
     expect(ended.text).not.toContain(blobId);
   });
 
+  it('counts a learned approval only once its payment is verified and a question only for an owner the page shows, and writes a seller host as the sentences do (C17, C18)', async () => {
+    const w = await proofOwner();
+    const odd = await proofPayment(w, 'verified', at(60_000), 10_000n, { sellerHost: 'evil"host.example' });
+    const plain = await proofPayment(w, 'verified', at(50_000), 10_000n, { rule: 'grant' });
+    await proofPayment(w, 'pending', at(40_000));
+    // Approved by learning, then refused at signing: no payment row at all.
+    await proofDecision(w, { status: 'refused' });
+    await proofDecision(w, { outcome: 'asked', rule: 'no_match', status: 'asked' });
+    // Opted in, but nothing of theirs is on the page: their questions are not counted.
+    const idle = await proofOwner();
+    for (let i = 0; i < 3; i += 1) await proofDecision(idle, { outcome: 'asked', rule: 'no_match', status: 'expired' });
+    await proofPayment(idle, 'pending', at(30_000));
+    // On the page through an on-chain memory alone.
+    const remembered = await proofOwner();
+    await proofMemory(remembered, 'outcome', 'confirmed', at(20_000));
+    await proofDecision(remembered, { outcome: 'asked', rule: 'recall_unavailable', status: 'asked' });
+
+    const { text, body } = await proof();
+    expect(body.totals).toMatchObject({ verifiedPayments: 2, approvedByLearning: 1, askedDecisions: 2 });
+    expect(body.payments.map((row) => [row.digest, row.sellerHost])).toEqual([
+      [plain, 'hotels.example'],
+      [odd, 'this seller'],
+    ]);
+    expect(text).not.toContain('evil');
+  });
+
   it('never shows an owner who has not opted in, in the lists or the totals, until they opt in', async () => {
     const shown = await proofOwner();
     const hidden = await proofOwner(false);
@@ -564,7 +598,8 @@ describe('GET /api/public/proof', () => {
     const first = await proof();
     expect(first.body.totals.verifiedPayments).toBe(1);
     const readsPerRefresh = selects.mock.calls.length;
-    expect(readsPerRefresh).toBe(5);
+    // Six reads, the questions' one built with two exists subqueries.
+    expect(readsPerRefresh).toBe(8);
 
     await proofPayment(w, 'verified', at(30_000));
     nowMs += LIMITS.publicProofCacheMs - 1;

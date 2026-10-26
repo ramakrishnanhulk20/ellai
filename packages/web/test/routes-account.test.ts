@@ -2,10 +2,11 @@
 // PGlite with a stub chain: the session requirement on every one and same origin on every one
 // that changes state; decision and memory history holding only the owner's own rows, newest
 // first, paged by before and limit without losing or repeating rows that share a millisecond;
-// agent tokens shown once and never again, revoking one stopping it, at most ten made an hour
-// and twenty held at once by one owner, each made and each loosening setting changed with a step-up
+// agent tokens shown once and never again, revoking one stopping it, at most five made an hour by
+// one session and ten by one owner, twenty held at once, each made and each loosening setting changed with a step-up
 // the owner's wallet signed (step-up.test covers which changes need one and every refusal of it),
-// the step-up route held to the session and the app's origin like the rest; onboarding passing
+// the step-up route held to the session and the app's origin like the rest; signing out
+// everywhere ending every live session of the owner and no one else's; onboarding passing
 // the owner, chain and master secret to the onboarding functions and their summaries and
 // refusals back unchanged, a Tatum budget refusal as chain_unavailable_today; settings held to their bounds at each edge, the auto pause cleared
 // only on request, the public proof opt-in starting off and switched for the signed-in owner
@@ -36,6 +37,7 @@ import * as buildRoute from '../src/app/api/owner/onboarding/build/route.js';
 import * as confirmRoute from '../src/app/api/owner/onboarding/confirm/route.js';
 import * as onboardingRoute from '../src/app/api/owner/onboarding/route.js';
 import * as overviewRoute from '../src/app/api/owner/overview/route.js';
+import * as sessionsRoute from '../src/app/api/owner/sessions/route.js';
 import * as settingsRoute from '../src/app/api/owner/settings/route.js';
 import * as stepUpRoute from '../src/app/api/owner/step-up/route.js';
 import { authenticateAgent } from '../src/server/auth/agents.js';
@@ -43,7 +45,7 @@ import { endSession } from '../src/server/auth/sessions.js';
 import { completeSignIn, issueSignIn } from '../src/server/auth/signin.js';
 import { hashBearerToken } from '../src/server/auth/tokens.js';
 import { type Database, createDb, migrate } from '../src/server/db/client.js';
-import { agents, decisionCitations, decisions, memories, owners, payments } from '../src/server/db/schema.js';
+import { agents, decisionCitations, decisions, memories, owners, payments, sessions } from '../src/server/db/schema.js';
 import type { ServerEnv } from '../src/server/env.js';
 import { type ServerContextFactory, setServerContextFactory } from '../src/server/http/context.js';
 import { HttpError, type HttpErrorCode } from '../src/server/http/errors.js';
@@ -178,8 +180,7 @@ async function sign(signer: Signer, message: string): Promise<string> {
   return (await signer.signPersonalMessage(new TextEncoder().encode(message))).signature;
 }
 
-async function signedInOwner(): Promise<Owner> {
-  const signer = Ed25519Keypair.generate();
+async function signedInOwner(signer: Signer = Ed25519Keypair.generate()): Promise<Owner> {
   const { message } = await issueSignIn({ db, address: signer.toSuiAddress(), appOrigin: APP_ORIGIN, now: clock });
   const done = await completeSignIn({ db, message, signature: await sign(signer, message), appOrigin: APP_ORIGIN, masterSecretHex: MASTER, sessionSecretHex: SECRET, now: clock });
   const row = one(await db.select({ suiAddress: owners.suiAddress }).from(owners).where(eq(owners.id, done.ownerId)));
@@ -278,6 +279,7 @@ const build = (body: unknown, options: SendOptions = {}) => buildRoute.POST(send
 const confirm = (body: unknown, options: SendOptions = {}) => confirmRoute.POST(send('POST', '/api/owner/onboarding/confirm', body, options));
 const patchSettings = (body: unknown, options: SendOptions = {}) => settingsRoute.PATCH(send('PATCH', '/api/owner/settings', body, options));
 const askStepUp = (body: unknown, options: SendOptions = {}) => stepUpRoute.POST(send('POST', '/api/owner/step-up', body, options));
+const signOutEverywhere = (options: SendOptions = {}) => sessionsRoute.DELETE(send('DELETE', '/api/owner/sessions', undefined, options));
 const overview = (cookie?: string) => overviewRoute.GET(get('/api/owner/overview', cookie));
 
 async function json<T>(response: Response, status = 200): Promise<T> {
@@ -377,6 +379,7 @@ describe('route files', () => {
     ['onboarding/confirm', confirmRoute],
     ['settings', settingsRoute],
     ['step-up', stepUpRoute],
+    ['sessions', sessionsRoute],
   ])('%s runs on Node and is never cached or prerendered', (_name, route) => {
     expect(route.runtime).toBe('nodejs');
     expect(route.dynamic).toBe('force-dynamic');
@@ -587,23 +590,32 @@ describe('GET and POST /api/owner/agents', () => {
       [{}, 400, 'bad_body'],
       ['{"label":', 400, 'bad_json'],
     ];
-    for (const [sent, status, code] of cases) await refusedWith(await createAgent(sent, { cookie: owner.cookie }), status, code);
+    // Each from a session of its own, as one session may try only five creates an hour.
+    for (const [sent, status, code] of cases) await refusedWith(await createAgent(sent, { cookie: (await signedInOwner(owner.signer)).cookie }), status, code);
     expect(await agentList(owner.cookie)).toEqual([]);
     const longest = await json<{ agentId: string }>(await createSigned(owner, '\u{1F600}'.repeat(60)));
     expect((await agentList(owner.cookie)).map((a) => a.agentId)).toEqual([longest.agentId]);
   });
 
-  it('turns away the 11th create in one hour for one owner with 429, others and the next hour untouched', async () => {
+  it('turns away the 6th create in one hour from one session and the 11th for one owner with 429, others and the next hour untouched (C22, C36)', async () => {
     quiet();
     const owner = await signedInOwner();
+    const second = await signedInOwner(owner.signer);
+    const third = await signedInOwner(owner.signer);
     const other = await signedInOwner();
-    expect(LIMITS.agentCreatesPerHour).toBe(10);
+    expect([LIMITS.agentCreatesPerSessionPerHour, LIMITS.agentCreatesPerHour]).toEqual([5, 10]);
+    const tooMany = async (response: Response) => {
+      expect(response.status).toBe(429);
+      expect(await response.json()).toEqual({ error: 'too_many_agent_creates', message: new HttpError(429, 'too_many_agent_creates').message });
+    };
     // The first call is a bad body: it is counted before the body is read.
     await refusedWith(await createAgent({}, { cookie: owner.cookie }), 400, 'bad_body');
-    for (let i = 2; i <= 10; i += 1) expect((await createSigned(owner, `Agent ${i}`)).status).toBe(200);
-    const refused = await createSigned(owner, 'One more');
-    expect(refused.status).toBe(429);
-    expect(await refused.json()).toEqual({ error: 'too_many_agent_creates', message: new HttpError(429, 'too_many_agent_creates').message });
+    for (let i = 2; i <= 5; i += 1) expect((await createSigned(owner, `Agent ${i}`)).status).toBe(200);
+    // A session past its own hour is turned away without spending the owner's.
+    await tooMany(await createSigned(owner, 'Sixth from one session'));
+    await tooMany(await createSigned(owner, 'Seventh from one session'));
+    for (let i = 6; i <= 10; i += 1) expect((await createSigned(second, `Agent ${i}`)).status).toBe(200);
+    await tooMany(await createSigned(third, 'One more'));
     expect(await agentList(owner.cookie)).toHaveLength(9);
 
     expect((await createSigned(other, 'Theirs')).status).toBe(200);
@@ -880,15 +892,48 @@ describe('PATCH /api/owner/settings', () => {
     expect((await storedSettings(owner.ownerId)).publicProof).toBe(false);
   });
 
-  it('clears an auto pause only when clearAutoPause is sent', async () => {
+  it('clears an auto pause, its reason and its time, only when clearAutoPause is sent', async () => {
     const owner = await signedInOwner();
-    await db.update(owners).set({ autoPausedReason: 'A payment landed that was not the one approved.' }).where(eq(owners.id, owner.ownerId));
+    await db.update(owners).set({ autoPausedReason: 'A payment landed that was not the one approved.', autoPausedAt: ago(60_000) }).where(eq(owners.id, owner.ownerId));
     for (const change of [{ paused: false }, { paused: true }, { paused: false, approvalsNeeded: 3 }]) {
       expect((await json<SettingsBody>(await changeSettings(owner, change))).autoPausedReason).toBe('A payment landed that was not the one approved.');
     }
     const cleared = await json<SettingsBody>(await changeSettings(owner, { clearAutoPause: true }));
     expect(cleared).toMatchObject({ autoPausedReason: null, paused: false, approvalsNeeded: 3 });
     expect((await storedSettings(owner.ownerId)).autoPausedReason).toBeNull();
+    expect(one(await db.select({ autoPausedAt: owners.autoPausedAt }).from(owners).where(eq(owners.id, owner.ownerId))).autoPausedAt).toBeNull();
+  });
+});
+
+describe('DELETE /api/owner/sessions', () => {
+  const tokenOf = (owner: Owner) => owner.cookie.slice('__Host-ellai_session='.length);
+  const liveSessions = async (ownerId: string) =>
+    (await db.select({ revokedAt: sessions.revokedAt }).from(sessions).where(eq(sessions.ownerId, ownerId))).filter((row) => row.revokedAt === null);
+
+  it("ends every live session of the owner, this one included, so a second session is refused at once, and clears this cookie; another owner's stay open (C13, C14)", async () => {
+    quiet();
+    const owner = await signedInOwner();
+    const stolen = await signedInOwner(owner.signer);
+    const ended = await signedInOwner(owner.signer);
+    const other = await signedInOwner();
+    const endedAt = clock;
+    await endSession({ db, token: tokenOf(ended), sessionSecretHex: SECRET, now: endedAt });
+    expect((await listAgents(stolen.cookie)).status).toBe(200);
+    clock = new Date(clock.getTime() + 1_000);
+
+    const response = await signOutEverywhere({ cookie: owner.cookie });
+    expect(response.headers.get('set-cookie')).toBe('__Host-ellai_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0; Secure');
+    expect(await json(response)).toEqual({ signedOut: true, sessionsEnded: 2 });
+    for (const cookie of [stolen.cookie, owner.cookie]) await refusedWith(await listAgents(cookie), 401, 'signed_out');
+    await refusedWith(await askStepUp({ action: 'create_agent', change: { label: 'Mine now' } }, { cookie: stolen.cookie }), 401, 'signed_out');
+    expect(await liveSessions(owner.ownerId)).toEqual([]);
+    const endedRow = one(await db.select({ revokedAt: sessions.revokedAt }).from(sessions).where(eq(sessions.tokenHash, hashBearerToken(tokenOf(ended), SECRET) ?? '')));
+    expect(endedRow.revokedAt).toEqual(endedAt);
+
+    expect((await listAgents(other.cookie)).status).toBe(200);
+    expect(await liveSessions(other.ownerId)).toHaveLength(1);
+    // Signing in again with the wallet opens a fresh session as usual.
+    expect((await listAgents((await signedInOwner(owner.signer)).cookie)).status).toBe(200);
   });
 });
 
@@ -905,6 +950,7 @@ describe('the session and origin requirements', () => {
     ['settings', (cookie) => patchSettings({ paused: true }, cookie === undefined ? {} : { cookie })],
     ['settings public proof', (cookie) => patchSettings({ publicProof: true }, cookie === undefined ? {} : { cookie })],
     ['step-up', (cookie) => askStepUp({ action: 'loosen_settings', change: { publicProof: true } }, cookie === undefined ? {} : { cookie })],
+    ['sessions', (cookie) => signOutEverywhere(cookie === undefined ? {} : { cookie })],
   ];
 
   it.each(routes)('%s is 401 signed_out with no cookie, a junk cookie, or a session that has ended', async (_name, run) => {
@@ -928,6 +974,7 @@ describe('the session and origin requirements', () => {
     ['settings', (options) => patchSettings({ paused: true }, options)],
     ['settings public proof', (options) => patchSettings({ publicProof: true }, options)],
     ['step-up', (options) => askStepUp({ action: 'create_agent', change: { label: 'From elsewhere' } }, options)],
+    ['sessions', (options) => signOutEverywhere(options)],
   ];
 
   it.each(changing)('%s is 403 cross_origin from another site or with no Origin, changing nothing', async (_name, run) => {
@@ -949,7 +996,7 @@ describe('the session and origin requirements', () => {
 });
 
 describe('error answers', () => {
-  const ROUTES = ['decisions', 'memories', 'agents', 'agents/[id]', 'onboarding', 'onboarding/build', 'onboarding/confirm', 'settings', 'step-up', 'overview'];
+  const ROUTES = ['decisions', 'memories', 'agents', 'agents/[id]', 'onboarding', 'onboarding/build', 'onboarding/confirm', 'settings', 'step-up', 'overview', 'sessions'];
 
   it('come from the one table in errors.ts: no owner route, nor the helpers they share, writes an error body by hand', async () => {
     const files = [...ROUTES.map((route) => `../src/app/api/owner/${route}/route.ts`), '../src/server/http/owner-limits.ts'];

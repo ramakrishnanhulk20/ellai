@@ -15,6 +15,7 @@ const OWNER_CHAIN_DAY_KEY_PREFIX = 'owner-chain-day:';
 const OWNER_CHAIN_CLIENT_DAY_KEY_PREFIX = 'owner-chain-client-day:';
 const OWNER_CHAIN_QUOTA = 'owner-chain-reads:day';
 const AGENT_CREATE_KEY_PREFIX = 'owner-agent-create:';
+const AGENT_CREATE_SESSION_KEY_PREFIX = 'owner-agent-create-session:';
 
 /**
  * Counts one request to an owner route that reads Sui through Tatum against this owner's
@@ -66,13 +67,19 @@ export async function limitOwnerChainCalls(ctx: ServerContext, request: Request,
 }
 
 /**
- * Counts one agent creation against this owner's LIMITS.agentCreatesPerHour, in the fixed hour
- * that holds the context's clock (C22). The key is the owner the session named, never anything
- * the caller sends, and a request over the limit still counts. Throws HttpError 429
- * too_many_agent_creates beyond the limit.
+ * Counts one agent creation in the fixed hour that holds the context's clock, first against this
+ * session's LIMITS.agentCreatesPerSessionPerHour and then against this owner's
+ * LIMITS.agentCreatesPerHour (C22, C36), so one session, a stolen one included, can never use up
+ * the owner's hour. Both keys come from the session, never from anything the caller sends. A
+ * request over a limit still counts toward it, and one over the session's limit is not counted
+ * against the owner's. Throws HttpError 429 too_many_agent_creates beyond either.
  */
-export async function limitAgentCreates(ctx: ServerContext, ownerId: string): Promise<void> {
-  if (!(await consumeWindow(ctx.db, `${AGENT_CREATE_KEY_PREFIX}${ownerId}`, LIMITS.agentCreatesPerHour, LIMITS.rateWindowHourMs, ctx.now()))) {
+export async function limitAgentCreates(ctx: ServerContext, owner: { ownerId: string; sessionId: string }): Promise<void> {
+  const now = ctx.now();
+  if (
+    !(await consumeWindow(ctx.db, `${AGENT_CREATE_SESSION_KEY_PREFIX}${owner.sessionId}`, LIMITS.agentCreatesPerSessionPerHour, LIMITS.rateWindowHourMs, now)) ||
+    !(await consumeWindow(ctx.db, `${AGENT_CREATE_KEY_PREFIX}${owner.ownerId}`, LIMITS.agentCreatesPerHour, LIMITS.rateWindowHourMs, now))
+  ) {
     throw new HttpError(429, 'too_many_agent_creates');
   }
 }

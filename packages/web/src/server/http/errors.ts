@@ -46,7 +46,8 @@ export type HttpErrorCode =
   | 'step_up_required'
   | 'step_up_rejected'
   | 'step_up_not_needed'
-  | 'too_many_step_ups';
+  | 'too_many_step_ups'
+  | 'pause_changed';
 
 /** The one code whose refusal may say which bound was passed, in a sentence Ellai wrote. */
 export type BoundsHttpErrorCode = 'out_of_bounds';
@@ -78,6 +79,8 @@ const HTTP_ERROR_MESSAGES: Readonly<Record<HttpErrorCode, string>> = {
   step_up_rejected: 'The wallet confirmation was not accepted. Ask for a new confirmation message and sign it.',
   step_up_not_needed: 'This change does not need a wallet confirmation. Send it on its own.',
   too_many_step_ups: 'Too many wallet confirmations were asked for this hour. Try again later.',
+  // A newer automatic pause is set than the one the owner signed to clear, so it stays.
+  pause_changed: 'The automatic pause changed after you signed. Nothing was changed. Ask for a new confirmation message, which names the pause now set, and sign it.',
 };
 
 // RFC 6750 section 3: a 401 from a resource behind a bearer token names the scheme it wants. Each
