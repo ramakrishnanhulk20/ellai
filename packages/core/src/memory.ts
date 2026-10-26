@@ -1055,13 +1055,15 @@ export async function checkJobs(
  *
  * Throws MemoryError: RECALL for a bad query, namespace, limit or cutoff, a hit without a
  * numeric distance in that range, text or blob id, more hits than asked for, or hits the relayer
- * dropped unread; TIMEOUT, DELEGATE, RATE_LIMITED or UPSTREAM from the relayer.
+ * dropped unread; TIMEOUT, DELEGATE, RATE_LIMITED or UPSTREAM from the relayer. With
+ * `pacing.waitForPoints` false, a key that has spent its points is RATE_LIMITED at once.
  */
 export async function recallSentences(
   client: MemWal,
   namespace: string,
   query: string,
   opts: { limit: number; maxDistance: number },
+  pacing: RelayerPacing = {},
 ): Promise<Array<{ text: string; blobId: string; distance: number; createdAt: string | null }>> {
   const label = checkNamespace(namespace, 'RECALL');
   if (typeof query !== 'string' || !hasVisibleText(query) || Buffer.byteLength(query, 'utf8') > LIMITS.memwalSentenceMaxBytes) {
@@ -1075,7 +1077,7 @@ export async function recallSentences(
     throw new MemoryError('RECALL', `the distance cutoff must be above 0 and at most ${LIMITS.recallDistanceMax}`);
   }
 
-  await spendRelayerPoints(client, LIMITS.memwalRequestPoints);
+  await spendRelayerPoints(client, LIMITS.memwalRequestPoints, pacing);
   let result: unknown;
   try {
     // maxDistance is applied below, not by the SDK: 0.1.8 filters with
