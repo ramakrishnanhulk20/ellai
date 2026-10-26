@@ -133,9 +133,14 @@ export const owners = pgTable(
     // Where the chain check of this owner's Walrus Blob objects stopped, since one tick reads a
     // bounded number of pages and anyone can send Blob objects to an address.
     blobScanCursor: text('blob_scan_cursor'),
+    // An allowance whose rate window has no room for a refill cannot change before the window
+    // ends, so the tick does not ask the chain again until then (C22).
+    refillNotBefore: at('refill_not_before'),
     createdAt: createdAt(),
   },
   (t) => [
+    // Sign-in creates an owner row for any wallet, so pruning finds old empty ones through this.
+    index('owners_created_at_idx').on(t.createdAt),
     check('owners_approvals_needed_range', sql`${t.approvalsNeeded} between 1 and 10`),
     maxLength('owners_blob_scan_cursor_length', t.blobScanCursor, TEXT_CAPS.pageCursor),
     check('owners_distance_cutoff_range', sql`${t.distanceCutoff} > 0 and ${t.distanceCutoff} <= 2`),
@@ -171,7 +176,7 @@ export const sessions = pgTable(
     expiresAt: at('expires_at').notNull(),
     revokedAt: at('revoked_at'),
   },
-  (t) => [index('sessions_expires_at_idx').on(t.expiresAt)],
+  (t) => [index('sessions_expires_at_idx').on(t.expiresAt), index('sessions_owner_expires_at_idx').on(t.ownerId, t.expiresAt)],
 );
 
 export const agents = pgTable(
@@ -191,6 +196,7 @@ export const agents = pgTable(
   },
   (t) => [
     unique('agents_id_owner_id_unique').on(t.id, t.ownerId),
+    index('agents_owner_idx').on(t.ownerId),
     // The built-in agent is found by kind, not by id, so a second live one for an owner would
     // leave which agent acts to row order. A revoked one no longer counts.
     uniqueIndex('agents_one_live_builtin_per_owner')
@@ -286,6 +292,10 @@ export const memories = pgTable(
     confirmedAt: at('confirmed_at'),
     // Set only after the blob id was found among the owner's Walrus Blob objects on chain.
     chainConfirmedAt: at('chain_confirmed_at'),
+    // The Walrus epoch the confirmed Blob is stored until, and when the tick saw that epoch
+    // arrive, so /proof stops showing a memory Walrus no longer keeps (C18).
+    blobEndEpoch: integer('blob_end_epoch'),
+    chainExpiredAt: at('chain_expired_at'),
   },
   (t) => [
     unique('memories_id_owner_id_unique').on(t.id, t.ownerId),
@@ -447,6 +457,7 @@ export const refills = pgTable(
     verifiedAt: at('verified_at'),
   },
   (t) => [
+    index('refills_owner_idx').on(t.ownerId),
     positive('refills_amount_positive', t.amountAtomic),
     oneOf('refills_status_known', t.status, REFILL_STATUSES),
     maxLength('refills_allowance_id_length', t.allowanceId, TEXT_CAPS.suiId),
@@ -484,6 +495,8 @@ export const rateCounters = pgTable(
   },
   (t) => [
     primaryKey({ columns: [t.key, t.windowStart] }),
+    // Per-client rows arrive at request rate, so pruning old windows needs its own index.
+    index('rate_counters_window_start_idx').on(t.windowStart),
     maxLength('rate_counters_key_length', t.key, TEXT_CAPS.rateKey),
   ],
 );
