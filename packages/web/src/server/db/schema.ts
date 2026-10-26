@@ -499,6 +499,9 @@ export const refills = pgTable(
     validUntilEpoch: bigint('valid_until_epoch', { mode: 'bigint' }),
     status: text('status', { enum: REFILL_STATUSES }).notNull().default('pending'),
     verifiedAt: at('verified_at'),
+    // The first pass that saw the refill's window closed and its digest missing; it is failed only
+    // after a second such pass well after it, as payments are (C27).
+    missingSince: at('missing_since'),
   },
   (t) => [
     index('refills_owner_idx').on(t.ownerId),

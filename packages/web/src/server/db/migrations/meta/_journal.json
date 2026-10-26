@@ -64,6 +64,13 @@
       "when": 1793010364900,
       "tag": "0008_elite_morbius",
       "breakpoints": true
+    },
+    {
+      "idx": 9,
+      "version": "7",
+      "when": 1793010713771,
+      "tag": "0009_gifted_spectrum",
+      "breakpoints": true
     }
   ]
 }
