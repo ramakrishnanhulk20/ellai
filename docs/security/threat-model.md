@@ -250,6 +250,7 @@ Each invariant names the risk it closes. Every backend work order carries the in
   - /proof and the live counts list only payments and blobs that are in Ellai's own records and confirmed on chain. Anything else found at an owner, purse or gas address is ignored.
   - A memory counts as confirmed on chain only once its blob id is found on a certified, unexpired Walrus Blob object owned by the owner, read through Tatum; the relayer's word is not enough.
   - A page cap can prove presence, never absence: a listing cut short defers the rest to a later read and never stops it.
+  - A memory leaves /proof once the Walrus epoch reaches the end its Blob was stored until.
   - An owner's payments and memories appear on a public page only if that owner opted in, since each digest leads to their wallet (Ram, 2026-10-25).
   - No memory text appears on a public page.
 - **C19 (A12). Secrets and bearer values stay put.**
@@ -271,7 +272,8 @@ Each invariant names the risk it closes. Every backend work order carries the in
   - No public or anonymous request triggers a paid upstream call per request. Public pages read a cache refreshed on a fixed schedule.
   - Where an anonymous request must reach a paid upstream (Ellai's seller sending a buyer's payment, a zkLogin check), it does so only inside per-client and global daily caps sized to the credit budget, and a capped request never calls upstream.
   - Any wallet can sign in for free, so owner routes that read the chain have a cap across all owners as well as per owner.
-  - Background work reads the chain only when Ellai's own records say there is something to learn: an idle owner costs nothing.
+  - Background work reads the chain only when Ellai's own records say there is something to learn: an idle owner costs nothing. A chain answer that cannot change until Ellai's records change (an allowance that can no longer pay, a full rate window) is recorded and not asked again until then.
+  - One meter stands in front of every request to Tatum, from routes, jobs and library calls alike. It charges each request to a daily budget for whoever started it (the client, the owner and their agents, everything people can start together, and the jobs tick apart from all of those), and refuses any request whose starter is unknown. A new path cannot spend credits outside a cap, because it cannot reach Tatum without passing the meter.
   - The demo has global caps on live sessions, demo spend per day and memory writes per hour, and they hold however many sessions exist.
   - Pay-requests and pending questions are capped per token and per owner.
   - Rate limits key on the platform's verified client address, never on a header the client sets.
@@ -308,6 +310,7 @@ Each invariant names the risk it closes. Every backend work order carries the in
 - **C34 (A11, G5). Every per-client limit has a global cap.**
   - Anonymous work (sign-in nonces, zkLogin checks, seller challenges) is capped across all callers as well as per client, and its rows are pruned on a schedule.
   - Cleanup outpaces the caps: every table anonymous callers can fill loses at least as many rows a day as the caps let in, through an indexed key, within a time slice of its own.
+  - Caps bound arrivals, so rows standing are a cap times how long each row is kept. That product fits the database plan for every such table, per-client rate counters included, and sign-ins have daily caps because each can create an owner row.
   - A sign-in nonce is burned before any chain check or shared quota, so a failed attempt cannot be retried on it and one caller cannot spend the shared quota without spending nonces.
   - Shared caps on paid upstream calls are sized to the credit budget. Exhausting one can lock out everyone using that path until the window ends; that is accepted, logged, and bounded per client.
   - IPv6 clients are keyed on their /64, since one host can hold the whole prefix.
