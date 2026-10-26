@@ -395,6 +395,23 @@ export const LIMITS = {
   signInRequestsPerMinute: 10,
   /** Sign-in requests every client together may make in a minute, for each step separately (C22). */
   signInRequestsPerMinuteGlobal: 300,
+  /** Sign-ins one client may complete in a day. Each can create an owner row and a session for any wallet (C22, C34). */
+  signInsPerClientPerDay: 30,
+  /** Sign-ins every client together may complete in a day, so owner and session rows standing stay small (C34). */
+  signInsPerDayGlobal: 2_000,
+  /**
+   * Requests to Tatum (each page and each retry counts) that everything a person can start may
+   * make in a day: anonymous callers, owners and their agents together. Tatum's free plan is a
+   * lifetime pool, so this is sized to the credit budget; past it those paths answer
+   * chain_unavailable_today and never call Tatum (C22).
+   */
+  tatumCallsPerDayGlobal: 1_500,
+  /** Requests to Tatum the jobs tick may make in a day, apart from the global count so strangers cannot starve settlement and refills. */
+  tatumCallsJobsPerDay: 1_500,
+  /** Requests to Tatum one owner and that owner's agents may cause in a day. */
+  tatumCallsPerOwnerPerDay: 300,
+  /** Requests to Tatum one client may cause in a day, across every owner it signs in as (C34). */
+  tatumCallsPerClientPerDay: 300,
   /** Random bytes in a sign-in nonce: 128 bits, so a nonce cannot be guessed before it expires (C14). */
   signinNonceBytes: 16,
   /** Longest address the sign-in nonce step reads. A Sui address is 66 characters. */
