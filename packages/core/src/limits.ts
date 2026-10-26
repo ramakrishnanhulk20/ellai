@@ -414,6 +414,40 @@ export const LIMITS = {
   tatumCallsJobsPerDay: 1_500,
   /** Requests to Tatum one owner and that owner's agents may cause in a day. */
   tatumCallsPerOwnerPerDay: 300,
+  /**
+   * Requests to Tatum the jobs tick may make for one owner in a day, counted before the shared
+   * jobs day, so owners who cost the tick reads without paying cannot starve everyone else's
+   * settlement and refills (C22, C28).
+   */
+  tatumCallsJobsPerOwnerPerDay: 200,
+  /**
+   * Requests to Tatum callers with no owner (strangers buying a wallet check, sign-in) may cause
+   * in a day, counted inside tatumCallsPerDayGlobal, so they can never take the share owners need
+   * to pay (C22).
+   */
+  tatumCallsAnonymousPerDay: 500,
+  /** Pay-requests one client may send through every agent token it holds in a day (C22, C34). */
+  agentFetchesPerClientPerDay: 2_000,
+  /** Pay-requests every agent together may send in a day; each one writes a decision row (C34). */
+  agentFetchesPerDayGlobal: 20_000,
+  /** How long a decision that closed without a payment (refused, expired, failed) is kept: 30 days (C34). */
+  closedDecisionKeepMs: 2_592_000_000,
+  /**
+   * The least time between the two tick passes that must both see a payment's window closed and
+   * its digest missing before it is released: 30 minutes, so one lagging node read can never free
+   * the budget (C4, C27).
+   */
+  paymentReleaseGapMs: 1_800_000,
+  /** An allowance that expires sooner than this is treated as unable to pay a refill: 10 minutes, so a send cannot abort after its dry run (C30). */
+  allowanceExpiryMarginMs: 600_000,
+  /** How long the seller remembers a failed epoch read before trying again, so an outage does not start a read per challenge (C22). */
+  epochFailureCacheMs: 30_000,
+  /** Largest distance a recall hit can honestly carry (cosine distance runs from 0 to 2); anything outside asks (C12). */
+  recallDistanceMax: 2,
+  /** Step-up messages one session may ask for in an hour, so a stolen session cannot use up the owner's allowance (C36). */
+  stepUpsPerSessionPerHour: 10,
+  /** Agent creates one session may attempt in an hour, so a stolen session cannot use up the owner's allowance (C36). */
+  agentCreatesPerSessionPerHour: 5,
   /** Requests to Tatum one client may cause in a day, across every owner it signs in as (C34). */
   tatumCallsPerClientPerDay: 300,
   /** Random bytes in a sign-in nonce: 128 bits, so a nonce cannot be guessed before it expires (C14). */
