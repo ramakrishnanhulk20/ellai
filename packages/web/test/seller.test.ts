@@ -11,7 +11,9 @@
 // closed for good once its epoch window has closed and a final read misses; a challenge pays once and one payment never pays
 // two challenges; the unpaid rate limit per caller and for every caller together; the caps on
 // sends per caller a minute and a day and for every caller a day, counted only after the offline
-// checks and never reaching the chain past them; one epoch
+// checks and never reaching the chain past them; a send Ellai's Tatum budget refused closed as
+// never sent, with 503 until the UTC day ends, while a refusal after the send keeps its sale
+// waiting; one epoch
 // read per cache window; the wallet check summary and its blob cap; the pay-to
 // fallback; and no response ever carries the payment header, its bytes or its signature.
 // Does NOT cover: the live chain or Tatum (`npm run prove:seller` pays one 0.01 USDC live),
@@ -731,6 +733,42 @@ describe('settleWalletCheckPayment', () => {
     expect(calls.reads).toEqual([]);
     expect(error.mock.calls.map((line) => line.join(' '))).toEqual(['[ellai seller] quota_spent seller-executes:day']);
     error.mockRestore();
+  });
+
+  it("closes a sale whose send Ellai's Tatum budget refused, nothing sent, with 503 until the UTC day ends and no chain read; a refusal after the send keeps its sale waiting (C22, C29)", async () => {
+    const now = new Date(dayAfter(5) + 60_000);
+    const notSent = () => {
+      throw new ChainError('BUDGET', 'Tatum executeTransaction: the request budget refused the send; transaction was not sent');
+    };
+    const { chain, calls } = stubChain({ execute: notSent });
+    const tomorrow = { ok: false, status: 503, reason: SETTLE_REASONS.chainUnavailableToday, retryAfterSeconds: DAY_MS / 1_000 - 60 };
+
+    const issued = await issue(chain, RESOURCE, now);
+    const { signed, header } = await pay(asBuyer(issued));
+    expect(await settle(chain, header, { now })).toEqual(tomorrow);
+    expect(await saleOf(issued.challengeId)).toMatchObject({ status: 'rejected', digest: null, payer: BUYER, settledAt: null });
+    // The same bytes find a closed sale, not one waiting on the chain.
+    expect(await settle(chain, header, { now: new Date(now.getTime() + LIMITS.sellerRecheckIntervalMs) })).toEqual({ ok: false, status: 409, reason: SETTLE_REASONS.used });
+
+    const unpaid = await call(chain, { now });
+    const paid = await call(chain, { headers: { 'content-type': 'application/json', 'X-PAYMENT': (await pay(asBuyer(unpaid))).header }, now });
+    expect(paid).toMatchObject({ status: 503, headers: { 'Retry-After': String(DAY_MS / 1_000 - 60) } });
+    expect(JSON.parse(paid.body)).toEqual({ error: SETTLE_REASONS.chainUnavailableToday });
+    expect(calls.executions).toHaveLength(2);
+    expect(calls.executions[0]).toBe(signed.digest);
+    expect(calls.reads).toEqual([]);
+
+    // Core reports a budget refusal after the bytes went out as an unknown outcome, never BUDGET.
+    const afterSend = stubChain({
+      execute: () => {
+        throw new ChainError('RATE_LIMITED', 'Tatum executeTransaction: the request budget refused a request after the bytes were sent; transaction may have landed', false);
+      },
+    });
+    const waiting = await issue(afterSend.chain, RESOURCE, now);
+    const sent = await pay(asBuyer(waiting));
+    expect(await settle(afterSend.chain, sent.header, { now })).toEqual({ ok: false, status: 402, reason: SETTLE_REASONS.unconfirmed });
+    expect(await saleOf(waiting.challengeId)).toMatchObject({ status: 'rejected', digest: sent.signed.digest, settledAt: null });
+    expect(afterSend.calls.reads).toEqual(Array<string>(LIMITS.chainReadAfterWriteTries).fill(sent.signed.digest));
   });
 });
 

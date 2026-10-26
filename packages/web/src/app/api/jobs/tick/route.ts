@@ -1,8 +1,7 @@
 import { Ed25519Keypair } from '@mysten/sui/keypairs/ed25519';
 import { scoped } from '../../../../server/http/context.js';
 import { jsonResponse } from '../../../../server/http/json.js';
-import { pruneRateCounters } from '../../../../server/http/ratelimit.js';
-import { errorCode, runJobsTick } from '../../../../server/jobs/tick.js';
+import { runJobsTick } from '../../../../server/jobs/tick.js';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -18,10 +17,10 @@ const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout
  * Runs one jobs tick: the scheduler's call, with `Authorization: Bearer <JOBS_SECRET>` compared
  * in constant time by scoped('jobs'); anything else is 401 jobs_unauthorized, with errors.ts's
  * `WWW-Authenticate: Bearer realm="ellai-jobs"`, and nothing runs. The tick's Tatum requests
- * count against the jobs budget alone (LIMITS.tatumCallsJobsPerDay). Then deletes rate
- * counters older than LIMITS.rateCounterRetentionMs, which outlives the longest window that reads them. Answers with runJobsTick's summary: counts,
- * owner ids and fixed codes only, never an error message or a value (C19). A failure to
- * prune is recorded in the summary under the step 'rate_counters' and does not hide the tick.
+ * count against the jobs budget alone (LIMITS.tatumCallsJobsPerDay). Old rate counters are
+ * deleted inside the tick, by its prune step, first and in bounded batches. Answers with
+ * runJobsTick's summary: counts, owner ids and fixed codes only, never an error message or a
+ * value (C19).
  */
 export const POST = scoped('jobs', async (_request, ctx): Promise<Response> => {
   const summary = await runJobsTick({
@@ -32,10 +31,5 @@ export const POST = scoped('jobs', async (_request, ctx): Promise<Response> => {
     now: ctx.now,
     sleep,
   });
-  try {
-    await pruneRateCounters(ctx.db, ctx.now());
-  } catch (error) {
-    summary.errors.push({ ownerId: '', step: 'rate_counters', code: errorCode(error) });
-  }
   return jsonResponse(summary);
 });

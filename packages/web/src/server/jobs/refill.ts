@@ -388,7 +388,9 @@ async function resolvePending(
  * 8. Then the bytes are sent. A failure the chain reports is 'failed' and throws RefillError
  *    FAILED. A success is read back by its digest: exactly the refill is 'verified'; not
  *    readable yet stays 'pending' for the next call. Either way 'refilled'. An unknown send
- *    outcome stays 'pending' and the ChainError is thrown.
+ *    outcome stays 'pending' and the ChainError is thrown. A send core reports as never sent,
+ *    INVALID_INPUT or BUDGET (Ellai's Tatum budget refused it), is 'failed' and its ChainError
+ *    is thrown, so no refill waits on bytes that never left.
  *
  * The ledger counts this purse's money in as its 'verified' refills, and this function is the
  * only way Ellai puts money in: the first refill after onboarding is this call's too, made by the
@@ -527,9 +529,10 @@ export async function refillIfNeeded(args: RefillJobArgs): Promise<RefillOutcome
   try {
     executed = await chain.executeTransaction(prepared.txBytes, prepared.signatures);
   } catch (error) {
-    // INVALID_INPUT is thrown before anything is sent, so those bytes can never land. Every
-    // other error leaves the outcome unknown, and the row stays pending for the next call.
-    if (error instanceof ChainError && error.code === 'INVALID_INPUT') await markFailed(db, prepared.row.id);
+    // Core throws INVALID_INPUT and BUDGET only before anything is sent, and the signatures never
+    // leave this call, so those bytes can never land. Every other error leaves the outcome
+    // unknown, and the row stays pending for the next call.
+    if (error instanceof ChainError && (error.code === 'INVALID_INPUT' || error.code === 'BUDGET')) await markFailed(db, prepared.row.id);
     throw error;
   }
   if (executed.status !== 'success') {

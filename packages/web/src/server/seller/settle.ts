@@ -20,7 +20,8 @@ export type SettleOutcome =
   | { ok: true; digest: string; payer: string }
   /**
    * `retryAfterSeconds` is set on a recheck that came too soon and on every 429 and 503: whole
-   * seconds, at least 1, until the window that turned it away ends.
+   * seconds, at least 1, until the window that turned it away ends, the UTC day for a send
+   * Ellai's Tatum budget refused.
    */
   | { ok: false; status: 402 | 409 | 429 | 503; reason: string; retryAfterSeconds?: number };
 
@@ -43,6 +44,7 @@ export const SETTLE_REASONS = {
   executeRate: 'too many payments from this caller this minute; ask for a new challenge in a minute',
   executeRateToday: 'too many payments from this caller today; ask for a new challenge tomorrow (days are counted in UTC)',
   executeBusy: 'this seller has sent all the payments it can today; ask for a new challenge tomorrow (days are counted in UTC)',
+  chainUnavailableToday: "this seller has used today's budget for reaching Sui and did not send the payment; ask for a new challenge tomorrow (days are counted in UTC)",
 } as const;
 
 type Sale = typeof sellerSales.$inferSelect;
@@ -225,6 +227,16 @@ async function closeOn(result: Pick<TransactionResult, 'status' | 'balanceChange
 }
 
 /**
+ * Ends the wait on a sale whose bytes core reported as never sent because Ellai's Tatum budget
+ * refused the send: the digest is cleared, so the sale is closed like a refusal before execution
+ * and is never read on chain. Answers 503 with the seconds left in the UTC day.
+ */
+async function closeUnsent(closing: Closing): Promise<SettleOutcome> {
+  await closing.db.update(sellerSales).set({ digest: null }).where(thisWait(closing));
+  return { ok: false, status: 503, reason: SETTLE_REASONS.chainUnavailableToday, retryAfterSeconds: secondsLeftInWindow(LIMITS.rateWindowDayMs, closing.now) };
+}
+
+/**
  * True once the cached epoch is past the bytes' max epoch. assertPlainUsdcSend has already held
  * the bytes' ValidDuring window equal to `expected`'s, so its maxEpoch is the bytes' own. An
  * epoch that cannot be read counts as a window still open.
@@ -295,8 +307,11 @@ async function confirmOnChain(closing: Closing): Promise<SettleOutcome> {
  * challenges; the bytes are executed once through Tatum. Only a definite answer closes the sale:
  * core's verifySettlement finding exactly the sender minus the amount and the recipient plus it
  * makes it 'settled'; a transaction that ran and failed, bytes the network refused, or one that
- * landed as anything but this payment leaves it 'rejected' with settled_at set. When the outcome
- * is unknown (any ChainError but core's own INVALID_INPUT refusal, which sends nothing), the
+ * landed as anything but this payment leaves it 'rejected' with settled_at set. Core's BUDGET,
+ * Ellai's Tatum budget refusing the send, means the bytes were never sent: the digest is cleared,
+ * closing the sale like a refusal before execution, and the answer is 503 chainUnavailableToday
+ * with retryAfterSeconds to the end of the UTC day. When the outcome is unknown (any other
+ * ChainError but core's own INVALID_INPUT refusal, which also sends nothing), the
  * digest is read up to LIMITS.chainReadAfterWriteTries times and the sale closed on what is
  * found; if nothing is found the answer is 402 unconfirmed and the sale keeps waiting for the
  * same bytes, until the seller's cached epoch (cachedEpoch) is past the bytes' max epoch: then
@@ -393,6 +408,7 @@ export async function settleWalletCheckPayment(args: {
     executed = await chain.executeTransaction(payment.txBytes, [payment.signature]);
   } catch (error) {
     if (error instanceof ChainError && error.code === 'INVALID_INPUT') return closeOn({ status: 'failure', balanceChanges: [] }, closing);
+    if (error instanceof ChainError && error.code === 'BUDGET') return closeUnsent(closing);
     return confirmOnChain(closing);
   }
   return closeOn(executed, closing);

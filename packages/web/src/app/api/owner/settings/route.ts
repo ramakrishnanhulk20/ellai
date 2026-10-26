@@ -97,7 +97,9 @@ export const PATCH = scoped('owner', async (request, ctx, { ownerId }): Promise<
 
   const outcome = await ctx.db.transaction(async (tx) => {
     const [current] = await tx.select(SETTINGS).from(owners).where(eq(owners.id, ownerId)).for('update');
-    // Owners are never deleted, so a session without one is treated as no session at all.
+    // The jobs tick deletes an owner only once nothing points at it, a live session included, so
+    // the row can be gone only if the session ended after the cookie was checked; that is
+    // treated as no session at all.
     if (current === undefined) throw new HttpError(401, 'signed_out');
     const problem = boundsProblem(current, change);
     if (problem !== null) return { problem };

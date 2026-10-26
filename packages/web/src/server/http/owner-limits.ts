@@ -162,13 +162,19 @@ export function cutPage<Row extends { createdAt: Date }>(rows: readonly Row[], l
  * for anything else, which the route rethrows. Onboarding reads these classes differently from
  * every other route, so they are mapped here, onto errors.ts's codes: a Walrus Memory account
  * or delegate refusal (Sui already shows the account, the key, a frozen account or a closed
- * registry) is 422 chain_refused; Tatum not answering is 503 chain_unavailable. Only the class
- * and code of the failure are logged.
+ * registry) is 422 chain_refused; ChainError BUDGET, Ellai's Tatum budget refusing a request
+ * with nothing sent, is 503 chain_unavailable_today, as errors.ts answers it on every other
+ * route; Tatum not answering is 503 chain_unavailable. Only the class and code of the failure
+ * are logged.
  */
 export function onboardingChainFailure(error: unknown): Response | null {
   if (error instanceof MemoryError && (error.code === 'ACCOUNT' || error.code === 'DELEGATE')) {
     console.warn(`[ellai http] MemoryError ${error.code}`);
     return httpErrorResponse(new HttpError(422, 'chain_refused'));
+  }
+  if (error instanceof ChainError && error.code === 'BUDGET') {
+    console.warn('[ellai http] ChainError BUDGET');
+    return httpErrorResponse(new HttpError(503, 'chain_unavailable_today'));
   }
   if (error instanceof MemoryError || error instanceof ChainError) {
     console.warn(`[ellai http] ${error.name} ${error.code}`);

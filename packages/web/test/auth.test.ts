@@ -3,7 +3,8 @@
 // site and nonce checked before any chain read; the nonce used up before anything is counted, so
 // ten tries of one zkLogin message reach the chain once and spend no client's places; every
 // refusal after that claim leaving the nonce used and no session; zkLogin through a stub client,
-// including a chain that cannot be read answering CHAIN_UNAVAILABLE (503); a signature past the
+// including a chain that cannot be read answering CHAIN_UNAVAILABLE (503) and the Tatum budget's
+// refusal answering chain_unavailable_today (503); a signature past the
 // zkLogin member cap refused with nothing counted; the per-client zkLogin limits per minute and per
 // day (429, the day's as rate_limited_today) counted before the shared quotas per minute and per
 // day (503, the day's as chain_unavailable_today), one check for each zkLogin member, with one log
@@ -28,6 +29,7 @@
 // rate limits (routes-auth runs the per-client zkLogin limit through the verify route).
 import { createHmac, randomBytes } from 'node:crypto';
 import type { PGlite } from '@electric-sql/pglite';
+import { ChainError } from '@ellai/core/chain';
 import { canonicalSuiAddress, derivePurseKeypair } from '@ellai/core/keys';
 import { LIMITS } from '@ellai/core/limits';
 import { bcs } from '@mysten/sui/bcs';
@@ -498,6 +500,24 @@ describe('completeSignIn', () => {
     await expect(complete(next, await zkLoginSignature(next), { zkLoginClient: client })).resolves.toMatchObject({ ownerId: expect.any(String) });
     expect(verifyZkLoginSignature).toHaveBeenCalledTimes(2);
     error.mockRestore();
+  });
+
+  it("refuses a zkLogin signature Ellai's Tatum budget kept from Sui as 503 chain_unavailable_today, not CHAIN_UNAVAILABLE, with the nonce used up and nothing made (C22)", async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    const { client, verifyZkLoginSignature } = zkLoginClient(async () => {
+      throw new ChainError('BUDGET', 'VerifySignature refused by the request budget, nothing was sent');
+    });
+    const sessionsBefore = await sessionCount();
+    const { nonce, message } = await issue(ZKLOGIN_ADDRESS);
+    const today = await refusal(complete(message, await zkLoginSignature(message), { zkLoginClient: client }));
+    expect(today).toBeInstanceOf(HttpError);
+    expect(today).toMatchObject({ status: 503, code: 'chain_unavailable_today' });
+    const response = toErrorResponse(today);
+    expect(response.status).toBe(503);
+    expect(await response.json()).toEqual({ error: 'chain_unavailable_today', message: "Ellai has used today's budget for reading Sui. Try again tomorrow (days are counted in UTC)." });
+    expect(await nonceUsedAt(nonce)).toEqual(NOW);
+    expect(await sessionCount()).toBe(sessionsBefore);
+    expect(verifyZkLoginSignature).toHaveBeenCalledTimes(1);
   });
 
   it('uses up the nonce before anything is counted, so ten tries of one fake zkLogin signature, in turn or all at once, reach Sui once and spend no place of their client (C14, C34)', async () => {

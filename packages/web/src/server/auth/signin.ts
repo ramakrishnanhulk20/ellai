@@ -1,4 +1,5 @@
 import { randomBytes } from 'node:crypto';
+import { ChainError } from '@ellai/core/chain';
 import { canonicalSuiAddress, derivePurseKeypair } from '@ellai/core/keys';
 import { LIMITS } from '@ellai/core/limits';
 import type { ClientWithCoreApi } from '@mysten/sui/client';
@@ -270,16 +271,18 @@ async function heldOwner(tx: Tx, address: string, purseAddress: string, now: Dat
  * The client with its one call the SDK makes for zkLogin, Sui's own check of the proof, watched.
  * The SDK answers a proof that does not hold with success false, so a throw from that call means
  * Sui could not be read, while every other throw during verification is about the signature.
- * The SDK calls nothing else on the client.
+ * Of those throws, ChainError BUDGET is Ellai's own Tatum budget refusing the check with nothing
+ * sent, which no retry fixes before the day ends. The SDK calls nothing else on the client.
  */
-function watchedClient(client: ClientWithCoreApi): { client: ClientWithCoreApi; chainFailed: () => boolean } {
-  let failed = false;
+function watchedClient(client: ClientWithCoreApi): { client: ClientWithCoreApi; chainFailed: () => 'budget' | 'unreadable' | null } {
+  let failed: 'budget' | 'unreadable' | null = null;
   const { core } = client;
   const verifyZkLoginSignature: typeof core.verifyZkLoginSignature = async (options) => {
     try {
       return await core.verifyZkLoginSignature(options);
     } catch (error) {
-      failed = true;
+      // A budget refusal of any member decides, since the day's budget refuses every later one too.
+      if (failed !== 'budget') failed = error instanceof ChainError && error.code === 'BUDGET' ? 'budget' : 'unreadable';
       throw error;
     }
   };
@@ -298,7 +301,9 @@ async function recoveredAddress(message: string, signature: string, claimed: str
     const publicKey = await verifyPersonalMessageSignature(new TextEncoder().encode(message), signature, { address: claimed, client: watched?.client });
     return canonicalSuiAddress(publicKey.toSuiAddress());
   } catch {
-    refuse(watched?.chainFailed() === true ? 'CHAIN_UNAVAILABLE' : 'BAD_SIGNATURE');
+    const failed = watched?.chainFailed() ?? null;
+    if (failed === 'budget') throw new HttpError(503, 'chain_unavailable_today');
+    refuse(failed === 'unreadable' ? 'CHAIN_UNAVAILABLE' : 'BAD_SIGNATURE');
   }
 }
 
@@ -377,7 +382,8 @@ type ZkLoginChecking = { zkLoginClient?: undefined; clientKey?: string } | { zkL
  * 6. The signature is checked as a Sui personal message that must recover to the address the
  *    message names: Ed25519, Secp256k1, Secp256r1 and multisig offline, zkLogin through
  *    `zkLoginClient` with its own timeout, and CHAIN_UNAVAILABLE rather than BAD_SIGNATURE when
- *    Sui cannot be read for it.
+ *    Sui cannot be read for it, or HttpError 503 chain_unavailable_today when that client's
+ *    check throws ChainError BUDGET, Ellai's Tatum budget refusing it with nothing sent.
  * 7. The sign-in is counted (C22, C34): against SIGN_IN_CLIENT_DAY for `clientKey`, past
  *    LIMITS.signInsPerClientPerDay HttpError 429 rate_limited_today with nothing shared spent,
  *    then against SIGN_IN_SHARED_DAY, past LIMITS.signInsPerDayGlobal HttpError 503
@@ -393,7 +399,7 @@ type ZkLoginChecking = { zkLoginClient?: undefined; clientKey?: string } | { zkL
  * expiry.
  * Throws SignInError: BAD_MESSAGE, WRONG_SITE, BAD_SIGNATURE, ZKLOGIN_UNAVAILABLE,
  * CHAIN_UNAVAILABLE, NONCE_UNKNOWN, NONCE_USED, NONCE_EXPIRED; and HttpError 429 rate_limited or
- * rate_limited_today, and 503 chain_unavailable_today.
+ * rate_limited_today, and 503 chain_unavailable_today (a spent shared day, or the Tatum budget).
  * A refused message or nonce never uses up the nonce; every refusal after the claim leaves it
  * used and creates nothing. Throws Error for server faults: a bad time, origin, master secret,
  * session secret, or an empty client key beside a zkLogin client.

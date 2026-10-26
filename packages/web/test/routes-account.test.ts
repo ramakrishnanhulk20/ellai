@@ -5,7 +5,7 @@
 // agent tokens shown once and never again, revoking one stopping it, at most ten made an hour
 // and twenty held at once by one owner; onboarding passing
 // the owner, chain and master secret to the onboarding functions and their summaries and
-// refusals back unchanged; settings held to their bounds at each edge, the auto pause cleared
+// refusals back unchanged, a Tatum budget refusal as chain_unavailable_today; settings held to their bounds at each edge, the auto pause cleared
 // only on request, the public proof opt-in starting off and switched for the signed-in owner
 // only; and the limits the routes that read Sui share: per owner a minute and a day, and for
 // every owner a day, with the overview counted only for an owner with an allowance.
@@ -707,6 +707,11 @@ describe('POST /api/owner/onboarding/build', () => {
       expect(unavailable.status).toBe(503);
       expect(await unavailable.text()).toBe('{"error":"chain_unavailable","message":"Ellai could not read Sui just now. Try again in a minute."}');
     }
+    // Ellai's own Tatum budget refused a request, which holds until the UTC day ends.
+    vi.mocked(buildCreateAccountTx).mockRejectedValueOnce(new ChainError('BUDGET', MARKER));
+    const today = await build({ step: 'memory_account' }, { cookie: owner.cookie });
+    expect(today.status).toBe(503);
+    expect(await today.json()).toEqual({ error: 'chain_unavailable_today', message: "Ellai has used today's budget for reading Sui. Try again tomorrow (days are counted in UTC)." });
     vi.mocked(buildCreateAccountTx).mockRejectedValueOnce(new Error(MARKER));
     const unexpected = await build({ step: 'memory_account' }, { cookie: owner.cookie });
     expect([unexpected.status, await unexpected.text()]).toEqual([500, '{"error":"internal"}']);

@@ -16,14 +16,18 @@ export const dynamic = 'force-dynamic';
 // types reads more pages; scratchpad/tatum-budget.md counts that as the worst case.
 const PURSE_READ_CALLS = 1;
 
+const BUDGET_SPENT = Symbol('budget spent');
+
 // The balance is shown, never acted on, so a chain that cannot be read blanks it rather than
-// failing the whole page. Only the class and code of the failure are logged.
-async function purseBalance(chain: Chain, purseAddress: string): Promise<{ usdcAtomic: bigint } | null> {
+// failing the whole page. Only the class and code of the failure are logged. A refusal by Ellai's
+// own Tatum budget is not a blank purse: it holds until the UTC day ends, so the route says so.
+async function purseBalance(chain: Chain, purseAddress: string): Promise<{ usdcAtomic: bigint } | null | typeof BUDGET_SPENT> {
   try {
     const { usdcAddressBalance } = await chain.getBalances(purseAddress);
     if (typeof usdcAddressBalance !== 'bigint' || usdcAddressBalance < 0n) throw new TypeError('the purse balance is not a USDC amount');
     return { usdcAtomic: usdcAddressBalance };
   } catch (error) {
+    if (error instanceof ChainError && error.code === 'BUDGET') return BUDGET_SPENT;
     console.warn(`[ellai http] purse_balance_unavailable ${error instanceof ChainError ? error.code : 'UNEXPECTED'}`);
     return null;
   }
@@ -69,7 +73,8 @@ async function questionRate(db: Database, ownerId: string): Promise<{ asked: num
  * through Tatum, and only then does the request count toward limitOwnerChainCalls's budgets at
  * one call (C22), answering with its 429 or 503 beyond them. An owner without one costs no chain read.
  * The read is also counted by the Tatum meter, as this owner from this client; a refusal there
- * blanks the purse like any failed read. Atomic amounts are decimal strings.
+ * (ChainError BUDGET, nothing sent) is 503 chain_unavailable_today, not a blank purse, while any
+ * other failed read blanks the purse. Atomic amounts are decimal strings.
  */
 export const GET = scoped('owner', async (request, ctx, { ownerId }): Promise<Response> => {
   const now = ctx.now();
@@ -104,5 +109,6 @@ export const GET = scoped('owner', async (request, ctx, { ownerId }): Promise<Re
     recentCounts(ctx.db, ownerId, since),
     questionRate(ctx.db, ownerId),
   ]);
+  if (purse === BUDGET_SPENT) throw new HttpError(503, 'chain_unavailable_today');
   return jsonResponse({ owner, onboarding, purse, counts, questionsPer20 });
 });

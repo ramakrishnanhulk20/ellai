@@ -1,8 +1,9 @@
 // Covers: the owner routes called as Next would call them, with Request objects, on PGlite
 // with a stub chain: a cookie from the real sign-in routes opening the overview; the session
 // requirement on every owner route; the overview's settings, onboarding, purse, counts and
-// question rate, with bigints as strings, a chain failure as purse null, and no chain read at all
-// for an owner with no allowance; the question list
+// question rate, with bigints as strings, a chain failure as purse null but the Tatum budget's
+// refusal as 503 chain_unavailable_today, and no chain read at all for an owner with no
+// allowance; the question list
 // with Ellai's payment facts apart from agent text; answering, with its memory and grant; one
 // owner never seeing or answering another's question; same origin on the answer; and that an
 // unexpected failure, including a real database error carrying SQL, is a bare 500.
@@ -357,6 +358,18 @@ describe('GET /api/owner/overview', () => {
       expect(body.owner.suiAddress).toBe(owner.address);
     }
     expect(warn.mock.calls.map((call) => call.join(' '))).toEqual(['[ellai http] purse_balance_unavailable TIMEOUT', '[ellai http] purse_balance_unavailable UNEXPECTED']);
+  });
+
+  it("answers 503 chain_unavailable_today, not a blank purse, when Ellai's Tatum budget refused the purse read (C22)", async () => {
+    quiet();
+    const owner = await withAllowance(await signedInOwner());
+    getBalances.mockRejectedValueOnce(new ChainError('BUDGET', MARKER));
+    const response = await overview(owner.cookie);
+    expect(response.status).toBe(503);
+    const text = await response.text();
+    expect(JSON.parse(text)).toEqual({ error: 'chain_unavailable_today', message: "Ellai has used today's budget for reading Sui. Try again tomorrow (days are counted in UTC)." });
+    expect(text).not.toContain(MARKER);
+    expect(getBalances).toHaveBeenCalledTimes(1);
   });
 
   it('counts the last 30 days of decisions by outcome, and payments the chain verified', async () => {

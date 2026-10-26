@@ -6,7 +6,8 @@
 // balance read that its own ledger contradicts; never from an allowance that is not this
 // owner's, for this purse, in USDC, unexpired and with room under its cap and in its rate
 // window; never signs bytes that are not exactly the refill; keeps an unknown send pending and
-// reads that digest first next time; releases a lost refill only once its epoch window has
+// reads that digest first next time, but marks one the Tatum budget kept from leaving failed;
+// releases a lost refill only once its epoch window has
 // closed and further reads still miss it, and leaves rows from before that window was kept
 // waiting; asks its own ledger first, so across a day of ticks an owner whose ledger rules a
 // refill out costs no chain read, the onboarded owner's first refill included, and one below
@@ -18,7 +19,9 @@
 // 200,000 owners in use, and old rate counters first, before the tick does any owner's work.
 // confirmBlobsOnChain marks a memory only when its blob id is on one of the owner's own Walrus Blob
 // objects, certified and not past its end epoch by the Walrus epoch (read once an hour), reading
-// in stretches from a stored cursor, matching every waiting memory and keeping the latest end
+// in stretches from a stored cursor, kept through a Tatum budget refusal, a rejected key or a
+// failure that can clear and dropped only when the listing cannot be used, matching every
+// waiting memory and keeping the latest end
 // epoch, filling that end in for memories found before it was kept and hiding one on no Blob of
 // the owner only after reading the whole listing in one call;
 // expireBlobsOnChain marks one expired once the Walrus epoch reaches that end, a bounded
@@ -629,6 +632,26 @@ describe('refillIfNeeded', () => {
     expect(calls).toEqual([`getTransactionResult:${row.digest}`]);
     expect(one(await refillRows(w.ownerId))).toMatchObject({ status: 'verified', verifiedAt: NOW });
     expect(executions).toHaveLength(1);
+  });
+
+  it("marks a refill failed, never pending, when core reports its send never left because Ellai's Tatum budget refused it, so the next call reads no digest first", async () => {
+    const w = await funded();
+    const { chain, state, calls, executions } = stubFor(w, 0n);
+    const send = state.execute;
+    state.execute = () => {
+      throw new ChainError('BUDGET', 'Tatum executeTransaction: the request budget refused the send; transaction was not sent');
+    };
+    await expect(refill(w, chain)).rejects.toMatchObject({ name: 'ChainError', code: 'BUDGET' });
+    const unsent = one(await refillRows(w.ownerId));
+    expect(unsent.status).toBe('failed');
+    expect(executions).toHaveLength(1);
+
+    calls.length = 0;
+    state.execute = send;
+    expect(await refill(w, chain)).toBe('refilled');
+    expect(calls[0]).toBe(`getBalances:${w.purse}`);
+    expect(calls).not.toContain(`getTransactionResult:${unsent.digest}`);
+    expect((await refillRows(w.ownerId)).map((row) => row.status).sort()).toEqual(['failed', 'verified']);
   });
 
   it('signs, records and sends nothing when the built bytes are not exactly the refill', async () => {
@@ -1331,6 +1354,40 @@ describe('confirmBlobsOnChain', () => {
     expect(await cursorOf(w, on)).toBe('page-2');
     await expect(confirmBlobsOnChain({ db: on, chain: failing(false), ownerId: w.ownerId, now: NOW })).rejects.toMatchObject({ code: 'BAD_RESPONSE' });
     expect(await cursorOf(w, on)).toBeNull();
+  });
+
+  it("keeps the scan cursor when Ellai's Tatum budget refused a page, the key was rejected or the failure can clear, and starts over only when the listing itself cannot be used", async () => {
+    const on = await freshDb();
+    const w = await world(on);
+    await confirmedMemory(w, 'blob-not-there', ago(120_000), on);
+    const { chain } = stubChain(on);
+    const failingWith = (failure: ChainError) =>
+      ({
+        ...chain,
+        scanOwnedWalrusBlobs: async () => {
+          throw failure;
+        },
+      }) as Chain;
+    const scanFrom = async (cursor: string, failure: ChainError) => {
+      await on.update(owners).set({ blobScanCursor: cursor }).where(eq(owners.id, w.ownerId));
+      await expect(confirmBlobsOnChain({ db: on, chain: failingWith(failure), ownerId: w.ownerId, now: NOW })).rejects.toBe(failure);
+      return cursorOf(w, on);
+    };
+    const kept = [
+      new ChainError('BUDGET', 'Tatum scanOwnedWalrusBlobs: EllaiOwnedWalrusBlobs refused by the request budget, nothing was sent'),
+      new ChainError('UNAUTHORIZED', 'Tatum scanOwnedWalrusBlobs: API key rejected (HTTP 401)'),
+      new ChainError('RATE_LIMITED', 'Tatum scanOwnedWalrusBlobs: rate limited (HTTP 429)', true),
+      new ChainError('TIMEOUT', 'Tatum scanOwnedWalrusBlobs: timed out', true),
+      new ChainError('UPSTREAM', 'Tatum scanOwnedWalrusBlobs: gateway error (HTTP 503)', true),
+    ];
+    for (const failure of kept) expect(await scanFrom('page-2', failure), failure.code).toBe('page-2');
+    const unusable = [
+      new ChainError('INVALID_INPUT', 'a page cursor is 1 to 512 characters'),
+      new ChainError('BAD_RESPONSE', 'unexpected response from Tatum: Walrus blob page has the wrong shape'),
+      new ChainError('LIMIT_EXCEEDED', 'GraphQL response is over the byte cap'),
+      new ChainError('UPSTREAM', 'Tatum scanOwnedWalrusBlobs: GraphQL returned 1 error(s)'),
+    ];
+    for (const failure of unusable) expect(await scanFrom('page-2', failure), failure.code).toBeNull();
   });
 });
 

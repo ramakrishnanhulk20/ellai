@@ -1,4 +1,4 @@
-import { type Chain, ChainError } from '@ellai/core/chain';
+import { type Chain, ChainError, type ChainErrorCode } from '@ellai/core/chain';
 import { LIMITS } from '@ellai/core/limits';
 import { type SQL, and, asc, count, eq, gte, inArray, isNotNull, isNull, lte, sql } from 'drizzle-orm';
 import type { Database } from '../db/client.js';
@@ -31,6 +31,28 @@ async function currentWalrusEpoch(chain: Chain, now: Date): Promise<number> {
   const epoch = await chain.getWalrusEpoch();
   walrusEpochs.set(chain, { epoch, readAtMs: now.getTime() });
   return epoch;
+}
+
+// Whether a ChainError that will not clear by itself says the listing cannot be read from the
+// stored cursor (a cursor refused, a page of the wrong shape or size, the gateway refusing the
+// query), so the next scan starts from the top. A request Ellai's Tatum budget refused (BUDGET,
+// nothing sent) or a rejected key says nothing about the listing, so the cursor is kept for them,
+// as for every failure that can clear by itself. A complete record, so a new code must be placed
+// here before this compiles.
+const LISTING_UNUSABLE: Readonly<Record<ChainErrorCode, boolean>> = {
+  INVALID_INPUT: true,
+  BAD_RESPONSE: true,
+  LIMIT_EXCEEDED: true,
+  UPSTREAM: true,
+  NOT_FOUND: true,
+  TIMEOUT: false,
+  RATE_LIMITED: false,
+  UNAUTHORIZED: false,
+  BUDGET: false,
+};
+
+function listingUnusable(error: unknown): boolean {
+  return error instanceof ChainError && !error.retryable && Object.hasOwn(LISTING_UNUSABLE, error.code) && LISTING_UNUSABLE[error.code];
 }
 
 /** A memory found on chain, with the end epoch its Blob was stored until, that has not been seen to expire. */
@@ -102,10 +124,12 @@ export function awaitingChainCheck(now: Date): SQL | undefined {
  * id found is proof however many objects the owner holds; the page cap only defers the rest to a
  * later call. The Walrus epoch comes from chain.getWalrusEpoch, at most once per
  * LIMITS.walrusEpochCacheMs per chain client. A Tatum failure keeps what the pages before it found
- * and where they reached, and is then thrown; one that will not clear by itself (a refused
- * cursor, a page of the wrong shape) also sends the next call back to the top, so one bad cursor
- * cannot stop the check for good. A memory not found before the maximum age is never checked
- * again and never shown on /proof.
+ * and where they reached, and is then thrown. Only one that says the listing itself cannot be
+ * read from there (listingUnusable: a refused cursor, a page of the wrong shape or size, the
+ * gateway refusing the query) also sends the next call back to the top, so one bad cursor cannot
+ * stop the check for good; a request Ellai's Tatum budget refused, a rejected key, or a failure
+ * that can clear by itself keeps the cursor, so the scan resumes where it stopped. A memory not
+ * found before the maximum age is never checked again and never shown on /proof.
  *
  * Blob ids are compared as exact text: the relayer and core's scan write the same base64url form
  * of the u256, and any other spelling does not match, which fails closed.
@@ -153,7 +177,7 @@ export async function confirmBlobsOnChain(args: BlobConfirmArgs): Promise<{ chec
     }
   } catch (error) {
     failure = error;
-    if (error instanceof ChainError && !error.retryable) next = null;
+    if (listingUnusable(error)) next = null;
   }
 
   const endsOf = (ends: Map<string, number>) =>

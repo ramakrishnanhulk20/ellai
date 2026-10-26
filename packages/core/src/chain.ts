@@ -722,8 +722,9 @@ function allowanceCoinType(repr: string): string {
  * `beforeRequest`, when given, is awaited before every request sent to Tatum: each gRPC call on
  * the transport, the Sui SDK's own calls through `grpc` included, each GraphQL fetch, each page
  * and each retry. If it throws, nothing is sent and that request fails with ChainError BUDGET,
- * which is never retried; streaming gRPC calls are then refused the same way, since they cannot
- * be counted. Without it nothing runs before a request.
+ * which is never retried, except inside executeTransaction after its first send, where the
+ * outcome is unknown (see there); streaming gRPC calls are then refused the same way, since they
+ * cannot be counted. Without it nothing runs before a request.
  */
 export function createChain(opts: { apiKey?: string; beforeRequest?: BeforeTatumRequest }): Chain {
   const apiKey = opts.apiKey === '' ? undefined : opts.apiKey;
@@ -1148,9 +1149,12 @@ export function createChain(opts: { apiKey?: string; beforeRequest?: BeforeTatum
    * each bounded by LIMITS.tatumTimeoutMs per request.
    *
    * Returns status "failure" with a fixed code for a transaction that ran and failed, or
-   * that the network refused before running it. Throws ChainError INVALID_INPUT for empty
-   * bytes or bad signatures without sending anything. Any other ChainError means the
-   * outcome is unknown, and its message says so and names the digest to read later.
+   * that the network refused before running it. Throws, without sending anything, ChainError
+   * INVALID_INPUT for empty bytes or bad signatures, and ChainError BUDGET when the
+   * beforeRequest hook refuses the first send; from this function BUDGET always means the bytes
+   * never left. Any other ChainError means the outcome is unknown, and its message says so and
+   * names the digest to read later. That includes the hook refusing any request after the first
+   * send, a lookup or a second send, which is reported as RATE_LIMITED, not retryable.
    */
   async function executeTransaction(txBytes: Uint8Array, signatures: string[]): Promise<ExecutionResult> {
     if (!(txBytes instanceof Uint8Array) || txBytes.length === 0) {
@@ -1158,14 +1162,18 @@ export function createChain(opts: { apiKey?: string; beforeRequest?: BeforeTatum
     }
     const userSignatures = signatureInputs(signatures);
     const digest = TransactionDataBuilder.getDigestFromBytes(txBytes);
-    const outcomeUnknown = (failure: ChainError) =>
-      scrub(
+    const outcomeUnknown = (failure: ChainError) => {
+      // A caller reads BUDGET from here as "never sent", so a budget refusal after bytes went out
+      // must not carry that code.
+      const refusedByBudget = failure.code === 'BUDGET';
+      return scrub(
         new ChainError(
-          failure.code,
-          `Tatum executeTransaction: ${failure.message}; transaction ${digest} may have landed, read it before building another`,
-          failure.retryable,
+          refusedByBudget ? 'RATE_LIMITED' : failure.code,
+          `Tatum executeTransaction: ${refusedByBudget ? 'the request budget refused a request after the bytes were sent' : failure.message}; transaction ${digest} may have landed, read it before building another`,
+          refusedByBudget ? false : failure.retryable,
         ),
       );
+    };
 
     let lastFailure: ChainError | null = null;
     for (let round = 0; round <= LIMITS.tatumRetries; round++) {
@@ -1191,6 +1199,11 @@ export function createChain(opts: { apiKey?: string; beforeRequest?: BeforeTatum
         return executedResult(response.transaction, digest);
       } catch (error) {
         const failure = classifyChainError(error);
+        // The hook runs before a request is sent, so a refused first send is a definite "not
+        // sent". After a later refusal an earlier send may still land.
+        if (failure.code === 'BUDGET' && round === 0) {
+          throw new ChainError('BUDGET', `Tatum executeTransaction: the request budget refused the send; transaction ${digest} was not sent`);
+        }
         if (failure.code === 'INVALID_INPUT') {
           const refusal = simulationRefusal(error) ?? 'REFUSED';
           // Tatum's free plan answers about 3 requests a second, so a read sent the moment the

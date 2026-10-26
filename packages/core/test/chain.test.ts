@@ -13,7 +13,8 @@
 // stand-in GraphQL answers: the beforeRequest hook running once for every page and every retry,
 // for calls made straight on chain.grpc (the SDK's zkLogin check among them) as well as through
 // the Chain methods, and a hook that throws sending nothing and failing the call as BUDGET, never
-// retried, with streaming calls refused.
+// retried, with streaming calls refused; executeTransaction reading a refused first send as not
+// sent, and a refusal of a lookup or a second send as an unknown outcome that never says BUDGET.
 // Does NOT cover: the hook against the live gateway (no live test passes one), a paid key's rate limits, the Walrus blob listing or scan against the live
 // gateway (the probe script and the scratch cross-check exercise the listing), an owner that
 // actually holds USDC, a failed transaction's status read from chain (none is pinned
@@ -763,6 +764,63 @@ describe('beforeRequest, against a stand-in gRPC transport and stand-in GraphQL 
     }
     expect(fetched).not.toHaveBeenCalled();
     expect(calls).toEqual([{ transport: 'graphql', method: 'EllaiAllowance' }]);
+  });
+
+  it('in executeTransaction, reads a refused first send as not sent, and a refusal after any send as an unknown outcome that never says BUDGET', async () => {
+    const firstRefused = hookRecorder(true);
+    const notSent = await withGrpcAnswers([], async (sent) => {
+      const local = createChain({ beforeRequest: firstRefused.beforeRequest });
+      try {
+        const failure = await failureOf(local.executeTransaction(SIGNED_BYTES, [SIGNATURE]));
+        expect(sent).toEqual([]);
+        return failure;
+      } finally {
+        local.close();
+      }
+    });
+    expect(notSent).toMatchObject({ code: 'BUDGET', retryable: false });
+    expect(notSent.message).toContain(`transaction ${SIGNED_DIGEST} was not sent`);
+    expect(notSent.message).not.toContain('may have landed');
+    expect(firstRefused.calls).toEqual([{ transport: 'grpc', method: 'ExecuteTransaction' }]);
+
+    // Sends pass and every lookup is refused: after a send that failed in transit, then after one the network refused.
+    const readsRefused = vi.fn(async (call: TatumCall) => {
+      if (call.method === 'GetTransaction') throw new Error('over budget');
+    });
+    // A first send that failed in transit, a lookup that found nothing, then the second send refused.
+    let sends = 0;
+    const resendRefused = vi.fn(async (call: TatumCall) => {
+      if (call.method === 'ExecuteTransaction' && ++sends > 1) throw new Error('over budget');
+    });
+    const unknown = [
+      ...(await withGrpcAnswers([unavailable, () => Promise.reject(rpcError('INVALID_ARGUMENT'))], async (sent) => {
+        const local = createChain({ beforeRequest: readsRefused });
+        try {
+          const failures = [await failureOf(local.executeTransaction(SIGNED_BYTES, [SIGNATURE])), await failureOf(local.executeTransaction(SIGNED_BYTES, [SIGNATURE]))];
+          expect(sent).toEqual(['ExecuteTransaction', 'ExecuteTransaction']);
+          return failures;
+        } finally {
+          local.close();
+        }
+      })),
+      await withGrpcAnswers([unavailable, () => Promise.reject(rpcError('NOT_FOUND'))], async (sent) => {
+        const local = createChain({ beforeRequest: resendRefused });
+        try {
+          const failure = await failureOf(local.executeTransaction(SIGNED_BYTES, [SIGNATURE]));
+          expect(sent).toEqual(['ExecuteTransaction', 'GetTransaction']);
+          return failure;
+        } finally {
+          local.close();
+        }
+      }),
+    ];
+    expect(readsRefused.mock.calls.map(([call]) => call.method)).toEqual(['ExecuteTransaction', 'GetTransaction', 'ExecuteTransaction', 'GetTransaction']);
+    expect(resendRefused.mock.calls.map(([call]) => call.method)).toEqual(['ExecuteTransaction', 'GetTransaction', 'ExecuteTransaction']);
+    for (const failure of unknown) {
+      expect(failure).toMatchObject({ code: 'RATE_LIMITED', retryable: false });
+      expect(failure.message).toContain(`transaction ${SIGNED_DIGEST} may have landed`);
+      expect(failure.message).not.toContain('not sent');
+    }
   });
 
   it('runs for calls made straight on chain.grpc, as the Sui SDK makes the zkLogin check, and refuses streaming calls', async () => {
