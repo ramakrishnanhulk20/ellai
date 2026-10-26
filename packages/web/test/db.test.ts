@@ -267,6 +267,7 @@ describe('migrations', () => {
       'seller_sales',
       'sessions',
       'signin_nonces',
+      'step_ups',
     ]);
   });
 
@@ -275,10 +276,10 @@ describe('migrations', () => {
       sql`select conrelid::regclass::text as source, confrelid::regclass::text as target, confdeltype::text as on_delete
           from pg_constraint where contype = 'f'`,
     );
-    expect(keys.length).toBe(18);
+    expect(keys.length).toBe(19);
     expect(keys.filter((key) => key.on_delete !== 'r')).toEqual([]);
     const pointingAtOwners = keys.filter((key) => key.target === 'owners').map((key) => key.source).sort();
-    expect(pointingAtOwners).toEqual(['agents', 'decisions', 'grants', 'memories', 'payments', 'questions', 'refills', 'sessions']);
+    expect(pointingAtOwners).toEqual(['agents', 'decisions', 'grants', 'memories', 'payments', 'questions', 'refills', 'sessions', 'step_ups']);
   });
 
   it('take a database from 0000 to 0001 to exactly what migrating in one go makes', async () => {

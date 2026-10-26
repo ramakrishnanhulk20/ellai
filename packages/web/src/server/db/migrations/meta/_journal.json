@@ -43,6 +43,13 @@
       "when": 1793003726438,
       "tag": "0005_first_proudstar",
       "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "7",
+      "when": 1793005468084,
+      "tag": "0006_lonely_leper_queen",
+      "breakpoints": true
     }
   ]
 }

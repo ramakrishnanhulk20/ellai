@@ -41,6 +41,8 @@ export const MEMORY_STATUSES = ['pending', 'confirmed', 'failed'] as const;
 export const SETTLEMENTS = ['pending', 'verified', 'mismatch', 'not_landed'] as const;
 export const REFILL_STATUSES = ['pending', 'verified', 'failed'] as const;
 export const SALE_STATUSES = ['issued', 'settled', 'rejected'] as const;
+/** Owner actions that loosen what Ellai may do, and so need a fresh wallet signature on top of the session. */
+export const STEP_UP_ACTIONS = ['create_agent', 'loosen_settings'] as const;
 
 /**
  * Longest text, in characters, the database accepts in each column that an agent, a
@@ -74,6 +76,8 @@ export const TEXT_CAPS = {
   rateKey: 200,
   /** A GraphQL page cursor is opaque; Sui's are base64 well under this. */
   pageCursor: 512,
+  /** A step-up message: Ellai's domain, the address, one line per changed setting, nonce and times. */
+  stepUpMessage: 2_000,
 } as const;
 
 const RESTRICT = { onDelete: 'restrict' } as const;
@@ -177,6 +181,32 @@ export const sessions = pgTable(
     revokedAt: at('revoked_at'),
   },
   (t) => [index('sessions_expires_at_idx').on(t.expiresAt), index('sessions_owner_expires_at_idx').on(t.ownerId, t.expiresAt)],
+);
+
+// One row per change an owner was asked to sign: the exact message, and a hash of the exact
+// change it names, so the signature authorises that change once and nothing else. They expire in
+// minutes, and pruning removes expired ones before it removes empty owners.
+export const stepUps = pgTable(
+  'step_ups',
+  {
+    nonce: text('nonce').primaryKey(),
+    ownerId: uuid('owner_id')
+      .notNull()
+      .references(() => owners.id, RESTRICT),
+    action: text('action', { enum: STEP_UP_ACTIONS }).notNull(),
+    changeHash: text('change_hash').notNull(),
+    message: text('message').notNull(),
+    createdAt: createdAt(),
+    expiresAt: at('expires_at').notNull(),
+    usedAt: at('used_at'),
+  },
+  (t) => [
+    index('step_ups_expires_at_idx').on(t.expiresAt),
+    index('step_ups_owner_idx').on(t.ownerId),
+    oneOf('step_ups_action_known', t.action, STEP_UP_ACTIONS),
+    check('step_ups_change_hash_hex', sql`${t.changeHash} ~ '^[0-9a-f]{64}$'`),
+    maxLength('step_ups_message_length', t.message, TEXT_CAPS.stepUpMessage),
+  ],
 );
 
 export const agents = pgTable(
