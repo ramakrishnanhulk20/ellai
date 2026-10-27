@@ -513,6 +513,16 @@ export const LIMITS = {
   questionsPerPage: 50,
   /** Latest verified payments and latest on-chain memories /proof lists (C22: it is one cached read). */
   publicProofLatest: 20,
+  /**
+   * Latest on-chain owner answers the public memory map lists. The map is one cached read a
+   * window (C22), and this keeps that read and its answer small however long the history grows.
+   */
+  memoryMapMemories: 200,
+  /**
+   * Latest decisions the public memory map lists. Each cites at most decideMaxCitedMemories
+   * memories, so the map's citation read is bounded at 50 times that, 1,000 rows.
+   */
+  memoryMapDecisions: 50,
   /** The span the overview counts decisions and verified payments over: 30 days. */
   overviewCountWindowMs: 2_592_000_000,
   /** Latest approved or asked decisions the overview's question rate is taken over; its questionsPer20 field is named for it. */

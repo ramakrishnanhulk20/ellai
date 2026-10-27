@@ -436,7 +436,8 @@ const STATUS_FOR = { approved: 'open', refused: 'refused', asked: 'asked' } as c
  *   during recall or the lock wait authorises nothing (C26). If that pass needs a recall the
  *   first did not take, the recall counts as failed and Ellai asks. The decision, its
  *   citations, its question (for an ask) and its grant use (for a grant approval) are written
- *   together, each stamped with that same reading.
+ *   together, each stamped with that same reading. A learned approval's citations keep the
+ *   distance recall gave each memory; every other citation keeps none.
  *
  * Statuses: approved is 'open', refused is 'refused', asked is 'asked'. expires_at is the
  * payment's own expiry. Throws DecideError: BAD_INPUT, BAD_PURPOSE (empty after trimming or
@@ -499,7 +500,9 @@ export async function decide(args: DecideArgs): Promise<DecideResult> {
     if (decided.citedMemoryIds.length > 0) {
       await tx
         .insert(decisionCitations)
-        .values(decided.citedMemoryIds.map((memoryId) => ({ decisionId: row.id, memoryId, ownerId: r.ownerId })));
+        .values(
+          decided.citedMemoryIds.map((memoryId) => ({ decisionId: row.id, memoryId, ownerId: r.ownerId, distance: decided.citedDistances?.get(memoryId) ?? null })),
+        );
     }
     if (decided.outcome === 'asked') {
       await tx.insert(questions).values({ decisionId: row.id, ownerId: r.ownerId, createdAt: at });

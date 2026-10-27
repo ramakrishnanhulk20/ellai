@@ -368,6 +368,10 @@ export const decisionCitations = pgTable(
     decisionId: uuid('decision_id').notNull(),
     memoryId: uuid('memory_id').notNull(),
     ownerId: uuid('owner_id').notNull(),
+    // How close recall found the memory to the request, kept so the public memory map can show
+    // why a learned approval paid. Null for citations found by exact lookup (refusals, bad
+    // outcomes) and for rows written before it was kept.
+    distance: real('distance'),
   },
   (t) => [
     primaryKey({ columns: [t.decisionId, t.memoryId] }),

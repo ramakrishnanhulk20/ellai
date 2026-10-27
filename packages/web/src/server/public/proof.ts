@@ -1,9 +1,9 @@
 import { LIMITS } from '@ellai/core/limits';
 import { isValidTransactionDigest } from '@mysten/sui/utils';
-import { and, count, desc, eq, exists, isNotNull, isNull, or, sql } from 'drizzle-orm';
+import { and, asc, count, desc, eq, exists, inArray, isNotNull, isNull, or, sql } from 'drizzle-orm';
 import type { Database } from '../db/client.js';
-import { type MEMORY_KINDS, decisions, memories, owners, payments } from '../db/schema.js';
-import { hostLabel } from '../decide/sentences.js';
+import { type DECISION_OUTCOMES, type DECISION_RULES, type MEMORY_KINDS, type VERDICTS, decisionCitations, decisions, memories, owners, payments } from '../db/schema.js';
+import { formatUsdc, hostLabel } from '../decide/sentences.js';
 
 /** The public proof could not be read and there is no earlier copy to show. The message is fixed text. */
 export class ProofUnavailableError extends Error {
@@ -44,18 +44,9 @@ const EXPLORER_TX = 'https://suiscan.xyz/mainnet/tx/';
 // checked again on the way out because this page is where a stranger will read it.
 const BLOB_ID = /^[A-Za-z0-9_-]{1,128}$/;
 
-/**
- * Reads the public proof from the database: six reads, no chain call, each joined to its
- * owner and kept to owners with public_proof true. The latest LIMITS.publicProofLatest verified
- * payments, newest first, each with its explorer link and its seller host through hostLabel; the
- * latest LIMITS.publicProofLatest memories confirmed by Walrus Memory, found on chain
- * (chain_confirmed_at set) and not expired there (chain_expired_at unset), newest first, by blob
- * id and kind only; and the totals, over the same owners, with an owner answer counted only while
- * it is so, a learned approval only once its payment is verified, and a question only for an owner
- * with a verified payment or an on-chain memory. A digest that is not a Sui transaction digest,
- * or a blob id that is not plain base64url, is left out rather than linked or shown.
- */
-export async function readPublicProof(db: Database): Promise<PublicProof> {
+// Built in one place so /proof and the memory map can never disagree on which owners, payments
+// and memories a stranger may see.
+function publicRules(db: Database) {
   const shown = eq(owners.publicProof, true);
   const verified = eq(payments.settlement, 'verified');
   const onChain = and(eq(memories.status, 'confirmed'), isNotNull(memories.blobId), isNotNull(memories.chainConfirmedAt), isNull(memories.chainExpiredAt));
@@ -63,12 +54,15 @@ export async function readPublicProof(db: Database): Promise<PublicProof> {
     exists(db.select({ one: sql`1` }).from(payments).where(and(eq(payments.ownerId, owners.id), verified))),
     exists(db.select({ one: sql`1` }).from(memories).where(and(eq(memories.ownerId, owners.id), onChain))),
   );
-  const [paid, answers, learned, asked, latestPayments, latestMemories] = await Promise.all([
-    db
-      .select({ n: count(), total: sql<string>`coalesce(sum(${payments.amountAtomic}), 0)::text` })
-      .from(payments)
-      .innerJoin(owners, eq(owners.id, payments.ownerId))
-      .where(and(eq(payments.settlement, 'verified'), shown)),
+  return { shown, verified, onChain, onPage };
+}
+
+type PublicRules = ReturnType<typeof publicRules>;
+
+// The three totals both public reads show, from the same queries, so the landing page's numbers
+// always match /proof's.
+async function learningTotals(db: Database, { shown, verified, onChain, onPage }: PublicRules) {
+  const [answers, learned, asked] = await Promise.all([
     db
       .select({ n: count() })
       .from(memories)
@@ -85,6 +79,31 @@ export async function readPublicProof(db: Database): Promise<PublicProof> {
       .from(decisions)
       .innerJoin(owners, eq(owners.id, decisions.ownerId))
       .where(and(eq(decisions.outcome, 'asked'), shown, onPage)),
+  ]);
+  return { ownerAnswers: answers[0]?.n ?? 0, learnedApprovals: learned[0]?.n ?? 0, questionsAsked: asked[0]?.n ?? 0 };
+}
+
+/**
+ * Reads the public proof from the database: six reads, no chain call, each joined to its
+ * owner and kept to owners with public_proof true. The latest LIMITS.publicProofLatest verified
+ * payments, newest first, each with its explorer link and its seller host through hostLabel; the
+ * latest LIMITS.publicProofLatest memories confirmed by Walrus Memory, found on chain
+ * (chain_confirmed_at set) and not expired there (chain_expired_at unset), newest first, by blob
+ * id and kind only; and the totals, over the same owners, with an owner answer counted only while
+ * it is so, a learned approval only once its payment is verified, and a question only for an owner
+ * with a verified payment or an on-chain memory. A digest that is not a Sui transaction digest,
+ * or a blob id that is not plain base64url, is left out rather than linked or shown.
+ */
+export async function readPublicProof(db: Database): Promise<PublicProof> {
+  const rules = publicRules(db);
+  const { shown, verified, onChain } = rules;
+  const [paid, learning, latestPayments, latestMemories] = await Promise.all([
+    db
+      .select({ n: count(), total: sql<string>`coalesce(sum(${payments.amountAtomic}), 0)::text` })
+      .from(payments)
+      .innerJoin(owners, eq(owners.id, payments.ownerId))
+      .where(and(eq(payments.settlement, 'verified'), shown)),
+    learningTotals(db, rules),
     db
       .select({ digest: payments.digest, amountAtomic: payments.amountAtomic, sellerHost: decisions.sellerHost, signedAt: payments.signedAt })
       .from(payments)
@@ -105,9 +124,9 @@ export async function readPublicProof(db: Database): Promise<PublicProof> {
     totals: {
       verifiedPayments: paid[0]?.n ?? 0,
       verifiedUsdcAtomic: paid[0]?.total ?? '0',
-      confirmedOwnerAnswers: answers[0]?.n ?? 0,
-      approvedByLearning: learned[0]?.n ?? 0,
-      askedDecisions: asked[0]?.n ?? 0,
+      confirmedOwnerAnswers: learning.ownerAnswers,
+      approvedByLearning: learning.learnedApprovals,
+      askedDecisions: learning.questionsAsked,
     },
     payments: latestPayments.flatMap((row) =>
       isValidTransactionDigest(row.digest)
@@ -120,34 +139,148 @@ export async function readPublicProof(db: Database): Promise<PublicProof> {
   };
 }
 
-interface ProofCache {
-  value: PublicProof | null;
+/**
+ * What the landing page's memory map draws, from Ellai's own records and only for owners who
+ * opted in (owners.public_proof): owner answers confirmed by Walrus Memory, found on chain and
+ * not expired there, and recent decisions, each with the shown answers it cited and how close
+ * recall found each one (null when the citation came from an exact lookup, or was written before
+ * distances were kept). A decision's id is its place in this answer, never its database id, and
+ * its digest is set only for a payment Ellai verified. The totals are /proof's: owner answers
+ * on chain, learned approvals whose payment Ellai verified, and questions asked of owners the
+ * page shows. It holds no memory sentence, purpose, reason, agent, owner id or address (C17,
+ * C18, C19). Hosts are written as the sentences write them (hostLabel), amounts as decimal USDC
+ * (formatUsdc), times as ISO strings; a memory's `at` is when Walrus Memory confirmed it.
+ */
+export interface MemoryMap {
+  generatedAt: string;
+  memories: Array<{ blobId: string; verdict: (typeof VERDICTS)[number]; host: string; amountUsdc: string; at: string }>;
+  decisions: Array<{
+    id: string;
+    at: string;
+    outcome: (typeof DECISION_OUTCOMES)[number];
+    rule: (typeof DECISION_RULES)[number];
+    host: string;
+    amountUsdc: string;
+    digest: string | null;
+    citations: Array<{ blobId: string; distance: number | null }>;
+  }>;
+  totals: { memories: number; learnedApprovals: number; questionsAsked: number };
+}
+
+// A real column keeps about six significant digits, so the stored value is cut back to them
+// rather than shown with the float's noise (0.1 reads back as 0.10000000149011612). Anything
+// that is not a distance recall could honestly give is shown as no distance.
+function shownDistance(distance: number | null): number | null {
+  if (distance === null || !Number.isFinite(distance) || distance < 0 || distance > LIMITS.recallDistanceMax) return null;
+  return Number(distance.toPrecision(6));
+}
+
+/**
+ * Reads the memory map from the database, at `now`: the totals' three reads, the latest
+ * LIMITS.memoryMapMemories owner answers on chain (the /proof rule) by Walrus Memory's
+ * confirmation time, the latest LIMITS.memoryMapDecisions decisions by creation time, both newest
+ * first and kept to owners with public_proof true, then one read of those decisions' citations to
+ * owner answers on chain, closest first. No chain or relayer call (C22). A citation to any other
+ * memory (an outcome, one not yet found on chain, one Walrus no longer stores) is left out, as is
+ * a blob id that is not plain base64url or a memory whose amount is not a whole number of atomic
+ * units. A digest that is not a Sui transaction digest is shown as none. Throws Error when `now`
+ * is not a valid date, which is a server bug.
+ */
+export async function readMemoryMap(db: Database, now: Date): Promise<MemoryMap> {
+  if (!(now instanceof Date) || Number.isNaN(now.getTime())) throw new Error('The current time is not a date');
+  const rules = publicRules(db);
+  const { shown, verified, onChain, onPage } = rules;
+  const ownerAnswer = and(eq(memories.kind, 'owner_decision'), onChain);
+  const [learning, latestMemories, latestDecisions] = await Promise.all([
+    learningTotals(db, rules),
+    db
+      .select({ blobId: memories.blobId, verdict: memories.verdict, sellerHost: memories.sellerHost, amountAtomic: memories.amountAtomic, confirmedAt: memories.confirmedAt })
+      .from(memories)
+      .innerJoin(owners, eq(owners.id, memories.ownerId))
+      .where(and(ownerAnswer, isNotNull(memories.confirmedAt), shown))
+      .orderBy(desc(memories.confirmedAt), desc(memories.id))
+      .limit(LIMITS.memoryMapMemories),
+    db
+      .select({
+        id: decisions.id,
+        createdAt: decisions.createdAt,
+        outcome: decisions.outcome,
+        rule: decisions.rule,
+        sellerHost: decisions.sellerHost,
+        amountAtomic: decisions.amountAtomic,
+        digest: payments.digest,
+      })
+      .from(decisions)
+      .innerJoin(owners, eq(owners.id, decisions.ownerId))
+      .leftJoin(payments, and(eq(payments.decisionId, decisions.id), eq(payments.ownerId, decisions.ownerId), verified))
+      // As on /proof: only owners with something on chain, so opting in alone cannot fill the map.
+      .where(and(shown, onPage))
+      .orderBy(desc(decisions.createdAt), desc(decisions.id))
+      .limit(LIMITS.memoryMapDecisions),
+  ]);
+
+  const decisionIds = latestDecisions.map((row) => row.id);
+  const cited =
+    decisionIds.length === 0
+      ? []
+      : await db
+          .select({ decisionId: decisionCitations.decisionId, blobId: memories.blobId, distance: decisionCitations.distance })
+          .from(decisionCitations)
+          .innerJoin(memories, and(eq(memories.id, decisionCitations.memoryId), eq(memories.ownerId, decisionCitations.ownerId)))
+          .innerJoin(owners, eq(owners.id, decisionCitations.ownerId))
+          .where(and(inArray(decisionCitations.decisionId, decisionIds), ownerAnswer, shown))
+          // Ascending puts nulls last in Postgres, so exact-lookup citations follow the measured ones.
+          .orderBy(asc(decisionCitations.decisionId), asc(decisionCitations.distance), asc(memories.blobId))
+          .limit(LIMITS.memoryMapDecisions * LIMITS.decideMaxCitedMemories);
+  const citations = new Map<string, Array<{ blobId: string; distance: number | null }>>();
+  for (const row of cited) {
+    if (row.blobId === null || !BLOB_ID.test(row.blobId)) continue;
+    const list = citations.get(row.decisionId) ?? [];
+    list.push({ blobId: row.blobId, distance: shownDistance(row.distance) });
+    citations.set(row.decisionId, list);
+  }
+
+  return {
+    generatedAt: now.toISOString(),
+    memories: latestMemories.flatMap((row) =>
+      row.blobId !== null && BLOB_ID.test(row.blobId) && row.verdict !== null && row.amountAtomic !== null && row.amountAtomic >= 0n && row.confirmedAt !== null
+        ? [{ blobId: row.blobId, verdict: row.verdict, host: hostLabel(row.sellerHost ?? ''), amountUsdc: formatUsdc(row.amountAtomic), at: row.confirmedAt.toISOString() }]
+        : [],
+    ),
+    decisions: latestDecisions.map((row, index) => ({
+      id: String(index),
+      at: row.createdAt.toISOString(),
+      outcome: row.outcome,
+      rule: row.rule,
+      host: hostLabel(row.sellerHost),
+      amountUsdc: formatUsdc(row.amountAtomic),
+      digest: row.digest !== null && isValidTransactionDigest(row.digest) ? row.digest : null,
+      citations: citations.get(row.id) ?? [],
+    })),
+    totals: { memories: learning.ownerAnswers, learnedApprovals: learning.learnedApprovals, questionsAsked: learning.questionsAsked },
+  };
+}
+
+interface ReadCache<T> {
+  value: T | null;
   refreshStartedAtMs: number | null;
-  refreshing: Promise<PublicProof> | null;
+  refreshing: Promise<T> | null;
 }
 
 // Kept on globalThis, as the server context is, because the Next dev server can load this
 // module more than once and two caches would mean two refreshes per window.
-const CACHE_KEY = '__ellaiPublicProof';
+const PROOF_CACHE_KEY = '__ellaiPublicProof';
+const MEMORY_MAP_CACHE_KEY = '__ellaiMemoryMap';
 
-function proofCache(): ProofCache {
-  const holder = globalThis as unknown as Record<string, ProofCache | undefined>;
-  holder[CACHE_KEY] ??= { value: null, refreshStartedAtMs: null, refreshing: null };
-  return holder[CACHE_KEY];
+function readCache<T>(key: string): ReadCache<T> {
+  const holder = globalThis as unknown as Record<string, ReadCache<T> | undefined>;
+  holder[key] ??= { value: null, refreshStartedAtMs: null, refreshing: null };
+  return holder[key];
 }
 
-/**
- * The public proof as of the latest refresh, calling `load` at most once in any window of
- * LIMITS.publicProofCacheMs, so anonymous traffic, however heavy, reads the database at most
- * once a window (C22). Callers that arrive during a refresh wait for that one refresh. A failed
- * refresh still uses up its window: the last good copy is served until the next window, and
- * with no good copy yet ProofUnavailableError is thrown, logged as a fixed code only. A clock
- * that has gone back before the last refresh counts as a new window. Throws Error when `nowMs`
- * is not a finite number, which is a server bug.
- */
-export function cachedPublicProof(load: () => Promise<PublicProof>, nowMs: number): Promise<PublicProof> {
+function cachedRead<T>(key: string, failedLog: string, load: () => Promise<T>, nowMs: number): Promise<T> {
   if (!Number.isFinite(nowMs)) throw new Error('The current time is not a number');
-  const cache = proofCache();
+  const cache = readCache<T>(key);
   if (cache.refreshing !== null) return cache.refreshing;
   const started = cache.refreshStartedAtMs;
   if (started !== null && nowMs >= started && nowMs - started < LIMITS.publicProofCacheMs) {
@@ -162,7 +295,7 @@ export function cachedPublicProof(load: () => Promise<PublicProof>, nowMs: numbe
         return value;
       },
       () => {
-        console.error('[ellai proof] refresh_failed');
+        console.error(failedLog);
         if (cache.value === null) throw new ProofUnavailableError();
         return cache.value;
       },
@@ -172,4 +305,27 @@ export function cachedPublicProof(load: () => Promise<PublicProof>, nowMs: numbe
     });
   cache.refreshing = refreshing;
   return refreshing;
+}
+
+/**
+ * The public proof as of the latest refresh, calling `load` at most once in any window of
+ * LIMITS.publicProofCacheMs, so anonymous traffic, however heavy, reads the database at most
+ * once a window (C22). Callers that arrive during a refresh wait for that one refresh. A failed
+ * refresh still uses up its window: the last good copy is served until the next window, and
+ * with no good copy yet ProofUnavailableError is thrown, logged as a fixed code only. A clock
+ * that has gone back before the last refresh counts as a new window. Throws Error when `nowMs`
+ * is not a finite number, which is a server bug.
+ */
+export function cachedPublicProof(load: () => Promise<PublicProof>, nowMs: number): Promise<PublicProof> {
+  return cachedRead(PROOF_CACHE_KEY, '[ellai proof] refresh_failed', load, nowMs);
+}
+
+/**
+ * The memory map as of its latest refresh, with a cache of its own under exactly the rules of
+ * cachedPublicProof: `load` called at most once in any window of LIMITS.publicProofCacheMs (C22),
+ * the last good copy served after a failed refresh, and ProofUnavailableError with none, since
+ * the map is part of the public proof. Throws Error when `nowMs` is not a finite number.
+ */
+export function cachedMemoryMap(load: () => Promise<MemoryMap>, nowMs: number): Promise<MemoryMap> {
+  return cachedRead(MEMORY_MAP_CACHE_KEY, '[ellai memory-map] refresh_failed', load, nowMs);
 }

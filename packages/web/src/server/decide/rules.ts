@@ -70,6 +70,12 @@ export interface RuleResult {
   outcome: 'approved' | 'refused' | 'asked';
   rule: DecisionRule;
   citedMemoryIds: string[];
+  /**
+   * Only on a learned approval: the distance recall gave each cited memory, by memory id, the
+   * smallest if recall returned it more than once. Every other rule cites by exact lookup, so
+   * there is no distance to give.
+   */
+  citedDistances?: ReadonlyMap<string, number>;
   /** Written by Ellai from the host, amounts and counts only, never from purpose or memory text (C17). */
   reason: string;
   grantId?: string;
@@ -179,7 +185,7 @@ function rulesAfterRecall(facts: DecideFacts): RuleResult {
   // cutoff that is not a number counts as cut inside it.
   const cutInside = recall.cutOffAt !== null && !(recall.cutOffAt >= settings.distanceCutoff);
   // Keyed by memory id, so a hit the relayer repeats counts once.
-  const matching = new Map<string, bigint>();
+  const matching = new Map<string, { amountAtomic: bigint; distance: number }>();
   for (const hit of recall.hits) {
     if (
       hit.countsAsOwnerDecision === true &&
@@ -188,18 +194,22 @@ function rulesAfterRecall(facts: DecideFacts): RuleResult {
       hit.amountAtomic >= facts.amountAtomic &&
       hit.distance < settings.distanceCutoff
     ) {
-      matching.set(hit.memoryId, hit.amountAtomic);
+      const seen = matching.get(hit.memoryId);
+      if (seen === undefined || hit.distance < seen.distance) matching.set(hit.memoryId, { amountAtomic: hit.amountAtomic, distance: hit.distance });
     }
   }
   const needed = settings.approvalsNeeded;
   if (Number.isInteger(needed) && needed >= 1 && matching.size >= needed) {
-    const highest = [...matching.values()].reduce((a, b) => (b > a ? b : a));
-    return result(
-      'approved',
-      'learned',
-      `You approved ${plural(matching.size, 'payment')} like this to ${host}, up to ${formatUsdc(highest)} USDC.`,
-      [...matching.keys()],
-    );
+    const highest = [...matching.values()].map((match) => match.amountAtomic).reduce((a, b) => (b > a ? b : a));
+    return {
+      ...result(
+        'approved',
+        'learned',
+        `You approved ${plural(matching.size, 'payment')} like this to ${host}, up to ${formatUsdc(highest)} USDC.`,
+        [...matching.keys()],
+      ),
+      citedDistances: new Map([...matching].map(([memoryId, match]) => [memoryId, match.distance])),
+    };
   }
   if (cutInside) {
     return result('asked', 'recall_unavailable', 'Ellai found more past answers like this than it can check at once, so it is asking you.');

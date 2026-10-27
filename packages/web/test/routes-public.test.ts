@@ -31,6 +31,7 @@ import { toBase58 } from '@mysten/sui/utils';
 import { eq } from 'drizzle-orm';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import * as jobsRoute from '../src/app/api/jobs/tick/route.js';
+import * as memoryMapRoute from '../src/app/api/public/memory-map/route.js';
 import * as proofRoute from '../src/app/api/public/proof/route.js';
 import * as sellRoute from '../src/app/api/sell/wallet-check/route.js';
 import { type Database, createDb, migrate } from '../src/server/db/client.js';
@@ -147,6 +148,7 @@ describe('route files', () => {
     ['sell', sellRoute],
     ['jobs', jobsRoute],
     ['proof', proofRoute],
+    ['memory-map', memoryMapRoute],
   ])('%s runs on Node and is never cached or prerendered', (_name, route) => {
     expect(route.runtime).toBe('nodejs');
     expect(route.dynamic).toBe('force-dynamic');

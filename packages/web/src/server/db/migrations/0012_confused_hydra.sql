@@ -1,0 +1,1 @@
+ALTER TABLE "decision_citations" ADD COLUMN "distance" real;

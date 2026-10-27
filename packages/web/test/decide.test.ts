@@ -2,7 +2,7 @@
 // fail-closed recall) with fast-check properties for the three outcomes that must never be
 // "approved"; then decide on PGlite: reuse of a live decision, pending refusals and refusals
 // under any namespace label, one-time grants, the agent and purpose checks, which recall hits
-// may count, bad outcomes (worded from the worst, cleared only by a yes to a question asked
+// may count, the distance kept on a learned approval's citations and on no other, bad outcomes (worded from the worst, cleared only by a yes to a question asked
 // after the outcome was recorded), the daily budget (the 24-hour window, counted from the later
 // of signing and verification, and pending payments however old), the clock read inside the
 // transaction for the grant expiry and the decision's time, and the question cap.
@@ -577,7 +577,7 @@ describe('decide', () => {
     expect(recall).not.toHaveBeenCalled();
     expect(one(await db.select().from(decisions).where(eq(decisions.id, result.decisionId))).status).toBe('refused');
     expect(await db.select().from(decisionCitations).where(eq(decisionCitations.decisionId, result.decisionId))).toEqual([
-      { decisionId: result.decisionId, memoryId, ownerId: w.ownerId },
+      { decisionId: result.decisionId, memoryId, ownerId: w.ownerId, distance: null },
     ]);
   });
 
@@ -689,6 +689,32 @@ describe('decide', () => {
       const x = await world();
       expect(await run(x, { recall: recallOf(await make(x)) })).toMatchObject({ outcome: 'asked', rule: 'no_match' });
     }
+  });
+
+  it("keeps the distance recall gave each memory a learned approval cites, the closest of a repeated hit, and none on a refusal's citations", async () => {
+    const w = await world();
+    const [first, second] = [await approvalMemory(w), await approvalMemory(w)];
+    // Powers of two, so a real column gives them back exactly.
+    const recall: Recall = async () => [
+      { blobId: first.blobId ?? '', distance: 0.125 },
+      { blobId: second.blobId ?? '', distance: 0.25 },
+      { blobId: second.blobId ?? '', distance: 0.375 },
+    ];
+    const learned = await run(w, { recall });
+    expect(learned).toMatchObject({ outcome: 'approved', rule: 'learned' });
+    const cited = (decisionId: string) =>
+      db.select({ memoryId: decisionCitations.memoryId, distance: decisionCitations.distance }).from(decisionCitations).where(eq(decisionCitations.decisionId, decisionId));
+    expect(new Map((await cited(learned.decisionId)).map((row) => [row.memoryId, row.distance]))).toEqual(
+      new Map([
+        [first.id, 0.125],
+        [second.id, 0.25],
+      ]),
+    );
+
+    const refusal = await approvalMemory(w, { verdict: 'refuse' });
+    const refused = await run(w, { recall, purpose: `${PURPOSE} again` });
+    expect(refused).toMatchObject({ outcome: 'refused', rule: 'refused_recipient', citedMemoryIds: [refusal.id] });
+    expect(await cited(refused.decisionId)).toEqual([{ memoryId: refusal.id, distance: null }]);
   });
 
   it('keeps learning for an owner with 20 memories when the full result ends past the cutoff (A2-1)', async () => {
