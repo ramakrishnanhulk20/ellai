@@ -16,7 +16,8 @@ import {
   type WebGLProgramParametersWithUniforms,
 } from 'three';
 import {
-  APPROVE_OPACITY,
+  APPROVE_CORE_OPACITY,
+  APPROVE_GLOW_OPACITY,
   FIELD_SPIN,
   GLOW_SIZE,
   MEMORY_RADIUS,
@@ -109,21 +110,22 @@ type ClusterProps = {
   items: Item[];
   markScale: number;
   color: Color;
-  opacity: number;
+  coreOpacity: number;
+  glowOpacity: number;
   scene: SceneState;
 };
 
-function Cluster({ items, markScale, color, opacity, scene }: ClusterProps) {
+function Cluster({ items, markScale, color, coreOpacity, glowOpacity, scene }: ClusterProps) {
   const invalidate = useThree((state) => state.invalidate);
   const cluster = useMemo(() => createCluster(items, markScale), [items, markScale]);
 
   useLayoutEffect(() => {
     cluster.sphereMaterial.color.copy(color);
     cluster.glowMaterial.color.copy(color);
-    cluster.sphereMaterial.opacity = opacity;
-    cluster.glowMaterial.opacity = opacity;
+    cluster.sphereMaterial.opacity = coreOpacity;
+    cluster.glowMaterial.opacity = glowOpacity;
     invalidate();
-  }, [cluster, color, opacity, invalidate]);
+  }, [cluster, color, coreOpacity, glowOpacity, invalidate]);
 
   useEffect(() => () => cluster.dispose(), [cluster]);
 
@@ -173,10 +175,24 @@ export function MemoryField({ layout, approveColor, refuseColor, scene, spin, ma
   return (
     <group ref={group}>
       {approve.length > 0 && (
-        <Cluster items={approve} markScale={markScale} color={approveColor} opacity={APPROVE_OPACITY} scene={scene} />
+        <Cluster
+          items={approve}
+          markScale={markScale}
+          color={approveColor}
+          coreOpacity={APPROVE_CORE_OPACITY}
+          glowOpacity={APPROVE_GLOW_OPACITY}
+          scene={scene}
+        />
       )}
       {refuse.length > 0 && (
-        <Cluster items={refuse} markScale={markScale} color={refuseColor} opacity={REFUSE_OPACITY} scene={scene} />
+        <Cluster
+          items={refuse}
+          markScale={markScale}
+          color={refuseColor}
+          coreOpacity={REFUSE_OPACITY}
+          glowOpacity={REFUSE_OPACITY}
+          scene={scene}
+        />
       )}
     </group>
   );

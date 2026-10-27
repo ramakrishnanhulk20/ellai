@@ -43,7 +43,7 @@ export function ExitStatement() {
         initial="hidden"
         whileInView="show"
         viewport={{ once: true, amount: 0.4 }}
-        className="font-display text-[clamp(3rem,10vw,9rem)] font-medium leading-none tracking-[-0.02em] text-fg"
+        className="font-display text-[clamp(3rem,10vw,9rem)] font-medium leading-none tracking-[-0.02em] text-balance text-fg"
       >
         <span className="block md:ml-[15%]">
           <Words words={FIRST_LINE} offset={0} />

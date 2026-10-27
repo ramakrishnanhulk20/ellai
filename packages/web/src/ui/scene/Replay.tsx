@@ -14,7 +14,7 @@ import {
   type SpriteMaterial,
 } from 'three';
 import {
-  APPROVE_OPACITY,
+  APPROVE_GLOW_OPACITY,
   GLOW_SIZE,
   MEMORY_RADIUS,
   REPLAY_SECONDS,
@@ -270,7 +270,7 @@ export function Replay({ active, layout, scene, colors, markScale }: Props) {
     glow.position.copy(position);
     glow.scale.setScalar(GLOW_SIZE * markScale);
     glowMaterial.color.copy(tint.current);
-    glowMaterial.opacity = APPROVE_OPACITY * alpha;
+    glowMaterial.opacity = APPROVE_GLOW_OPACITY * alpha;
 
     ring.visible = asking >= 0;
     if (asking >= 0) {

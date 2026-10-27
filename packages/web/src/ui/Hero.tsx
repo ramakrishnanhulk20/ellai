@@ -58,6 +58,7 @@ export function Hero() {
         ref={panel}
         className="enter-reveal relative mx-4 h-[max(68svh,420px)] overflow-hidden rounded-panel border border-line bg-panel md:mx-8 md:h-[calc(100svh-120px-56px)]"
       >
+        <div aria-hidden="true" className="panel-light pointer-events-none absolute inset-0" />
         <ParallaxLayer disabled={reduced}>
           {Scene ? (
             <SceneBoundary>
@@ -73,6 +74,7 @@ export function Hero() {
             </SceneBoundary>
           ) : null}
         </ParallaxLayer>
+        <div aria-hidden="true" className="panel-vignette pointer-events-none absolute inset-0" />
 
         <div className="pointer-events-none absolute bottom-4 left-4 md:bottom-6 md:left-6 md:max-w-[calc(100%-392px)]">
           <LiveCaption state={state} />

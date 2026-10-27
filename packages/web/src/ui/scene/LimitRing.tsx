@@ -7,6 +7,8 @@ import type { Color, Group } from 'three';
 import {
   RING_GAP_CENTRE_DEGREES,
   RING_GAP_DEGREES,
+  RING_HALO_OPACITY,
+  RING_HALO_WIDTH,
   RING_LINE_WIDTH,
   RING_OPACITY,
   RING_RADIUS,
@@ -47,6 +49,13 @@ export function LimitRing({ color, scene, spin }: Props) {
 
   return (
     <group ref={group}>
+      <Line
+        points={points}
+        color={color}
+        lineWidth={RING_HALO_WIDTH}
+        transparent
+        opacity={RING_HALO_OPACITY}
+      />
       <Line
         points={points}
         color={color}

@@ -1,6 +1,7 @@
 'use client';
 
 import { AnimatePresence, motion } from 'motion/react';
+import { formatUsdc } from './format-usdc.js';
 import type { MapDecision } from './memory-map.js';
 import { usePrefersReducedMotion } from './useMediaQuery.js';
 
@@ -32,7 +33,7 @@ function CardBody({ decision }: { decision: MapDecision }) {
     <>
       <p className="label-mono text-muted">AGENT WANTS TO PAY</p>
       <p className="mt-2 break-words text-[20px] leading-[1.25] text-fg">
-        {decision.amountUsdc} USDC to {decision.host}
+        {formatUsdc(decision.amountUsdc)} USDC to {decision.host}
       </p>
       <p
         className={`label-mono mt-3 inline-flex h-6 items-center rounded-button border px-2 ${badge.tone}`}

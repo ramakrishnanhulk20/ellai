@@ -33,7 +33,6 @@ export function SceneCanvas({ memories, active, reducedMotion, paused, parallax,
   const markScale = compact ? COMPACT_MARK_SCALE : 1;
   const colors = useMemo(
     () => ({
-      panel: readColor('--panel'),
       fg: readColor('--fg'),
       paid: readColor('--paid'),
       asked: readColor('--asked'),
@@ -46,13 +45,12 @@ export function SceneCanvas({ memories, active, reducedMotion, paused, parallax,
     <Canvas
       flat
       dpr={[1, maxDpr]}
-      gl={{ antialias: true, alpha: false }}
+      gl={{ antialias: true, alpha: true }}
       camera={{ fov: CAMERA_FOV, position: [0, 0, CAMERA_DISTANCE], near: 0.1, far: 60 }}
       frameloop={reducedMotion || paused ? 'demand' : 'always'}
       style={{ position: 'absolute', inset: 0 }}
       aria-hidden="true"
     >
-      <color attach="background" args={[colors.panel]} />
       <CameraRig enabled={parallax && !reducedMotion} />
       <LimitRing color={accent} scene={scene} spin={!reducedMotion} />
       <MemoryField

@@ -11,6 +11,9 @@ export const RING_GAP_DEGREES = 40;
 export const RING_GAP_CENTRE_DEGREES = 45;
 export const RING_OPACITY = 0.42;
 export const RING_LINE_WIDTH = 1.2;
+// A wide, faint copy of the ring drawn underneath gives it a soft halo.
+export const RING_HALO_WIDTH = 6;
+export const RING_HALO_OPACITY = 0.08;
 export const RING_SPIN = 0.015;
 
 export const FIELD_RADIUS = 2.8;
@@ -18,8 +21,10 @@ export const FIELD_FLATTEN = 0.55;
 export const FIELD_SPIN = 0.02;
 
 export const MEMORY_RADIUS = 0.035;
-export const GLOW_SIZE = 0.42;
-export const APPROVE_OPACITY = 0.85;
+export const GLOW_SIZE = 0.7;
+// The core of an approved memory is solid; its glow is softer. Refused memories are dimmer throughout.
+export const APPROVE_CORE_OPACITY = 1;
+export const APPROVE_GLOW_OPACITY = 0.85;
 export const REFUSE_OPACITY = 0.6;
 
 export const PARALLAX_YAW_DEGREES = 4;
