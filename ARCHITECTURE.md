@@ -170,6 +170,8 @@ Only memories Ellai wrote from an owner's answer count toward approval. Outcomes
 
 Postgres (Neon) holds what must be current: owners, sessions, agent tokens (hashed), decisions, owner answers and grants, payments and their verification, the daily budget ledger, refills, memory write jobs, and the structured copy of every memory Ellai wrote. Walrus Memory, in the owner's own account, holds the decisions and lessons as plain sentences that the owner owns, can read from any tool, and can verify on chain.
 
+Two public reads show what Ellai did, for owners who opted in and only once it is on chain: `/api/public/proof` (verified payments, chain-confirmed memories, learning totals) and `/api/public/memory-map` (those memories with recent decisions, the past answers each one cited and how close each was), which the landing page draws as the live memory map. Both come from Ellai's database alone, cached a minute, and carry no text an owner or agent wrote.
+
 ## Sponsor technology, and what each part does
 
 | Technology | What Ellai uses it for |

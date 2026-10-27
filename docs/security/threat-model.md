@@ -254,6 +254,7 @@ Each invariant names the risk it closes. Every backend work order carries the in
   - A memory counts as confirmed on chain only once its blob id is found on a certified, unexpired Walrus Blob object owned by the owner, read through Tatum; the relayer's word is not enough.
   - A page cap can prove presence, never absence: a listing cut short defers the rest to a later read and never stops it.
   - A memory leaves /proof once the Walrus epoch reaches the end its Blob was stored until.
+  - The public memory map (/api/public/memory-map, drawn on the landing page) follows the same rules: opted-in owners with something on chain, chain-confirmed unexpired answers only, citations only to such answers, host labels, amounts and distances, and never a sentence, purpose, reason, owner id, agent id or address. It reads Ellai's database alone, cached a minute.
   - An owner's payments and memories appear on a public page only if that owner opted in, since each digest leads to their wallet (Ram, 2026-10-25).
   - No memory text appears on a public page.
 - **C19 (A12). Secrets and bearer values stay put.**
