@@ -10,7 +10,7 @@ import {
   useState,
   type ReactNode,
 } from 'react';
-import { fetchOverview, fetchQuestions, onSignedOut, type Question } from './api.js';
+import { fetchOverview, fetchQuestions, onSignedOut, type Overview, type Question } from './api.js';
 
 export type Verdict = 'approve' | 'refuse';
 
@@ -98,4 +98,24 @@ export function useQuestions() {
   const all: Question[] = query.data?.questions ?? [];
   const waiting = all.filter((question) => answers[question.decisionId] === undefined);
   return { query, all, waiting, answers };
+}
+
+/**
+ * Updates the cached overview from an answer that already carries the new values, so the banners
+ * follow a change without a second, chain-costing read of the overview.
+ */
+export function usePatchOverview() {
+  const queryClient = useQueryClient();
+  return useCallback(
+    (patch: (overview: Overview) => Overview) => {
+      queryClient.setQueryData<Overview>(OVERVIEW_KEY, (current) => (current ? patch(current) : current));
+    },
+    [queryClient],
+  );
+}
+
+/** Reads the overview again. It costs a Sui call, so only for a change the overview itself would show, like a new purse. */
+export function useReloadOverview() {
+  const queryClient = useQueryClient();
+  return useCallback(() => queryClient.invalidateQueries({ queryKey: OVERVIEW_KEY }), [queryClient]);
 }

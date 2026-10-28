@@ -79,3 +79,42 @@ export const RefreshIcon = (props: IconProps) => (
     <path d="M13.25 2.5v2.75H10.5" />
   </Icon>
 );
+
+export const AgentsIcon = (props: IconProps) => (
+  <Icon {...props}>
+    <circle cx="8" cy="5.25" r="2.5" />
+    <path d="M3 13.5c0-2.5 2.2-4 5-4s5 1.5 5 4" />
+  </Icon>
+);
+
+export const RunIcon = (props: IconProps) => (
+  <Icon {...props}>
+    <path d="M4.75 3v10l8-5z" />
+  </Icon>
+);
+
+export const SettingsIcon = (props: IconProps) => (
+  <Icon {...props}>
+    <path d="M2.5 4.5H8M13.5 4.5H12M2.5 11.5H4M13.5 11.5H8.5" />
+    <circle cx="10" cy="4.5" r="1.75" />
+    <circle cx="6.25" cy="11.5" r="1.75" />
+  </Icon>
+);
+
+export const ChevronIcon = (props: IconProps) => (
+  <Icon {...props}>
+    <path d="M3.5 6l4.5 4.5L12.5 6" />
+  </Icon>
+);
+
+export const PlusIcon = (props: IconProps) => (
+  <Icon {...props}>
+    <path d="M8 3.25v9.5M3.25 8h9.5" />
+  </Icon>
+);
+
+export const MinusIcon = (props: IconProps) => (
+  <Icon {...props}>
+    <path d="M3.25 8h9.5" />
+  </Icon>
+);

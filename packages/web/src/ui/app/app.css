@@ -139,6 +139,95 @@
   animation: sheet-up 280ms cubic-bezier(0.22, 1, 0.36, 1) both;
 }
 
+/* Dialogs: the backdrop fades in, the panel rises on wide screens and slides up as a sheet on small ones. */
+@keyframes dialog-rise {
+  from {
+    opacity: 0;
+    transform: translateY(12px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.dialog-backdrop {
+  animation: sheet-fade 200ms ease-out both;
+}
+
+.dialog-panel {
+  animation: dialog-rise 240ms cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+@media (max-width: 767px) {
+  .dialog-panel {
+    animation: sheet-up 280ms cubic-bezier(0.22, 1, 0.36, 1) both;
+  }
+}
+
+/* The cutoff slider: a thin track filled with the accent up to the thumb, and a halo on hover. */
+.app-range {
+  -webkit-appearance: none;
+  appearance: none;
+  display: block;
+  width: 100%;
+  height: 24px;
+  margin: 0;
+  background: transparent;
+  cursor: pointer;
+}
+
+.app-range::-webkit-slider-runnable-track {
+  height: 4px;
+  border-radius: 2px;
+  background: linear-gradient(to right, var(--accent) var(--fill), var(--line) var(--fill));
+}
+
+.app-range::-moz-range-track {
+  height: 4px;
+  border-radius: 2px;
+  background: var(--line);
+}
+
+.app-range::-moz-range-progress {
+  height: 4px;
+  border-radius: 2px;
+  background: var(--accent);
+}
+
+.app-range::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 20px;
+  height: 20px;
+  margin-top: -8px;
+  border: 0;
+  border-radius: 50%;
+  background: var(--accent);
+  box-shadow: 0 0 0 0 transparent;
+  transition: box-shadow 160ms ease-out;
+}
+
+.app-range::-moz-range-thumb {
+  width: 20px;
+  height: 20px;
+  border: 0;
+  border-radius: 50%;
+  background: var(--accent);
+  box-shadow: 0 0 0 0 transparent;
+  transition: box-shadow 160ms ease-out;
+}
+
+.app-range:hover::-webkit-slider-thumb,
+.app-range:focus-visible::-webkit-slider-thumb {
+  box-shadow: 0 0 0 4px color-mix(in srgb, var(--accent) 24%, transparent);
+}
+
+.app-range:hover::-moz-range-thumb,
+.app-range:focus-visible::-moz-range-thumb {
+  box-shadow: 0 0 0 4px color-mix(in srgb, var(--accent) 24%, transparent);
+}
+
 /* Bar and tab backgrounds used on small screens. */
 .app-glass {
   background-color: rgba(8, 9, 10, 0.92);
@@ -161,13 +250,17 @@
   .save-pulse,
   .app-skeleton,
   .sheet-backdrop,
-  .sheet-panel {
+  .sheet-panel,
+  .dialog-backdrop,
+  .dialog-panel {
     animation: none;
   }
 
   .app-expand,
   .app-expand > div,
-  .app-underline {
+  .app-underline,
+  .app-range::-webkit-slider-thumb,
+  .app-range::-moz-range-thumb {
     transition: none;
   }
 }

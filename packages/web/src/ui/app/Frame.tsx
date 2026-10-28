@@ -6,22 +6,38 @@ import { useCallback, useEffect, useRef, useState, type ComponentType, type Reac
 import { EllaiMark } from '../EllaiMark.js';
 import { isApiError, logout } from './api.js';
 import { shortAddress } from './format.js';
-import { HistoryIcon, MemoriesIcon, MoreIcon, OverviewIcon, QuestionsIcon } from './icons.js';
+import {
+  AgentsIcon,
+  HistoryIcon,
+  MemoriesIcon,
+  MoreIcon,
+  OverviewIcon,
+  QuestionsIcon,
+  RunIcon,
+  SettingsIcon,
+} from './icons.js';
 import { useOverview, useQuestions, useSession } from './session.js';
 import { Button, CopyButton, ErrorLine } from './ui.js';
 
 type NavItem = { href: string; label: string; Icon: ComponentType<{ size?: number }> };
 
-// Agents and Settings join this list when part 2 of the app lands.
 const NAV: NavItem[] = [
   { href: '/app', label: 'Overview', Icon: OverviewIcon },
   { href: '/app/questions', label: 'Questions', Icon: QuestionsIcon },
   { href: '/app/history', label: 'History', Icon: HistoryIcon },
   { href: '/app/memories', label: 'Memories', Icon: MemoriesIcon },
+  { href: '/app/agents', label: 'Agents', Icon: AgentsIcon },
+  { href: '/app/run', label: 'Run', Icon: RunIcon },
+  { href: '/app/settings', label: 'Settings', Icon: SettingsIcon },
 ];
 
-const TABS: NavItem[] = NAV.filter((item) => item.href !== '/app/memories');
-const OVERFLOW: NavItem[] = NAV.filter((item) => item.href === '/app/memories');
+// The tab bar holds the four pages used most; the rest sit in the More sheet.
+const TAB_HREFS = ['/app', '/app/questions', '/app/history', '/app/agents'];
+const TABS: NavItem[] = NAV.filter((item) => TAB_HREFS.includes(item.href));
+const OVERFLOW: NavItem[] = NAV.filter((item) => !TAB_HREFS.includes(item.href));
+
+// Setup is reached from the banner and the ready card, not from the menu, but its page still has a title.
+const TITLED: NavItem[] = [...NAV, { href: '/app/setup', label: 'Setup', Icon: SettingsIcon }];
 
 function isActive(pathname: string, href: string): boolean {
   return href === '/app' ? pathname === '/app' : pathname === href || pathname.startsWith(`${href}/`);
@@ -149,7 +165,7 @@ export function Frame({ children }: { children: ReactNode }) {
   const [signOutError, setSignOutError] = useState<string | null>(null);
 
   const address = overview?.owner.suiAddress ?? null;
-  const title = NAV.find((item) => isActive(pathname, item.href))?.label ?? '';
+  const title = TITLED.find((item) => isActive(pathname, item.href))?.label ?? '';
   const moreActive = OVERFLOW.some((item) => isActive(pathname, item.href));
   const count = waiting.length;
 
@@ -200,7 +216,7 @@ export function Frame({ children }: { children: ReactNode }) {
         </div>
       </main>
 
-      <nav aria-label="Tabs" className="app-glass fixed inset-x-0 bottom-0 z-30 grid h-16 grid-cols-4 border-t border-line lg:hidden">
+      <nav aria-label="Tabs" className="app-glass fixed inset-x-0 bottom-0 z-30 grid h-16 grid-cols-5 border-t border-line lg:hidden">
         {TABS.map((item) => (
           <TabLink key={item.href} item={item} active={isActive(pathname, item.href)} count={count} />
         ))}

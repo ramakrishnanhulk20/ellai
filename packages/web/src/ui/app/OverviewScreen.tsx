@@ -3,7 +3,7 @@
 import Link from 'next/link';
 import { useEffect, useRef, useState, type CSSProperties, type ReactNode } from 'react';
 import type { Overview, Question } from './api.js';
-import { atomicToUsdc } from './format.js';
+import { atomicToUsdc, lastPayments, yesesLikeIt } from './format.js';
 import { RefreshIcon } from './icons.js';
 import { useOverview, useQuestions } from './session.js';
 import { Button, Card, ErrorLine, PageShell, Skeleton, When, place } from './ui.js';
@@ -70,13 +70,13 @@ function AskRate({ asked, window }: { asked: number; window: number }) {
       <h2 className="text-[18px] font-medium leading-[1.4] text-fg">
         {window === 0
           ? 'No payments yet. This fills in as your agents pay.'
-          : `Of your last ${window} payments, Ellai asked you about ${asked}.`}
+          : `Of your ${lastPayments(window)}, Ellai asked you about ${asked}.`}
       </h2>
       {window > 0 ? (
         <>
           <div
             role="img"
-            aria-label={`Ellai asked about ${asked} of your last ${window} payments`}
+            aria-label={`Ellai asked about ${asked} of your ${lastPayments(window)}`}
             className="mt-5 flex flex-wrap gap-2"
           >
             {Array.from({ length: window }, (_, index) => {
@@ -162,7 +162,7 @@ function LimitsCard({ owner }: { owner: Overview['owner'] }) {
   const rows: Array<[string, string]> = [
     ['Per payment', `${atomicToUsdc(owner.perPaymentMaxAtomic)} USDC`],
     ['Per day', `${atomicToUsdc(owner.dailyBudgetAtomic)} USDC`],
-    ['Pays on its own after', `${owner.approvalsNeeded} yeses like it`],
+    ['Pays on its own after', `${owner.approvalsNeeded} ${yesesLikeIt(owner.approvalsNeeded)}`],
     ['How alike', owner.distanceCutoff.toFixed(2)],
   ];
   return (

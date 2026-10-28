@@ -4,6 +4,7 @@ import { useEffect, useRef, useState, type ComponentProps, type CSSProperties, t
 import type { CitedMemory } from './api.js';
 import { Banners } from './Banners.js';
 import { formatWhen, useNow, walruscanUrl } from './format.js';
+import { BUTTON_BASE, BUTTON_VARIANT, type Variant } from './button-styles.js';
 import { CheckIcon, CopyIcon } from './icons.js';
 
 /** The limit ring: a circle with a 40 degree gap at the top right. Stroke width is in screen pixels at any size. */
@@ -31,20 +32,6 @@ export function Ring({ size, stroke = 1.5, className = '' }: { size?: number; st
 export function place(index: number): CSSProperties {
   return { '--i': index } as CSSProperties;
 }
-
-type Variant = 'primary' | 'ghost' | 'refuse' | 'text';
-
-const BUTTON_BASE =
-  'inline-flex items-center justify-center gap-2 rounded-button font-sans text-[15px] font-medium leading-none whitespace-nowrap transition-[translate,box-shadow,background-color,border-color,color,opacity] duration-[160ms] ease-out disabled:cursor-not-allowed disabled:opacity-40';
-
-const BUTTON_VARIANT: Record<Variant, string> = {
-  primary:
-    'bg-accent px-4 text-accent-ink enabled:hover:-translate-y-px enabled:hover:shadow-[0_0_0_4px_color-mix(in_srgb,var(--accent)_24%,transparent)]',
-  ghost: 'border border-line px-4 text-fg enabled:hover:border-fg enabled:hover:bg-[rgba(242,242,238,0.06)]',
-  refuse:
-    'border border-refused/40 px-4 text-refused enabled:hover:border-refused enabled:hover:bg-refused/10',
-  text: 'app-underline px-0 text-muted enabled:hover:text-fg',
-};
 
 type ButtonProps = ComponentProps<'button'> & {
   variant?: Variant;
@@ -204,13 +191,14 @@ export function AgentQuote({ purpose }: { purpose: string }) {
   );
 }
 
-export type Tone = 'accent' | 'paid' | 'asked' | 'refused';
+export type Tone = 'accent' | 'paid' | 'asked' | 'refused' | 'muted';
 
 const TONE: Record<Tone, string> = {
   accent: 'border-accent text-accent',
   paid: 'border-paid text-paid',
   asked: 'border-asked text-asked',
   refused: 'border-refused text-refused',
+  muted: 'border-muted text-muted',
 };
 
 export function Badge({ tone, children }: { tone: Tone; children: ReactNode }) {
@@ -228,4 +216,5 @@ export const TONE_TEXT: Record<Tone, string> = {
   paid: 'text-paid',
   asked: 'text-asked',
   refused: 'text-refused',
+  muted: 'text-muted',
 };

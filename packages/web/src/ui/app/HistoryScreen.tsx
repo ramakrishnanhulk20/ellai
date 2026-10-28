@@ -17,22 +17,24 @@ import {
 } from './rows.js';
 import { AgentQuote, Badge, Button, ErrorLine, MemoryChips, PageShell, When, type Tone } from './ui.js';
 
-type Kind = 'own' | 'yes' | 'asked' | 'refused' | 'other';
+type Kind = 'own' | 'yes' | 'asked' | 'refused' | 'approved';
 
 const BADGE: Record<Kind, { label: string; tone: Tone }> = {
   own: { label: 'PAID ON ITS OWN', tone: 'accent' },
   yes: { label: 'PAID AFTER YOUR YES', tone: 'paid' },
   asked: { label: 'ASKED YOU', tone: 'asked' },
   refused: { label: 'REFUSED', tone: 'refused' },
-  other: { label: 'APPROVED', tone: 'paid' },
+  approved: { label: 'APPROVED', tone: 'muted' },
 };
 
+// Ellai's first verdict never changes, so "paid" is read from the status: an approval that was
+// never paid, or failed at signing, must not be shown as money that moved.
 function kindOf(decision: Decision): Kind {
   if (decision.outcome === 'asked') return 'asked';
   if (decision.outcome === 'refused') return 'refused';
-  if (decision.rule === 'learned') return 'own';
-  if (decision.rule === 'grant') return 'yes';
-  return 'other';
+  if (decision.status === 'paid' && decision.rule === 'learned') return 'own';
+  if (decision.status === 'paid' && decision.rule === 'grant') return 'yes';
+  return 'approved';
 }
 
 type Filter = 'all' | 'own' | 'asked' | 'refused';
@@ -82,7 +84,8 @@ function PaymentState({ paid }: { paid: NonNullable<Decision['paid']> }) {
 }
 
 function DecisionRow({ decision }: { decision: Decision }) {
-  const badge = BADGE[kindOf(decision)];
+  const kind = kindOf(decision);
+  const badge = BADGE[kind];
   const line = `${atomicToUsdc(decision.payment.amountAtomic)} USDC to ${decision.payment.sellerHost}`;
   return (
     <ExpandableRow
@@ -100,8 +103,9 @@ function DecisionRow({ decision }: { decision: Decision }) {
           <span className={`${CELL_MAIN} text-[15px] leading-[1.4] text-fg [overflow-wrap:anywhere] xl:line-clamp-2`} title={line}>
             {line}
           </span>
-          <span className={`${CELL_BADGE} flex items-center gap-2`}>
+          <span className={`${CELL_BADGE} flex flex-wrap items-center justify-end gap-x-2 gap-y-1 xl:justify-start`}>
             <Badge tone={badge.tone}>{badge.label}</Badge>
+            {kind === 'approved' ? <span className="text-[13px] text-muted">{STATUS_WORDS[decision.status]}</span> : null}
             {decision.answer === 'approve' ? <span className="text-[13px] text-paid">You approved</span> : null}
             {decision.answer === 'refuse' ? <span className="text-[13px] text-refused">You refused</span> : null}
           </span>
@@ -162,11 +166,15 @@ export function HistoryScreen() {
               </button>
             ))}
           </div>
-          <RowList>
-            {shown.map((decision) => (
-              <DecisionRow key={decision.decisionId} decision={decision} />
-            ))}
-          </RowList>
+          {shown.length === 0 ? (
+            <p className="text-[15px] leading-[1.5] text-muted">No decisions match this filter.</p>
+          ) : (
+            <RowList>
+              {shown.map((decision) => (
+                <DecisionRow key={decision.decisionId} decision={decision} />
+              ))}
+            </RowList>
+          )}
           <LoadMore
             show={query.hasNextPage}
             busy={query.isFetchingNextPage}

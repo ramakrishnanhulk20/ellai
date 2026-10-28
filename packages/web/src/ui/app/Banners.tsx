@@ -1,20 +1,33 @@
 'use client';
 
+import type { ReactNode } from 'react';
 import type { Overview } from './api.js';
 import { useOverview } from './session.js';
+import { ButtonLink } from './ButtonLink.js';
 
-const AUTO_PAUSE_TEXT: Record<string, string> = {
+export const AUTO_PAUSE_TEXT: Record<string, string> = {
   settlement_mismatch: 'A payment landed that did not match what was agreed. Check History, then resume in Settings.',
   settlement_unverifiable: 'Ellai could not confirm a payment on Sui. Check History, then resume in Settings.',
   purse_key_mismatch: "Ellai's key for your purse did not match. Payments stay paused until this is fixed on Ellai's side.",
 };
 
-function Banner({ border, title, text }: { border: string; title: string; text?: string }) {
+function Banner({ border, title, text, action }: { border: string; title: string; text?: string; action?: ReactNode }) {
   return (
-    <div className={`rounded-panel border bg-panel px-6 py-4 ${border}`}>
-      <p className="text-[16px] font-medium leading-[1.4] text-fg">{title}</p>
-      {text ? <p className="mt-1 text-[15px] leading-[1.5] text-muted">{text}</p> : null}
+    <div className={`flex flex-wrap items-center justify-between gap-x-6 gap-y-3 rounded-panel border bg-panel px-6 py-4 ${border}`}>
+      <div className="min-w-0 flex-1 basis-[280px]">
+        <p className="text-[16px] font-medium leading-[1.4] text-fg">{title}</p>
+        {text ? <p className="mt-1 text-[15px] leading-[1.5] text-muted">{text}</p> : null}
+      </div>
+      {action}
     </div>
+  );
+}
+
+function SettingsLink() {
+  return (
+    <ButtonLink href="/app/settings" variant="text">
+      Settings
+    </ButtonLink>
   );
 }
 
@@ -35,6 +48,7 @@ export function Banners() {
         border="border-asked"
         title="Automatic payments are paused"
         text="You paused them. Ellai refuses every payment until you resume in Settings."
+        action={<SettingsLink />}
       />
     ) : null,
     owner.autoPausedReason !== null ? (
@@ -43,6 +57,7 @@ export function Banners() {
         border="border-refused"
         title="Automatic payments are paused"
         text={AUTO_PAUSE_TEXT[owner.autoPausedReason]}
+        action={<SettingsLink />}
       />
     ) : null,
     done < 3 ? (
@@ -51,6 +66,7 @@ export function Banners() {
         border="border-accent/40"
         title="Finish setting up Ellai"
         text={`${done} of 3 steps done: your Walrus Memory account, Ellai's key on it, and your spending allowance.`}
+        action={<ButtonLink href="/app/setup" variant="primary">Continue setup</ButtonLink>}
       />
     ) : null,
   ].filter((banner) => banner !== null);

@@ -23,6 +23,59 @@ export type Overview = {
   purse: { usdcAtomic: string } | null;
   counts: { asked: number; approved: number; refused: number; paid: number };
   questionsPer20: { asked: number; window: number };
+  builtinAgent: 'ready' | 'needs_key';
+};
+
+export type OnboardingState = Overview['onboarding'];
+
+export type OnboardingStepName = 'memory_account' | 'add_delegate' | 'allowance';
+
+/** Allowance terms as the server takes them: amounts as atomic USDC text, the length in whole days. */
+export type AllowanceTerms = { dailyLimitAtomic: string; lifetimeCapAtomic: string; days: number };
+
+export type BuiltStep = { txBytesBase64: string; summary: Array<{ label: string; value: string }> };
+
+export type Settings = Omit<Overview['owner'], 'suiAddress' | 'purseAddress'>;
+
+/** A settings change as the server takes it. Only the fields that differ are sent. */
+export type SettingsChange = Partial<{
+  paused: boolean;
+  perPaymentMaxAtomic: string;
+  dailyBudgetAtomic: string;
+  approvalsNeeded: number;
+  distanceCutoff: number;
+  clearAutoPause: true;
+  publicProof: boolean;
+}>;
+
+export type StepUpRequest =
+  | { action: 'create_agent'; change: { label: string } }
+  | { action: 'loosen_settings'; change: SettingsChange };
+
+export type StepUpProof = { nonce: string; signature: string };
+
+export type StepUpIssued = { nonce: string; message: string; expiresAt: string };
+
+export type Agent = {
+  agentId: string;
+  label: string;
+  kind: 'external' | 'builtin';
+  displayPrefix: string;
+  createdAt: string;
+  revokedAt: string | null;
+};
+
+export type RunStep = {
+  sellerId: string;
+  outcome: 'free' | 'paid' | 'asked' | 'refused' | 'failed';
+  reason: string;
+  digest: string | null;
+};
+
+export type RunResult = {
+  status: 'done' | 'needs_key' | 'stopped' | 'limit' | 'refused';
+  answer: string;
+  steps: RunStep[];
 };
 
 export type Question = {
@@ -106,7 +159,7 @@ export function onSignedOut(listener: () => void): () => void {
   };
 }
 
-type RequestOptions = { method?: 'GET' | 'POST'; body?: unknown; signal?: AbortSignal };
+type RequestOptions = { method?: 'GET' | 'POST' | 'PATCH' | 'DELETE'; body?: unknown; signal?: AbortSignal };
 
 async function readJson(response: Response): Promise<unknown> {
   const text = await response.text();
@@ -184,3 +237,52 @@ export const verifySignIn = (message: string, signature: string) =>
   ownerFetch<{ ownerId: string }>('/api/auth/verify', { method: 'POST', body: { message, signature } });
 
 export const logout = () => ownerFetch<{ signedOut: true }>('/api/auth/logout', { method: 'POST' });
+
+export const fetchOnboarding = () => ownerFetch<OnboardingState>('/api/owner/onboarding');
+
+export const buildOnboardingStep = (step: OnboardingStepName, allowance?: AllowanceTerms) =>
+  ownerFetch<BuiltStep>('/api/owner/onboarding/build', {
+    method: 'POST',
+    body: allowance === undefined ? { step } : { step, allowance },
+  });
+
+/** 200 answers with `recorded` too; 202 answers with the digest alone, meaning Sui has not shown the result yet. */
+export const submitOnboardingStep = (step: OnboardingStepName, txBytesBase64: string, signature: string) =>
+  ownerFetch<{ recorded?: string; digest: string }>('/api/owner/onboarding/submit', {
+    method: 'POST',
+    body: { step, txBytesBase64, signature },
+  });
+
+export const confirmOnboardingDigest = (step: OnboardingStepName, digest: string) =>
+  ownerFetch<{ recorded: string }>('/api/owner/onboarding/confirm', { method: 'POST', body: { step, digest } });
+
+export const confirmExistingStep = (step: 'memory_account' | 'add_delegate') =>
+  ownerFetch<{ recorded: string }>('/api/owner/onboarding/confirm', { method: 'POST', body: { step, existing: true } });
+
+export const requestStepUp = (request: StepUpRequest) =>
+  ownerFetch<StepUpIssued>('/api/owner/step-up', { method: 'POST', body: request });
+
+export const fetchAgents = () => ownerFetch<{ agents: Agent[] }>('/api/owner/agents');
+
+export const createAgent = (label: string, stepUp: StepUpProof) =>
+  ownerFetch<{ agentId: string; token: string; displayPrefix: string }>('/api/owner/agents', {
+    method: 'POST',
+    body: { label, stepUp },
+  });
+
+export const revokeAgent = (agentId: string) =>
+  ownerFetch<{ revoked: true }>(`/api/owner/agents/${encodeURIComponent(agentId)}`, { method: 'DELETE' });
+
+export const fetchSettings = () => ownerFetch<Settings>('/api/owner/settings');
+
+export const patchSettings = (change: SettingsChange, stepUp?: StepUpProof) =>
+  ownerFetch<Settings>('/api/owner/settings', {
+    method: 'PATCH',
+    body: stepUp === undefined ? change : { ...change, stepUp },
+  });
+
+export const endEverySession = () =>
+  ownerFetch<{ signedOut: true; sessionsEnded: number }>('/api/owner/sessions', { method: 'DELETE' });
+
+export const runBuiltinAgent = (task: string, signal?: AbortSignal) =>
+  ownerFetch<RunResult>('/api/owner/agent/run', { method: 'POST', body: { task }, signal });

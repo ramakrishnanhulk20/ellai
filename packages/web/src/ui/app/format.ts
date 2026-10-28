@@ -10,6 +10,16 @@ export function atomicToUsdc(atomic: string): string {
   return formatUsdc(`${padded.slice(0, -6)}.${padded.slice(-6)}`);
 }
 
+/** The word after a count of approvals: "yes like it" for one, "yeses like it" for any other number. */
+export function yesesLikeIt(count: number): string {
+  return count === 1 ? 'yes like it' : 'yeses like it';
+}
+
+/** "last payment" for one, "last 12 payments" for any other number, so a sentence about a count reads right. */
+export function lastPayments(count: number): string {
+  return count === 1 ? 'last payment' : `last ${count} payments`;
+}
+
 /** "0x1234...abcd" from a full Sui address. */
 export function shortAddress(address: string): string {
   return address.length > 12 ? `${address.slice(0, 6)}...${address.slice(-4)}` : address;
