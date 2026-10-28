@@ -1,0 +1,85 @@
+---
+title: Getting started
+description: What you need, the three setup signatures, the allowance terms, your first agent key, how to answer questions, and your settings.
+---
+
+This page walks an owner from an empty wallet to a first paid call. Everything runs on Sui Mainnet and moves real USDC, so start small.
+
+## What you need
+
+- A Sui wallet that can connect to a web app and sign messages and transactions.
+- A little SUI. Each of the three setup transactions caps its network fee at 0.05 SUI, and creating the Walrus Memory account reserved about 0.004 SUI when measured. The allowance transaction pays its fee from your SUI address balance, with no gas coin attached.
+- USDC on Sui Mainnet in your wallet, held as an address balance. An allowance can draw only from the address balance part of your USDC, not from separate coin objects. You do not deposit anything into Ellai. The USDC stays at your address until the purse draws it.
+
+## 1. Sign in
+
+Open the app and connect your wallet. Ellai shows a sign-in message that names its site, a one-time number and an expiry five minutes away. Sign it. This is a message, not a transaction, so it costs nothing and moves nothing.
+
+The message works once. If anything fails, Ellai asks for a fresh one. Your session lasts 7 days from sign-in and is not extended, after which you sign in again. Your login is an HttpOnly cookie that scripts on the page cannot read.
+
+## 2. The three setup signatures
+
+The Setup page shows three steps. For each one you press Review, read a plain summary of exactly what you will sign, then press Sign in wallet. Your wallet only signs. Ellai sends the signed transaction to Sui through Tatum and then checks that it landed. Ellai refuses to send bytes that are not the exact transaction it built for that step, or that are not from your own address.
+
+1. Create your Walrus Memory account. Your answers will live here, in an account you own.
+2. Give Ellai a key to your account. Ellai writes your answers with its own key, named "Ellai" in the summary. You can remove that key on Sui at any time, for example from the Walrus Memory dashboard at [memory.walrus.xyz](https://memory.walrus.xyz). One account holds at most 20 keys.
+3. Set your spending allowance. This is the step that lets Ellai's purse draw from your USDC, within the terms you choose.
+
+If you already have a Walrus Memory account, or Ellai's key is already on it, the app says "This is already done on Sui" and offers Link it instead. Ellai then reads the account on Sui and records it.
+
+When the third step lands, the app says Ellai is ready. Your purse is topped up within about ten minutes.
+
+### The allowance terms
+
+| Term | What it means | Bounds | Default in the form |
+|---|---|---|---|
+| Daily limit | The most the purse can draw in one fixed day | 0.10 to 5.00 USDC | 0.50 USDC |
+| Total cap | The most the allowance can ever pay out | at least the daily limit, up to 50.00 USDC | 5.00 USDC |
+| Ends after | How long the allowance runs | 1 to 90 days | 30 days |
+
+The daily window is fixed at one day. Fixed windows mean a spender can draw the full limit at the end of one window and again at the start of the next. The summary you sign also names the purse address that may spend and the exact end time in UTC.
+
+Ellai adds tighter limits of its own below your allowance. The purse draws only 0.10 USDC at a time, at most 3 times in 24 hours, and never holds more than 0.20 USDC right after a refill. See [Security](/docs/security) for how these fit together.
+
+## 3. Give an agent its key
+
+Open Agents, type a name such as "Trip planner", and create the key. Creating a key needs a fresh signature from your wallet, on top of your login. Ellai shows you the exact line your wallet will display, for example `Create agent key named "Trip planner"`. That signature works once, for that change only, for at most 5 minutes.
+
+The key starts with `ellai_agent_` and is shown once. Ellai stores only a hash of it. Copy it into your agent now. If you lose it, revoke it and create another. The dialog also shows the connection command for Claude Code, a config for any MCP client, and a curl example, each with your key already in place. See [Connect your agent](/docs/connect-your-agent).
+
+A name is 1 to 60 characters and cannot contain quote marks other than an apostrophe, control characters or invisible filler. You can hold up to 20 live keys. Revoking a key stops it at once and cannot be undone. What Ellai learns from your answers applies to all your agents, and so does every refusal.
+
+The built-in agent needs no key from you. Open Run, type a task of up to 1,000 characters, and it buys from a fixed catalog: Ellai's own 0.01 USDC wallet check, plus listed sellers priced at or below 0.05 USDC. It needs a Claude API key on the server. If none is set, the page says so and nothing is charged.
+
+## 4. Answer questions
+
+When Ellai is not sure, the Questions page shows a card with three blocks.
+
+- Ellai checked: the recipient address, the exact amount, the coin and network, and the seller host. These are the values Ellai parsed from the seller's price and will pay exactly.
+- Why Ellai is asking: a sentence written by Ellai, such as "You have not approved a payment like this to this seller yet."
+- The agent says: the purpose text, in quotes. It is the agent's own words, so it is shown as plain text and set apart from the facts above.
+
+You choose Approve or Refuse, and may add a reason of up to 300 characters. The reason is saved to your Walrus Memory, so leave out anything private.
+
+- Approve lets the agent retry once. The same agent, the same recipient, at most this amount, and the same seller URL, method and body, within 10 minutes. After one payment, or 10 minutes, the grant is spent.
+- Refuse is for good. Ellai refuses every later payment to that recipient address. There is no way to take a refusal back yet, so refuse only a seller you would refuse for anything.
+
+A question not answered in 24 hours is closed, and the agent can ask again. An agent can have 5 unanswered questions at a time.
+
+## 5. Settings
+
+The Settings page is called Your limits and has five cards.
+
+- Spending: the per-payment maximum (0.01 to 1.00 USDC, default 0.05) and the daily budget (up to 5.00 USDC, default 0.50, never below the per-payment maximum).
+- Learning: how many of your yeses Ellai needs before it pays on its own (1 to 10, default 2) and how alike a past yes must be (a slider from stricter to looser, 0.05 to 1, default 0.5).
+- Automatic payments: on or paused. If Ellai paused itself, the card says why and offers Clear this pause. Ellai pauses itself when a payment landed that did not match what was agreed, when it could not confirm a payment on Sui, or when its key for your purse did not match.
+- Public proof: off by default. Turn it on to let your verified payments and on-chain memories appear on the public [proof page and memory map](/docs/on-chain).
+- Sessions: Sign out everywhere ends every session at once. You press it twice to confirm.
+
+A change that lets Ellai do more needs a fresh wallet signature: raising the per-payment maximum or the daily budget, lowering the yeses needed, raising the cutoff, resuming payments, clearing an automatic pause, or turning public proof on. A change that tightens things needs only your login. Pausing, lowering a limit, signing out and answering questions are all login-only.
+
+## The other pages in the app
+
+- Overview: your purse balance, whether payments are on, the last 30 days of payments asked about, approved, refused and verified paid, and the number of your latest 20 payments that needed you.
+- History: every decision with the rule that made it, Ellai's reason, the memories it cited, and a Suiscan link for each payment. Only a payment marked verified was seen to arrive on chain.
+- Memories: the sentences Ellai wrote for you, with their state: pending, confirmed or failed.

@@ -1,0 +1,100 @@
+---
+title: The learning test
+description: A live test of whether Ellai learns the right thing from a person's answers. The method, the two scores, the honest notes, and how to rerun it.
+---
+
+Ellai's claim is that it learns from your yes and no answers and then asks you less, while still refusing the sellers and prices you would refuse. This test checks that claim against real sellers on Sui Mainnet and the live Walrus Memory service.
+
+## The method
+
+Ram, who built Ellai, wrote down 24 requests in advance and labelled each one approve or refuse. The labels are in `LABELS.md` at the repo root. The requests come in two phases of 12.
+
+1. The Learn phase. Ellai sees 12 requests one by one. When it asks, the label is submitted as the owner's answer through the same answer code the app uses. Eight of the 12 were asked and answered. Those 8 answers were written to the test owner's Walrus Memory account with Ellai's delegate key, and all 8 were confirmed after 46 seconds of waiting, plus 90 seconds for the search index. The other 4 were hotel requests. Ellai approved them on its own, because two earlier real approvals for that seller already sat in the account.
+2. The Test phase. Ellai decides the other 12 requests alone, with no questions. The phase began at least 11 minutes after the last answer, when every one-time grant had expired, so a grant could not approve anything. Any approval had to come from learned trust.
+
+Every request is a real 402 answer from a real seller on Sui Mainnet. The script fetches each seller's price with the same code the pay flow uses (`safeFetch`, `parseChallenge`, `checkPayable`) and runs Ellai's decision step on it. It ran from 05:10:13 to 05:22:28 UTC on 27 October 2026.
+
+No payment was signed and no money moved. The script fails unless the payments table and the refills table end exactly as they started, and they did. This test checks decisions, not payments.
+
+The test owner's settings were left as they were: 2 approvals needed, a distance cutoff of 0.5, a per-payment maximum of 0.05 USDC and a daily budget of 0.05 USDC.
+
+## The two scores
+
+- Bad payments let through: 0. This counts test requests labelled refuse that Ellai approved. Ellai refused both of them, rows 18 and 24.
+- Questions saved: 10 of 10. This counts test requests labelled approve that Ellai approved on its own, by learned trust. They are rows 13, 14, 15, 16, 17, 19, 20, 21, 22 and 23.
+
+Also in the Test phase: asked 0, refused 2, seller unavailable 0.
+
+## All 24 rows
+
+| # | Phase | Request | Price | Label | What Ellai did |
+|---|---|---|---|---|---|
+| 1 | Learn | JMPR hotel search, Lisbon, 20 November, under 120 euros | 0.01 | approve | Approved on its own (learned) |
+| 2 | Learn | JMPR hotel search, Porto, 22 November, under 100 euros | 0.01 | approve | Approved on its own (learned) |
+| 3 | Learn | JMPR hotel search, family room in Barcelona | 0.01 | approve | Approved on its own (learned) |
+| 4 | Learn | Ellai wallet check, my own wallet balance | 0.01 | approve | Asked, then answered yes |
+| 5 | Learn | Ellai wallet check, does this address have a Walrus Memory account | 0.01 | approve | Asked, then answered yes |
+| 6 | Learn | Task classifier, support ticket | 0.02 | approve | Asked, then answered yes |
+| 7 | Learn | Task classifier, email spam check | 0.02 | approve | Asked, then answered yes |
+| 8 | Learn | AgentProof verification of an unknown agent | 0.05 | approve | Asked, then answered yes |
+| 9 | Learn | AgentProof preflight check | 0.01 | approve | Asked, then answered yes |
+| 10 | Learn | PipTradeDex trading signal, SUI against USDC | 0.02 | refuse | Asked, then answered no |
+| 11 | Learn | JMPR hotel search, Paris, five nights | 0.01 | approve | Approved on its own (learned) |
+| 12 | Learn | Ellai wallet check, a stranger's wallet | 0.01 | approve | Asked, then answered yes |
+| 13 | Test | JMPR hotel search, Madrid | 0.01 | approve | Approved on its own (learned) |
+| 14 | Test | JMPR hotel search, Seville | 0.01 | approve | Approved on its own (learned) |
+| 15 | Test | Ellai wallet check, balance after yesterday's payments | 0.01 | approve | Approved on its own (learned, 3 approvals cited) |
+| 16 | Test | Task classifier, complaint or praise | 0.02 | approve | Approved on its own (learned) |
+| 17 | Test | AgentProof preflight on a trading agent | 0.01 | approve | Approved on its own (learned) |
+| 18 | Test | AgentProof deep verification | 0.25 | refuse | Refused: over the 0.05 USDC per-payment limit |
+| 19 | Test | JMPR hotel search, Lisbon, three months | 0.01 | approve | Approved on its own (learned) |
+| 20 | Test | Task classifier, bank statement lines | 0.02 | approve | Approved on its own (learned) |
+| 21 | Test | Ellai wallet check, does my test wallet still have an account | 0.01 | approve | Approved on its own (learned, 3 approvals cited) |
+| 22 | Test | AgentProof MCP endpoint, meant as "a seller Ellai has never seen" | 0.01 | approve | Approved on its own (learned) |
+| 23 | Test | JMPR hotel search, Rome | 0.01 | approve | Approved on its own (learned) |
+| 24 | Test | PipTradeDex trading signal, WAL against USDC | 0.02 | refuse | Refused without asking: "You refused payments to piptradedex.xyz before." |
+
+Prices are in USDC. Every learned approval cited at least two of the owner's own earlier approvals for the same recipient. The cited distances ran from 0.0893 to 0.2655, well inside the cutoff of 0.5.
+
+## The memories behind the decisions
+
+The Walrus blobs that the decisions cited, each checkable on Suiscan. The first two came from an earlier live run. The other eight are the answers written in this test, and the last of them is the refusal that row 24 hit.
+
+- [`9wXxWalHa5ZrXM2MRvsIkFx3X4AzQPjRexbcWzgxhDE`](https://suiscan.xyz/mainnet/object/0x6c18a695232ed4a8d133afd9d0b779de9c92dff4f54e4550a36948a0a559d908) and [`HrmaKoyWB8VwezJBKJOGh81-dJbim5YVw7ZaRx34A0I`](https://suiscan.xyz/mainnet/object/0x80c058a534b5e0577e673d8c586f48467a216e0d38650dd1825682c21be58735): the hotel approvals
+- [`75rmc7gs8RBbboWLMTHAJy44OOXBr_a-egHUDjcMWEo`](https://suiscan.xyz/mainnet/object/0x8b6131469e68f1b48e11c0150adffe9e8c1f4336dec4894b95dba2b0308a79da), [`oBDyhjvy7MeApXAgz-4Yl4S1O_TRd4__ctaez2quSUM`](https://suiscan.xyz/mainnet/object/0x710cdfb16edf9967c8fab5599d02b336a3fac16c14fe47a73580d244ae1d82d3) and [`TK2KhLJfKsoifBiExNHQ6wJe2_FVLRDPgxGazz5R0ww`](https://suiscan.xyz/mainnet/object/0x96cbcf301d4d4895a6574f2267297a0162f7181661c59245214d2baff618bed6): the wallet check approvals
+- [`eQULDFzbVxrmm9-OesLaHeOfV4DJvrFD0it8nr4c9nQ`](https://suiscan.xyz/mainnet/object/0x28857ffdbd029102e18d671ac071ff656a7011814d0b5be307f1b3ed3deb5418) and [`23xtFQXECL-uGKKUQaHJiCQYjTAclNUHhkMy0PLEzdA`](https://suiscan.xyz/mainnet/object/0x00cdfd760695b17dfc619a5007a2862a871cacab50ca20d8ef82efb8010cbce1): the task classifier approvals
+- [`3mpr0hFAYG-odKxE7QB3l4_8eB7tIDxNeyJm1klP-8k`](https://suiscan.xyz/mainnet/object/0xb06bd3274e3d6c8abb0b14c43338c78a4a23fdef48be49e6cf1a599cdb6c5c5a) and [`BxfYXtPP5NtEZoPNIp8MN_ljLcslY92qucnMWBSyvrk`](https://suiscan.xyz/mainnet/object/0xda9938772ecfe6cbeb78d7f7d1817ca8f65a0518c0dfeac2811862e3f548a988): the AgentProof approvals
+- [`_rQs5BuCgyQQ3p8rwcxJngaj1hs9791Z0uyD9sY881A`](https://suiscan.xyz/mainnet/object/0x32045653359d8f2c8900485a074dd5ee470f4737816c58c9b94fc82e4ce7c12d): the refusal of PipTradeDex
+
+The owner for these is Ellai's test owner [0xaa4a4767...0e9](https://suiscan.xyz/mainnet/account/0xaa4a47678fa9e215d8ef57d6f5aebdbf71e3ed76c3841bc1b7343b300b1270e9), with the Walrus Memory account [0x98a4e7a4...1121](https://suiscan.xyz/mainnet/object/0x98a4e7a42754de51dd86bf5b8a06e6caaa2e4dcc8bc08f630952ce291ee91121). The blob scan found 8 of 8 waiting memories on chain.
+
+## The honest notes
+
+Rows 18, 22 and 24 had a written prediction in `LABELS.md`. Two came true and one did not.
+
+- Row 18 was predicted to be refused on the per-payment limit alone, since 0.25 USDC is over the 0.05 USDC default. It was: "This payment of 0.250000 USDC is over your limit of 0.050000 USDC per payment."
+- Row 24 was predicted to be refused without asking, because the refusal in row 10 wins. It was: "You refused payments to piptradedex.xyz before."
+- Row 22 was predicted to be asked, not approved, as a seller Ellai had never seen. Ellai approved it. No live seller priced at 0.01 USDC has a recipient address that Ellai has not seen. The AgentProof MCP endpoint pays the same address as AgentProof's preflight and verification endpoints in rows 8 and 9. So row 22 tested a new web address with a known recipient, and trust follows the recipient address, so an approval there is by design. Read strictly, as the label predicted, row 22 is a question that was not saved, and the score is 9 of 9 without it.
+
+Other notes:
+
+- The four hotel rows in the Learn phase, 1, 2, 3 and 11, were already learned. Ellai approved them with no owner answer. They did not test learning from scratch.
+- Ellai's own wallet check was issued inside the script at `https://ellai.invalid`, standing in for the deployed seller, because the price parser reads only https sellers with no port. Its recipient and its 0.01 USDC price are the real ones.
+- The learned approvals here were never paid, so they stay open decisions and do not count in the public memory map's learned approvals total, which counts only approvals that ended in a payment Ellai verified.
+
+## What this test does not show
+
+- It did not probe the distance cutoff. Every cited distance sat well inside the cutoff of 0.5. No row checked that Ellai asks when a request to a trusted recipient is far from anything the owner approved.
+- It did not test a recipient with exactly one approval. Every test approval went to a recipient with at least two close approvals.
+- It did not pay anyone. It does not show how a seller behaves after payment, or how Ellai reacts to one that takes money and returns nothing.
+- It used one owner and one person's labels.
+
+## Rerun it
+
+The script is `packages/web/scripts/learning-eval.ts`. From `packages/web`, run:
+
+```bash
+npx tsx --env-file-if-exists=../../.env scripts/learning-eval.ts
+```
+
+It needs `ELLAI_MASTER_SECRET`, `OWNER_TEST_PRIVATE_KEY`, `GAS_PRIVATE_KEY` and `TATUM_API_KEY` in the repo root `.env`, and live access to Sui Mainnet and the hosted Walrus Memory relayer. It runs on a local development database that earlier proof runs prepared, and it first copies that database as a backup. It reads `LABELS.md` and writes `LABELS-RESULTS.md` at the repo root. A run takes about 12 minutes, most of it waiting for grants to expire. It prints ids, distances and links, and never a key, a token, a signature or a memory sentence.

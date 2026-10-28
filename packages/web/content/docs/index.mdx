@@ -1,0 +1,44 @@
+---
+title: What Ellai is
+description: Ellai lets an AI agent pay small web sellers on Sui under rules you set. It learns from your yes and no answers, so it asks you less over time.
+---
+
+Ellai is Tamil for "limit". It lets your AI agent pay for things on Sui without you approving every payment and without handing the agent a wallet.
+
+## The problem
+
+Agents now meet sellers that want money before they answer. A hotel search costs 0.01 USDC. A ticket classifier costs 0.02 USDC. These sellers use x402. The seller replies to a request with HTTP status 402, which means payment required, and names a price. The buyer pays and asks again.
+
+An owner has two poor choices. Approve every small payment by hand, and the agent stops being useful. Or put a wallet in the agent's hands, and one bad prompt can empty it. Ellai sits between the agent and the seller and takes a third path.
+
+## The three parts
+
+Ellai pays for the agent under fixed rules. Before every payment it decides one of three things: pay, refuse, or ask you. The rules are written code. No AI model ever decides about money. The full list is in [How it works](/docs/how-it-works).
+
+Ellai learns from your yes and no. When it asks and you answer, your answer becomes a short sentence in your own Walrus Memory account. You own that account and can read it from other tools. The next time a similar payment comes up, Ellai looks at your past answers. When it finds enough close ones for the same seller address, it pays on its own.
+
+Your money stays behind a Sui allowance. Your USDC stays at your own wallet address. You sign one transaction that lets Ellai's purse draw from it, within a total cap, a daily limit and an end date that you choose. The purse is a small Sui wallet that Ellai keeps for you, and it holds at most 0.20 USDC right after a refill. Ellai has no smart contract of its own. The allowance is Sui's own, and the memory is Walrus Memory. See [On chain and proof](/docs/on-chain).
+
+## What "asks you less every week" means
+
+Your overview shows one number: of your latest 20 payments that were approved or asked about, how many needed you. At the start most do. As you answer, the number falls, because Ellai pays on its own where your past answers say yes. A falling number is the product working.
+
+In [the learning test](/docs/learning-results), Ellai asked 8 questions across the first 12 requests. Across the next 12 requests it asked none, and it refused the 2 that broke a limit or a refusal. Those are test numbers from one owner on Sui Mainnet. They are not a promise about your agents.
+
+Two things do not change as Ellai learns. It always asks about a seller address you have never approved. And a refusal always wins: once you refuse a seller address, Ellai refuses every later payment to it.
+
+## Where to go next
+
+- [How it works](/docs/how-it-works): one paid call end to end, the rules in order, the money flow, and what becomes a memory.
+- [Getting started](/docs/getting-started): what you need, the three setup signatures, your first agent key, and your settings.
+- [Connect your agent](/docs/connect-your-agent): the two MCP tools, the HTTP routes, and what each answer means for your agent.
+- [On chain and proof](/docs/on-chain): every object and transaction you can check on Suiscan, which Tatum call powers which feature, and the commands that prove it.
+- [The learning test](/docs/learning-results): the method and the two scores, with the honest notes.
+- [Security](/docs/security): the limits that hold your money and what is not covered.
+- [FAQ](/docs/faq): the questions people ask first.
+
+## What is not built yet
+
+- Ellai pays one x402 form today: version 1, as t2000 sellers send it. A seller that asks in another form is refused with a plain message.
+- The app has no button to revoke the allowance. Revoking is a Sui transaction that you sign yourself.
+- The app has no way to take back a refusal.

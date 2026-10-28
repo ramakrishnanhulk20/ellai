@@ -1,0 +1,104 @@
+---
+title: On chain and proof
+description: Why Ellai has no contract of its own, every object and transaction you can check on Suiscan, which Tatum call powers which feature, and the commands that prove it.
+---
+
+## No contract of its own
+
+Ellai has no Move contract of its own. It uses two things that already exist on Sui Mainnet: the native allowance (the `sui::allowance` module in the Sui framework) and Walrus Memory.
+
+The reason is risk. Every line of on-chain code Ellai wrote would be another place your money could be lost, and it would need an upgrade key that someone has to guard. The threat model looked at adding a small Ellai module that would cap each refill on chain and carry a pause flag. It did not choose that design. Such a module brings its own assets to protect: the package upgrade key, and a permit that could redirect every owner's allowance if it were handled badly.
+
+So the split is plain. Sui enforces the allowance: a total cap, a daily limit in fixed one-day windows, an end time and one named spender. Ellai's server enforces everything else, in code you can read: the per-payment maximum, the daily budget, the purse float and the decision rules. The allowance has no per-payment cap, which is why the purse holds at most 0.20 USDC. That float is the real ceiling on any single payment.
+
+When Ellai was designed, on 20 October 2026, the allowance module was about six and a half weeks old, and the Sui docs did not state an audit. Ellai relies on Sui's code for the allowance and on Walrus's code for memory. Ellai's self-audit covers Ellai's code, not those two.
+
+## What lives where
+
+| Thing | Who holds it | What it does |
+|---|---|---|
+| Your wallet address | You | Holds your USDC as an address balance. It moves only through the allowance. |
+| The allowance | A shared object. You are the funder, your purse is the spender. | Holds the total cap, the daily limit and the end date. Sui checks it on every refill. |
+| The purse | An address Ellai derives for you. Ellai holds the key. | Holds at most 0.20 USDC and sends each payment. It needs no SUI. |
+| The gas wallet | Ellai | Pays the network fee of each refill, at most 0.02 SUI. |
+| Your Walrus Memory account | You | Holds your answers. Ellai's key is one delegate on it, and you can remove it. |
+| Walrus Blob objects | They sit at your address | Each memory write leaves one. Their blob ids are what the proof page shows. |
+
+## The live objects and transactions
+
+These are real objects from Ellai's own test owner on Sui Mainnet. The test owner's allowance was issued for 1.00 USDC in total, 0.50 per 24 hours, for 30 days, with the purse as the spender.
+
+- Test owner: [0xaa4a4767...0e9](https://suiscan.xyz/mainnet/account/0xaa4a47678fa9e215d8ef57d6f5aebdbf71e3ed76c3841bc1b7343b300b1270e9)
+- Its purse, derived by Ellai: [0xf9ce8209...dbbe](https://suiscan.xyz/mainnet/account/0xf9ce82090ab9e6cac693577e1c983eb868048e49706973425a2c4923d0bbdbbe)
+- Gas wallet, which sponsors refills: [0x54298b73...201d](https://suiscan.xyz/mainnet/account/0x54298b73a1a3fecfc23ffc9d5897888e527c06dd30dce5476dfeda1b146d201d)
+- Allowance object: [0xd2b94108...99c8](https://suiscan.xyz/mainnet/object/0xd2b941082590b7d9d0a04482109670f94c290714889b67e8ef2c60ec6d9699c8)
+- Walrus Memory account: [0x98a4e7a4...1121](https://suiscan.xyz/mainnet/object/0x98a4e7a42754de51dd86bf5b8a06e6caaa2e4dcc8bc08f630952ce291ee91121)
+- A 1-of-2 multisig recovery test purse: [0x6daa23a5...487e](https://suiscan.xyz/mainnet/account/0x6daa23a562bce04861813e77bf6a1f515f90637e8f6f08d375e5c3710870487e). This was an experiment to see whether either of two keys alone could make a gasless USDC send from a multisig address. Ellai does not use multisig purses today.
+
+Transactions:
+
+- First payment to a real seller: [JD999NqS](https://suiscan.xyz/mainnet/tx/JD999NqSNbgJVLHF5ikv1wSirNm1v9gbhm4Xva1JAmv4)
+- Full pay flow, with the seller's answer delivered: [DC9NrrTa](https://suiscan.xyz/mainnet/tx/DC9NrrTaomMRd9RcHgKWAnFNaTukKVVzg3migMYsd9wF)
+- Ellai's own seller, paid: [GQJtLy5o](https://suiscan.xyz/mainnet/tx/GQJtLy5oFGSVdvs1aZEqVWdstpEUPJ5VmuuYWMDMHy9j)
+- Sponsored refills: [HwmDFQi6](https://suiscan.xyz/mainnet/tx/HwmDFQi6M9CwSKac3SYsGT27Jcr2Rk9vQ9W3qmCa37ow) and [AEkEASpR](https://suiscan.xyz/mainnet/tx/AEkEASpR1MTzawpvXZctLnAaMACMpUtnbMUB1nmK9NJ)
+- Multisig recovery test: [Dn8hJfLP](https://suiscan.xyz/mainnet/tx/Dn8hJfLPUA2fSjg9R5SqYZmdskjKoZvZUBiD5KZucydF), [4uRB3xMC](https://suiscan.xyz/mainnet/tx/4uRB3xMCH623DzpkQQ2akasUiD9unqqFZ4ScdbvrZbvy) and [37uBVJr9](https://suiscan.xyz/mainnet/tx/37uBVJr9sVkqG8dvob9xJYrn4cxN8MhCUgYTcdk23j1e)
+
+The learning loop is on chain too. One payment was approved as "learned", citing the Walrus blobs `9wXxWalHa5ZrXM2MRvsIkFx3X4AzQPjRexbcWzgxhDE` and `HrmaKoyWB8VwezJBKJOGh81-dJbim5YVw7ZaRx34A0I` at distances 0.1527 and 0.1730. A request to a different recipient was asked instead. See [the learning test](/docs/learning-results) for a larger run.
+
+## Which Tatum call powers which feature
+
+Ellai reads and sends on Sui only through Tatum's Sui gateway, using gRPC for balances, transactions and sending, and GraphQL for objects. The code is in `packages/core/src/chain.ts`.
+
+| Feature | Tatum call | Transport |
+|---|---|---|
+| Purse balance on your overview, the check that the purse holds enough before signing, the refill decision, the gas wallet check, and the balances in Ellai's own wallet check | `getBalances`, which calls `stateService.listBalances` | gRPC |
+| The epoch window a payment is valid in, whether a signed payment's window has closed, and the gas price used to build transactions | `getCurrentEpoch` and `getReferenceGasPrice`, which call `ledgerService.getEpoch` | gRPC |
+| The settlement check: reading a payment by the digest Ellai computed, and confirming that your three setup transactions landed | `getTransactionResult`, which calls `ledgerService.getTransaction` | gRPC |
+| The dry run of every refill before the gas wallet signs | `simulate`, which calls `transactionExecutionService.simulateTransaction` | gRPC |
+| Sending refills, sending the setup transactions you signed, and settling a buyer's payment to Ellai's own seller | `executeTransaction`, which calls `transactionExecutionService.executeTransaction` | gRPC |
+| Reading your allowance: funder, spender, total cap, daily limit, end time and how much of the current window is spent | `getAllowance`, the GraphQL query `EllaiAllowance` | GraphQL |
+| Finding your Walrus Blob objects, so a memory can be shown as on chain, and the blob count in Ellai's wallet check | `scanOwnedWalrusBlobs` and `listOwnedWalrusBlobs`, the GraphQL query `EllaiOwnedWalrusBlobs` | GraphQL |
+| The current Walrus epoch, so a memory leaves the proof page when its storage ends | `getWalrusEpoch`, two reads with the GraphQL query `EllaiMoveObject` | GraphQL |
+| Checking a zkLogin proof at sign-in, for zkLogin wallets only | The Sui SDK's own zkLogin check, made through Tatum | Chosen by the SDK |
+
+Every Tatum request goes through one meter, `packages/web/src/server/http/tatum-meter.ts`. A live check on 26 October 2026 showed each gRPC and GraphQL request reaching the meter, and showed a refusing meter sending nothing. The daily budgets are on the [Security](/docs/security) page.
+
+## The public proof page and memory map
+
+The `/proof` page and the memory map on the landing page show what Ellai actually did. They read two public routes: `/api/public/proof` and `/api/public/memory-map`.
+
+Who appears. Only owners who turned on Public proof in Settings, which is off by default, and only once they have a verified payment or a memory confirmed on chain.
+
+What `/api/public/proof` returns:
+
+- Totals: verified payments, their USDC total, owner answers confirmed on chain, approvals made by learning, and questions asked.
+- The latest 20 verified payments: transaction digest, amount, seller host, time and a Suiscan link.
+- The latest 20 memories: Walrus blob id, whether it is an owner answer or an outcome, and when it was confirmed.
+
+What `/api/public/memory-map` returns:
+
+- The latest 200 owner answers that are on chain: blob id, approve or refuse, seller host, amount and time.
+- The latest 50 decisions: outcome, rule, host, amount, the transaction digest if Ellai verified a payment, and the past answers it cited with how close each was. The distance is a cosine distance from 0 to 2, smaller meaning closer.
+- Totals for memories, learned approvals and questions asked.
+
+What they never show: a memory sentence, a purpose, a reason, an owner id, an agent id or label, or an address. They read Ellai's database alone and are cached for 60 seconds, so a visitor cannot spend Tatum credits.
+
+How a memory earns a place. It counts as confirmed on chain only once its blob id is found on a certified, unexpired Walrus Blob object that you own, read through Tatum. The word of Walrus Memory's relayer, the service that takes the writes, is not enough. A memory leaves the page when the Walrus epoch reaches the end of its storage period.
+
+One number needs care. The learned approvals total counts only learned approvals that ended in a payment Ellai verified on chain. Approvals Ellai made in tests without paying do not count, so the total can sit below the number of learned decisions in History.
+
+## The prove-it commands
+
+Run these from the repository root. Live proofs read a `.env` file at the repo root. `.env.example` lists every variable, and `npm run setup -w packages/proof` writes the wallet and master secrets. They use your own test wallets on Sui Mainnet, so fund those first. Each live proof is capped, and the last column gives the cap.
+
+| Command | What it shows | USDC moved |
+|---|---|---|
+| `npm test` | Everything offline, plus the live core reads through Tatum. Run it alone, with a Tatum key in `.env`. It takes about 2.5 minutes. | None |
+| `npm run typecheck` | The types of every package. | None |
+| `npm run prove:loop -w packages/web` | The learning loop on Sui Mainnet. Two owner approvals are written as Walrus Memory blobs signed by Ellai's delegate key, come back confirmed, and are found again by meaning. A third similar request is approved on its own citing both, and the same request to another recipient is still asked. | None |
+| `npm run prove:flow -w packages/web` | The pay flow. An agent asks for a hotel search. Ellai fetches the seller's price itself, approves it on its own from the two earlier approvals, checks the daily budget at signing, pays 0.01 USDC from the purse with a gasless send, hands back the seller's answer and verifies the payment on chain by its own digest. It starts from the approvals that `prove:loop` writes, so run that one first. | At most 0.02 USDC |
+| `npm run prove:seller -w packages/web` | Ellai's own seller. It answers a request with a 402, a buyer reads and pays it, and the seller checks the bytes and signature, sends the payment through Tatum, verifies the settlement from the chain's effects and answers with the wallet check. | Exactly 0.01 USDC on the first run. A rerun pays nothing. |
+| `npm run prove:pay -w packages/proof` | The money path end to end. The owner issues an allowance to the purse (1.00 USDC in total, 0.50 per 24 hours, 30 days), the purse pulls one 0.10 USDC refill with the gas wallet paying the fee, and the purse pays at most one live seller 0.01 USDC. Each payment is verified from its own digest. | Capped. At most 0.20 USDC may leave the owner, and at most 0.02 USDC is newly signed to sellers. |
+| `npm run prove:memory -w packages/proof` | The Walrus Memory slice. It makes sure the owner has an account with Ellai's derived key on it, writes 10 true sentences once, recalls one by meaning, and reads the owner's Walrus Blob objects back from chain through Tatum. | None |
+
+At commit b086bf6 on 26 October 2026, `npm test` at the root ran core 236, proof 8 and web 627 tests, all passing, with live core reads included. The root typecheck and the web build were clean.

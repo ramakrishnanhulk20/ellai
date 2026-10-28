@@ -1,0 +1,69 @@
+---
+title: FAQ
+description: Straight answers to the questions people ask first about limits, custody, Walrus Memory, Tatum, the AI, failed sellers, Claude Code and Sui Agent Pass.
+---
+
+## Can Ellai spend more than I allow?
+
+Not past the allowance. Sui enforces the allowance you sign: a total cap, a daily limit and an end date, all chosen by you. Inside it, Ellai adds limits of its own. A per-payment maximum, a daily budget, and a purse that never holds more than 0.20 USDC right after a refill. The numbers are on the [Security](/docs/security) page.
+
+Two honest limits. The per-payment maximum and the daily budget are Ellai's rules, held in Ellai's code and not by Sui. And the allowance uses fixed daily windows, so across a window boundary Sui lets up to twice the daily limit through.
+## What happens if Ellai's server is broken into?
+
+Ellai holds every purse key, derived from one master secret. A full break-in would let the attacker take each purse's float, and draw from each allowance up to its daily limit, until each owner ends their allowance. One stolen key costs every owner. This is the one case the rules cannot cover, because the rules run on the server.
+
+The chain still bounds the loss. Your main balance stays at your own address and cannot be reached. The allowance is capped in total, per day and by its end date. A design that split signing with the owner would have cut this risk. The threat model chose the simpler purse and states the cost.
+
+## Why Walrus Memory?
+
+Your yes and no answers should belong to you, not to Ellai. In Walrus Memory you own the account, you can read it from other tools that sign in to it (Claude Code is one), you can check each memory as a Walrus blob on Sui, and you can remove Ellai's key at any time. Walrus Memory also does the meaning-based search that learning needs: given a new payment, it returns the closest past decisions with a distance.
+
+The costs. Walrus's relayer operator and the service that turns text into search vectors can read the memory text, and the delegate key holder can too. A memory is stored for a fixed storage period, and it leaves the public proof page when that period ends. And if Walrus Memory is down, Ellai asks you instead of paying.
+
+## Why Tatum?
+
+Ellai needs to read Sui and send transactions from a server. Tatum's Sui gateway gives it gRPC for balances, transactions and sending, and GraphQL for objects such as your allowance and your Walrus blobs. Every chain fact Ellai uses comes through it. A payment counts as verified only after Ellai reads it back from Tatum by the digest Ellai computed itself. The full list of calls is on the [On chain and proof](/docs/on-chain) page.
+
+The costs. Ellai trusts what Tatum answers. Tatum's free plan is one lifetime pool of credits, so Ellai meters every request and caps what each owner, client and job can spend. When Tatum is down or a cap is reached, Ellai asks or refuses and does not pay blind.
+
+## Does the AI decide payments?
+
+No. Every payment decision is fixed code, applied in the order set out in [How it works](/docs/how-it-works). No AI model ever decides about money.
+
+The built-in agent runs on Claude Haiku and only chooses what to buy, from a fixed catalog. It cannot name a URL, and it has no path to a signer. Your own agent, such as Claude Code, chooses what to ask for. Both go through the same rules, limits and owner checks. The agent's purpose text is shown to you as the agent's words, apart from the facts Ellai checked.
+
+## What if a seller takes the money and delivers nothing?
+
+Ellai cannot take a payment back. A payment is final on Sui once it lands, and Ellai does not judge whether a seller is honest. What it does is limit the damage and learn from it. The loss from one payment cannot exceed your per-payment maximum, and the purse holds at most 0.20 USDC.
+
+When a payment is verified on chain but the seller returned nothing, Ellai writes an outcome memory. From that moment it asks before paying that seller again. Only your yes to a question asked after the failure lifts it. A yes you gave before the failure does not.
+
+## Can I use Ellai from Claude Code?
+
+Yes. Create an agent key in the app, then run:
+
+```bash
+claude mcp add --transport http ellai <origin>/api/mcp --header "Authorization: Bearer YOUR_AGENT_KEY"
+```
+
+Replace `<origin>` with this site's address and `YOUR_AGENT_KEY` with your key. Claude Code then has two tools, `paid_fetch` and `check_decision`. You can also read your own memories from Claude Code through the Walrus Memory MCP. Both are covered in [Connect your agent](/docs/connect-your-agent).
+
+## How is Ellai different from Sui Agent Pass?
+
+Sui Agent Pass is a Mysten Labs product, shown in October 2026, and Ellai and Agent Pass come from the same family of ideas: both are built on Sui's native `sui::allowance`, and both say an agent should act only inside limits the owner set. They do different jobs. Agent Pass bounds an agent's DeFi actions, such as transfers, swaps, lending and staking, to recipients, pools and validators that the owner lists in advance. Ellai pays web sellers that an agent finds at run time over x402, where no list can be written in advance, and it learns from the owner's answers which of those sellers the owner trusts. As read on 27 October 2026, Agent Pass was a mainnet test build at version 0.1.10, and its package does not mention x402, Walrus, Tatum or memory.
+
+## What happens when Walrus Memory is down?
+
+Ellai asks you instead of paying. If a search errors, times out or comes back empty, the rule is to ask. Refusals still hold, because Ellai finds them by exact lookup in its own records and does not need the search. Your new answers are saved in Ellai's database at once, a refusal binds at once, and the background job retries the Walrus write until it succeeds or ends in a visible failed state.
+
+## Does Ellai hold my money?
+
+Your USDC stays at your own address until the allowance lets the purse draw it. The purse is an address Ellai derives for you, and Ellai holds its key. It holds at most 0.20 USDC right after a refill, so at most that much is in Ellai's hands at once. If you end the allowance, whatever is already in the purse stays spendable by whoever can sign for it, which is Ellai.
+
+## Can I take back a refusal?
+
+Not yet. A refusal always wins, and the app has no way to undo one. Refuse only a seller you would refuse for anything.
+
+## What can Ellai pay today?
+
+USDC on Sui Mainnet, from 0.01 USDC up to your per-payment maximum, to sellers that use x402 version 1 in the form t2000 sellers send it. In practice a single payment cannot exceed what the purse holds, which is at most 0.20 USDC. Other forms are not paid yet. x402 version 2 is read but refused, and MPP is not supported. The live tests used a hotel search, a task classifier, an agent verification service and Ellai's own 0.01 USDC wallet check.

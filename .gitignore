@@ -28,6 +28,5 @@ coverage/
 
 # Review notes
 REVIEW-BACKEND.md
-LABELS-RESULTS.md
 # next dev writes an agent rules file into the app folder on every run
 packages/web/AGENTS.md

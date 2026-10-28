@@ -1,0 +1,132 @@
+---
+title: Security
+description: The limits that hold your money, what needs a fresh wallet signature, what a stolen login can and cannot do, and what Ellai does not cover.
+---
+
+Ellai signs payments when an agent asks, on terms written by a seller it does not control. That makes it a money signer, so its security rules were written down before any code. The written standard is the [threat model](https://github.com/ramakrishnanhulk20/ellai/blob/main/docs/security/threat-model.md). It lists 36 numbered rules, C1 to C36, and the threat model describes Ellai as self-audited. This page explains the ones that matter most, in plain words.
+
+## The limits that hold your money
+
+| Limit | Value | Held by |
+|---|---|---|
+| Allowance total cap | You choose, up to 50.00 USDC | Sui |
+| Allowance daily limit | You choose, 0.10 to 5.00 USDC, in fixed one-day windows | Sui |
+| Allowance end date | You choose, 1 to 90 days | Sui |
+| Purse float | At most 0.20 USDC right after a refill | Ellai's code |
+| Refills | Exactly 0.10 USDC each, only when the purse holds under 0.05 USDC, at most 3 in any 24 hours | Ellai's code |
+| Per-payment maximum | 0.01 to 1.00 USDC, default 0.05 | Ellai's code |
+| Daily budget | Up to 5.00 USDC, default 0.50, never below the per-payment maximum | Ellai's code |
+| Smallest payment | 0.01 USDC, the minimum for a gasless send | Ellai's code |
+
+Sui holds the first three, so even a bug in Ellai cannot make the purse draw more than the allowance says. You can end the allowance. Ending it is a Sui transaction that you sign yourself, using the allowance's own revoke call. The app has no revoke button for it yet. The money already in the purse when you end the allowance stays spendable by whoever can sign for the purse, which is Ellai.
+
+Ellai holds the rest. A plain send from the purse has no cap of its own on chain, so the 0.20 USDC float is the real ceiling on any single payment. The per-payment maximum can be set higher than the float, but a payment above what the purse holds fails with a message that the purse does not hold enough.
+
+Each refill is 0.10 USDC and there are at most 3 in 24 hours. So as the code stands today, the purse takes at most 0.30 USDC a day from your allowance, however high you set the allowance's daily limit. The allowance limit is the wall that protects you if Ellai is wrong. It is not the pace Ellai runs at.
+
+The daily budget counts every payment Ellai has signed in any 24 hours, whether or not it has landed yet. It is checked and debited in one step at the moment of signing, and again when your yes is turned into a signature, so two requests at once cannot both pass. A signed payment is released from the budget only after its validity window has closed and the chain shows, on two separate checks at least 30 minutes apart, that it never landed.
+
+A signed payment cannot be recalled. Sui does not accept a timestamp limit on a transaction today, so the bytes stay valid until their epoch window closes. That window spans up to two Sui epochs, which are about a day each on mainnet. The budget counts the payment until then.
+
+## A fresh wallet signature for anything that loosens
+
+Some changes let Ellai do more than it does now. Each one needs a signature from your wallet, made within minutes, over a message that names that exact change:
+
+- Creating an agent key.
+- Raising the per-payment maximum or the daily budget.
+- Lowering the approvals needed.
+- Raising the distance cutoff.
+- Resuming automatic payments.
+- Clearing an automatic pause.
+- Turning the public proof page on.
+
+The signature works once, for your account and that change only, for at most 5 minutes. A failed attempt burns it, and you start again. Tightening a limit needs only your login. A change that mixes loosening and tightening needs the signature for the whole change. Asking for these messages is itself limited: 10 an hour per session and 20 an hour per owner, and agent keys are limited to 5 an hour per session and 10 per owner.
+
+## What a stolen login can and cannot do
+
+Suppose someone copies your session cookie. They can answer questions, so they can approve what an agent has asked for. They can run the built-in agent, which buys only from its fixed catalog, up to your daily budget. They can pause payments, tighten limits and sign you out.
+
+They cannot create an agent key. They cannot raise a limit, lower the approvals needed, raise the cutoff, resume payments, clear a pause or turn the public proof page on, because each of those needs your wallet. They cannot pay anyone outside the catalog or past your budget. Every payment shows in your History, and you can end every session at once from Settings or pause payments.
+
+That was a choice. Answering questions needs only the session, so a stolen session can approve what agents ask for. The damage is bounded by the daily budget and visible in History.
+
+## A stolen or hostile agent key
+
+An agent key can ask Ellai to pay. It cannot make Ellai pay without the rules saying so. Automatic payment goes only to seller addresses you have approved, at or below an amount you approved, within your daily budget. A hostile agent can repeat the purpose text of requests you approved, so the closeness check is not what stops it. The rest of the rule is. Revoking a key stops new decisions at once and stops any signature for that key's pending decisions.
+
+## What a seller cannot do
+
+- Name a price Ellai does not see. Ellai fetches the price itself, over checked HTTPS, so the agent cannot report a different one.
+- Borrow a good name. Trust follows the seller's money address, not its website name. A seller that rotates addresses falls back to asking you, which is the safe direction.
+- Trick the amount. An amount must be a whole number of atomic units, at least 0.01 USDC and within your limit. The coin and network must be Sui Mainnet USDC. Ellai refuses, rather than guesses, a price request with more than one payable option, copies of a value that disagree, a repeated key in the JSON, a host ending in a dot, or a body over 32,768 bytes.
+- Change what Ellai signs. Before signing, Ellai decodes the transaction it built and checks that it equals the one parsed payment, field by field, and that it is a plain USDC send with no extra commands, no other recipient and no other coin.
+
+## What cannot teach Ellai to pay
+
+Only your own answers earn trust. Outcome memories, payments approved by the rules, memories written by any other tool and memories from another namespace carry no weight. The rules read Ellai's own structured record of each memory, never the sentence the search returned. A refusal is an exact lookup by recipient address, so no search result can hide it. A bad outcome makes Ellai ask from the moment it happens, and only a yes to a question asked after that lifts it.
+
+When something cannot be checked, the answer is no. If Walrus Memory errors, times out or comes back empty, Ellai asks. If Tatum is down, Ellai asks or refuses. A missing chain answer counts as unknown, never as zero or as verified. Anything that fails to parse, is ambiguous or is too large is refused.
+
+## Every outside call is bounded and metered
+
+| Call | Bound |
+|---|---|
+| Tatum, each request | 10 seconds, with 2 retries after the first try, and a 1 MiB response cap |
+| A seller | 10 seconds for the first request; a paid request waits 15 seconds for a lookup seller, 60 seconds for a seller that plans with a language model, and 30 seconds otherwise; 256 KiB of response read |
+| Walrus Memory relayer | 30 seconds a request, 120 seconds for a whole SDK call, a 2 MiB response cap |
+| A memory write | Ends as written or as a visible "failed" state, after 5 refused attempts or 6 hours |
+| A paid call, in all | 240 seconds |
+| A recall during a decision | 15 seconds, after which Ellai asks |
+
+Ellai connects to sellers over HTTPS on port 443 only. It resolves the host once, checks that the address is a public one, and sends the request to that checked address. It sends no cookie, key or agent token to a seller.
+
+Every polling loop has a ceiling and ends in a state you can see. Public pages read a cache refreshed once a minute, so a visitor cannot trigger a paid upstream call.
+
+### The Tatum budget
+
+Tatum's free plan is one lifetime pool of credits, so Ellai counts every request and spends from daily budgets. One meter stands in front of every request to Tatum, from routes, background jobs and library calls alike. A new code path cannot reach Tatum without passing it.
+
+- Everything that people can start together: 1,500 requests a day.
+- One owner and that owner's agents: 300 a day.
+- One client address, across every wallet it signs in: 300 a day.
+- Callers with no owner, such as strangers buying a wallet check: 500 a day, counted inside the 1,500.
+- The background job: 1,500 a day, with 200 for any one owner, kept apart from the budgets above so strangers cannot starve payment checks.
+- Refills: 500 a day, a pool of their own.
+
+Past a cap, Ellai answers that it cannot read Sui and does not call Tatum. An owner with nothing pending costs nothing.
+
+### Limits on who can ask
+
+- Sign-in: 10 requests a minute per client for each of the two steps, 300 a minute across everyone, 30 completed sign-ins a day per client and 2,000 a day across everyone.
+- Pay requests: 30 a minute per agent, 60 a minute per owner, 2,000 a day per client and 20,000 a day across all agents.
+- Ellai's own wallet check seller: 10 price requests a minute per caller address, and payments it sends through Tatum are capped per caller at 3 a minute and 20 a day, and across every caller at 150 a day.
+- The built-in agent: 10 runs an hour per owner and 200 a day across all owners.
+
+## Everything an attacker could write is shown as plain text
+
+Purposes, seller hosts, challenge fields, reasons, memory sentences, seller answers and the built-in agent's own words are rendered as plain text in the app, on the proof page and in the docs. They are never rendered as HTML and never turned into links. Answers to agents carry Ellai's own reasons and memory ids. They never carry a memory sentence.
+
+## What Ellai does not cover
+
+The threat model names its non-goals. In plain words, Ellai does not:
+
+- Judge whether a seller is honest or delivers what it charged for.
+- Prove that a recipient address belongs to the business a website names, unless Ellai fetched the price from that site itself.
+- Cancel a payment once it has left Ellai. Expiry is the only brake.
+- Hide memory text from the Walrus Memory relayer operator, from the service that turns text into search vectors, or from the holder of a delegate key. Namespace names and blob details are public on chain.
+- Protect you from your own approvals, or from a compromised owner wallet.
+- Keep paying when Walrus Memory or Tatum is down. It asks or refuses instead.
+- Cap each payment on chain. The on-chain ceiling is the float plus the allowance caps, and fixed windows let up to twice the daily limit through across a window boundary.
+- Stop an approved agent from spending badly within its limits.
+- Stop a replay of a landed payment's header. Its bytes and signature are public on chain, so anyone can present them to the seller. That is how x402 bearer payments work.
+- Stop non-browser callers with its same-origin check. That check stops cross-site browser requests only.
+- Check a zkLogin proof without Tatum. Sign-in and the wallet confirmation for zkLogin wallets trust Tatum's answer, as every chain fact Ellai uses comes through Tatum.
+- Survive a full server compromise beyond what the chain bounds.
+
+Shared daily caps, once spent by strangers, can lock a path out for everyone until the window ends. That is accepted, logged and bounded per client.
+
+## If Ellai's server is broken into
+
+Ellai holds every purse key, derived from one master secret. Someone who took the whole server could take each purse's float and each allowance up to its daily limit, until each owner ends their allowance. One stolen key would cost every owner. This is the one case the rules cannot cover, because the rules run on the server.
+
+The chain still bounds the loss. Your main balance stays at your own address, out of reach, and the allowance is capped in total, per day and by its end date. The threat model weighed two designs that would have split signing between Ellai, the agent and the owner. It chose the simpler single-key purse, and says plainly what that costs.
