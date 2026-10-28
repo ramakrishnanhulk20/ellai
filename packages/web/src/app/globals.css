@@ -292,3 +292,204 @@ html.lenis body {
 .lenis.lenis-stopped {
   overflow: clip;
 }
+
+/* A proof row is lit and underlined as one thing: the link inside it stretches over the whole row. */
+.proof-row {
+  transition: background-color 160ms ease-out;
+}
+
+.proof-row:hover {
+  background-color: rgba(242, 242, 238, 0.03);
+}
+
+.proof-row:hover .link-draw,
+.proof-row:focus-within .link-draw {
+  background-size: 100% 1px;
+}
+
+.proof-row a:focus-visible {
+  outline: none;
+}
+
+.proof-row:has(a:focus-visible) {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .proof-row {
+    transition: none;
+  }
+}
+
+/* The limits diagram: shapes scale with the column, every word is HTML placed by percentage so it stays 12px. */
+.limits-diagram {
+  position: relative;
+  container-type: inline-size;
+}
+
+/* Hangs above the wallet and drops a thin line to the middle of the first path. The line is the pill's offset plus 48 drawing units. */
+.limits-pill-stack {
+  position: absolute;
+  width: max-content;
+  max-width: 68.57cqw;
+  translate: -50% calc(-100% - 20px);
+}
+
+.limits-pill-stack::after {
+  content: '';
+  position: absolute;
+  top: 100%;
+  left: 50%;
+  width: 1px;
+  height: calc(20px + 48 * 100cqw / 560);
+  background: color-mix(in srgb, var(--accent) 50%, transparent);
+}
+
+.limits-pill {
+  padding: 8px 12px;
+  border: 1px solid color-mix(in srgb, var(--accent) 50%, transparent);
+  border-radius: 8px;
+  color: var(--fg);
+  text-align: center;
+  text-wrap: balance;
+}
+
+/* Sits just above the top of the seller and purse shapes (32 drawing units plus 4px) so it can never touch them. */
+.limits-tick-stack {
+  position: absolute;
+  width: max-content;
+  translate: -50% calc(-100% - 32 * 100cqw / 560 - 4px);
+}
+
+.limits-tick-stack::after {
+  content: '';
+  position: absolute;
+  top: 100%;
+  left: 50%;
+  width: 1px;
+  height: calc(32 * 100cqw / 560 + 4px);
+  background: var(--line);
+}
+
+.limits-name {
+  position: absolute;
+  translate: -50% 12px;
+  color: var(--muted);
+  text-align: center;
+  white-space: nowrap;
+}
+
+/* The purse amount sits inside the circle once the drawing is wide enough, and under its name before that. */
+.limits-cap-below {
+  display: block;
+}
+
+.limits-cap-inside {
+  position: absolute;
+  display: none;
+  translate: -50% -50%;
+  color: var(--fg);
+  line-height: 1.2;
+  text-align: center;
+}
+
+@container (min-width: 480px) {
+  .limits-cap-below {
+    display: none;
+  }
+
+  .limits-cap-inside {
+    display: block;
+  }
+}
+
+/* One 4 second loop: the allowance dot for 1.2s, a 0.4s pause, then the payment dot for 0.9s. Paused whenever the diagram is off screen. */
+.limits-dot {
+  position: absolute;
+  top: 55.556%;
+  left: 0;
+  width: 6px;
+  height: 6px;
+  margin: -3px 0 0 -3px;
+  border-radius: 9999px;
+  opacity: 0;
+  animation-duration: 4s;
+  animation-timing-function: ease-in-out;
+  animation-iteration-count: infinite;
+  animation-play-state: paused;
+}
+
+.limits-diagram[data-live] .limits-dot {
+  animation-play-state: running;
+}
+
+.limits-dot-allowance {
+  background: var(--accent);
+  animation-name: limits-allowance;
+}
+
+.limits-dot-payment {
+  background: var(--fg);
+  animation-name: limits-payment;
+}
+
+@keyframes limits-allowance {
+  0% {
+    translate: calc(100cqw * 0.24286) 0;
+    opacity: 0;
+  }
+  3% {
+    opacity: 1;
+  }
+  27% {
+    opacity: 1;
+  }
+  30%,
+  100% {
+    translate: calc(100cqw * 0.44286) 0;
+    opacity: 0;
+  }
+}
+
+@keyframes limits-payment {
+  0%,
+  40% {
+    translate: calc(100cqw * 0.55714) 0;
+    opacity: 0;
+  }
+  43% {
+    opacity: 1;
+  }
+  60% {
+    opacity: 1;
+  }
+  62.5%,
+  100% {
+    translate: calc(100cqw * 0.78571) 0;
+    opacity: 0;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .limits-dot {
+    display: none;
+  }
+}
+
+/* The closing ring turns once every 90 seconds. */
+@keyframes ring-turn {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.closing-ring {
+  animation: ring-turn 90s linear infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .closing-ring {
+    animation: none;
+  }
+}
