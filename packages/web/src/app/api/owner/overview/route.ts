@@ -67,11 +67,14 @@ async function questionRate(db: Database, ownerId: string): Promise<{ asked: num
  * of asked, approved and refused decisions and verified payments over the last
  * LIMITS.overviewCountWindowMs (30 days), and questionsPer20: of the latest
  * LIMITS.overviewQuestionWindow (20) approved or asked decisions, how many were asked, with
- * `window` saying how many there were. The owner comes from the session alone (C13); 401
- * signed_out without one.
+ * `window` saying how many there were, and builtinAgent: 'ready' when the server holds an
+ * Anthropic key and 'needs_key' when it does not, never the key itself. The owner comes from
+ * the session alone (C13); 401 signed_out without one.
  * Only an owner with an allowance has a purse Ellai can fill, so only then is the purse read
  * through Tatum, and only then does the request count toward limitOwnerChainCalls's budgets at
- * one call (C22), answering with its 429 or 503 beyond them. An owner without one costs no chain read.
+ * one call (C22), answering with its 429 or 503 beyond them. An owner without one costs no chain
+ * read. Because of that one call, screens load the overview on demand (page load, after an
+ * action), never on a timer; GET /api/owner/settings reads the settings with no chain call.
  * The read is also counted by the Tatum meter, as this owner from this client; a refusal there
  * (ChainError BUDGET, nothing sent) is 503 chain_unavailable_today, not a blank purse, while any
  * other failed read blanks the purse. Atomic amounts are decimal strings.
@@ -110,5 +113,7 @@ export const GET = scoped('owner', async (request, ctx, { ownerId }): Promise<Re
     questionRate(ctx.db, ownerId),
   ]);
   if (purse === BUDGET_SPENT) throw new HttpError(503, 'chain_unavailable_today');
-  return jsonResponse({ owner, onboarding, purse, counts, questionsPer20 });
+  // The same test the run route makes before it builds a client, so the two can never disagree.
+  const builtinAgent = ctx.env.ANTHROPIC_API_KEY === undefined ? 'needs_key' : 'ready';
+  return jsonResponse({ owner, onboarding, purse, counts, questionsPer20, builtinAgent });
 });

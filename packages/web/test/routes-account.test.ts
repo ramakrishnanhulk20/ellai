@@ -8,25 +8,34 @@
 // the step-up route held to the session and the app's origin like the rest; signing out
 // everywhere ending every live session of the owner and no one else's; onboarding passing
 // the owner, chain and master secret to the onboarding functions and their summaries and
-// refusals back unchanged, a Tatum budget refusal as chain_unavailable_today; settings held to their bounds at each edge, the auto pause cleared
+// refusals back unchanged, a Tatum budget refusal as chain_unavailable_today; an account step Sui
+// already shows done answered 409 already_done and then confirmed with no digest from what Sui
+// shows; submit relaying only bytes the owner signed that are the step Ellai builds, refusing
+// another sender's and another kind of transaction before sending, recording a success, and
+// answering an unknown outcome 202 with the digest and a definite refusal 422; decisions saying
+// what the owner answered without the memory sentence; settings read with no chain call;
+// settings held to their bounds at each edge, the auto pause cleared
 // only on request, the public proof opt-in starting off and switched for the signed-in owner
 // only; and the limits the routes that read Sui share: per owner a minute and a day, and for
 // every owner a day, with the overview counted only for an owner with an allowance.
 // Does NOT cover: a real chain or wallet (the chain is stubbed and core's Walrus Memory builders
-// are stand-ins; onboarding.test and prove:onboarding cover those), two database connections
+// are stand-ins; onboarding.test and prove:onboarding cover those), a real wallet's signature
+// being accepted by Sui (submit's signatures are made with a test key and the send is a stand-in),
+// two database connections
 // racing a settings change against signing (PGlite serves one connection, so the FOR UPDATE
 // lock is not raced here), or how a page renders agent text (no pages exist yet).
 import { randomBytes } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
+import { buildIssueAllowance } from '@ellai/core/allowance';
 import { type Chain, ChainError } from '@ellai/core/chain';
 import { LIMITS } from '@ellai/core/limits';
-import { buildAddDelegateTx, buildCreateAccountTx, findMemoryAccount, MemoryError } from '@ellai/core/memory';
+import { buildAddDelegateTx, buildCreateAccountTx, findMemoryAccount, MemoryError, WALRUS_MEMORY_PACKAGE_ID, WALRUS_MEMORY_REGISTRY_ID } from '@ellai/core/memory';
 import { USDC_TYPE_MAINNET } from '@ellai/core/usdc';
 import type { Signer } from '@mysten/sui/cryptography';
 import { GrpcTypes } from '@mysten/sui/grpc';
 import { Ed25519Keypair } from '@mysten/sui/keypairs/ed25519';
-import { Transaction } from '@mysten/sui/transactions';
-import { fromBase64, toBase64 } from '@mysten/sui/utils';
+import { Transaction, TransactionDataBuilder } from '@mysten/sui/transactions';
+import { fromBase64, normalizeStructTag, normalizeSuiAddress, toBase64 } from '@mysten/sui/utils';
 import { eq } from 'drizzle-orm';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import * as agentRoute from '../src/app/api/owner/agents/[id]/route.js';
@@ -36,6 +45,7 @@ import * as memoriesRoute from '../src/app/api/owner/memories/route.js';
 import * as buildRoute from '../src/app/api/owner/onboarding/build/route.js';
 import * as confirmRoute from '../src/app/api/owner/onboarding/confirm/route.js';
 import * as onboardingRoute from '../src/app/api/owner/onboarding/route.js';
+import * as submitRoute from '../src/app/api/owner/onboarding/submit/route.js';
 import * as overviewRoute from '../src/app/api/owner/overview/route.js';
 import * as sessionsRoute from '../src/app/api/owner/sessions/route.js';
 import * as settingsRoute from '../src/app/api/owner/settings/route.js';
@@ -50,9 +60,12 @@ import type { ServerEnv } from '../src/server/env.js';
 import { type ServerContextFactory, setServerContextFactory } from '../src/server/http/context.js';
 import { HttpError, type HttpErrorCode } from '../src/server/http/errors.js';
 import { limitOwnerChainCalls } from '../src/server/http/owner-limits.js';
+import { ownerDelegate } from '../src/server/memory/delegate.js';
 import { MEMORY_NAMESPACE } from '../src/server/memory/namespace.js';
 import { BUILD_CHAIN_CALLS, buildOnboardingTx } from '../src/server/onboarding/build.js';
-import { CONFIRM_CHAIN_CALLS, confirmOnboardingTx } from '../src/server/onboarding/confirm.js';
+import { CONFIRM_CHAIN_CALLS, CONFIRM_EXISTING_CHAIN_CALLS, confirmOnboardingTx } from '../src/server/onboarding/confirm.js';
+import { ALREADY_DONE_MESSAGE } from '../src/server/onboarding/state.js';
+import { SUBMIT_CHAIN_CALLS, submitOnboardingTx } from '../src/server/onboarding/submit.js';
 
 vi.mock('@ellai/core/memory', async (importOriginal) => ({
   ...(await importOriginal<typeof import('@ellai/core/memory')>()),
@@ -69,6 +82,10 @@ vi.mock('../src/server/onboarding/build.js', async (importOriginal) => {
 vi.mock('../src/server/onboarding/confirm.js', async (importOriginal) => {
   const real = await importOriginal<typeof import('../src/server/onboarding/confirm.js')>();
   return { ...real, confirmOnboardingTx: vi.fn(real.confirmOnboardingTx) };
+});
+vi.mock('../src/server/onboarding/submit.js', async (importOriginal) => {
+  const real = await importOriginal<typeof import('../src/server/onboarding/submit.js')>();
+  return { ...real, submitOnboardingTx: vi.fn(real.submitOnboardingTx) };
 });
 
 let handle: Awaited<ReturnType<typeof createDb>>;
@@ -121,12 +138,17 @@ const getTransaction = vi.fn(async ({ digest }: { digest: string }) => ({
     },
   },
 }));
+// Submit's send and its read of the allowance it created.
+const executeTransaction = vi.fn<Chain['executeTransaction']>();
+const getAllowance = vi.fn<Chain['getAllowance']>();
 const chain = {
   usesApiKey: true,
   getBalances,
   getTransactionResult,
   getCurrentEpoch: async () => 900n,
   getReferenceGasPrice: async () => 100n,
+  executeTransaction,
+  getAllowance,
   grpc: { ledgerService: { getTransaction } },
 } as unknown as Chain;
 
@@ -152,10 +174,16 @@ beforeEach(() => {
   getBalances.mockResolvedValue({ usdcAddressBalance: 123_456n, usdcCoinBalance: 0n, suiTotal: 0n });
   getTransactionResult.mockClear();
   getTransaction.mockClear();
+  executeTransaction.mockReset();
+  getAllowance.mockReset();
   vi.mocked(findMemoryAccount).mockReset();
+  // Sui shows no account unless a test says otherwise, so a build goes on to core's builder.
+  vi.mocked(findMemoryAccount).mockResolvedValue(null);
   vi.mocked(buildCreateAccountTx).mockReset();
+  vi.mocked(buildAddDelegateTx).mockReset();
   vi.mocked(buildOnboardingTx).mockClear();
   vi.mocked(confirmOnboardingTx).mockClear();
+  vi.mocked(submitOnboardingTx).mockClear();
 });
 
 afterEach(() => {
@@ -277,6 +305,8 @@ const revoke = (id: string, options: SendOptions = {}) => agentRoute.DELETE(send
 const onboarding = (cookie?: string) => onboardingRoute.GET(get('/api/owner/onboarding', cookie));
 const build = (body: unknown, options: SendOptions = {}) => buildRoute.POST(send('POST', '/api/owner/onboarding/build', body, options));
 const confirm = (body: unknown, options: SendOptions = {}) => confirmRoute.POST(send('POST', '/api/owner/onboarding/confirm', body, options));
+const submit = (body: unknown, options: SendOptions = {}) => submitRoute.POST(send('POST', '/api/owner/onboarding/submit', body, options));
+const getSettings = (cookie?: string, query = '') => settingsRoute.GET(get(`/api/owner/settings${query}`, cookie));
 const patchSettings = (body: unknown, options: SendOptions = {}) => settingsRoute.PATCH(send('PATCH', '/api/owner/settings', body, options));
 const askStepUp = (body: unknown, options: SendOptions = {}) => stepUpRoute.POST(send('POST', '/api/owner/step-up', body, options));
 const signOutEverywhere = (options: SendOptions = {}) => sessionsRoute.DELETE(send('DELETE', '/api/owner/sessions', undefined, options));
@@ -346,6 +376,8 @@ interface DecisionItem {
   rule: string;
   reason: string;
   status: string;
+  answer: 'approve' | 'refuse' | null;
+  answeredAt: string | null;
   citedMemories: Array<{ memoryId: string; blobId: string | null }>;
   paid: { digest: string; settlement: string; explorerUrl: string } | null;
 }
@@ -377,6 +409,7 @@ describe('route files', () => {
     ['onboarding', onboardingRoute],
     ['onboarding/build', buildRoute],
     ['onboarding/confirm', confirmRoute],
+    ['onboarding/submit', submitRoute],
     ['settings', settingsRoute],
     ['step-up', stepUpRoute],
     ['sessions', sessionsRoute],
@@ -413,6 +446,8 @@ describe('GET /api/owner/decisions', () => {
       rule: 'learned',
       reason: 'You approved this recipient before.',
       status: 'paid',
+      answer: null,
+      answeredAt: null,
       citedMemories: [{ memoryId, blobId }],
       paid: { digest: DIGEST, settlement: 'verified', explorerUrl: `https://suiscan.xyz/mainnet/tx/${DIGEST}` },
     });
@@ -420,6 +455,32 @@ describe('GET /api/owner/decisions', () => {
 
     const theirList = await json<{ decisions: DecisionItem[] }>(await listDecisions(other.cookie));
     expect(theirList.decisions.map((d) => d.decisionId)).toEqual([theirs]);
+  });
+
+  it("says what the owner answered and when, from the owner_decision memory for that decision, and never its sentence (C17)", async () => {
+    const owner = await signedInOwner();
+    const agentId = await agentFor(owner.ownerId);
+    const asked = { outcome: 'asked' as const, rule: 'no_match' as const, status: 'answered' as const };
+    const refused = await insertDecision(owner.ownerId, agentId, { ...asked, createdAt: ago(3 * DAY_MS) });
+    const approved = await insertDecision(owner.ownerId, agentId, { ...asked, createdAt: ago(2 * DAY_MS) });
+    const byRule = await insertDecision(owner.ownerId, agentId, { createdAt: ago(DAY_MS) });
+    const refusedAt = ago(3 * DAY_MS - 60_000);
+    const approvedAt = ago(2 * DAY_MS - 60_000);
+    await insertMemory(owner.ownerId, { decisionId: refused, verdict: 'refuse', sentence: `Reason: "${MARKER}"`, createdAt: refusedAt });
+    await insertMemory(owner.ownerId, { decisionId: approved, verdict: 'approve', sentence: MARKER, createdAt: approvedAt });
+    // An outcome memory names a decision too, but it is Ellai's note on the seller, not an answer.
+    await insertMemory(owner.ownerId, { kind: 'outcome', decisionId: byRule, verdict: null, sentence: MARKER, createdAt: ago(60_000) });
+
+    const response = await listDecisions(owner.cookie);
+    const text = await response.clone().text();
+    const { decisions: listed } = await json<{ decisions: DecisionItem[] }>(response);
+    expect(listed.map((d) => [d.decisionId, d.status, d.answer, d.answeredAt])).toEqual([
+      [byRule, 'paid', null, null],
+      [approved, 'answered', 'approve', approvedAt.toISOString()],
+      [refused, 'answered', 'refuse', refusedAt.toISOString()],
+    ]);
+    expect(text).not.toContain(MARKER);
+    expect(text).not.toContain('sentence');
   });
 
   it('pages by before and limit, 20 by default and never more than 50', async () => {
@@ -785,6 +846,219 @@ describe('POST /api/owner/onboarding/confirm', () => {
   });
 });
 
+const ALREADY_DONE = { error: 'already_done', message: 'This step is already done on Sui. Confirm it to continue.' };
+const NOT_THIS_STEP = 'it is not the transaction Ellai builds for this step';
+const ALLOWANCE_TYPE = normalizeStructTag(`0x2::allowance::Allowance<0x2::balance::Balance<${USDC_TYPE_MAINNET}>>`);
+
+const accountRow = async (owner: Owner) =>
+  one(await db.select({ memwalAccountId: owners.memwalAccountId, delegateRegisteredAt: owners.delegateRegisteredAt, allowanceId: owners.allowanceId }).from(owners).where(eq(owners.id, owner.ownerId)));
+const purseOf = async (owner: Owner) => one(await db.select({ purse: owners.purseAddress }).from(owners).where(eq(owners.id, owner.ownerId))).purse;
+
+/** Signs bytes as a wallet does, giving the two fields submit takes besides the step. */
+async function signedBy(signer: Signer, bytes: Uint8Array): Promise<{ txBytesBase64: string; signature: string }> {
+  return { txBytesBase64: toBase64(bytes), signature: (await signer.signTransaction(bytes)).signature };
+}
+
+/** An allowance as buildIssueAllowance makes it for this owner and purse, or with one of these changed. */
+async function allowanceBytes(owner: Owner, change: { sender?: string; spender?: string; lifetimeCapAtomic?: bigint } = {}): Promise<Uint8Array> {
+  const terms = { lifetimeCapAtomic: change.lifetimeCapAtomic ?? 1_000_000n, periodMs: BigInt(LIMITS.allowancePeriodMs), periodLimitAtomic: 500_000n, expirationMs: BigInt(clock.getTime() + 30 * DAY_MS) };
+  return buildIssueAllowance({ owner: change.sender ?? owner.address, spender: change.spender ?? (await purseOf(owner)), terms }, { epoch: 900n, referenceGasPrice: 100n, nonce: 7 });
+}
+
+/** A create_account call as core's builder hands it over once Tatum has resolved it, built offline with one gas coin. */
+async function createAccountBytes(sender: string, options: { gasVersion?: number; budget?: number } = {}): Promise<Uint8Array> {
+  const tx = new Transaction();
+  tx.setSender(sender);
+  tx.moveCall({
+    target: `${WALRUS_MEMORY_PACKAGE_ID}::account::create_account`,
+    arguments: [tx.sharedObjectRef({ objectId: WALRUS_MEMORY_REGISTRY_ID, initialSharedVersion: '1', mutable: true }), tx.object.clock()],
+  });
+  tx.setGasOwner(sender);
+  tx.setGasPrice(100);
+  tx.setGasBudget(options.budget ?? 5_000_000);
+  tx.setGasPayment([{ objectId: `0x${'ab'.repeat(32)}`, version: String(options.gasVersion ?? 1), digest: DIGEST }]);
+  return tx.build();
+}
+
+function allowanceOnChain(owner: Owner, purse: string) {
+  const expirationMs = BigInt(clock.getTime() + 30 * DAY_MS);
+  return { funder: owner.address, spender: purse, coinType: USDC_TYPE_MAINNET, lifetimeCap: 1_000_000n, spentTotal: 0n, periodMs: BigInt(LIMITS.allowancePeriodMs), periodLimit: 500_000n, expirationMs, initialSharedVersion: 1n, periodSpent: null, periodEndMs: null };
+}
+
+describe('an account step Sui already shows done', () => {
+  it("is answered 409 already_done at build, building nothing, for the account and for Ellai's key on the recorded account", async () => {
+    clock = new Date(Date.UTC(2031, 4, 1, 10));
+    const owner = await signedInOwner();
+    const accountId = address();
+    const delegateHex = ownerDelegate(MASTER, owner.address).publicKeyHex;
+    vi.mocked(findMemoryAccount).mockResolvedValue({ accountId, delegates: [] });
+    vi.mocked(buildAddDelegateTx).mockResolvedValue(ACCOUNT_BYTES);
+    const done = await build({ step: 'memory_account' }, { cookie: owner.cookie });
+    expect([done.status, await done.json()]).toEqual([409, ALREADY_DONE]);
+    expect(ALREADY_DONE.message).toBe(ALREADY_DONE_MESSAGE);
+    expect(vi.mocked(findMemoryAccount)).toHaveBeenCalledWith(chain, owner.address);
+    expect(vi.mocked(buildCreateAccountTx)).not.toHaveBeenCalled();
+
+    await db.update(owners).set({ memwalAccountId: accountId }).where(eq(owners.id, owner.ownerId));
+    // Another owner's derived key, or Ellai's key on an account other than the recorded one, is not this step done.
+    vi.mocked(findMemoryAccount).mockResolvedValue({ accountId, delegates: [ownerDelegate(MASTER, address()).publicKeyHex] });
+    expect((await build({ step: 'add_delegate' }, { cookie: owner.cookie })).status).toBe(200);
+    vi.mocked(findMemoryAccount).mockResolvedValue({ accountId: address(), delegates: [delegateHex] });
+    expect((await build({ step: 'add_delegate' }, { cookie: owner.cookie })).status).toBe(200);
+    vi.mocked(findMemoryAccount).mockResolvedValue({ accountId, delegates: [delegateHex] });
+    const keyDone = await build({ step: 'add_delegate' }, { cookie: owner.cookie });
+    expect([keyDone.status, await keyDone.json()]).toEqual([409, ALREADY_DONE]);
+    expect(vi.mocked(buildAddDelegateTx)).toHaveBeenCalledTimes(2);
+  });
+
+  it("is recorded from { step, existing: true } by what Sui shows for the owner's address, reading no transaction", async () => {
+    clock = new Date(Date.UTC(2031, 4, 2, 10));
+    const owner = await signedInOwner();
+    const accountId = address();
+    const delegateHex = ownerDelegate(MASTER, owner.address).publicKeyHex;
+    vi.mocked(findMemoryAccount).mockResolvedValue({ accountId, delegates: [delegateHex] });
+    await refusedWith(await confirm({ step: 'add_delegate', existing: true }, { cookie: owner.cookie }), 409, 'not_ready');
+    expect(await json(await confirm({ step: 'memory_account', existing: true }, { cookie: owner.cookie }))).toEqual({ recorded: accountId });
+    expect(await json(await confirm({ step: 'add_delegate', existing: true }, { cookie: owner.cookie }))).toEqual({ recorded: delegateHex });
+    // Again, the same values.
+    expect(await json(await confirm({ step: 'memory_account', existing: true }, { cookie: owner.cookie }))).toEqual({ recorded: accountId });
+    expect(vi.mocked(findMemoryAccount).mock.calls.every(([used, ownerAddress]) => used === chain && ownerAddress === owner.address)).toBe(true);
+    expect(getTransactionResult).not.toHaveBeenCalled();
+    expect(vi.mocked(confirmOnboardingTx)).not.toHaveBeenCalled();
+    expect(await accountRow(owner)).toEqual({ memwalAccountId: accountId, delegateRegisteredAt: clock, allowanceId: null });
+    expect(await json(await onboarding(owner.cookie))).toMatchObject({ memoryAccount: 'present', delegate: 'present', allowance: 'missing' });
+  });
+
+  it('refuses an existing confirm Sui does not back, or one carrying anything but the step, recording nothing (C7)', async () => {
+    quiet();
+    clock = new Date(Date.UTC(2031, 4, 3, 10));
+    const owner = await signedInOwner();
+    for (const sent of [
+      { step: 'allowance', existing: true },
+      { step: 'memory_account', existing: false },
+      { step: 'memory_account', existing: 'true' },
+      { step: 'memory_account', existing: true, digest: DIGEST },
+      { step: 'memory_account', existing: true, accountId: address() },
+    ]) {
+      await refusedWith(await confirm(sent, { cookie: owner.cookie }), 400, 'bad_body');
+    }
+    vi.mocked(findMemoryAccount).mockResolvedValue(null);
+    const none = await confirm({ step: 'memory_account', existing: true }, { cookie: owner.cookie });
+    expect([none.status, await none.json()]).toEqual([422, { error: 'refused', message: 'Sui shows no Walrus Memory account for this owner' }]);
+    vi.mocked(findMemoryAccount).mockRejectedValue(new MemoryError('ACCOUNT', 'the Walrus Memory account belongs to another owner'));
+    await refusedWith(await confirm({ step: 'memory_account', existing: true }, { cookie: owner.cookie }), 422, 'refused');
+    expect(await accountRow(owner)).toEqual({ memwalAccountId: null, delegateRegisteredAt: null, allowanceId: null });
+  });
+});
+
+describe('POST /api/owner/onboarding/submit', () => {
+  it("sends an allowance the owner signed exactly as the build route made it, through the context's chain, and records it from the result", async () => {
+    clock = new Date(Date.UTC(2031, 4, 4, 10));
+    const owner = await signedInOwner();
+    const built = await json<{ txBytesBase64: string }>(
+      await build({ step: 'allowance', allowance: { dailyLimitAtomic: '500000', lifetimeCapAtomic: '1000000', days: 30 } }, { cookie: owner.cookie }),
+    );
+    const bytes = fromBase64(built.txBytesBase64);
+    const digest = TransactionDataBuilder.getDigestFromBytes(bytes);
+    const allowanceId = address();
+    executeTransaction.mockResolvedValue({ digest, status: 'success', errorCode: null, balanceChanges: [], createdObjects: [{ objectId: allowanceId, type: ALLOWANCE_TYPE }] });
+    getAllowance.mockResolvedValue(allowanceOnChain(owner, await purseOf(owner)));
+    const sent = await signedBy(owner.signer, bytes);
+
+    expect(await json(await submit({ step: 'allowance', ...sent }, { cookie: owner.cookie }))).toEqual({ recorded: allowanceId, digest });
+    expect(vi.mocked(submitOnboardingTx).mock.calls[0]?.[0]).toMatchObject({ ownerId: owner.ownerId, step: 'allowance', chain, masterSecretHex: MASTER, now: clock });
+    expect(executeTransaction.mock.calls).toEqual([[bytes, [sent.signature]]]);
+    expect(getAllowance.mock.calls).toEqual([[allowanceId]]);
+    expect(await accountRow(owner)).toMatchObject({ allowanceId });
+    expect(await json(await onboarding(owner.cookie))).toMatchObject({ allowance: 'present' });
+  });
+
+  it('sends an account step only when it makes the same call on the same inputs as a fresh build, and records the account Sui then shows', async () => {
+    clock = new Date(Date.UTC(2031, 4, 5, 10));
+    const owner = await signedInOwner();
+    const accountId = address();
+    const signedBytes = await createAccountBytes(owner.address, { gasVersion: 1 });
+    // Tatum picks the gas again for the fresh build, so only the call and its inputs can match.
+    vi.mocked(buildCreateAccountTx).mockResolvedValue(await createAccountBytes(owner.address, { gasVersion: 2 }));
+    vi.mocked(findMemoryAccount).mockResolvedValueOnce(null).mockResolvedValue({ accountId, delegates: [] });
+    const digest = TransactionDataBuilder.getDigestFromBytes(signedBytes);
+    executeTransaction.mockResolvedValue({ digest, status: 'success', errorCode: null, balanceChanges: [], createdObjects: [] });
+    const sent = await signedBy(owner.signer, signedBytes);
+
+    expect(await json(await submit({ step: 'memory_account', ...sent }, { cookie: owner.cookie }))).toEqual({ recorded: accountId, digest });
+    expect(executeTransaction.mock.calls).toEqual([[signedBytes, [sent.signature]]]);
+    expect(await accountRow(owner)).toMatchObject({ memwalAccountId: accountId });
+    // Sui now shows the account, so the same bytes again are refused before anything is sent.
+    await refusedWith(await submit({ step: 'memory_account', ...sent }, { cookie: owner.cookie }), 409, 'already_done');
+    expect(executeTransaction).toHaveBeenCalledTimes(1);
+  });
+
+  it("refuses another sender's bytes, another kind of transaction and an allowance Ellai would not build with 400 bad_transaction, sending nothing (C6, C7)", async () => {
+    quiet();
+    clock = new Date(Date.UTC(2031, 4, 6, 10));
+    const owner = await signedInOwner();
+    const stranger = Ed25519Keypair.generate();
+    const strangerAddress = normalizeSuiAddress(stranger.toSuiAddress());
+    vi.mocked(buildCreateAccountTx).mockResolvedValue(await createAccountBytes(owner.address));
+    const allowance = await allowanceBytes(owner);
+    const cases: Array<[string, { txBytesBase64: string; signature: string }, string]> = [
+      ['allowance', await signedBy(stranger, await allowanceBytes(owner, { sender: strangerAddress })), 'the transaction is not sent from your own address'],
+      ['memory_account', await signedBy(stranger, await createAccountBytes(strangerAddress)), 'the transaction is not sent from your own address'],
+      ['memory_account', await signedBy(owner.signer, allowance), NOT_THIS_STEP],
+      ['allowance', await signedBy(owner.signer, await createAccountBytes(owner.address)), NOT_THIS_STEP],
+      ['allowance', await signedBy(owner.signer, await allowanceBytes(owner, { spender: address() })), NOT_THIS_STEP],
+      ['allowance', await signedBy(owner.signer, await allowanceBytes(owner, { lifetimeCapAtomic: BigInt(LIMITS.onboardingLifetimeCapMaxAtomic) + 1n })), 'the total cap is missing or over the onboarding maximum'],
+      ['memory_account', await signedBy(owner.signer, await createAccountBytes(owner.address, { budget: LIMITS.memwalAccountTxMaxGasMist + 1 })), 'its gas budget is over the most Ellai builds with'],
+      ['allowance', await signedBy(owner.signer, new Uint8Array([...allowance, 0])), 'the transaction bytes are not one Sui transaction'],
+      ['allowance', { txBytesBase64: `${toBase64(allowance)} `, signature: 'AA==' }, 'the transaction bytes are not base64'],
+    ];
+    for (const [step, sent, message] of cases) {
+      const response = await submit({ step, ...sent }, { cookie: owner.cookie });
+      expect([step, response.status, await response.json()]).toEqual([step, 400, { error: 'bad_transaction', message }]);
+    }
+    const signedAllowance = await signedBy(owner.signer, allowance);
+    for (const sent of [
+      { step: 'allowance', txBytesBase64: signedAllowance.txBytesBase64 },
+      { step: 'allowance', ...signedAllowance, digest: DIGEST },
+      { step: 'allowance', txBytesBase64: '', signature: signedAllowance.signature },
+      { step: 'everything', ...signedAllowance },
+    ]) {
+      await refusedWith(await submit(sent, { cookie: owner.cookie }), 400, 'bad_body');
+    }
+    expect(executeTransaction).not.toHaveBeenCalled();
+    expect(await accountRow(owner)).toEqual({ memwalAccountId: null, delegateRegisteredAt: null, allowanceId: null });
+  });
+
+  it('answers 202 with the digest when the outcome is unknown or Sui does not show the result yet, and 422 chain_refused on a definite refusal, recording nothing', async () => {
+    quiet();
+    clock = new Date(Date.UTC(2031, 4, 7, 10));
+    const owner = await signedInOwner();
+    const bytes = await allowanceBytes(owner);
+    const sent = await signedBy(owner.signer, bytes);
+    const digest = TransactionDataBuilder.getDigestFromBytes(bytes);
+    const relay = async () => {
+      const response = await submit({ step: 'allowance', ...sent }, { cookie: owner.cookie });
+      return [response.status, await response.text()];
+    };
+
+    executeTransaction.mockRejectedValueOnce(new ChainError('TIMEOUT', `transaction ${digest} may have landed ${MARKER}`, true));
+    expect(await relay()).toEqual([202, JSON.stringify({ digest })]);
+    executeTransaction.mockResolvedValueOnce({ digest, status: 'success', errorCode: null, balanceChanges: [], createdObjects: [{ objectId: address(), type: ALLOWANCE_TYPE }] });
+    getAllowance.mockRejectedValueOnce(new ChainError('NOT_FOUND', 'stand-in not found'));
+    expect(await relay()).toEqual([202, JSON.stringify({ digest })]);
+    executeTransaction.mockResolvedValueOnce({ digest, status: 'failure', errorCode: 'INSUFFICIENT_ADDRESS_BALANCE', balanceChanges: [], createdObjects: [] });
+    expect(await relay()).toEqual([422, JSON.stringify({ error: 'chain_refused', message: 'Sui does not allow this step for your Walrus Memory account right now.' })]);
+    // These two codes mean the bytes never left.
+    executeTransaction.mockRejectedValueOnce(new ChainError('INVALID_INPUT', 'a signature is not base64'));
+    expect(await relay()).toEqual([400, JSON.stringify({ error: 'bad_transaction', message: 'the signature is not one Sui can read' })]);
+    executeTransaction.mockRejectedValueOnce(new ChainError('BUDGET', MARKER));
+    expect(await relay()).toEqual([503, JSON.stringify({ error: 'chain_unavailable_today', message: "Ellai has used today's budget for reading Sui. Try again tomorrow (days are counted in UTC)." })]);
+
+    expect(executeTransaction).toHaveBeenCalledTimes(5);
+    expect(await accountRow(owner)).toEqual({ memwalAccountId: null, delegateRegisteredAt: null, allowanceId: null });
+  });
+});
+
 interface SettingsBody {
   paused: boolean;
   autoPausedReason: string | null;
@@ -813,6 +1087,19 @@ async function storedSettings(ownerId: string) {
       .where(eq(owners.id, ownerId)),
   );
 }
+
+describe('GET /api/owner/settings', () => {
+  it("gives the session's owner's settings in the shape PATCH answers with, whatever the query names, reading no chain", async () => {
+    const owner = await withAllowance(await signedInOwner());
+    const other = await signedInOwner();
+    await db.update(owners).set({ publicProof: true, autoPausedReason: 'settlement_mismatch', autoPausedAt: clock, approvalsNeeded: 5 }).where(eq(owners.id, other.ownerId));
+    expect(await json(await getSettings(owner.cookie, `?ownerId=${other.ownerId}`))).toEqual(DEFAULTS);
+    const changed = await json<SettingsBody>(await changeSettings(owner, { paused: true, perPaymentMaxAtomic: '200000', dailyBudgetAtomic: '1000000', approvalsNeeded: 3, distanceCutoff: 0.3 }));
+    expect(await json(await getSettings(owner.cookie))).toEqual(changed);
+    expect(await json(await getSettings(other.cookie))).toEqual({ ...DEFAULTS, publicProof: true, autoPausedReason: 'settlement_mismatch', approvalsNeeded: 5 });
+    expect(getBalances).not.toHaveBeenCalled();
+  });
+});
 
 describe('PATCH /api/owner/settings', () => {
   it("changes only what is sent, on this owner's row only, and returns the settings after the change", async () => {
@@ -947,6 +1234,9 @@ describe('the session and origin requirements', () => {
     ['onboarding', (cookie) => onboarding(cookie)],
     ['onboarding build', (cookie) => build({ step: 'memory_account' }, cookie === undefined ? {} : { cookie })],
     ['onboarding confirm', (cookie) => confirm({ step: 'memory_account', digest: DIGEST }, cookie === undefined ? {} : { cookie })],
+    ['onboarding confirm existing', (cookie) => confirm({ step: 'memory_account', existing: true }, cookie === undefined ? {} : { cookie })],
+    ['onboarding submit', (cookie) => submit({ step: 'allowance', txBytesBase64: 'AA==', signature: 'AA==' }, cookie === undefined ? {} : { cookie })],
+    ['settings read', (cookie) => getSettings(cookie)],
     ['settings', (cookie) => patchSettings({ paused: true }, cookie === undefined ? {} : { cookie })],
     ['settings public proof', (cookie) => patchSettings({ publicProof: true }, cookie === undefined ? {} : { cookie })],
     ['step-up', (cookie) => askStepUp({ action: 'loosen_settings', change: { publicProof: true } }, cookie === undefined ? {} : { cookie })],
@@ -964,6 +1254,8 @@ describe('the session and origin requirements', () => {
     }
     expect(vi.mocked(buildOnboardingTx)).not.toHaveBeenCalled();
     expect(vi.mocked(confirmOnboardingTx)).not.toHaveBeenCalled();
+    expect(vi.mocked(submitOnboardingTx)).not.toHaveBeenCalled();
+    expect(vi.mocked(findMemoryAccount)).not.toHaveBeenCalled();
   });
 
   const changing: Array<[string, (options: SendOptions, agentId: string) => Promise<Response>]> = [
@@ -971,6 +1263,8 @@ describe('the session and origin requirements', () => {
     ['agents revoke', (options, agentId) => revoke(agentId, options)],
     ['onboarding build', (options) => build({ step: 'memory_account' }, options)],
     ['onboarding confirm', (options) => confirm({ step: 'memory_account', digest: DIGEST }, options)],
+    ['onboarding confirm existing', (options) => confirm({ step: 'memory_account', existing: true }, options)],
+    ['onboarding submit', (options) => submit({ step: 'allowance', txBytesBase64: 'AA==', signature: 'AA==' }, options)],
     ['settings', (options) => patchSettings({ paused: true }, options)],
     ['settings public proof', (options) => patchSettings({ publicProof: true }, options)],
     ['step-up', (options) => askStepUp({ action: 'create_agent', change: { label: 'From elsewhere' } }, options)],
@@ -992,11 +1286,13 @@ describe('the session and origin requirements', () => {
     expect(await authenticateAgent({ db, token, sessionSecretHex: SECRET })).not.toBeNull();
     expect(vi.mocked(buildOnboardingTx)).not.toHaveBeenCalled();
     expect(vi.mocked(confirmOnboardingTx)).not.toHaveBeenCalled();
+    expect(vi.mocked(submitOnboardingTx)).not.toHaveBeenCalled();
+    expect(executeTransaction).not.toHaveBeenCalled();
   });
 });
 
 describe('error answers', () => {
-  const ROUTES = ['decisions', 'memories', 'agents', 'agents/[id]', 'onboarding', 'onboarding/build', 'onboarding/confirm', 'settings', 'step-up', 'overview', 'sessions'];
+  const ROUTES = ['decisions', 'memories', 'agents', 'agents/[id]', 'onboarding', 'onboarding/build', 'onboarding/confirm', 'onboarding/submit', 'settings', 'step-up', 'overview', 'sessions'];
 
   it('come from the one table in errors.ts: no owner route, nor the helpers they share, writes an error body by hand', async () => {
     const files = [...ROUTES.map((route) => `../src/app/api/owner/${route}/route.ts`), '../src/server/http/owner-limits.ts'];
@@ -1066,19 +1362,16 @@ describe('the limits on routes that read Sui', () => {
     const owner = await withAllowance(await signedInOwner());
     const other = await withAllowance(await signedInOwner());
     vi.mocked(buildCreateAccountTx).mockResolvedValue(ACCOUNT_BYTES);
-    expect([LIMITS.ownerChainReadsPerMinute, LIMITS.ownerChainReadsPerDay, BUILD_CHAIN_CALLS.memory_account]).toEqual([30, 200, 3]);
+    expect([LIMITS.ownerChainReadsPerMinute, LIMITS.ownerChainReadsPerDay, BUILD_CHAIN_CALLS.memory_account]).toEqual([30, 200, 5]);
     const buildOnce = async () => (await build({ step: 'memory_account' }, { cookie: owner.cookie })).status;
 
-    // 30 builds are 90 calls; the 31st request is the minute's to refuse, and costs the day nothing.
+    // 30 builds are 150 calls; the 31st request is the minute's to refuse, and costs the day nothing.
     for (let i = 0; i < LIMITS.ownerChainReadsPerMinute; i += 1) expect(await buildOnce()).toBe(200);
     expect(await buildOnce()).toBe(429);
     clock = minute(1);
-    for (let i = 0; i < LIMITS.ownerChainReadsPerMinute; i += 1) expect(await buildOnce()).toBe(200);
-    clock = minute(2);
-    for (let i = 0; i < 6; i += 1) expect(await buildOnce()).toBe(200);
-    // 66 builds and two overviews: exactly 200 calls, in 68 requests.
-    expect((await overview(owner.cookie)).status).toBe(200);
-    expect((await overview(owner.cookie)).status).toBe(200);
+    for (let i = 0; i < 9; i += 1) expect(await buildOnce()).toBe(200);
+    // 39 builds and five overviews: exactly 200 calls, in 44 requests.
+    for (let i = 0; i < 5; i += 1) expect((await overview(owner.cookie)).status).toBe(200);
     // Still inside this minute's 30, so only the day can be what turns these away.
     const balanceReads = getBalances.mock.calls.length;
     const builds = vi.mocked(buildOnboardingTx).mock.calls.length;
@@ -1097,22 +1390,46 @@ describe('the limits on routes that read Sui', () => {
     expect((await overview(owner.cookie)).status).toBe(200);
   });
 
-  it("counts a confirm and a delegate build at their own step's calls, 5 and 4 (C22)", async () => {
+  it("counts a confirm and a delegate build at their own step's calls, 5 and 7 (C22)", async () => {
     quiet();
     clock = new Date(Date.UTC(2031, 1, 2, 10));
     const owner = await withAllowance(await signedInOwner());
     chainOwner = owner.address;
     vi.mocked(findMemoryAccount).mockResolvedValue({ accountId: address(), delegates: [] });
     vi.mocked(buildAddDelegateTx).mockResolvedValue(ACCOUNT_BYTES);
-    expect(BUILD_CHAIN_CALLS).toEqual({ memory_account: 3, add_delegate: 4, allowance: 2 });
+    expect(BUILD_CHAIN_CALLS).toEqual({ memory_account: 5, add_delegate: 7, allowance: 2 });
     expect(CONFIRM_CHAIN_CALLS).toEqual({ memory_account: 5, add_delegate: 5, allowance: 3 });
 
-    // 28 confirms are 140 calls; 15 delegate builds a minute later bring the day to exactly 200.
-    for (let i = 0; i < 28; i += 1) expect((await confirm({ step: 'memory_account', digest: DIGEST }, { cookie: owner.cookie })).status).toBe(200);
+    // 26 confirms are 130 calls; 10 delegate builds a minute later bring the day to exactly 200.
+    for (let i = 0; i < 26; i += 1) expect((await confirm({ step: 'memory_account', digest: DIGEST }, { cookie: owner.cookie })).status).toBe(200);
     clock = new Date(clock.getTime() + 60_000);
-    for (let i = 0; i < 15; i += 1) expect((await build({ step: 'add_delegate' }, { cookie: owner.cookie })).status).toBe(200);
+    for (let i = 0; i < 10; i += 1) expect((await build({ step: 'add_delegate' }, { cookie: owner.cookie })).status).toBe(200);
     const refused = await build({ step: 'add_delegate' }, { cookie: owner.cookie });
     expect([refused.status, ((await refused.json()) as { error: string }).error]).toEqual([429, 'rate_limited_today']);
+  });
+
+  it("counts a confirm with no digest at 3 calls and a submit at its step's calls, before anything is sent (C22)", async () => {
+    quiet();
+    clock = new Date(Date.UTC(2031, 4, 8, 10));
+    const owner = await signedInOwner();
+    vi.mocked(findMemoryAccount).mockResolvedValue({ accountId: address(), delegates: [] });
+    expect(CONFIRM_EXISTING_CHAIN_CALLS).toEqual({ memory_account: 3, add_delegate: 3 });
+    expect(SUBMIT_CHAIN_CALLS).toEqual({ memory_account: 9, add_delegate: 11, allowance: 2 });
+    const bytes = await allowanceBytes(owner);
+    const sent = await signedBy(owner.signer, bytes);
+    const digest = TransactionDataBuilder.getDigestFromBytes(bytes);
+    executeTransaction.mockResolvedValue({ digest, status: 'success', errorCode: null, balanceChanges: [], createdObjects: [{ objectId: address(), type: ALLOWANCE_TYPE }] });
+    getAllowance.mockResolvedValue(allowanceOnChain(owner, await purseOf(owner)));
+
+    // 60 existing confirms over two minutes are 180 calls; 10 allowance submits bring the day to exactly 200.
+    for (let n = 0; n < 2; n += 1) {
+      for (let i = 0; i < 30; i += 1) expect((await confirm({ step: 'memory_account', existing: true }, { cookie: owner.cookie })).status).toBe(200);
+      clock = new Date(clock.getTime() + 60_000);
+    }
+    for (let i = 0; i < 10; i += 1) expect((await submit({ step: 'allowance', ...sent }, { cookie: owner.cookie })).status).toBe(200);
+    const refused = await submit({ step: 'allowance', ...sent }, { cookie: owner.cookie });
+    expect([refused.status, ((await refused.json()) as { error: string }).error]).toEqual([429, 'rate_limited_today']);
+    expect(executeTransaction).toHaveBeenCalledTimes(10);
   });
 
   const fromClient = (client: string) => new Request(`${APP_ORIGIN}/api/owner/onboarding/confirm`, { headers: { 'x-forwarded-for': client } });

@@ -21,6 +21,21 @@ export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 
 /**
+ * The signed-in owner's settings, { paused, autoPausedReason, perPaymentMaxAtomic,
+ * dailyBudgetAtomic, approvalsNeeded, distanceCutoff, publicProof }, in exactly the shape and
+ * formats PATCH answers with and the overview's owner object carries, amounts as decimal strings.
+ * Read from the owner row alone, so a settings screen costs no chain read, unlike the overview.
+ * The owner comes from the session alone (C13); 401 signed_out without one.
+ */
+export const GET = scoped('owner', async (_request, ctx, { ownerId }): Promise<Response> => {
+  const [settings] = await ctx.db.select(OWNER_SETTINGS).from(owners).where(eq(owners.id, ownerId));
+  // The jobs tick prunes an owner only once it has no live session, so the row can be gone only
+  // if the session ended after the cookie was checked; that is treated as no session at all.
+  if (settings === undefined) throw new HttpError(401, 'signed_out');
+  return jsonResponse(settings);
+});
+
+/**
  * Changes the signed-in owner's own limits: any of { paused, perPaymentMaxAtomic,
  * dailyBudgetAtomic, approvalsNeeded, distanceCutoff, clearAutoPause, publicProof } in, at
  * least one, the amounts as decimal strings, with an optional stepUp; the owner's settings after

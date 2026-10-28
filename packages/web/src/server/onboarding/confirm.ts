@@ -9,7 +9,16 @@ import { and, eq, isNull, or } from 'drizzle-orm';
 import type { Database } from '../db/client.js';
 import { owners } from '../db/schema.js';
 import { ownerDelegate } from '../memory/delegate.js';
-import { checkNow, checkStep, loadOwner, OnboardingError, type OnboardingStep, type OwnerRow } from './state.js';
+import {
+  ACCOUNT_STEPS,
+  type AccountStep,
+  checkNow,
+  checkStep,
+  loadOwner,
+  OnboardingError,
+  type OnboardingStep,
+  type OwnerRow,
+} from './state.js';
 
 /**
  * The Tatum calls confirmOnboardingTx's success path makes for each step, which the confirm route
@@ -18,6 +27,9 @@ import { checkNow, checkStep, loadOwner, OnboardingError, type OnboardingStep, t
  * (one GraphQL call).
  */
 export const CONFIRM_CHAIN_CALLS: Readonly<Record<OnboardingStep, number>> = { memory_account: 5, add_delegate: 5, allowance: 3 };
+
+/** The Tatum calls confirmExistingStep makes: findMemoryAccount's registry, registry entry and account. */
+export const CONFIRM_EXISTING_CHAIN_CALLS: Readonly<Record<AccountStep, number>> = { memory_account: 3, add_delegate: 3 };
 
 const { ChangedObject_IdOperation: IdOperation } = GrpcTypes;
 const FRAMEWORK_ADDRESS = normalizeSuiAddress('0x2');
@@ -146,11 +158,23 @@ async function confirmDelegate(
   return publicKeyHex;
 }
 
+/** An allowance's limits, as getAllowance reads them from chain or submit reads them from the signed bytes. */
+export type AllowanceLimits = Pick<AllowanceState, 'lifetimeCap' | 'periodMs' | 'periodLimit' | 'expirationMs'>;
+
 /** Names the first way the allowance falls outside what onboarding lets an owner set up, or null. */
 function allowanceProblem(state: AllowanceState, ownerAddress: string, purseAddress: string, now: Date): string | null {
   if (canonicalSuiAddress(state.funder) !== ownerAddress) return "the allowance does not draw from the owner's address";
   if (canonicalSuiAddress(state.spender) !== purseAddress) return "the allowance's spender is not the owner's purse";
   if (state.coinType !== USDC_TYPE_MAINNET) return 'the allowance is not over Sui Mainnet USDC';
+  return allowanceLimitsProblem(state, now);
+}
+
+/**
+ * Names the first way an allowance's cap, window, daily limit or end falls outside what onboarding
+ * lets an owner set up, or null. The one rule for these, so what submit relays is held to exactly
+ * what confirm would record.
+ */
+export function allowanceLimitsProblem(state: AllowanceLimits, now: Date): string | null {
   const capMax = BigInt(LIMITS.onboardingLifetimeCapMaxAtomic);
   if (state.lifetimeCap === null || state.lifetimeCap <= 0n || state.lifetimeCap > capMax) return 'the total cap is missing or over the onboarding maximum';
   if (state.periodMs !== BigInt(LIMITS.allowancePeriodMs)) return 'the rate-limit window is not one day';
@@ -169,10 +193,10 @@ async function confirmAllowance(
   owner: OwnerRow,
   chain: Chain,
   ownerAddress: string,
-  facts: TransactionFacts,
+  createdObjects: TransactionFacts['created'],
   now: Date,
 ): Promise<string> {
-  const allowances = facts.created.filter((object) => isAllowance(object.type));
+  const allowances = createdObjects.filter((object) => isAllowance(object.type));
   const [created] = allowances;
   if (allowances.length > 1) refuse('the transaction created more than one allowance');
   if (created === undefined) refuse('the transaction created no allowance');
@@ -231,8 +255,76 @@ export async function confirmOnboardingTx(args: {
   if (result.status !== 'success') refuse('the transaction failed on chain');
   const facts = await readTransactionFacts(chain, digest);
   if (facts.sender !== ownerAddress) refuse("the transaction was not sent from the owner's address");
+  return { recorded: await recordStep(db, owner, chain, step, facts.created, args.masterSecretHex, now) };
+}
 
-  if (step === 'memory_account') return { recorded: await confirmAccount(db, owner, chain, ownerAddress) };
-  if (step === 'add_delegate') return { recorded: await confirmDelegate(db, owner, chain, ownerAddress, args.masterSecretHex, now) };
-  return { recorded: await confirmAllowance(db, owner, chain, ownerAddress, facts, now) };
+/** What each step records once its transaction is known to have succeeded from the owner's address. */
+async function recordStep(
+  db: Database,
+  owner: OwnerRow,
+  chain: Chain,
+  step: OnboardingStep,
+  created: TransactionFacts['created'],
+  masterSecretHex: string,
+  now: Date,
+): Promise<string> {
+  const ownerAddress = canonicalSuiAddress(owner.suiAddress);
+  if (step === 'memory_account') return confirmAccount(db, owner, chain, ownerAddress);
+  if (step === 'add_delegate') return confirmDelegate(db, owner, chain, ownerAddress, masterSecretHex, now);
+  return confirmAllowance(db, owner, chain, ownerAddress, created, now);
+}
+
+/**
+ * Records an account step Sui already shows done, with no transaction to read: for an owner who
+ * made their Walrus Memory account, or added Ellai's key to it, before using Ellai, which the
+ * build route answers with ALREADY_DONE. The account is read from Sui by the owner's own address
+ * and recorded exactly as confirmOnboardingTx records it, with the same checks: the registry's
+ * account for the owner, owned by the owner and not frozen, never one already recorded otherwise;
+ * for add_delegate that recorded account holding Ellai's derived key for this owner. No id comes
+ * from the caller (C7, C8). Idempotent like confirmOnboardingTx.
+ * Returns the account id or the delegate public key as hex.
+ * Throws OnboardingError: BAD_INPUT for a step that is not an account step, a bad date or owner
+ * id; NO_OWNER; NOT_READY for add_delegate before the account is recorded; REFUSED when Sui does
+ * not show the step done. Throws ChainError or MemoryError when Tatum cannot answer, recording nothing.
+ */
+export async function confirmExistingStep(args: {
+  db: Database;
+  ownerId: string;
+  step: AccountStep;
+  chain: Chain;
+  masterSecretHex: string;
+  now: Date;
+}): Promise<{ recorded: string }> {
+  const step = checkStep(args.step);
+  if (!(ACCOUNT_STEPS as readonly string[]).includes(step)) throw new OnboardingError('BAD_INPUT', `the step must be one of ${ACCOUNT_STEPS.join(', ')}`);
+  const now = checkNow(args.now);
+  const owner = await loadOwner(args.db, args.ownerId);
+  if (step === 'add_delegate' && owner.memwalAccountId === null) throw new OnboardingError('NOT_READY', 'confirm the Walrus Memory account first');
+  return { recorded: await recordStep(args.db, owner, args.chain, step, [], args.masterSecretHex, now) };
+}
+
+/**
+ * Records a step whose transaction Ellai itself relayed (submitOnboardingTx) and saw succeed: the
+ * bytes were checked to be sent from the owner's own address before they went out, and the result
+ * names the digest Ellai computed from those bytes, so the success and the created objects are
+ * Ellai's own facts (C8), and the step is recorded exactly as confirmOnboardingTx records it, the
+ * owner row read again now. The allowance id comes from those created objects, never the caller.
+ * Throws as confirmOnboardingTx does once the transaction is read: NOT_READY; NOT_LANDED while
+ * Sui does not show the allowance yet; REFUSED for what the chain shows, which straight after a
+ * send can also be a read that has not caught up with the account change; ChainError or MemoryError.
+ */
+export async function recordRelayedStep(args: {
+  db: Database;
+  ownerId: string;
+  step: OnboardingStep;
+  created: Array<{ objectId: string; type: string }>;
+  chain: Chain;
+  masterSecretHex: string;
+  now: Date;
+}): Promise<{ recorded: string }> {
+  const step = checkStep(args.step);
+  const now = checkNow(args.now);
+  const owner = await loadOwner(args.db, args.ownerId);
+  if (step === 'add_delegate' && owner.memwalAccountId === null) throw new OnboardingError('NOT_READY', 'confirm the Walrus Memory account first');
+  return { recorded: await recordStep(args.db, owner, args.chain, step, args.created, args.masterSecretHex, now) };
 }

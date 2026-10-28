@@ -20,7 +20,10 @@ const EXPLORER_TX = 'https://suiscan.xyz/mainnet/tx/';
  * agent's words (C15, C17): `payment` is the canonical recipient, amount and host Ellai
  * parsed; `agent` is the agent's id and the label the owner gave it; `purpose` is the
  * agent's own text and must be shown as quoted text; `outcome`, `rule`, `reason` and
- * `status` are Ellai's; `citedMemories` names the memories it cited; and `paid` is the
+ * `status` are Ellai's; `answer` ('approve' or 'refuse') and `answeredAt` say what the owner
+ * said to Ellai's question and when, from the owner_decision memory Ellai wrote for this
+ * decision, or both null when there is none, and never the owner's reason or the memory
+ * sentence (C17); `citedMemories` names the memories it cited; and `paid` is the
  * payment Ellai signed for it, with its settlement and an explorer link, or null when there
  * is none. Only this owner's rows are read (C13). 401 signed_out without a session, 400
  * bad_query for a query readPageQuery refuses. Atomic amounts are decimal strings.
@@ -74,6 +77,24 @@ export const GET = scoped('owner', async (request, ctx, { ownerId }): Promise<Re
     citedBy.set(decisionId, list);
   }
 
+  // answerQuestion writes one owner_decision memory per decision, under the question's lock and
+  // only while it is unanswered, so this reads at most one row per decision on the page. Only the
+  // verdict and its time are read: the sentence holds the owner's reason and the agent's purpose
+  // in Ellai's own words, which stay on the memories route (C17).
+  const answered =
+    decisionIds.length === 0
+      ? []
+      : await ctx.db
+          .select({ decisionId: memories.decisionId, verdict: memories.verdict, createdAt: memories.createdAt })
+          .from(memories)
+          .where(and(eq(memories.ownerId, ownerId), eq(memories.kind, 'owner_decision'), inArray(memories.decisionId, decisionIds)))
+          .orderBy(asc(memories.createdAt), asc(memories.id));
+  const answerOf = new Map<string, { answer: 'approve' | 'refuse'; answeredAt: Date }>();
+  for (const { decisionId, verdict, createdAt } of answered) {
+    // The first answer is the one that bound the decision, should a second ever exist.
+    if (decisionId !== null && verdict !== null && !answerOf.has(decisionId)) answerOf.set(decisionId, { answer: verdict, answeredAt: createdAt });
+  }
+
   return jsonResponse({
     decisions: rows.map((row) => ({
       decisionId: row.decisionId,
@@ -85,6 +106,8 @@ export const GET = scoped('owner', async (request, ctx, { ownerId }): Promise<Re
       rule: row.rule,
       reason: row.reason,
       status: row.status,
+      answer: answerOf.get(row.decisionId)?.answer ?? null,
+      answeredAt: answerOf.get(row.decisionId)?.answeredAt ?? null,
       citedMemories: citedBy.get(row.decisionId) ?? [],
       paid:
         row.digest === null || row.settlement === null

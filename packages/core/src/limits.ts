@@ -488,6 +488,19 @@ export const LIMITS = {
   onboardingBuildBodyMaxBytes: 1_024,
   /** Largest onboarding confirm body, in bytes: a step and a digest of at most 44 characters. */
   onboardingConfirmBodyMaxBytes: 1_024,
+  /**
+   * Largest signed onboarding transaction the submit route relays, in bytes. Ellai's own builds are
+   * under 1 KiB apart from the gas coins Tatum picks for an account step, and the SDK picks at most
+   * 256 of those at 73 bytes each (about 19 KiB), so every build fits and nothing much larger is decoded.
+   */
+  onboardingSubmitTxMaxBytes: 32_768,
+  /** Longest signature the submit route relays. A multisig with zkLogin members can reach 16 KiB, and core's executeTransaction refuses longer. */
+  onboardingSubmitSignatureMaxChars: 16_384,
+  /**
+   * Largest onboarding submit body, in bytes: the largest transaction as base64 (43,692 characters),
+   * the longest signature (16,384) and the keys come to under 60,200.
+   */
+  onboardingSubmitBodyMaxBytes: 61_440,
   /** Largest settings body, in bytes: seven settings, each a short number, amount or boolean. */
   settingsBodyMaxBytes: 1_024,
   /**

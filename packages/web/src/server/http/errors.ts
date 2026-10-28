@@ -186,6 +186,8 @@ const ONBOARDING_STATUS: Readonly<Record<OnboardingErrorCode, number>> = {
   NOT_READY: 409,
   NOT_LANDED: 409,
   REFUSED: 422,
+  ALREADY_DONE: 409,
+  BAD_TRANSACTION: 400,
 };
 
 const PAYMENT_STATUS: Readonly<Record<PaymentErrorCode, number>> = {

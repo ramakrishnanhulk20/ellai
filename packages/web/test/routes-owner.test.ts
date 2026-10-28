@@ -3,7 +3,7 @@
 // requirement on every owner route; the overview's settings, onboarding, purse, counts and
 // question rate, with bigints as strings, a chain failure as purse null but the Tatum budget's
 // refusal as 503 chain_unavailable_today, and no chain read at all for an owner with no
-// allowance; the question list
+// allowance; whether the built-in agent has a key, never the key; the question list
 // with Ellai's payment facts apart from agent text; answering, with its memory and grant; one
 // owner never seeing or answering another's question; same origin on the answer; and that an
 // unexpected failure, including a real database error carrying SQL, is a bare 500.
@@ -309,8 +309,18 @@ describe('GET /api/owner/overview', () => {
       purse: null,
       counts: { asked: 0, approved: 0, refused: 0, paid: 0 },
       questionsPer20: { asked: 0, window: 0 },
+      builtinAgent: 'needs_key',
     });
     expect(getBalances).not.toHaveBeenCalled();
+  });
+
+  it("says whether the built-in agent can run, 'ready' only with a key on the server, and never the key", async () => {
+    const owner = await signedInOwner();
+    const builtinAgent = async () => ((await (await overview(owner.cookie)).json()) as { builtinAgent: unknown }).builtinAgent;
+    expect(await builtinAgent()).toBe('needs_key');
+    setServerContextFactory(async () => ({ db, chain, env: { ...ENV, ANTHROPIC_API_KEY: MARKER }, now: () => clock }));
+    expect(await builtinAgent()).toBe('ready');
+    expect(await (await overview(owner.cookie)).text()).not.toContain(MARKER);
   });
 
   it("reads the purse's USDC from chain once the owner has an allowance, and the rest of the answer keeps its shape", async () => {
@@ -319,7 +329,7 @@ describe('GET /api/owner/overview', () => {
     const body = (await (await overview(owner.cookie)).json()) as Record<string, unknown>;
     expect(body.purse).toEqual({ usdcAtomic: '123456' });
     expect(body.onboarding).toEqual({ memoryAccount: 'missing', delegate: 'missing', allowance: 'present', purseAddress });
-    expect(Object.keys(body)).toEqual(['owner', 'onboarding', 'purse', 'counts', 'questionsPer20']);
+    expect(Object.keys(body)).toEqual(['owner', 'onboarding', 'purse', 'counts', 'questionsPer20', 'builtinAgent']);
     expect(Object.keys(body.owner as object)).not.toContain('allowanceId');
     expect(getBalances.mock.calls).toEqual([[purseAddress]]);
   });

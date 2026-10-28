@@ -3,23 +3,34 @@ import { buildIssueAllowance } from '@ellai/core/allowance';
 import type { Chain } from '@ellai/core/chain';
 import { canonicalSuiAddress } from '@ellai/core/keys';
 import { LIMITS } from '@ellai/core/limits';
-import { buildAddDelegateTx, buildCreateAccountTx } from '@ellai/core/memory';
+import { buildAddDelegateTx, buildCreateAccountTx, findMemoryAccount } from '@ellai/core/memory';
 import { toBase64 } from '@mysten/sui/utils';
 import type { Database } from '../db/client.js';
 import { formatUsdc } from '../decide/sentences.js';
 import { ownerDelegate } from '../memory/delegate.js';
-import { checkNow, checkStep, loadOwner, OnboardingError, type OnboardingStep } from './state.js';
+import {
+  ALREADY_DONE_MESSAGE,
+  type AccountStep,
+  checkNow,
+  checkStep,
+  loadOwner,
+  OnboardingError,
+  type OnboardingStep,
+  type OwnerRow,
+} from './state.js';
 
 /** Stored on chain next to Ellai's key on the owner's Walrus Memory account. */
 export const DELEGATE_LABEL = 'Ellai';
 
 /**
  * The Tatum calls buildOnboardingTx's success path makes for each step, which the build route
- * counts against the day's budgets before any of them (C22): the registry and the owner's registry
- * entry, the account too for a delegate, then the one simulate call that resolves the
- * transaction; or the epoch and the gas price for an allowance.
+ * counts against the day's budgets before any of them (C22). An account step first reads what Sui
+ * already shows with findMemoryAccount (the registry and the owner's registry entry, the account
+ * too for a delegate), then core's builder reads the registry and the entry again, the account too
+ * for a delegate, and makes the one simulate call that resolves the transaction: 2 + 3 and 3 + 4.
+ * An allowance reads the epoch and the gas price.
  */
-export const BUILD_CHAIN_CALLS: Readonly<Record<OnboardingStep, number>> = { memory_account: 3, add_delegate: 4, allowance: 2 };
+export const BUILD_CHAIN_CALLS: Readonly<Record<OnboardingStep, number>> = { memory_account: 5, add_delegate: 7, allowance: 2 };
 // A unit conversion: the owner sets how long the allowance runs as a count of days.
 const MS_PER_DAY = 86_400_000;
 const MAX_DAYS = Math.floor(LIMITS.onboardingAllowanceMaxMs / MS_PER_DAY);
@@ -72,13 +83,75 @@ function utcMinute(ms: number): string {
 }
 
 /**
+ * Builds the owner's own unsigned transaction for an account step, with the owner, the account
+ * and Ellai's derived delegate key taken from the owner row and the master secret, never from a
+ * caller (C7), and a plain summary of it. Before building, Sui is read through `chain` with
+ * findMemoryAccount, and a step Sui already shows done is refused with ALREADY_DONE, so the owner
+ * is never asked to sign a transaction that could only fail: memory_account when the owner has
+ * any account; add_delegate when the recorded account holds Ellai's key for this owner.
+ * add_delegate needs the account recorded first (NOT_READY), checked before any chain read.
+ * Core's builders check the bytes they return (one call to the account function, the owner as
+ * sender and gas payer, gas at most LIMITS.memwalAccountTxMaxGasMist).
+ * Throws OnboardingError ALREADY_DONE or NOT_READY; MemoryError or ChainError from core when
+ * Sui refuses the build or Tatum cannot answer.
+ */
+export async function buildAccountStep(args: {
+  chain: Chain;
+  owner: OwnerRow;
+  step: AccountStep;
+  masterSecretHex: string;
+}): Promise<{ bytes: Uint8Array; summary: SummaryLine[] }> {
+  const { chain, owner, step } = args;
+  const ownerAddress = canonicalSuiAddress(owner.suiAddress);
+
+  if (step === 'memory_account') {
+    if ((await findMemoryAccount(chain, ownerAddress)) !== null) throw new OnboardingError('ALREADY_DONE', ALREADY_DONE_MESSAGE);
+    const bytes = await buildCreateAccountTx({ chain, owner: ownerAddress });
+    return {
+      bytes,
+      summary: [
+        { label: 'Action', value: 'Create your Walrus Memory account' },
+        { label: 'Account owner', value: ownerAddress },
+      ],
+    };
+  }
+
+  if (owner.memwalAccountId === null) throw new OnboardingError('NOT_READY', 'create the Walrus Memory account first');
+  const accountId = canonicalSuiAddress(owner.memwalAccountId);
+  const { keypair, publicKeyHex } = ownerDelegate(args.masterSecretHex, ownerAddress);
+  const onChain = await findMemoryAccount(chain, ownerAddress);
+  // The delegate list and publicKeyHex are lowercase hex from the same SDK encoder. A key on some
+  // other account is not this step done: core's builder refuses that account instead.
+  if (onChain !== null && canonicalSuiAddress(onChain.accountId) === accountId && onChain.delegates.includes(publicKeyHex)) {
+    throw new OnboardingError('ALREADY_DONE', ALREADY_DONE_MESSAGE);
+  }
+  const bytes = await buildAddDelegateTx({
+    chain,
+    owner: ownerAddress,
+    accountId,
+    delegatePublicKey: keypair.getPublicKey().toRawBytes(),
+    label: DELEGATE_LABEL,
+  });
+  return {
+    bytes,
+    summary: [
+      { label: 'Action', value: "Add Ellai's key to your Walrus Memory account" },
+      { label: 'Walrus Memory account', value: accountId },
+      { label: 'Key added', value: publicKeyHex },
+      { label: 'Key name', value: DELEGATE_LABEL },
+    ],
+  };
+}
+
+/**
  * Builds the transaction the owner signs in their own wallet for one onboarding step, and a
  * plain list of what it does. Nothing is signed or sent, and nothing is recorded: the step
  * counts only once confirmOnboardingTx has read its result from chain.
  * - memory_account: create_account for the owner's own Walrus Memory account (core
- *   buildCreateAccountTx), refused when Sui already shows one.
+ *   buildCreateAccountTx), refused with ALREADY_DONE when Sui already shows one (buildAccountStep).
  * - add_delegate: adds Ellai's derived delegate key for this owner, named "Ellai", to the
- *   recorded account (core buildAddDelegateTx). Needs the account recorded first.
+ *   recorded account (core buildAddDelegateTx). Needs the account recorded first, and is refused
+ *   with ALREADY_DONE when Sui shows that account already holding the key.
  * - allowance: the owner lets their own purse draw Sui Mainnet USDC from the owner's address
  *   balance: at most dailyLimitAtomic per LIMITS.allowancePeriodMs (a fixed day),
  *   lifetimeCapAtomic in total, ending `days` whole days after `now` (core buildIssueAllowance, epoch and gas price read through
@@ -89,8 +162,9 @@ function utcMinute(ms: number): string {
  * Owner, purse and account come from the owner row, never from the caller, and every
  * summary value is one of those or a validated term (C7, C15).
  * Throws OnboardingError: BAD_INPUT for a bad step, date, owner id or allowance term;
- * NO_OWNER; NOT_READY for add_delegate before the account is recorded. Throws MemoryError,
- * AllowanceError or ChainError from core when Sui refuses the build or Tatum cannot answer.
+ * NO_OWNER; NOT_READY for add_delegate before the account is recorded; ALREADY_DONE for an
+ * account step Sui already shows done. Throws MemoryError, AllowanceError or ChainError from
+ * core when Sui refuses the build or Tatum cannot answer.
  */
 export async function buildOnboardingTx(args: {
   db: Database;
@@ -108,37 +182,9 @@ export async function buildOnboardingTx(args: {
   const ownerAddress = canonicalSuiAddress(owner.suiAddress);
   const { chain } = args;
 
-  if (step === 'memory_account') {
-    const bytes = await buildCreateAccountTx({ chain, owner: ownerAddress });
-    return {
-      txBytesBase64: toBase64(bytes),
-      summary: [
-        { label: 'Action', value: 'Create your Walrus Memory account' },
-        { label: 'Account owner', value: ownerAddress },
-      ],
-    };
-  }
-
-  if (step === 'add_delegate') {
-    if (owner.memwalAccountId === null) throw new OnboardingError('NOT_READY', 'create the Walrus Memory account first');
-    const accountId = canonicalSuiAddress(owner.memwalAccountId);
-    const { keypair, publicKeyHex } = ownerDelegate(args.masterSecretHex, ownerAddress);
-    const bytes = await buildAddDelegateTx({
-      chain,
-      owner: ownerAddress,
-      accountId,
-      delegatePublicKey: keypair.getPublicKey().toRawBytes(),
-      label: DELEGATE_LABEL,
-    });
-    return {
-      txBytesBase64: toBase64(bytes),
-      summary: [
-        { label: 'Action', value: "Add Ellai's key to your Walrus Memory account" },
-        { label: 'Walrus Memory account', value: accountId },
-        { label: 'Key added', value: publicKeyHex },
-        { label: 'Key name', value: DELEGATE_LABEL },
-      ],
-    };
+  if (step !== 'allowance') {
+    const { bytes, summary } = await buildAccountStep({ chain, owner, step, masterSecretHex: args.masterSecretHex });
+    return { txBytesBase64: toBase64(bytes), summary };
   }
 
   if (terms === null) bad('give the daily limit, the total cap and the number of days');

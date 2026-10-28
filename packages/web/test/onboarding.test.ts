@@ -5,8 +5,10 @@
 // by someone else, a delegate list without Ellai's key, and add_delegate before the account; a new
 // allowance clears the refill wait the one it replaces left.
 // buildOnboardingTx refuses allowance terms outside the maxima and add_delegate before the
-// account, takes owner, purse and account from the owner row, and its summaries hold only
-// validated values. onboardingState follows the row.
+// account, takes owner, purse and account from the owner row, reads what Sui shows before an
+// account step, and its summaries hold only validated values. confirmExistingStep takes account
+// steps only, needs the account before the key, and refuses Ellai's key on another account and a
+// frozen account. onboardingState follows the row.
 // Does NOT cover: the live chain (proven read only by `npm run prove:onboarding`), core's own
 // registry and account reads (core's memory tests), or a real wallet signing the built bytes.
 import { randomBytes } from 'node:crypto';
@@ -24,7 +26,7 @@ import { type Database, createDb, migrate } from '../src/server/db/client.js';
 import { owners } from '../src/server/db/schema.js';
 import { ownerDelegate } from '../src/server/memory/delegate.js';
 import { buildOnboardingTx } from '../src/server/onboarding/build.js';
-import { confirmOnboardingTx } from '../src/server/onboarding/confirm.js';
+import { confirmExistingStep, confirmOnboardingTx } from '../src/server/onboarding/confirm.js';
 import { type OnboardingStep, OnboardingError, onboardingState } from '../src/server/onboarding/state.js';
 
 const DAY_MS = 86_400_000;
@@ -294,6 +296,33 @@ describe('confirmOnboardingTx', () => {
   });
 });
 
+describe('confirmExistingStep', () => {
+  const existing = (owner: Owner, step: string, chain: Chain) =>
+    confirmExistingStep({ db, ownerId: owner.id, step: step as 'memory_account', chain, masterSecretHex: MASTER, now: NOW });
+
+  it("takes account steps only, the account before the key, and refuses Ellai's key on another account or a frozen account, recording nothing", async () => {
+    const recordedAccount = address();
+    const owner = await newOwner({ memwalAccountId: recordedAccount });
+    const delegateHex = ownerDelegate(MASTER, owner.suiAddress).publicKeyHex;
+    const { chain, getTransactionResult } = stubChain(owner);
+    expect((await refusal(existing(owner, 'allowance', untouchable))).code).toBe('BAD_INPUT');
+    expect((await refusal(existing(await newOwner(), 'add_delegate', untouchable))).code).toBe('NOT_READY');
+
+    vi.mocked(findMemoryAccount).mockResolvedValueOnce({ accountId: address(), delegates: [delegateHex] });
+    const elsewhere = await refusal(existing(owner, 'add_delegate', chain));
+    expect([elsewhere.code, elsewhere.message]).toEqual(['REFUSED', 'Sui does not show the recorded Walrus Memory account for this owner']);
+    vi.mocked(findMemoryAccount).mockRejectedValueOnce(new MemoryError('ACCOUNT', 'the Walrus Memory account is frozen'));
+    const frozen = await refusal(existing(owner, 'add_delegate', chain));
+    expect([frozen.code, frozen.message]).toEqual(['REFUSED', 'the Walrus Memory account is frozen']);
+    expect(getTransactionResult).not.toHaveBeenCalled();
+    expect((await reread(owner)).delegateRegisteredAt).toBeNull();
+
+    vi.mocked(findMemoryAccount).mockResolvedValueOnce({ accountId: recordedAccount, delegates: [delegateHex] });
+    expect(await existing(owner, 'add_delegate', chain)).toEqual({ recorded: delegateHex });
+    expect((await reread(owner)).delegateRegisteredAt).toEqual(NOW);
+  });
+});
+
 describe('buildOnboardingTx', () => {
   const build = (owner: Owner, step: OnboardingStep, chain: Chain, allowance?: unknown) =>
     buildOnboardingTx({ db, ownerId: owner.id, step, allowance: allowance as never, chain, masterSecretHex: MASTER, now: NOW });
@@ -351,6 +380,8 @@ describe('buildOnboardingTx', () => {
     const delegate = ownerDelegate(MASTER, owner.suiAddress);
     vi.mocked(buildCreateAccountTx).mockResolvedValue(new Uint8Array([1, 2, 3]));
     vi.mocked(buildAddDelegateTx).mockResolvedValue(new Uint8Array([4, 5, 6]));
+    // Sui shows no account yet, and on the recorded one no key of Ellai's.
+    vi.mocked(findMemoryAccount).mockResolvedValueOnce(null).mockResolvedValueOnce({ accountId, delegates: [] });
     // The builders are stand-ins, so the chain is only passed through; identity is what is checked.
     const marker = {} as Chain;
 
@@ -378,6 +409,10 @@ describe('buildOnboardingTx', () => {
       { label: 'Walrus Memory account', value: accountId },
       { label: 'Key added', value: delegate.publicKeyHex },
       { label: 'Key name', value: 'Ellai' },
+    ]);
+    expect(vi.mocked(findMemoryAccount).mock.calls).toEqual([
+      [marker, owner.suiAddress],
+      [marker, owner.suiAddress],
     ]);
   });
 });
