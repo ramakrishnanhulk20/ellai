@@ -1,7 +1,7 @@
 import { isDeepStrictEqual } from 'node:util';
 import { bcs } from '@mysten/sui/bcs';
 import { Transaction } from '@mysten/sui/transactions';
-import { fromBase64, normalizeStructTag, normalizeSuiAddress, SUI_ADDRESS_LENGTH } from '@mysten/sui/utils';
+import { fromBase64, isValidTransactionDigest, normalizeStructTag, normalizeSuiAddress, SUI_ADDRESS_LENGTH } from '@mysten/sui/utils';
 import { canonicalSuiAddress } from './keys.js';
 import { LIMITS } from './limits.js';
 import { SUI_MAINNET_CHAIN_ID } from './network.js';
@@ -50,7 +50,36 @@ export interface RefillFacts extends ChainFacts {
   allowanceInitialSharedVersion: bigint;
 }
 
-export type AllowanceErrorCode = 'BAD_TERMS' | 'BAD_ARGS' | 'BUILD_FAILED' | 'MISMATCH';
+/** One of the owner's coins, named exactly as a transaction must name an owned object. */
+export interface CoinRef {
+  objectId: string;
+  version: bigint;
+  /** The coin's current object digest, base58. */
+  digest: string;
+}
+
+/**
+ * Facts for a transaction whose sender pays gas with their own SUI coins, for an owner whose SUI
+ * address balance cannot cover the budget. There is no epoch window: the coins' versions already
+ * stop the bytes being run twice, and the Sui SDK builds coin-paid transactions the same way.
+ */
+export interface CoinGasFacts {
+  referenceGasPrice: bigint;
+  /** The sender's own SUI coins, holding the gas budget between them. Sui merges them into the first. */
+  gasCoins: CoinRef[];
+}
+
+/** How an owner pays for a transaction Ellai builds for them: from their SUI address balance (ChainFacts) or with their SUI coins. */
+export type OwnerGasFacts = ChainFacts | CoinGasFacts;
+
+export interface UsdcMoveArgs {
+  /** The sender, the gas payer, and the address whose address balance the coins go into. */
+  owner: string;
+  /** Coins the owner holds now, as listUsdcCoins read them. Their order does not matter. */
+  coins: CoinRef[];
+}
+
+export type AllowanceErrorCode = 'BAD_TERMS' | 'BAD_ARGS' | 'BUILD_FAILED' | 'MISMATCH' | 'NOTHING_TO_MOVE';
 
 /**
  * Every refusal from this module. The message is fixed text, never a value from the
@@ -72,6 +101,8 @@ const OPTION_SOME = '0x1::option::some';
 const RATE_LIMIT_TYPE = '0x2::allowance::RateLimit';
 const BALANCE_SPEND = '0x2::allowance::balance_spend';
 const SEND_FUNDS = '0x2::balance::send_funds';
+// public fun send_funds<T>(coin: Coin<T>, recipient: address), read from Sui Mainnet on 2026-10-28.
+const COIN_SEND_FUNDS = '0x2::coin::send_funds';
 // Issuing takes the balance type; spending takes the coin type (Sui allowance docs).
 const ALLOWANCE_BALANCE_TYPE = normalizeStructTag(`0x2::balance::Balance<${USDC_TYPE_MAINNET}>`);
 // Shown by wallets and dashboards; the chain never reads it.
@@ -101,15 +132,13 @@ function isU64(value: unknown, min: bigint): value is bigint {
   return typeof value === 'bigint' && value >= min && value <= U64_MAX;
 }
 
+function checkGasPrice(price: unknown): void {
+  if (typeof price !== 'bigint' || price < 1n || price > BigInt(LIMITS.maxGasPriceMist)) fail('BAD_ARGS', 'the gas price is outside the limits');
+}
+
 function checkFacts(facts: ChainFacts): void {
   if (!isU64(facts?.epoch, 0n) || facts.epoch === U64_MAX) fail('BAD_ARGS', 'the epoch is not a u64 with room for the next one');
-  if (
-    typeof facts.referenceGasPrice !== 'bigint' ||
-    facts.referenceGasPrice < 1n ||
-    facts.referenceGasPrice > BigInt(LIMITS.maxGasPriceMist)
-  ) {
-    fail('BAD_ARGS', 'the gas price is outside the limits');
-  }
+  checkGasPrice(facts.referenceGasPrice);
   if (!Number.isSafeInteger(facts.nonce) || facts.nonce < 0 || facts.nonce > U32_MAX) fail('BAD_ARGS', 'the nonce is not a u32');
 }
 
@@ -140,6 +169,53 @@ function payGasFromAddressBalance(tx: Transaction, gasOwner: string, facts: Chai
   });
 }
 
+function paysWithCoins(facts: OwnerGasFacts): facts is CoinGasFacts {
+  return typeof facts === 'object' && facts !== null && 'gasCoins' in facts;
+}
+
+/** Validated, normalised coin refs: 1 to LIMITS.ownedCoinsMax of them, none named twice. */
+function coinRefsOrFail(list: unknown, what: string): CoinRef[] {
+  if (!Array.isArray(list)) fail('BAD_ARGS', `the ${what} are not a list`);
+  if (list.length > LIMITS.ownedCoinsMax) fail('BAD_ARGS', `a transaction names at most ${LIMITS.ownedCoinsMax} ${what}`);
+  const seen = new Set<string>();
+  return list.map((coin: CoinRef) => {
+    const objectId = addressOrFail(coin?.objectId, `an id among the ${what}`);
+    if (seen.has(objectId)) fail('BAD_ARGS', `one of the ${what} is named twice`);
+    seen.add(objectId);
+    if (!isU64(coin.version, 1n)) fail('BAD_ARGS', `a version among the ${what} is not a positive u64`);
+    // Object digests and transaction digests share one form: 32 bytes in base58.
+    if (typeof coin.digest !== 'string' || !isValidTransactionDigest(coin.digest)) fail('BAD_ARGS', `a digest among the ${what} is not 32 bytes of base58`);
+    return { objectId, version: coin.version, digest: coin.digest };
+  });
+}
+
+function checkCoinGasFacts(facts: CoinGasFacts): CoinGasFacts {
+  checkGasPrice(facts.referenceGasPrice);
+  const gasCoins = coinRefsOrFail(facts.gasCoins, 'gas coins');
+  if (gasCoins.length === 0) fail('BAD_ARGS', 'a coin-paid transaction names no gas coins');
+  return { referenceGasPrice: facts.referenceGasPrice, gasCoins };
+}
+
+/** The facts checked, gas coins normalised, so a build and a byte check read them the same way (standard 2). */
+function checkOwnerGasFacts(facts: OwnerGasFacts): OwnerGasFacts {
+  if (paysWithCoins(facts)) return checkCoinGasFacts(facts);
+  checkFacts(facts);
+  return facts;
+}
+
+/** The owner pays gas from their SUI address balance (payGasFromAddressBalance) or with the SUI coins the facts name. */
+function payOwnerGas(tx: Transaction, owner: string, facts: OwnerGasFacts, budgetMist: number): void {
+  if (!paysWithCoins(facts)) {
+    payGasFromAddressBalance(tx, owner, facts, budgetMist);
+    return;
+  }
+  tx.setGasOwner(owner);
+  tx.setGasPrice(facts.referenceGasPrice);
+  tx.setGasBudget(budgetMist);
+  tx.setGasPayment(facts.gasCoins.map((coin) => ({ objectId: coin.objectId, version: String(coin.version), digest: coin.digest })));
+  tx.setExpiration({ None: true });
+}
+
 async function offlineBuild(tx: Transaction): Promise<Uint8Array> {
   try {
     // No client: every input is pure, a withdrawal or a fully named shared object, and
@@ -154,14 +230,16 @@ async function offlineBuild(tx: Transaction): Promise<Uint8Array> {
  * Builds the unsigned transaction in which the owner issues a direct native allowance
  * (sui::allowance::new) over its Sui Mainnet USDC address balance, as the Sui docs show:
  * spender = the purse, a lifetime cap, a fixed-window periodic limit, an expiration and
- * no start time. The owner sends it and pays its gas from its own SUI address balance,
- * at most LIMITS.issueGasBudgetMist. Offline and deterministic for the same args and facts.
- * Preconditions: facts were read from the chain just before; expirationMs is in the future.
+ * no start time. The owner sends it and pays its gas, at most LIMITS.issueGasBudgetMist, from
+ * its own SUI address balance inside the epoch window ChainFacts name, or with the SUI coins
+ * CoinGasFacts name and no expiration. Offline and deterministic for the same args and facts.
+ * Preconditions: facts were read from the chain just before, gas coins among them as the owner's
+ * own; expirationMs is in the future.
  * Throws AllowanceError: BAD_ARGS for an address that is not a Sui address, the zero
- * address, a spender equal to the owner, or facts out of range; BAD_TERMS for a zero or
- * out-of-range term, or a period limit above the lifetime cap; BUILD_FAILED.
+ * address, a spender equal to the owner, or facts out of range (gas coins included); BAD_TERMS
+ * for a zero or out-of-range term, or a period limit above the lifetime cap; BUILD_FAILED.
  */
-export async function buildIssueAllowance(args: IssueArgs, facts: ChainFacts): Promise<Uint8Array> {
+export async function buildIssueAllowance(args: IssueArgs, facts: OwnerGasFacts): Promise<Uint8Array> {
   const owner = addressOrFail(args?.owner, 'the owner');
   const spender = addressOrFail(args.spender, 'the spender');
   if (spender === owner) fail('BAD_ARGS', 'the spender is the owner');
@@ -174,7 +252,7 @@ export async function buildIssueAllowance(args: IssueArgs, facts: ChainFacts): P
     fail('BAD_TERMS', 'the period limit is not between one atomic unit and the lifetime cap');
   }
   if (!isU64(terms.expirationMs, 1n)) fail('BAD_TERMS', 'the expiration is not a positive u64');
-  checkFacts(facts);
+  const gas = checkOwnerGasFacts(facts);
 
   const tx = new Transaction();
   tx.setSender(owner);
@@ -196,7 +274,7 @@ export async function buildIssueAllowance(args: IssueArgs, facts: ChainFacts): P
       someRateLimit,
     ],
   });
-  payGasFromAddressBalance(tx, owner, facts, LIMITS.issueGasBudgetMist);
+  payOwnerGas(tx, owner, gas, LIMITS.issueGasBudgetMist);
   return offlineBuild(tx);
 }
 
@@ -266,6 +344,56 @@ export async function buildRefill(args: RefillArgs, facts: RefillFacts): Promise
   return offlineBuild(refillTransaction(terms, facts));
 }
 
+interface UsdcMoveTerms {
+  owner: string;
+  /** Sorted by object id, so one set of coins always builds the same bytes. */
+  coins: CoinRef[];
+  gas: OwnerGasFacts;
+}
+
+function usdcMoveTerms(args: UsdcMoveArgs, facts: OwnerGasFacts): UsdcMoveTerms {
+  const owner = addressOrFail(args?.owner, 'the owner');
+  const coins = coinRefsOrFail(args.coins, 'USDC coins');
+  if (coins.length === 0) fail('NOTHING_TO_MOVE', 'there are no USDC coins to move');
+  coins.sort((a, b) => (a.objectId < b.objectId ? -1 : 1));
+  const gas = checkOwnerGasFacts(facts);
+  if (paysWithCoins(gas) && gas.gasCoins.some((gasCoin) => coins.some((coin) => coin.objectId === gasCoin.objectId))) {
+    fail('BAD_ARGS', 'a gas coin is also one of the USDC coins moved');
+  }
+  return { owner, coins, gas };
+}
+
+function usdcMoveTransaction(terms: UsdcMoveTerms): Transaction {
+  const tx = new Transaction();
+  tx.setSender(terms.owner);
+  const [first, ...rest] = terms.coins.map((coin) => tx.objectRef({ objectId: coin.objectId, version: String(coin.version), digest: coin.digest }));
+  if (first === undefined) fail('NOTHING_TO_MOVE', 'there are no USDC coins to move');
+  // send_funds takes one Coin, so every other coin is first merged into it; MergeCoins deletes them.
+  if (rest.length > 0) tx.mergeCoins(first, rest);
+  tx.moveCall({ target: COIN_SEND_FUNDS, typeArguments: [USDC_TYPE_MAINNET], arguments: [first, tx.pure.address(terms.owner)] });
+  payOwnerGas(tx, terms.owner, terms.gas, LIMITS.usdcMoveGasBudgetMist);
+  return tx;
+}
+
+/**
+ * Builds the unsigned transaction in which the owner moves the named Sui Mainnet USDC coins into
+ * their own address balance, the only part of their USDC a Sui allowance can draw from: when there
+ * is more than one coin, MergeCoins of the rest into the coin with the lowest object id, then
+ * 0x2::coin::send_funds<USDC>(that coin, owner). Nothing else is in the transaction, and every coin
+ * named ends up in the owner's address balance. The owner sends it and pays its gas, at most
+ * LIMITS.usdcMoveGasBudgetMist, from their SUI address balance inside the epoch window ChainFacts
+ * name, or with the SUI coins CoinGasFacts name and no expiration. Offline and deterministic for
+ * the same owner, set of coins and facts, whatever order the USDC coins come in.
+ * Preconditions: the coins, gas coins included, were read from chain just before as the owner's own.
+ * Throws AllowanceError: NOTHING_TO_MOVE for an empty list; BAD_ARGS for an owner or coin id that
+ * is not a Sui address or is the zero address, more than LIMITS.ownedCoinsMax coins of either kind,
+ * a coin named twice, a gas coin that is also a USDC coin, a version or digest out of form, or
+ * facts out of range; BUILD_FAILED.
+ */
+export async function buildUsdcToAddress(args: UsdcMoveArgs, facts: OwnerGasFacts): Promise<Uint8Array> {
+  return offlineBuild(usdcMoveTransaction(usdcMoveTerms(args, facts)));
+}
+
 type DecodedTransaction = ReturnType<typeof bcs.TransactionData.parse>;
 type DecodedV1 = Extract<DecodedTransaction, { $kind: 'V1' }>['V1'];
 type DecodedPtb = Extract<DecodedV1['kind'], { $kind: 'ProgrammableTransaction' }>['ProgrammableTransaction'];
@@ -312,15 +440,9 @@ function sameBytes(a: Uint8Array, b: Uint8Array): boolean {
   return a.length === b.length && a.every((byte, index) => byte === b[index]);
 }
 
-/** Names the first way the decoded transaction differs from the refill these terms describe, or null. */
-function firstRefillDifference(actual: Decoded, expected: Decoded, terms: RefillTerms, facts: RefillFacts): string | null {
-  const { v1, ptb } = actual;
-  if (!sameAddress(v1.sender, terms.spender)) return 'the sender is not the purse';
-  if (!sameAddress(v1.gasData.owner, terms.gasOwner)) return 'the gas owner is not the gas wallet';
-  if (v1.gasData.payment.length !== 0) return 'the transaction carries gas coins';
-  if (BigInt(v1.gasData.budget) !== BigInt(LIMITS.refillGasBudgetMist)) return 'the gas budget is not the refill budget';
+/** Names the first way the gas price or the ValidDuring window differs from the facts built with, or null. */
+function firstPriceOrWindowDifference(v1: DecodedV1, facts: ChainFacts): string | null {
   if (BigInt(v1.gasData.price) !== facts.referenceGasPrice) return 'the gas price is not the price built with';
-
   if (v1.expiration.$kind !== 'ValidDuring') return 'the expiration is not a ValidDuring window';
   const window = v1.expiration.ValidDuring;
   if (window.minEpoch === null || window.maxEpoch === null) return 'the epoch window is open';
@@ -330,6 +452,18 @@ function firstRefillDifference(actual: Decoded, expected: Decoded, terms: Refill
   if (window.minTimestamp !== null || window.maxTimestamp !== null) return 'the expiration carries a timestamp';
   if (window.chain !== SUI_MAINNET_CHAIN_ID) return 'the chain is not Sui Mainnet';
   if (window.nonce !== facts.nonce) return 'the nonce is not the one built with';
+  return null;
+}
+
+/** Names the first way the decoded transaction differs from the refill these terms describe, or null. */
+function firstRefillDifference(actual: Decoded, expected: Decoded, terms: RefillTerms, facts: RefillFacts): string | null {
+  const { v1, ptb } = actual;
+  if (!sameAddress(v1.sender, terms.spender)) return 'the sender is not the purse';
+  if (!sameAddress(v1.gasData.owner, terms.gasOwner)) return 'the gas owner is not the gas wallet';
+  if (v1.gasData.payment.length !== 0) return 'the transaction carries gas coins';
+  if (BigInt(v1.gasData.budget) !== BigInt(LIMITS.refillGasBudgetMist)) return 'the gas budget is not the refill budget';
+  const gas = firstPriceOrWindowDifference(v1, facts);
+  if (gas !== null) return gas;
 
   if (ptb.commands.length !== expected.ptb.commands.length) {
     return `the transaction has ${ptb.commands.length} commands, a refill has ${expected.ptb.commands.length}`;
@@ -389,6 +523,83 @@ export async function assertRefill(txBytes: Uint8Array, args: RefillArgs, facts:
   const difference = firstRefillDifference(decode(txBytes), decode(expectedBytes), terms, facts);
   if (difference !== null) fail('MISMATCH', difference);
   if (!sameBytes(txBytes, expectedBytes)) fail('MISMATCH', 'the bytes differ from a fresh build of the refill');
+}
+
+/** Names the first way the decoded transaction differs from the move these terms describe, or null. */
+/** Names the first way the gas payment, price or expiration differs from how the owner was to pay, or null. */
+function firstOwnerGasDifference(v1: DecodedV1, gas: OwnerGasFacts): string | null {
+  if (!paysWithCoins(gas)) {
+    if (v1.gasData.payment.length !== 0) return 'the transaction carries gas coins';
+    return firstPriceOrWindowDifference(v1, gas);
+  }
+  const payment = v1.gasData.payment.map((coin) => ({ objectId: normalizeSuiAddress(coin.objectId), version: BigInt(coin.version), digest: coin.digest }));
+  if (!isDeepStrictEqual(payment, gas.gasCoins)) return 'the gas coins are not the ones built with';
+  if (BigInt(v1.gasData.price) !== gas.referenceGasPrice) return 'the gas price is not the price built with';
+  if (v1.expiration.$kind !== 'None') return 'a coin-paid transaction carries an expiration';
+  return null;
+}
+
+function firstUsdcMoveDifference(actual: Decoded, expected: Decoded, terms: UsdcMoveTerms): string | null {
+  const { v1, ptb } = actual;
+  if (!sameAddress(v1.sender, terms.owner)) return 'the sender is not the owner';
+  if (!sameAddress(v1.gasData.owner, terms.owner)) return 'the gas owner is not the owner';
+  if (BigInt(v1.gasData.budget) !== BigInt(LIMITS.usdcMoveGasBudgetMist)) return 'the gas budget is not the move budget';
+  const gas = firstOwnerGasDifference(v1, terms.gas);
+  if (gas !== null) return gas;
+
+  if (ptb.commands.length !== expected.ptb.commands.length) {
+    return `the transaction has ${ptb.commands.length} commands, this move has ${expected.ptb.commands.length}`;
+  }
+  if (ptb.inputs.length !== expected.ptb.inputs.length) {
+    return `the transaction has ${ptb.inputs.length} inputs, this move has ${expected.ptb.inputs.length}`;
+  }
+
+  const coinTypes = ptb.commands.flatMap((command) => (command.$kind === 'MoveCall' ? command.MoveCall.typeArguments : []));
+  if (!coinTypes.every(isUsdc)) return 'a call is not typed in Sui Mainnet USDC';
+
+  const recipients = ptb.inputs.flatMap((input) => (input.$kind === 'Pure' ? [pureAddress(input.Pure.bytes)] : []));
+  if (recipients.length !== 1 || recipients[0] !== terms.owner) return "the coins are not sent to the owner's own address balance";
+
+  const named = new Set(terms.coins.map((coin) => coin.objectId));
+  for (const input of ptb.inputs) {
+    if (input.$kind !== 'Object') continue;
+    const object = input.Object;
+    if (object.$kind !== 'ImmOrOwnedObject' || !named.has(normalizeSuiAddress(object.ImmOrOwnedObject.objectId))) {
+      return 'an object in the transaction is not one of the coins named';
+    }
+  }
+
+  for (const [index, command] of ptb.commands.entries()) {
+    if (!isDeepStrictEqual(command, expected.ptb.commands[index])) return `command ${index} is not the expected call`;
+  }
+  for (const [index, input] of ptb.inputs.entries()) {
+    if (!isDeepStrictEqual(input, expected.ptb.inputs[index])) return `input ${index} is not the expected input`;
+  }
+  return null;
+}
+
+/**
+ * Proves txBytes are the move these args and facts describe and nothing else: equal, byte for
+ * byte, to buildUsdcToAddress with the same args and facts (standard 1). Both sides are first
+ * decoded by the same SDK parser and compared field by field, so a refusal names the first
+ * difference: sender, gas owner, gas budget, then how gas is paid (no gas coins, the price and the
+ * epoch window, chain and nonce for the address balance; exactly the gas coins named, the price
+ * and no expiration for coins), the command and input counts, the coin type of every call, the
+ * single recipient, every object being one of the coins named, then each command and input in order.
+ * Covers: another sender or gas payer, another recipient, another coin type, coins other than
+ * the ones named (another owner's among them), other gas coins, extra commands, a larger gas budget.
+ * Does not cover: whether the coins named, gas coins included, are the owner's own at their
+ * current versions; the caller reads them through Tatum first and passes exactly those (C7).
+ * Throws AllowanceError: MISMATCH for any difference; NOTHING_TO_MOVE, BAD_ARGS or BUILD_FAILED
+ * when the expected move itself cannot be built.
+ */
+export async function assertUsdcToAddress(txBytes: Uint8Array, args: UsdcMoveArgs, facts: OwnerGasFacts): Promise<void> {
+  if (!(txBytes instanceof Uint8Array)) fail('MISMATCH', 'the move bytes are missing');
+  const terms = usdcMoveTerms(args, facts);
+  const expectedBytes = await offlineBuild(usdcMoveTransaction(terms));
+  const difference = firstUsdcMoveDifference(decode(txBytes), decode(expectedBytes), terms);
+  if (difference !== null) fail('MISMATCH', difference);
+  if (!sameBytes(txBytes, expectedBytes)) fail('MISMATCH', 'the bytes differ from a fresh build of the move');
 }
 
 const NO_REFILL = Object.freeze({ refill: false, amountAtomic: 0n });

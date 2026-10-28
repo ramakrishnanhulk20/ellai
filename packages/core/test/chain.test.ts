@@ -18,7 +18,11 @@
 // the Chain methods, and a hook that throws sending nothing and failing the call as BUDGET, never
 // retried, with streaming calls refused; executeTransaction reading a refused first send as not
 // sent, and a refusal of a lookup or a second send as an unknown outcome that never says BUDGET.
-// Does NOT cover: the hook against the live gateway (no live test passes one), whether Tatum ever
+// Offline too, against stand-in ListOwnedObjects pages: listUsdcCoins and listSuiCoins asking for exactly their
+// coin type, stopping at the coin cap or the page cap and saying more remain, and refusing any
+// listed object that is not the address's own coin of that type; getWalletBalances splitting SUI as USDC.
+// Does NOT cover: listUsdcCoins against the live gateway, an address holding more coins than one
+// move takes on mainnet, the hook against the live gateway (no live test passes one), whether Tatum ever
 // answers a missing digest with an empty OK (the live made-up digest test fails if it does), a paid key's rate limits, the Walrus blob listing or scan against the live
 // gateway (the probe script and the scratch cross-check exercise the listing), an owner that
 // actually holds USDC, a failed transaction's status read from chain (none is pinned
@@ -910,6 +914,148 @@ describe('beforeRequest, against a stand-in gRPC transport and stand-in GraphQL 
       }
     });
     expect(refused.calls).toEqual([{ transport: 'grpc', method: 'VerifySignature' }]);
+  });
+});
+
+const COIN_HOLDER = normalizeSuiAddress(`0x${'6d'.repeat(32)}`);
+const USDC_COIN_TYPE = `0x0000000000000000000000000000000000000000000000000000000000000002::coin::Coin<${USDC_TYPE_MAINNET}>`;
+
+/** A coin as ListOwnedObjects describes one, in the short 0x2 form, numbered so each is its own. */
+function coinObject(n: number, change: (coin: any) => void = () => undefined) {
+  const coin = {
+    objectId: `0x${n.toString(16)}`,
+    version: 1_000n + BigInt(n),
+    digest: toBase58(new Uint8Array(32).fill(n)),
+    objectType: `0x2::coin::Coin<${USDC_TYPE_MAINNET}>`,
+    owner: { kind: GrpcTypes.Owner_OwnerKind.ADDRESS, address: COIN_HOLDER },
+    balance: 250_000n * BigInt(n),
+  };
+  change(coin);
+  return coin;
+}
+
+/** Answers each gRPC call on chains created inside `run` with the next page, recording what each one asked. */
+async function withCoinPages<T>(pages: object[], run: (asked: Array<Record<string, unknown>>) => Promise<T>): Promise<T> {
+  const asked: Array<Record<string, unknown>> = [];
+  const unary = vi.spyOn(GrpcTransport.prototype, 'unary').mockImplementation(((method: MethodInfo, input: object) => {
+    asked.push({ method: method.name, ...input });
+    const page = pages[asked.length - 1];
+    const response = page === undefined ? Promise.reject(new Error('the test gave no answer for this call')) : Promise.resolve(page);
+    response.catch(() => undefined);
+    const after = <V>(value: V) => response.then(() => value);
+    return new UnaryCall(method, {}, input, after({}), response, after({ code: 'OK', detail: '' }), after({}));
+  }) as never);
+  try {
+    return await run(asked);
+  } finally {
+    unary.mockRestore();
+  }
+}
+
+describe('listUsdcCoins, against stand-in ListOwnedObjects pages', () => {
+  // The SDK binds the transport's unary when a chain is made, so each test makes its own inside withCoinPages.
+  const listed = (address = COIN_HOLDER) => {
+    const local = createChain({});
+    return local.listUsdcCoins(address).finally(() => local.close());
+  };
+
+  it("asks for exactly the USDC coin type and the fields a transaction needs, and reads each coin normalised", async () => {
+    const listing = await withCoinPages([{ objects: [coinObject(1), coinObject(2)] }], async (asked) => {
+      const read = await listed();
+      expect(asked).toEqual([
+        {
+          method: 'ListOwnedObjects',
+          owner: COIN_HOLDER,
+          objectType: USDC_COIN_TYPE,
+          pageSize: LIMITS.ownedCoinsMax,
+          pageToken: undefined,
+          readMask: { paths: ['object_id', 'version', 'digest', 'object_type', 'owner', 'balance'] },
+        },
+      ]);
+      return read;
+    });
+    expect(listing).toEqual({
+      coins: [
+        { objectId: normalizeSuiAddress('0x1'), version: 1_001n, digest: toBase58(new Uint8Array(32).fill(1)), balance: 250_000n },
+        { objectId: normalizeSuiAddress('0x2'), version: 1_002n, digest: toBase58(new Uint8Array(32).fill(2)), balance: 500_000n },
+      ],
+      more: false,
+    });
+  });
+
+  it('stops at LIMITS.ownedCoinsMax coins or LIMITS.ownedCoinsMaxPages pages, saying more remain, and follows a short page to the end', async () => {
+    const full = Array.from({ length: LIMITS.ownedCoinsMax }, (_, i) => coinObject(i + 1));
+    const capped = await withCoinPages([{ objects: full, nextPageToken: Uint8Array.of(1) }], async (asked) => {
+      const read = await listed();
+      expect(asked).toHaveLength(1);
+      return read;
+    });
+    expect([capped.coins.length, capped.more]).toEqual([LIMITS.ownedCoinsMax, true]);
+
+    const thin = Array.from({ length: LIMITS.ownedCoinsMaxPages + 1 }, (_, i) => ({ objects: [coinObject(i + 1)], nextPageToken: Uint8Array.of(i + 1) }));
+    const pagedOut = await withCoinPages(thin, async (asked) => {
+      const read = await listed();
+      expect(asked.map((call) => call.pageToken)).toEqual([undefined, ...thin.slice(0, LIMITS.ownedCoinsMaxPages - 1).map((page) => page.nextPageToken)]);
+      return read;
+    });
+    expect([pagedOut.coins.length, pagedOut.more]).toEqual([LIMITS.ownedCoinsMaxPages, true]);
+
+    const short = await withCoinPages([{ objects: [coinObject(1)], nextPageToken: Uint8Array.of(9) }, { objects: [coinObject(2)] }], () => listed());
+    expect([short.coins.map((coin) => coin.balance), short.more]).toEqual([[250_000n, 500_000n], false]);
+  });
+
+  it('lists SUI coins the same way under the SUI coin type, and reads SUI split into its two parts like USDC', async () => {
+    const onLocal = async <T>(run: (local: ReturnType<typeof createChain>) => Promise<T>): Promise<T> => {
+      const local = createChain({});
+      try {
+        return await run(local);
+      } finally {
+        local.close();
+      }
+    };
+    const suiCoin = coinObject(3, (coin) => (coin.objectType = '0x2::coin::Coin<0x2::sui::SUI>'));
+    const sui = await withCoinPages([{ objects: [suiCoin] }], async (asked) => {
+      const read = await onLocal((local) => local.listSuiCoins(COIN_HOLDER));
+      expect(asked).toMatchObject([{ method: 'ListOwnedObjects', objectType: `0x0000000000000000000000000000000000000000000000000000000000000002::coin::Coin<${SUI}>` }]);
+      return read;
+    });
+    expect(sui).toEqual({ coins: [{ objectId: normalizeSuiAddress('0x3'), version: 1_003n, digest: suiCoin.digest, balance: 750_000n }], more: false });
+    const usdcAmongSui = await withCoinPages([{ objects: [coinObject(1)] }], () => onLocal((local) => failureOf(local.listSuiCoins(COIN_HOLDER))));
+    expect(usdcAmongSui.code).toBe('BAD_RESPONSE');
+
+    const page = {
+      balances: [
+        { coinType: USDC_TYPE_MAINNET, balance: '30', addressBalance: '20', coinBalance: '10' },
+        { coinType: SUI, balance: '9', addressBalance: '2', coinBalance: '7' },
+      ],
+    };
+    const [split, plain] = await withCoinPages([page, page], () => onLocal(async (local) => [await local.getWalletBalances(COIN_HOLDER), await local.getBalances(COIN_HOLDER)] as const));
+    expect(split).toEqual({ usdcAddressBalance: 20n, usdcCoinBalance: 10n, suiAddressBalance: 2n, suiCoinBalance: 7n });
+    expect(plain).toEqual({ usdcAddressBalance: 20n, usdcCoinBalance: 10n, suiTotal: 9n });
+  });
+
+  it("refuses a listing holding anything but the address's own USDC coins, and a bad address without asking", async () => {
+    const refusals: Array<[string, object]> = [
+      ['a coin of another type', { objects: [coinObject(1, (coin) => (coin.objectType = '0x2::coin::Coin<0x2::sui::SUI>'))] }],
+      ['a coin another address owns', { objects: [coinObject(1, (coin) => (coin.owner.address = `0x${'99'.repeat(32)}`))] }],
+      ['a shared coin', { objects: [coinObject(1, (coin) => (coin.owner = { kind: GrpcTypes.Owner_OwnerKind.SHARED, version: 3n }))] }],
+      ['a coin held by consensus', { objects: [coinObject(1, (coin) => (coin.owner.kind = GrpcTypes.Owner_OwnerKind.CONSENSUS_ADDRESS))] }],
+      ['a coin listed twice', { objects: [coinObject(1), coinObject(1)] }],
+      ['version zero', { objects: [coinObject(1, (coin) => (coin.version = 0n))] }],
+      ['a digest that is not 32 bytes', { objects: [coinObject(1, (coin) => (coin.digest = toBase58(new Uint8Array(31))))] }],
+      ['no balance', { objects: [coinObject(1, (coin) => delete coin.balance)] }],
+      ['more coins than the page size', { objects: Array.from({ length: LIMITS.ownedCoinsMax + 1 }, (_, i) => coinObject(i + 1)) }],
+    ];
+    for (const [what, page] of refusals) {
+      const failure = await withCoinPages([page], () => failureOf(listed()));
+      expect(failure.code, what).toBe('BAD_RESPONSE');
+    }
+    const malformed = await withCoinPages([], async (asked) => {
+      const failure = await failureOf(listed('not an address'));
+      expect(asked).toEqual([]);
+      return failure;
+    });
+    expect(malformed.code).toBe('INVALID_INPUT');
   });
 });
 

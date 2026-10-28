@@ -9,10 +9,35 @@ export type OnboardingStep = (typeof ONBOARDING_STEPS)[number];
 export const ACCOUNT_STEPS = ['memory_account', 'add_delegate'] as const;
 export type AccountStep = (typeof ACCOUNT_STEPS)[number];
 
-export type OnboardingErrorCode = 'BAD_INPUT' | 'NO_OWNER' | 'NOT_READY' | 'NOT_LANDED' | 'REFUSED' | 'ALREADY_DONE' | 'BAD_TRANSACTION';
+/**
+ * Moves the owner's USDC coins into their address balance, the only part an allowance draws from.
+ * Not one of the three recorded steps: nothing is stored, and it can be run any number of times.
+ */
+export const USDC_MOVE_STEP = 'usdc_to_address';
+
+/** Every transaction the build and submit routes make for an owner: the three steps and the USDC move. */
+export const BUILD_STEPS = [...ONBOARDING_STEPS, USDC_MOVE_STEP] as const;
+export type BuildStep = (typeof BUILD_STEPS)[number];
+
+export type OnboardingErrorCode =
+  | 'BAD_INPUT'
+  | 'NO_OWNER'
+  | 'NOT_READY'
+  | 'NOT_LANDED'
+  | 'REFUSED'
+  | 'ALREADY_DONE'
+  | 'BAD_TRANSACTION'
+  | 'NOTHING_TO_MOVE'
+  | 'NOT_ENOUGH_SUI';
 
 /** The one sentence for ALREADY_DONE, which the screens show as it is. */
 export const ALREADY_DONE_MESSAGE = 'This step is already done on Sui. Confirm it to continue.';
+
+/** The one sentence for NOTHING_TO_MOVE: the owner's wallet holds no USDC coins, so any USDC it has is already in its address balance. */
+export const NOTHING_TO_MOVE_MESSAGE = 'Your wallet holds no USDC coins to move. Any USDC it has is already in its address balance.';
+
+/** The one sentence for NOT_ENOUGH_SUI: neither the owner's SUI address balance nor their SUI coins cover the transaction's gas budget. */
+export const NOT_ENOUGH_SUI_MESSAGE = "Your wallet needs a little SUI to pay this transaction's fee.";
 
 /**
  * Every refusal from onboarding. The message is fixed text plus limits and ids Ellai read or
@@ -21,7 +46,8 @@ export const ALREADY_DONE_MESSAGE = 'This step is already done on Sui. Confirm i
  * shortly can succeed. REFUSED means the chain shows something other than what the step needs.
  * ALREADY_DONE means Sui already shows what the step would do, so it is confirmed without a
  * transaction. BAD_TRANSACTION means signed bytes sent to be relayed are not the step Ellai
- * builds for this owner, and nothing was sent.
+ * builds for this owner, and nothing was sent. NOTHING_TO_MOVE means the owner holds no USDC
+ * coins for the USDC move. NOT_ENOUGH_SUI means the owner's SUI cannot cover the gas budget.
  */
 export class OnboardingError extends Error {
   readonly code: OnboardingErrorCode;
@@ -42,6 +68,13 @@ export function checkStep(step: unknown): OnboardingStep {
     throw new OnboardingError('BAD_INPUT', `the step must be one of ${ONBOARDING_STEPS.join(', ')}`);
   }
   return step as OnboardingStep;
+}
+
+export function checkBuildStep(step: unknown): BuildStep {
+  if (typeof step !== 'string' || !(BUILD_STEPS as readonly string[]).includes(step)) {
+    throw new OnboardingError('BAD_INPUT', `the step must be one of ${BUILD_STEPS.join(', ')}`);
+  }
+  return step as BuildStep;
 }
 
 export function checkNow(now: unknown): Date {

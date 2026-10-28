@@ -71,7 +71,7 @@ const HTTP_ERROR_MESSAGES: Readonly<Record<HttpErrorCode, string>> = {
   out_of_bounds: 'A value in the request is outside the bounds this endpoint allows.',
   too_many_requests: 'Too many requests. Try again in a minute.',
   bad_task: `The task must be 1 to ${LIMITS.agentTaskMaxChars} characters.`,
-  chain_refused: 'Sui does not allow this step for your Walrus Memory account right now.',
+  chain_refused: 'Sui refused this setup transaction. Nothing changed; try again in a minute.',
   chain_unavailable: 'Ellai could not read Sui just now. Try again in a minute.',
   // A shared quota counted over a whole day is spent: Ellai, not the caller, is over its budget.
   chain_unavailable_today: "Ellai has used today's budget for reading Sui. Try again tomorrow (days are counted in UTC).",
@@ -188,6 +188,8 @@ const ONBOARDING_STATUS: Readonly<Record<OnboardingErrorCode, number>> = {
   REFUSED: 422,
   ALREADY_DONE: 409,
   BAD_TRANSACTION: 400,
+  NOTHING_TO_MOVE: 409,
+  NOT_ENOUGH_SUI: 409,
 };
 
 const PAYMENT_STATUS: Readonly<Record<PaymentErrorCode, number>> = {

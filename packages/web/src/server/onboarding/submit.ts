@@ -1,5 +1,5 @@
 import { isDeepStrictEqual } from 'node:util';
-import { AllowanceError, type AllowanceTerms, type ChainFacts, buildIssueAllowance } from '@ellai/core/allowance';
+import { AllowanceError, type AllowanceTerms, buildIssueAllowance, type OwnerGasFacts } from '@ellai/core/allowance';
 import { type Chain, ChainError, type ExecutionResult } from '@ellai/core/chain';
 import { canonicalSuiAddress } from '@ellai/core/keys';
 import { LIMITS } from '@ellai/core/limits';
@@ -10,25 +10,31 @@ import { fromBase64, toBase64 } from '@mysten/sui/utils';
 import type { Database } from '../db/client.js';
 import { buildAccountStep } from './build.js';
 import { allowanceLimitsProblem, recordRelayedStep } from './confirm.js';
-import { type AccountStep, checkNow, checkStep, loadOwner, OnboardingError, type OnboardingStep, type OwnerRow } from './state.js';
+import { checkUsdcMoveStep, requireOwnersGasCoins } from './funds.js';
+import { type AccountStep, type BuildStep, checkBuildStep, checkNow, loadOwner, OnboardingError, type OwnerRow, USDC_MOVE_STEP } from './state.js';
 
 /**
  * The Tatum calls submitOnboardingTx's success path makes for each step, which the submit route
  * counts against the day's budgets before any of them (C22): for an account step, the fresh build
  * the signed bytes are compared with (BUILD_CHAIN_CALLS, 5 and 7), the one send, and
  * findMemoryAccount's three reads to record the result; for an allowance, which is rebuilt
- * offline, the send and the one read of the allowance it created.
+ * offline, the re-read of the owner's SUI coins when it pays its fee with them, the send and the
+ * one read of the allowance it created; for the USDC move, the re-read of the owner's USDC coins,
+ * that same SUI coin re-read, and the send.
  */
-export const SUBMIT_CHAIN_CALLS: Readonly<Record<OnboardingStep, number>> = { memory_account: 9, add_delegate: 11, allowance: 2 };
+export const SUBMIT_CHAIN_CALLS: Readonly<Record<BuildStep, number>> = { memory_account: 9, add_delegate: 11, allowance: 3, usdc_to_address: 3 };
 
 /**
  * How a relayed transaction ended. `recorded`: it succeeded and the step is recorded. `sent`: it
  * went out but Ellai has not recorded the step, either because the outcome is unknown or because
  * Sui does not show its result yet; the client confirms it later with the digest. `refused`: the
- * network refused it or it ran and failed, which is definite, and nothing is recorded.
+ * network refused it or it ran and failed, which is definite, and nothing is recorded. `moved`:
+ * the USDC move succeeded, putting movedAtomic, what the coins held as read just before the send,
+ * in the owner's address balance; nothing is recorded for it.
  */
 export type SubmitOutcome =
   | { status: 'recorded'; recorded: string; digest: string }
+  | { status: 'moved'; movedAtomic: string; digest: string }
   | { status: 'sent'; digest: string }
   | { status: 'refused'; digest: string };
 
@@ -105,11 +111,30 @@ async function checkAccountStep(decoded: Decoded, step: AccountStep, owner: Owne
 }
 
 /**
- * The allowance terms and chain facts read from the places buildIssueAllowance puts them: the rate
- * limit call first, allowance::new third, and the epoch window. The bytes are then compared with a
- * fresh build from these, so a wrong reading can only refuse, never let other bytes through.
+ * How the bytes pay their fee, read from where core's builders put it: the gas coins named when
+ * there are any, otherwise the epoch window of an address-balance payment. The bytes are then
+ * compared with a fresh build from this, so a wrong reading can only refuse, never let other bytes
+ * through; gas coins read here are re-read from chain as the owner's before anything is sent.
  */
-function allowanceOf(decoded: Decoded): { terms: AllowanceTerms; facts: ChainFacts } | null {
+function gasFactsOf(v1: DecodedV1): OwnerGasFacts | null {
+  try {
+    const referenceGasPrice = BigInt(v1.gasData.price);
+    if (v1.gasData.payment.length > 0) {
+      return { referenceGasPrice, gasCoins: v1.gasData.payment.map((coin) => ({ objectId: coin.objectId, version: BigInt(coin.version), digest: coin.digest })) };
+    }
+    if (v1.expiration.$kind !== 'ValidDuring' || v1.expiration.ValidDuring.minEpoch === null) return null;
+    return { epoch: BigInt(v1.expiration.ValidDuring.minEpoch), referenceGasPrice, nonce: v1.expiration.ValidDuring.nonce };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The allowance terms read from the places buildIssueAllowance puts them: the rate limit call
+ * first, allowance::new third; the gas facts as gasFactsOf reads them. The bytes are then compared
+ * with a fresh build from these, so a wrong reading can only refuse, never let other bytes through.
+ */
+function allowanceOf(decoded: Decoded): { terms: AllowanceTerms; facts: OwnerGasFacts } | null {
   const { v1, ptb } = decoded;
   const pure = (argument: DecodedArgument | undefined): Uint8Array => {
     const input = argument?.$kind === 'Input' ? ptb.inputs[argument.Input] : undefined;
@@ -118,17 +143,14 @@ function allowanceOf(decoded: Decoded): { terms: AllowanceTerms; facts: ChainFac
   };
   try {
     const [rateLimit, , issue] = ptb.commands;
-    if (rateLimit?.$kind !== 'MoveCall' || issue?.$kind !== 'MoveCall' || v1.expiration.$kind !== 'ValidDuring') return null;
+    const facts = gasFactsOf(v1);
+    if (rateLimit?.$kind !== 'MoveCall' || issue?.$kind !== 'MoveCall' || facts === null) return null;
     const periodMs = BigInt(bcs.u64().parse(pure(rateLimit.MoveCall.arguments[0])));
     const periodLimitAtomic = BigInt(bcs.u256().parse(pure(rateLimit.MoveCall.arguments[1])));
     const cap = bcs.option(bcs.u256()).parse(pure(issue.MoveCall.arguments[2]));
     const expiration = bcs.option(bcs.u64()).parse(pure(issue.MoveCall.arguments[4]));
-    const { minEpoch, nonce } = v1.expiration.ValidDuring;
-    if (cap === null || expiration === null || minEpoch === null) return null;
-    return {
-      terms: { lifetimeCapAtomic: BigInt(cap), periodMs, periodLimitAtomic, expirationMs: BigInt(expiration) },
-      facts: { epoch: BigInt(minEpoch), referenceGasPrice: BigInt(v1.gasData.price), nonce },
-    };
+    if (cap === null || expiration === null) return null;
+    return { terms: { lifetimeCapAtomic: BigInt(cap), periodMs, periodLimitAtomic, expirationMs: BigInt(expiration) }, facts };
   } catch {
     return null;
   }
@@ -138,9 +160,10 @@ function allowanceOf(decoded: Decoded): { terms: AllowanceTerms; facts: ChainFac
  * core has no assertIssueAllowance, so the rule is assertRefill's: the bytes must equal, byte for
  * byte, a fresh buildIssueAllowance with the owner and purse from the owner row and the terms and
  * facts the bytes carry. The terms are then held to allowanceLimitsProblem, the rule confirm
- * records under, so nothing is relayed that confirm would refuse.
+ * records under, so nothing is relayed that confirm would refuse, and gas coins the bytes pay with
+ * to the owner's own SUI coins as Sui shows them now.
  */
-async function checkAllowanceStep(bytes: Uint8Array, decoded: Decoded, owner: OwnerRow, now: Date): Promise<void> {
+async function checkAllowanceStep(bytes: Uint8Array, decoded: Decoded, owner: OwnerRow, now: Date, chain: Chain): Promise<void> {
   const read = allowanceOf(decoded);
   if (read === null) badTransaction(NOT_THIS_STEP);
   let expected: Uint8Array;
@@ -157,6 +180,7 @@ async function checkAllowanceStep(bytes: Uint8Array, decoded: Decoded, owner: Ow
     now,
   );
   if (problem !== null) badTransaction(problem);
+  if ('gasCoins' in read.facts) await requireOwnersGasCoins(chain, canonicalSuiAddress(owner.suiAddress), read.facts.gasCoins);
 }
 
 function unknownOutcome(digest: string, why: string): SubmitOutcome {
@@ -175,26 +199,32 @@ function unknownOutcome(digest: string, why: string): SubmitOutcome {
  *   which also refuses with ALREADY_DONE when Sui already shows it done, and a gas budget at most
  *   LIMITS.memwalAccountTxMaxGasMist.
  * - allowance: byte for byte a fresh buildIssueAllowance for the owner and the owner's purse from
- *   the owner row, its terms within the onboarding maxima confirm records under.
+ *   the owner row, with the gas source the bytes carry, its terms within the onboarding maxima
+ *   confirm records under.
+ * - usdc_to_address: byte for byte a fresh buildUsdcToAddress for the owner with their USDC coins
+ *   re-read now and the gas source the bytes carry (checkUsdcMoveStep).
+ * - for both, gas coins the bytes pay with must be the owner's own SUI coins as Sui shows them now.
  * Then the bytes go to chain.executeTransaction once, metered on this owner's Tatum budget (C22),
- * with the digest Ellai computed from them. A success is recorded as confirm records it, from the
- * result's own effects (recordRelayedStep), never from anything the caller sends (C7, C8).
+ * with the digest Ellai computed from them. A step's success is recorded as confirm records it,
+ * from the result's own effects (recordRelayedStep), never from anything the caller sends (C7, C8);
+ * the move records nothing and answers what the coins held as read before the send.
  * Returns SubmitOutcome. Throws OnboardingError: BAD_INPUT for a bad step, date or owner id;
  * NO_OWNER; BAD_TRANSACTION for bytes or a signature refused as above, nothing sent; NOT_READY and
- * ALREADY_DONE from the account build. Throws ChainError BUDGET when Ellai's Tatum budget refused
- * the send before it left, and MemoryError or ChainError when the fresh build cannot be made.
+ * ALREADY_DONE from the account build; NOTHING_TO_MOVE for the move when the owner holds no USDC
+ * coins now. Throws ChainError BUDGET when Ellai's Tatum budget refused the send before it left,
+ * and MemoryError or ChainError when the fresh build or a re-read cannot be made.
  */
 export async function submitOnboardingTx(args: {
   db: Database;
   ownerId: string;
-  step: OnboardingStep;
+  step: BuildStep;
   txBytesBase64: string;
   signature: string;
   chain: Chain;
   masterSecretHex: string;
   now: Date;
 }): Promise<SubmitOutcome> {
-  const step = checkStep(args.step);
+  const step = checkBuildStep(args.step);
   const now = checkNow(args.now);
   if (typeof args.txBytesBase64 !== 'string' || typeof args.signature !== 'string') badTransaction('send the signed transaction bytes and the signature as text');
   const owner = await loadOwner(args.db, args.ownerId);
@@ -202,7 +232,12 @@ export async function submitOnboardingTx(args: {
   const ownerAddress = canonicalSuiAddress(owner.suiAddress);
   if (!sameAddress(decoded.v1.sender, ownerAddress)) badTransaction('the transaction is not sent from your own address');
   if (!sameAddress(decoded.v1.gasData.owner, ownerAddress)) badTransaction('someone other than you would pay its gas');
-  if (step === 'allowance') await checkAllowanceStep(bytes, decoded, owner, now);
+  let moved: bigint | null = null;
+  if (step === USDC_MOVE_STEP) {
+    const facts = gasFactsOf(decoded.v1);
+    if (facts === null) badTransaction(NOT_THIS_STEP);
+    moved = (await checkUsdcMoveStep(args.chain, ownerAddress, bytes, facts)).movedAtomic;
+  } else if (step === 'allowance') await checkAllowanceStep(bytes, decoded, owner, now, args.chain);
   else await checkAccountStep(decoded, step, owner, args.chain, args.masterSecretHex);
 
   const digest = TransactionDataBuilder.getDigestFromBytes(bytes);
@@ -219,6 +254,7 @@ export async function submitOnboardingTx(args: {
     console.warn(`[ellai onboarding] submit_refused ${result.errorCode ?? 'UNKNOWN'}`);
     return { status: 'refused', digest };
   }
+  if (step === USDC_MOVE_STEP) return { status: 'moved', movedAtomic: String(moved), digest };
   try {
     const { recorded } = await recordRelayedStep({ db: args.db, ownerId: owner.id, step, created: result.createdObjects, chain: args.chain, masterSecretHex: args.masterSecretHex, now });
     return { status: 'recorded', recorded, digest };

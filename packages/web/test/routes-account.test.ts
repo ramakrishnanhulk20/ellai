@@ -13,7 +13,12 @@
 // shows; submit relaying only bytes the owner signed that are the step Ellai builds, refusing
 // another sender's and another kind of transaction before sending, recording a success, and
 // answering an unknown outcome 202 with the digest and a definite refusal 422; decisions saying
-// what the owner answered without the memory sentence; settings read with no chain call;
+// what the owner answered without the memory sentence; the wallet route reading the session owner's
+// own address, split into address balance and coins, counted at one chain call; the USDC move built
+// and relayed only as Ellai builds it from the coins Sui lists for the owner, refusing another
+// recipient, another coin type and a third party's coins before sending and answering
+// nothing_to_move and not_enough_sui; a fee paid with the owner's SUI coins relayed only while Sui
+// still shows those coins as the owner's; settings read with no chain call;
 // settings held to their bounds at each edge, the auto pause cleared
 // only on request, the public proof opt-in starting off and switched for the signed-in owner
 // only; and the limits the routes that read Sui share: per owner a minute and a day, and for
@@ -26,8 +31,8 @@
 // lock is not raced here), or how a page renders agent text (no pages exist yet).
 import { randomBytes } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
-import { buildIssueAllowance } from '@ellai/core/allowance';
-import { type Chain, ChainError } from '@ellai/core/chain';
+import { buildIssueAllowance, buildUsdcToAddress } from '@ellai/core/allowance';
+import { type Chain, ChainError, type OwnedCoin } from '@ellai/core/chain';
 import { LIMITS } from '@ellai/core/limits';
 import { buildAddDelegateTx, buildCreateAccountTx, findMemoryAccount, MemoryError, WALRUS_MEMORY_PACKAGE_ID, WALRUS_MEMORY_REGISTRY_ID } from '@ellai/core/memory';
 import { USDC_TYPE_MAINNET } from '@ellai/core/usdc';
@@ -35,7 +40,7 @@ import type { Signer } from '@mysten/sui/cryptography';
 import { GrpcTypes } from '@mysten/sui/grpc';
 import { Ed25519Keypair } from '@mysten/sui/keypairs/ed25519';
 import { Transaction, TransactionDataBuilder } from '@mysten/sui/transactions';
-import { fromBase64, normalizeStructTag, normalizeSuiAddress, toBase64 } from '@mysten/sui/utils';
+import { fromBase64, normalizeStructTag, normalizeSuiAddress, toBase58, toBase64 } from '@mysten/sui/utils';
 import { eq } from 'drizzle-orm';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import * as agentRoute from '../src/app/api/owner/agents/[id]/route.js';
@@ -46,6 +51,7 @@ import * as buildRoute from '../src/app/api/owner/onboarding/build/route.js';
 import * as confirmRoute from '../src/app/api/owner/onboarding/confirm/route.js';
 import * as onboardingRoute from '../src/app/api/owner/onboarding/route.js';
 import * as submitRoute from '../src/app/api/owner/onboarding/submit/route.js';
+import * as walletRoute from '../src/app/api/owner/onboarding/wallet/route.js';
 import * as overviewRoute from '../src/app/api/owner/overview/route.js';
 import * as sessionsRoute from '../src/app/api/owner/sessions/route.js';
 import * as settingsRoute from '../src/app/api/owner/settings/route.js';
@@ -64,6 +70,7 @@ import { ownerDelegate } from '../src/server/memory/delegate.js';
 import { MEMORY_NAMESPACE } from '../src/server/memory/namespace.js';
 import { BUILD_CHAIN_CALLS, buildOnboardingTx } from '../src/server/onboarding/build.js';
 import { CONFIRM_CHAIN_CALLS, CONFIRM_EXISTING_CHAIN_CALLS, confirmOnboardingTx } from '../src/server/onboarding/confirm.js';
+import { WALLET_CHAIN_CALLS } from '../src/server/onboarding/funds.js';
 import { ALREADY_DONE_MESSAGE } from '../src/server/onboarding/state.js';
 import { SUBMIT_CHAIN_CALLS, submitOnboardingTx } from '../src/server/onboarding/submit.js';
 
@@ -141,9 +148,16 @@ const getTransaction = vi.fn(async ({ digest }: { digest: string }) => ({
 // Submit's send and its read of the allowance it created.
 const executeTransaction = vi.fn<Chain['executeTransaction']>();
 const getAllowance = vi.fn<Chain['getAllowance']>();
+// The owner's wallet, as the fee choice, the wallet route and the USDC move read it.
+const getWalletBalances = vi.fn<Chain['getWalletBalances']>();
+const listUsdcCoins = vi.fn<Chain['listUsdcCoins']>();
+const listSuiCoins = vi.fn<Chain['listSuiCoins']>();
 const chain = {
   usesApiKey: true,
   getBalances,
+  getWalletBalances,
+  listUsdcCoins,
+  listSuiCoins,
   getTransactionResult,
   getCurrentEpoch: async () => 900n,
   getReferenceGasPrice: async () => 100n,
@@ -176,6 +190,13 @@ beforeEach(() => {
   getTransaction.mockClear();
   executeTransaction.mockReset();
   getAllowance.mockReset();
+  // One SUI in the address balance and no coins of either kind, unless a test says otherwise.
+  getWalletBalances.mockReset();
+  getWalletBalances.mockResolvedValue({ usdcAddressBalance: 0n, usdcCoinBalance: 0n, suiAddressBalance: 1_000_000_000n, suiCoinBalance: 0n });
+  listUsdcCoins.mockReset();
+  listUsdcCoins.mockResolvedValue({ coins: [], more: false });
+  listSuiCoins.mockReset();
+  listSuiCoins.mockResolvedValue({ coins: [], more: false });
   vi.mocked(findMemoryAccount).mockReset();
   // Sui shows no account unless a test says otherwise, so a build goes on to core's builder.
   vi.mocked(findMemoryAccount).mockResolvedValue(null);
@@ -306,6 +327,7 @@ const onboarding = (cookie?: string) => onboardingRoute.GET(get('/api/owner/onbo
 const build = (body: unknown, options: SendOptions = {}) => buildRoute.POST(send('POST', '/api/owner/onboarding/build', body, options));
 const confirm = (body: unknown, options: SendOptions = {}) => confirmRoute.POST(send('POST', '/api/owner/onboarding/confirm', body, options));
 const submit = (body: unknown, options: SendOptions = {}) => submitRoute.POST(send('POST', '/api/owner/onboarding/submit', body, options));
+const wallet = (cookie?: string) => walletRoute.GET(get('/api/owner/onboarding/wallet', cookie));
 const getSettings = (cookie?: string, query = '') => settingsRoute.GET(get(`/api/owner/settings${query}`, cookie));
 const patchSettings = (body: unknown, options: SendOptions = {}) => settingsRoute.PATCH(send('PATCH', '/api/owner/settings', body, options));
 const askStepUp = (body: unknown, options: SendOptions = {}) => stepUpRoute.POST(send('POST', '/api/owner/step-up', body, options));
@@ -410,6 +432,7 @@ describe('route files', () => {
     ['onboarding/build', buildRoute],
     ['onboarding/confirm', confirmRoute],
     ['onboarding/submit', submitRoute],
+    ['onboarding/wallet', walletRoute],
     ['settings', settingsRoute],
     ['step-up', stepUpRoute],
     ['sessions', sessionsRoute],
@@ -799,7 +822,7 @@ describe('POST /api/owner/onboarding/build', () => {
     vi.mocked(buildCreateAccountTx).mockRejectedValueOnce(new MemoryError('ACCOUNT', `the owner already has a Walrus Memory account ${MARKER}`));
     const refused = await build({ step: 'memory_account' }, { cookie: owner.cookie });
     expect(refused.status).toBe(422);
-    expect(await refused.json()).toEqual({ error: 'chain_refused', message: 'Sui does not allow this step for your Walrus Memory account right now.' });
+    expect(await refused.json()).toEqual({ error: 'chain_refused', message: 'Sui refused this setup transaction. Nothing changed; try again in a minute.' });
     for (const failure of [new MemoryError('TIMEOUT', MARKER), new ChainError('UPSTREAM', MARKER, true)]) {
       vi.mocked(buildCreateAccountTx).mockRejectedValueOnce(failure);
       const unavailable = await build({ step: 'memory_account' }, { cookie: owner.cookie });
@@ -1047,7 +1070,7 @@ describe('POST /api/owner/onboarding/submit', () => {
     getAllowance.mockRejectedValueOnce(new ChainError('NOT_FOUND', 'stand-in not found'));
     expect(await relay()).toEqual([202, JSON.stringify({ digest })]);
     executeTransaction.mockResolvedValueOnce({ digest, status: 'failure', errorCode: 'INSUFFICIENT_ADDRESS_BALANCE', balanceChanges: [], createdObjects: [] });
-    expect(await relay()).toEqual([422, JSON.stringify({ error: 'chain_refused', message: 'Sui does not allow this step for your Walrus Memory account right now.' })]);
+    expect(await relay()).toEqual([422, JSON.stringify({ error: 'chain_refused', message: 'Sui refused this setup transaction. Nothing changed; try again in a minute.' })]);
     // These two codes mean the bytes never left.
     executeTransaction.mockRejectedValueOnce(new ChainError('INVALID_INPUT', 'a signature is not base64'));
     expect(await relay()).toEqual([400, JSON.stringify({ error: 'bad_transaction', message: 'the signature is not one Sui can read' })]);
@@ -1056,6 +1079,189 @@ describe('POST /api/owner/onboarding/submit', () => {
 
     expect(executeTransaction).toHaveBeenCalledTimes(5);
     expect(await accountRow(owner)).toEqual({ memwalAccountId: null, delegateRegisteredAt: null, allowanceId: null });
+  });
+});
+
+describe('GET /api/owner/onboarding/wallet', () => {
+  it("reads the session owner's own address, whatever the query names, and gives USDC and SUI split into address balance and coins as decimal strings", async () => {
+    const owner = await signedInOwner();
+    getWalletBalances.mockResolvedValue({ usdcAddressBalance: 2_830_000n, usdcCoinBalance: 9_007_199_254_740_993n, suiAddressBalance: 0n, suiCoinBalance: 51_000_000n });
+    const response = await walletRoute.GET(get(`/api/owner/onboarding/wallet?address=${address()}`, owner.cookie));
+    expect(await json(response)).toEqual({ usdcAddressAtomic: '2830000', usdcCoinAtomic: '9007199254740993', suiAddressMist: '0', suiCoinMist: '51000000' });
+    expect(response.headers.get('cache-control')).toBe('no-store');
+    expect(getWalletBalances.mock.calls).toEqual([[owner.address]]);
+    expect(getBalances).not.toHaveBeenCalled();
+  });
+
+  it("answers Tatum failing as 503 chain_unavailable and Ellai's own budget as 503 chain_unavailable_today, with fixed text", async () => {
+    quiet();
+    const owner = await signedInOwner();
+    getWalletBalances.mockRejectedValueOnce(new ChainError('TIMEOUT', MARKER, true));
+    const down = await wallet(owner.cookie);
+    expect([down.status, await down.text()]).toEqual([503, '{"error":"chain_unavailable","message":"Ellai could not read Sui just now. Try again in a minute."}']);
+    getWalletBalances.mockRejectedValueOnce(new ChainError('BUDGET', MARKER));
+    await refusedWith(await wallet(owner.cookie), 503, 'chain_unavailable_today');
+  });
+});
+
+/** A coin as listUsdcCoins and listSuiCoins give one, numbered so each is its own. */
+function ownedCoin(n: number, balance: bigint): OwnedCoin {
+  return { objectId: normalizeSuiAddress(`0x${n.toString(16)}`), version: BigInt(n), digest: toBase58(new Uint8Array(32).fill(n)), balance };
+}
+
+const MOVE_FACTS = { epoch: 900n, referenceGasPrice: 100n, nonce: 7 };
+
+/** The USDC move by hand, with one thing changed: what a tampered client would hand back to be relayed. */
+async function handBuiltMove(owner: Owner, coins: OwnedCoin[], change: { recipient?: string; coinType?: string } = {}): Promise<Uint8Array> {
+  const tx = new Transaction();
+  tx.setSender(owner.address);
+  const [first, ...rest] = [...coins]
+    .sort((a, b) => (a.objectId < b.objectId ? -1 : 1))
+    .map((coin) => tx.objectRef({ objectId: coin.objectId, version: String(coin.version), digest: coin.digest }));
+  if (first === undefined) throw new Error('a move needs a coin');
+  if (rest.length > 0) tx.mergeCoins(first, rest);
+  tx.moveCall({ target: '0x2::coin::send_funds', typeArguments: [change.coinType ?? USDC_TYPE_MAINNET], arguments: [first, tx.pure.address(change.recipient ?? owner.address)] });
+  tx.setGasOwner(owner.address);
+  tx.setGasPrice(MOVE_FACTS.referenceGasPrice);
+  tx.setGasBudget(LIMITS.usdcMoveGasBudgetMist);
+  tx.setGasPayment([]);
+  tx.setExpiration({ ValidDuring: { minEpoch: '900', maxEpoch: '901', minTimestamp: null, maxTimestamp: null, chain: '4btiuiMPvEENsttpZC7CZ53DruC3MAgfznDbASZ7DR6S', nonce: MOVE_FACTS.nonce } });
+  return tx.build();
+}
+
+describe('the USDC move through build and submit', () => {
+  const MINE = [ownedCoin(0x51, 1_500_000n), ownedCoin(0x52, 250_000n)];
+
+  it("builds the move from the coins Sui lists for the owner and relays exactly that, answering what moved and recording nothing", async () => {
+    clock = new Date(Date.UTC(2031, 4, 9, 10));
+    const owner = await signedInOwner();
+    listUsdcCoins.mockResolvedValue({ coins: MINE, more: false });
+    const built = await json<{ txBytesBase64: string; summary: unknown }>(await build({ step: 'usdc_to_address' }, { cookie: owner.cookie }));
+    expect(built.summary).toEqual([
+      { label: 'Action', value: 'Move your USDC into your address balance' },
+      { label: 'Amount', value: '1.750000 USDC' },
+      { label: 'From', value: '2 coins in your wallet' },
+      { label: 'To', value: `your address balance at ${owner.address}` },
+    ]);
+    const bytes = fromBase64(built.txBytesBase64);
+    const digest = TransactionDataBuilder.getDigestFromBytes(bytes);
+    executeTransaction.mockResolvedValue({ digest, status: 'success', errorCode: null, balanceChanges: [], createdObjects: [] });
+    const sent = await signedBy(owner.signer, bytes);
+
+    expect(await json(await submit({ step: 'usdc_to_address', ...sent }, { cookie: owner.cookie }))).toEqual({ recorded: { movedAtomic: '1750000' }, digest });
+    expect(executeTransaction.mock.calls).toEqual([[bytes, [sent.signature]]]);
+    expect(listUsdcCoins.mock.calls).toEqual([[owner.address], [owner.address]]);
+    expect(await accountRow(owner)).toEqual({ memwalAccountId: null, delegateRegisteredAt: null, allowanceId: null });
+    expect(await json(await onboarding(owner.cookie))).toMatchObject({ memoryAccount: 'missing', delegate: 'missing', allowance: 'missing' });
+  });
+
+  it("refuses another recipient, another coin type, a third party's coins and another sender with 400 bad_transaction, sending nothing (C6, C7)", async () => {
+    quiet();
+    clock = new Date(Date.UTC(2031, 4, 10, 10));
+    const owner = await signedInOwner();
+    const stranger = Ed25519Keypair.generate();
+    listUsdcCoins.mockResolvedValue({ coins: MINE, more: false });
+    const control = await buildUsdcToAddress({ owner: owner.address, coins: MINE }, MOVE_FACTS);
+    expect(await handBuiltMove(owner, MINE)).toEqual(control);
+    const theirs = [ownedCoin(0x61, 1_500_000n), ownedCoin(0x62, 250_000n)];
+    const cases: Array<[Uint8Array, Signer, string]> = [
+      [await handBuiltMove(owner, MINE, { recipient: normalizeSuiAddress(stranger.toSuiAddress()) }), owner.signer, NOT_THIS_STEP],
+      [await handBuiltMove(owner, MINE, { coinType: '0x2::sui::SUI' }), owner.signer, NOT_THIS_STEP],
+      [await buildUsdcToAddress({ owner: owner.address, coins: theirs }, MOVE_FACTS), owner.signer, NOT_THIS_STEP],
+      [await buildUsdcToAddress({ owner: owner.address, coins: [...MINE, ...theirs] }, MOVE_FACTS), owner.signer, NOT_THIS_STEP],
+      [await buildUsdcToAddress({ owner: normalizeSuiAddress(stranger.toSuiAddress()), coins: MINE }, MOVE_FACTS), stranger, 'the transaction is not sent from your own address'],
+      [await allowanceBytes(owner), owner.signer, NOT_THIS_STEP],
+    ];
+    for (const [bytes, signer, message] of cases) {
+      const response = await submit({ step: 'usdc_to_address', ...(await signedBy(signer, bytes)) }, { cookie: owner.cookie });
+      expect([response.status, await response.json()]).toEqual([400, { error: 'bad_transaction', message }]);
+    }
+    // The move's bytes are not any of the three steps either.
+    await refusedWith(await submit({ step: 'allowance', ...(await signedBy(owner.signer, control)) }, { cookie: owner.cookie }), 400, 'bad_transaction');
+    await refusedWith(await confirm({ step: 'usdc_to_address', digest: DIGEST }, { cookie: owner.cookie }), 400, 'bad_body');
+    expect(executeTransaction).not.toHaveBeenCalled();
+  });
+
+  it('answers 409 nothing_to_move when the owner holds no USDC coins, at build and at submit, and 409 not_enough_sui when no SUI covers the fee', async () => {
+    quiet();
+    clock = new Date(Date.UTC(2031, 4, 11, 10));
+    const owner = await signedInOwner();
+    const nothing = await build({ step: 'usdc_to_address' }, { cookie: owner.cookie });
+    expect([nothing.status, await nothing.json()]).toEqual([409, { error: 'nothing_to_move', message: 'Your wallet holds no USDC coins to move. Any USDC it has is already in its address balance.' }]);
+    expect(getWalletBalances).not.toHaveBeenCalled();
+    const signed = await signedBy(owner.signer, await buildUsdcToAddress({ owner: owner.address, coins: MINE }, MOVE_FACTS));
+    await refusedWith(await submit({ step: 'usdc_to_address', ...signed }, { cookie: owner.cookie }), 409, 'nothing_to_move');
+
+    listUsdcCoins.mockResolvedValue({ coins: MINE, more: false });
+    getWalletBalances.mockResolvedValue({ usdcAddressBalance: 0n, usdcCoinBalance: 1_750_000n, suiAddressBalance: BigInt(LIMITS.usdcMoveGasBudgetMist) - 1n, suiCoinBalance: 1n });
+    listSuiCoins.mockResolvedValue({ coins: [ownedCoin(0x71, 1n)], more: false });
+    const poor = await build({ step: 'usdc_to_address' }, { cookie: owner.cookie });
+    expect([poor.status, await poor.json()]).toEqual([409, { error: 'not_enough_sui', message: "Your wallet needs a little SUI to pay this transaction's fee." }]);
+    expect(executeTransaction).not.toHaveBeenCalled();
+  });
+
+  it('answers 202 with the digest when the outcome is unknown and 422 chain_refused with the step-neutral text on a definite refusal', async () => {
+    quiet();
+    clock = new Date(Date.UTC(2031, 4, 12, 10));
+    const owner = await signedInOwner();
+    listUsdcCoins.mockResolvedValue({ coins: MINE, more: false });
+    const bytes = await buildUsdcToAddress({ owner: owner.address, coins: MINE }, MOVE_FACTS);
+    const digest = TransactionDataBuilder.getDigestFromBytes(bytes);
+    const sent = await signedBy(owner.signer, bytes);
+    executeTransaction.mockRejectedValueOnce(new ChainError('TIMEOUT', `transaction ${digest} may have landed ${MARKER}`, true));
+    const unknown = await submit({ step: 'usdc_to_address', ...sent }, { cookie: owner.cookie });
+    expect([unknown.status, await unknown.text()]).toEqual([202, JSON.stringify({ digest })]);
+    executeTransaction.mockResolvedValueOnce({ digest, status: 'failure', errorCode: 'INSUFFICIENT_ADDRESS_BALANCE', balanceChanges: [], createdObjects: [] });
+    const refused = await submit({ step: 'usdc_to_address', ...sent }, { cookie: owner.cookie });
+    expect([refused.status, await refused.json()]).toEqual([422, { error: 'chain_refused', message: 'Sui refused this setup transaction. Nothing changed; try again in a minute.' }]);
+  });
+});
+
+describe('a fee paid with the owner SUI coins', () => {
+  const GAS = [ownedCoin(0x81, 30_000_000n), ownedCoin(0x82, 40_000_000n)];
+  const budget = BigInt(LIMITS.issueGasBudgetMist);
+
+  it("is built when the SUI address balance falls short and relayed only while Sui still shows those coins as the owner's own", async () => {
+    quiet();
+    clock = new Date(Date.UTC(2031, 4, 13, 10));
+    const owner = await signedInOwner();
+    getWalletBalances.mockResolvedValue({ usdcAddressBalance: 2_000_000n, usdcCoinBalance: 0n, suiAddressBalance: budget - 1n, suiCoinBalance: 70_000_000n });
+    listSuiCoins.mockResolvedValue({ coins: GAS, more: false });
+    const built = await json<{ txBytesBase64: string }>(
+      await build({ step: 'allowance', allowance: { dailyLimitAtomic: '500000', lifetimeCapAtomic: '1000000', days: 30 } }, { cookie: owner.cookie }),
+    );
+    const bytes = fromBase64(built.txBytesBase64);
+    const data = Transaction.from(bytes).getData();
+    expect(data.gasData.payment?.map((coin) => coin.objectId)).toEqual([GAS[1]?.objectId, GAS[0]?.objectId]);
+    expect(data.expiration).toEqual({ $kind: 'None', None: true });
+    const sent = await signedBy(owner.signer, bytes);
+
+    // One gas coin was spent since the build, so it is no longer the coin the bytes name.
+    listSuiCoins.mockResolvedValue({ coins: [GAS[0] as OwnedCoin, { ...(GAS[1] as OwnedCoin), version: 99n }], more: false });
+    const stale = await submit({ step: 'allowance', ...sent }, { cookie: owner.cookie });
+    expect([stale.status, await stale.json()]).toEqual([400, { error: 'bad_transaction', message: 'the SUI coins it pays its fee with are not yours as Sui shows them now; build it again' }]);
+    expect(executeTransaction).not.toHaveBeenCalled();
+
+    listSuiCoins.mockResolvedValue({ coins: GAS, more: false });
+    const allowanceId = address();
+    executeTransaction.mockResolvedValue({ digest: TransactionDataBuilder.getDigestFromBytes(bytes), status: 'success', errorCode: null, balanceChanges: [], createdObjects: [{ objectId: allowanceId, type: ALLOWANCE_TYPE }] });
+    getAllowance.mockResolvedValue(allowanceOnChain(owner, await purseOf(owner)));
+    expect(await json(await submit({ step: 'allowance', ...sent }, { cookie: owner.cookie }))).toMatchObject({ recorded: allowanceId });
+    expect(executeTransaction).toHaveBeenCalledTimes(1);
+  });
+
+  it("refuses a move paid with someone else's SUI coin before sending it", async () => {
+    quiet();
+    clock = new Date(Date.UTC(2031, 4, 14, 10));
+    const owner = await signedInOwner();
+    const mine = [ownedCoin(0x91, 1_000_000n)];
+    listUsdcCoins.mockResolvedValue({ coins: mine, more: false });
+    listSuiCoins.mockResolvedValue({ coins: GAS, more: false });
+    const theirGas = [ownedCoin(0x99, budget)];
+    const bytes = await buildUsdcToAddress({ owner: owner.address, coins: mine }, { referenceGasPrice: 100n, gasCoins: theirGas });
+    await refusedWith(await submit({ step: 'usdc_to_address', ...(await signedBy(owner.signer, bytes)) }, { cookie: owner.cookie }), 400, 'bad_transaction');
+    expect(listSuiCoins.mock.calls).toEqual([[owner.address]]);
+    expect(executeTransaction).not.toHaveBeenCalled();
   });
 });
 
@@ -1236,6 +1442,7 @@ describe('the session and origin requirements', () => {
     ['onboarding confirm', (cookie) => confirm({ step: 'memory_account', digest: DIGEST }, cookie === undefined ? {} : { cookie })],
     ['onboarding confirm existing', (cookie) => confirm({ step: 'memory_account', existing: true }, cookie === undefined ? {} : { cookie })],
     ['onboarding submit', (cookie) => submit({ step: 'allowance', txBytesBase64: 'AA==', signature: 'AA==' }, cookie === undefined ? {} : { cookie })],
+    ['onboarding wallet', (cookie) => wallet(cookie)],
     ['settings read', (cookie) => getSettings(cookie)],
     ['settings', (cookie) => patchSettings({ paused: true }, cookie === undefined ? {} : { cookie })],
     ['settings public proof', (cookie) => patchSettings({ publicProof: true }, cookie === undefined ? {} : { cookie })],
@@ -1256,6 +1463,7 @@ describe('the session and origin requirements', () => {
     expect(vi.mocked(confirmOnboardingTx)).not.toHaveBeenCalled();
     expect(vi.mocked(submitOnboardingTx)).not.toHaveBeenCalled();
     expect(vi.mocked(findMemoryAccount)).not.toHaveBeenCalled();
+    expect(getWalletBalances).not.toHaveBeenCalled();
   });
 
   const changing: Array<[string, (options: SendOptions, agentId: string) => Promise<Response>]> = [
@@ -1265,6 +1473,8 @@ describe('the session and origin requirements', () => {
     ['onboarding confirm', (options) => confirm({ step: 'memory_account', digest: DIGEST }, options)],
     ['onboarding confirm existing', (options) => confirm({ step: 'memory_account', existing: true }, options)],
     ['onboarding submit', (options) => submit({ step: 'allowance', txBytesBase64: 'AA==', signature: 'AA==' }, options)],
+    ['onboarding move build', (options) => build({ step: 'usdc_to_address' }, options)],
+    ['onboarding move submit', (options) => submit({ step: 'usdc_to_address', txBytesBase64: 'AA==', signature: 'AA==' }, options)],
     ['settings', (options) => patchSettings({ paused: true }, options)],
     ['settings public proof', (options) => patchSettings({ publicProof: true }, options)],
     ['step-up', (options) => askStepUp({ action: 'create_agent', change: { label: 'From elsewhere' } }, options)],
@@ -1292,7 +1502,7 @@ describe('the session and origin requirements', () => {
 });
 
 describe('error answers', () => {
-  const ROUTES = ['decisions', 'memories', 'agents', 'agents/[id]', 'onboarding', 'onboarding/build', 'onboarding/confirm', 'onboarding/submit', 'settings', 'step-up', 'overview', 'sessions'];
+  const ROUTES = ['decisions', 'memories', 'agents', 'agents/[id]', 'onboarding', 'onboarding/build', 'onboarding/confirm', 'onboarding/submit', 'onboarding/wallet', 'settings', 'step-up', 'overview', 'sessions'];
 
   it('come from the one table in errors.ts: no owner route, nor the helpers they share, writes an error body by hand', async () => {
     const files = [...ROUTES.map((route) => `../src/app/api/owner/${route}/route.ts`), '../src/server/http/owner-limits.ts'];
@@ -1397,7 +1607,7 @@ describe('the limits on routes that read Sui', () => {
     chainOwner = owner.address;
     vi.mocked(findMemoryAccount).mockResolvedValue({ accountId: address(), delegates: [] });
     vi.mocked(buildAddDelegateTx).mockResolvedValue(ACCOUNT_BYTES);
-    expect(BUILD_CHAIN_CALLS).toEqual({ memory_account: 5, add_delegate: 7, allowance: 2 });
+    expect(BUILD_CHAIN_CALLS).toEqual({ memory_account: 5, add_delegate: 7, allowance: 3, usdc_to_address: 4 });
     expect(CONFIRM_CHAIN_CALLS).toEqual({ memory_account: 5, add_delegate: 5, allowance: 3 });
 
     // 26 confirms are 130 calls; 10 delegate builds a minute later bring the day to exactly 200.
@@ -1408,28 +1618,32 @@ describe('the limits on routes that read Sui', () => {
     expect([refused.status, ((await refused.json()) as { error: string }).error]).toEqual([429, 'rate_limited_today']);
   });
 
-  it("counts a confirm with no digest at 3 calls and a submit at its step's calls, before anything is sent (C22)", async () => {
+  it("counts a confirm with no digest at 3 calls, a submit at its step's calls and a wallet read at 1, before anything is sent (C22)", async () => {
     quiet();
     clock = new Date(Date.UTC(2031, 4, 8, 10));
     const owner = await signedInOwner();
     vi.mocked(findMemoryAccount).mockResolvedValue({ accountId: address(), delegates: [] });
     expect(CONFIRM_EXISTING_CHAIN_CALLS).toEqual({ memory_account: 3, add_delegate: 3 });
-    expect(SUBMIT_CHAIN_CALLS).toEqual({ memory_account: 9, add_delegate: 11, allowance: 2 });
+    expect(SUBMIT_CHAIN_CALLS).toEqual({ memory_account: 9, add_delegate: 11, allowance: 3, usdc_to_address: 3 });
+    expect(WALLET_CHAIN_CALLS).toBe(1);
     const bytes = await allowanceBytes(owner);
     const sent = await signedBy(owner.signer, bytes);
     const digest = TransactionDataBuilder.getDigestFromBytes(bytes);
     executeTransaction.mockResolvedValue({ digest, status: 'success', errorCode: null, balanceChanges: [], createdObjects: [{ objectId: address(), type: ALLOWANCE_TYPE }] });
     getAllowance.mockResolvedValue(allowanceOnChain(owner, await purseOf(owner)));
 
-    // 60 existing confirms over two minutes are 180 calls; 10 allowance submits bring the day to exactly 200.
+    // 60 existing confirms over two minutes are 180 calls; 6 allowance submits make 198 and 2 wallet reads exactly 200.
     for (let n = 0; n < 2; n += 1) {
       for (let i = 0; i < 30; i += 1) expect((await confirm({ step: 'memory_account', existing: true }, { cookie: owner.cookie })).status).toBe(200);
       clock = new Date(clock.getTime() + 60_000);
     }
-    for (let i = 0; i < 10; i += 1) expect((await submit({ step: 'allowance', ...sent }, { cookie: owner.cookie })).status).toBe(200);
-    const refused = await submit({ step: 'allowance', ...sent }, { cookie: owner.cookie });
-    expect([refused.status, ((await refused.json()) as { error: string }).error]).toEqual([429, 'rate_limited_today']);
-    expect(executeTransaction).toHaveBeenCalledTimes(10);
+    for (let i = 0; i < 6; i += 1) expect((await submit({ step: 'allowance', ...sent }, { cookie: owner.cookie })).status).toBe(200);
+    for (let i = 0; i < 2; i += 1) expect((await wallet(owner.cookie)).status).toBe(200);
+    for (const refused of [await submit({ step: 'allowance', ...sent }, { cookie: owner.cookie }), await wallet(owner.cookie)]) {
+      expect([refused.status, ((await refused.json()) as { error: string }).error]).toEqual([429, 'rate_limited_today']);
+    }
+    expect(executeTransaction).toHaveBeenCalledTimes(6);
+    expect(getWalletBalances).toHaveBeenCalledTimes(2);
   });
 
   const fromClient = (client: string) => new Request(`${APP_ORIGIN}/api/owner/onboarding/confirm`, { headers: { 'x-forwarded-for': client } });

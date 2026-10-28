@@ -203,7 +203,7 @@ describe('the one table of HTTP error codes', () => {
     [429, 'too_many_requests', 'Too many requests. Try again in a minute.'],
     [429, 'rate_limited_today', 'Too many requests today. Try again tomorrow (days are counted in UTC).'],
     [429, 'too_many_agent_creates', 'Too many agent keys were made this hour. Try again later.'],
-    [422, 'chain_refused', 'Sui does not allow this step for your Walrus Memory account right now.'],
+    [422, 'chain_refused', 'Sui refused this setup transaction. Nothing changed; try again in a minute.'],
     [503, 'chain_unavailable', 'Ellai could not read Sui just now. Try again in a minute.'],
     [503, 'chain_unavailable_today', "Ellai has used today's budget for reading Sui. Try again tomorrow (days are counted in UTC)."],
   ] as const)('answers %s %s with its fixed text, the same whether thrown or returned', async (status, code, message) => {

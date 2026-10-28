@@ -91,6 +91,23 @@ export const LIMITS = {
   refillGasBudgetMist: 20_000_000,
   /** Gas budget the owner signs for when issuing an allowance, which creates two objects: 0.05 SUI. */
   issueGasBudgetMist: 50_000_000,
+  /**
+   * Coins of one type a listing of an owner's coins returns, and so the most USDC coins one move into
+   * the address balance takes and the most SUI coins one owner transaction names as gas. Each is an
+   * owned object reference of about 75 bytes, so 50 of each come to about 7.5 KB, far inside
+   * onboardingSubmitTxMaxBytes, Sui's 2,048 input objects and its 256 gas coins a transaction, and
+   * gas grows with every coin loaded. An owner holding more USDC coins signs the move again.
+   */
+  ownedCoinsMax: 50,
+  /** Pages one listing of an owner's coins reads, each asking for ownedCoinsMax, since the service may answer with fewer a page. */
+  ownedCoinsMaxPages: 3,
+  /**
+   * Gas budget the owner signs for when moving USDC coins into the address balance: 0.05 SUI, the
+   * allowance step's own budget, so an owner who can pay for one can pay for the other. A one-coin
+   * move simulated on mainnet on 2026-10-28 charged about 0.0011 SUI and returned 0.0023 SUI of
+   * storage; a move of ownedCoinsMax coins has not been measured.
+   */
+  usdcMoveGasBudgetMist: 50_000_000,
   /** Highest gas price Ellai builds with, in MIST per unit. Mainnet's reference price was 100 on 2026-10-20. */
   maxGasPriceMist: 1_000,
   /** Settlement reads for one payment before it is reported unsettled. */

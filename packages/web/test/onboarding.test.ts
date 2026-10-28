@@ -8,18 +8,22 @@
 // account, takes owner, purse and account from the owner row, reads what Sui shows before an
 // account step, and its summaries hold only validated values. confirmExistingStep takes account
 // steps only, needs the account before the key, and refuses Ellai's key on another account and a
-// frozen account. onboardingState follows the row.
+// frozen account. onboardingState follows the row. Every fee is paid from the owner's SUI address
+// balance when it covers the budget, otherwise with the fewest of the owner's SUI coins that do, and
+// NOT_ENOUGH_SUI when neither does. The USDC move builds from the coins Sui lists for the owner with
+// its exact summary, NOTHING_TO_MOVE coming before any gas read; ownerWallet reads the owner's own
+// address and splits USDC and SUI.
 // Does NOT cover: the live chain (proven read only by `npm run prove:onboarding`), core's own
 // registry and account reads (core's memory tests), or a real wallet signing the built bytes.
 import { randomBytes } from 'node:crypto';
-import type { AllowanceState, Chain } from '@ellai/core/chain';
+import type { AllowanceState, Chain, OwnedCoin, WalletBalances } from '@ellai/core/chain';
 import { ChainError } from '@ellai/core/chain';
 import { LIMITS } from '@ellai/core/limits';
 import { buildAddDelegateTx, buildCreateAccountTx, findMemoryAccount, MemoryError } from '@ellai/core/memory';
 import { USDC_TYPE_MAINNET } from '@ellai/core/usdc';
 import { GrpcTypes } from '@mysten/sui/grpc';
 import { Transaction } from '@mysten/sui/transactions';
-import { fromBase64, normalizeStructTag, toHex } from '@mysten/sui/utils';
+import { fromBase64, normalizeStructTag, toBase58, toHex } from '@mysten/sui/utils';
 import { eq } from 'drizzle-orm';
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { type Database, createDb, migrate } from '../src/server/db/client.js';
@@ -27,7 +31,8 @@ import { owners } from '../src/server/db/schema.js';
 import { ownerDelegate } from '../src/server/memory/delegate.js';
 import { buildOnboardingTx } from '../src/server/onboarding/build.js';
 import { confirmExistingStep, confirmOnboardingTx } from '../src/server/onboarding/confirm.js';
-import { type OnboardingStep, OnboardingError, onboardingState } from '../src/server/onboarding/state.js';
+import { fewestCovering, ownerWallet } from '../src/server/onboarding/funds.js';
+import { type BuildStep, type OnboardingStep, OnboardingError, onboardingState } from '../src/server/onboarding/state.js';
 
 const DAY_MS = 86_400_000;
 
@@ -102,6 +107,14 @@ interface ChainSetup {
   landed?: boolean;
   created?: Array<{ objectId: string; type: string }>;
   allowance?: Partial<AllowanceState>;
+  wallet?: Partial<WalletBalances>;
+  suiCoins?: OwnedCoin[];
+  usdcCoins?: OwnedCoin[];
+}
+
+/** A coin as listUsdcCoins and listSuiCoins give it, numbered so each is its own. */
+function ownedCoin(n: number, balance: bigint): OwnedCoin {
+  return { objectId: `0x${n.toString(16).padStart(64, '0')}`, version: BigInt(n), digest: toBase58(new Uint8Array(32).fill(n)), balance };
 }
 
 /** A chain that answers only the reads confirm and build make. Anything else fails the test. */
@@ -127,15 +140,22 @@ function stubChain(owner: Owner, setup: ChainSetup = {}) {
     },
   }));
   const getAllowance = vi.fn(async () => ({ ...goodAllowance(owner), ...setup.allowance }));
+  // One SUI in the address balance unless a test says otherwise, so a fee is paid from it.
+  const getWalletBalances = vi.fn(async () => ({ usdcAddressBalance: 0n, usdcCoinBalance: 0n, suiAddressBalance: 1_000_000_000n, suiCoinBalance: 0n, ...setup.wallet }));
+  const listSuiCoins = vi.fn(async () => ({ coins: setup.suiCoins ?? [], more: false }));
+  const listUsdcCoins = vi.fn(async () => ({ coins: setup.usdcCoins ?? [], more: false }));
   const chain = {
     usesApiKey: true,
     getTransactionResult,
     getAllowance,
+    getWalletBalances,
+    listSuiCoins,
+    listUsdcCoins,
     getCurrentEpoch: async () => 900n,
     getReferenceGasPrice: async () => 100n,
     grpc: { ledgerService: { getTransaction } },
   } as unknown as Chain;
-  return { chain, getTransactionResult, getTransaction, getAllowance };
+  return { chain, getTransactionResult, getTransaction, getAllowance, getWalletBalances, listSuiCoins, listUsdcCoins };
 }
 
 const untouchable = new Proxy({}, {
@@ -324,7 +344,7 @@ describe('confirmExistingStep', () => {
 });
 
 describe('buildOnboardingTx', () => {
-  const build = (owner: Owner, step: OnboardingStep, chain: Chain, allowance?: unknown) =>
+  const build = (owner: Owner, step: BuildStep, chain: Chain, allowance?: unknown) =>
     buildOnboardingTx({ db, ownerId: owner.id, step, allowance: allowance as never, chain, masterSecretHex: MASTER, now: NOW });
 
   it('refuses allowance terms outside the maxima before touching the chain', async () => {
@@ -414,5 +434,100 @@ describe('buildOnboardingTx', () => {
       [marker, owner.suiAddress],
       [marker, owner.suiAddress],
     ]);
+  });
+});
+
+describe('the fee on a setup transaction', () => {
+  const TERMS = { dailyLimitAtomic: 500_000n, lifetimeCapAtomic: 1_000_000n, days: 30 };
+  const buildAllowance = (owner: Owner, chain: Chain) =>
+    buildOnboardingTx({ db, ownerId: owner.id, step: 'allowance', allowance: TERMS, chain, masterSecretHex: MASTER, now: NOW });
+  const budget = BigInt(LIMITS.issueGasBudgetMist);
+
+  it("is paid from the owner's SUI address balance when it covers the budget, valid this epoch and the next", async () => {
+    const owner = await newOwner();
+    const stub = stubChain(owner, { wallet: { suiAddressBalance: budget }, suiCoins: [ownedCoin(1, budget * 10n)] });
+    const data = Transaction.from(fromBase64((await buildAllowance(owner, stub.chain)).txBytesBase64)).getData();
+    expect(data.gasData.payment).toEqual([]);
+    expect(data.expiration).toMatchObject({ $kind: 'ValidDuring', ValidDuring: { minEpoch: '900', maxEpoch: '901' } });
+    expect(stub.getWalletBalances.mock.calls).toEqual([[owner.suiAddress]]);
+    expect(stub.listSuiCoins).not.toHaveBeenCalled();
+  });
+
+  it("is paid with the fewest of the owner's SUI coins that cover it when the address balance falls short, with no expiration", async () => {
+    const owner = await newOwner();
+    const coins = [ownedCoin(1, budget / 4n), ownedCoin(2, budget / 2n), ownedCoin(3, budget / 2n + 1n), ownedCoin(4, 7n)];
+    const stub = stubChain(owner, { wallet: { suiAddressBalance: budget - 1n }, suiCoins: coins });
+    const data = Transaction.from(fromBase64((await buildAllowance(owner, stub.chain)).txBytesBase64)).getData();
+    expect(data.gasData.payment?.map((ref) => ref.objectId)).toEqual([coins[2]?.objectId, coins[1]?.objectId]);
+    expect(data.gasData.owner).toBe(owner.suiAddress);
+    expect(data.expiration).toEqual({ $kind: 'None', None: true });
+    expect(stub.listSuiCoins.mock.calls).toEqual([[owner.suiAddress]]);
+  });
+
+  it('is refused NOT_ENOUGH_SUI when neither the address balance nor all the coins cover it', async () => {
+    const owner = await newOwner();
+    const stub = stubChain(owner, { wallet: { suiAddressBalance: budget - 1n }, suiCoins: [ownedCoin(1, budget / 2n), ownedCoin(2, budget / 2n - 1n)] });
+    const refused = await refusal(buildAllowance(owner, stub.chain));
+    expect([refused.code, refused.message]).toEqual(['NOT_ENOUGH_SUI', "Your wallet needs a little SUI to pay this transaction's fee."]);
+  });
+
+  it('takes the largest coins first, ties by object id, and nothing when they fall short', () => {
+    const [small, big, tieLow, tieHigh] = [ownedCoin(1, 1n), ownedCoin(2, 9n), ownedCoin(3, 5n), ownedCoin(4, 5n)];
+    if (!small || !big || !tieLow || !tieHigh) throw new Error('expected four coins');
+    const ids = (picked: ReturnType<typeof fewestCovering>) => picked?.map((coin) => coin.objectId) ?? null;
+    expect(ids(fewestCovering([small, tieHigh, big, tieLow], 9n))).toEqual([big.objectId]);
+    expect(ids(fewestCovering([small, tieHigh, big, tieLow], 14n))).toEqual([big.objectId, tieLow.objectId]);
+    expect(ids(fewestCovering([small, tieHigh, big, tieLow], 21n))).toBeNull();
+    expect(ids(fewestCovering([], 1n))).toBeNull();
+  });
+});
+
+describe('the USDC move', () => {
+  const buildMove = (owner: Owner, chain: Chain) => buildOnboardingTx({ db, ownerId: owner.id, step: 'usdc_to_address', chain, masterSecretHex: MASTER, now: NOW });
+
+  it("moves every USDC coin Sui lists for the owner into the owner's own address balance, and says so in plain words", async () => {
+    const owner = await newOwner();
+    const coins = [ownedCoin(9, 1_500_000n), ownedCoin(5, 250_000n)];
+    const stub = stubChain(owner, { usdcCoins: coins });
+    const built = await buildMove(owner, stub.chain);
+    const data = Transaction.from(fromBase64(built.txBytesBase64)).getData();
+    expect(data.sender).toBe(owner.suiAddress);
+    expect(data.commands.map((command) => command.$kind)).toEqual(['MergeCoins', 'MoveCall']);
+    expect(data.commands[1]?.MoveCall).toMatchObject({ module: 'coin', function: 'send_funds', typeArguments: [USDC_TYPE_MAINNET] });
+    expect(data.inputs.flatMap((input) => (input.Object?.ImmOrOwnedObject ? [input.Object.ImmOrOwnedObject.objectId] : []))).toEqual([coins[1]?.objectId, coins[0]?.objectId]);
+    expect(built.summary).toEqual([
+      { label: 'Action', value: 'Move your USDC into your address balance' },
+      { label: 'Amount', value: '1.750000 USDC' },
+      { label: 'From', value: '2 coins in your wallet' },
+      { label: 'To', value: `your address balance at ${owner.suiAddress}` },
+    ]);
+    expect(stub.listUsdcCoins.mock.calls).toEqual([[owner.suiAddress]]);
+    const one = await buildMove(owner, stubChain(owner, { usdcCoins: [ownedCoin(3, 10_000n)] }).chain);
+    expect(one.summary[2]).toEqual({ label: 'From', value: '1 coin in your wallet' });
+  });
+
+  it('answers NOTHING_TO_MOVE for an owner with no USDC coins, or only empty ones, before reading anything about gas', async () => {
+    const owner = await newOwner();
+    for (const usdcCoins of [[], [ownedCoin(2, 0n)]]) {
+      const stub = stubChain(owner, { usdcCoins });
+      const refused = await refusal(buildMove(owner, stub.chain));
+      expect([refused.code, refused.message]).toEqual(['NOTHING_TO_MOVE', 'Your wallet holds no USDC coins to move. Any USDC it has is already in its address balance.']);
+      expect(stub.getWalletBalances).not.toHaveBeenCalled();
+    }
+  });
+});
+
+describe('ownerWallet', () => {
+  it("reads the owner's own address and gives USDC and SUI each split into address balance and coins, as decimal strings", async () => {
+    const owner = await newOwner();
+    const stub = stubChain(owner, { wallet: { usdcAddressBalance: 2_830_000n, usdcCoinBalance: 9_007_199_254_740_993n, suiAddressBalance: 0n, suiCoinBalance: 51_000_000n } });
+    expect(await ownerWallet({ db, ownerId: owner.id, chain: stub.chain })).toEqual({
+      usdcAddressAtomic: '2830000',
+      usdcCoinAtomic: '9007199254740993',
+      suiAddressMist: '0',
+      suiCoinMist: '51000000',
+    });
+    expect(stub.getWalletBalances.mock.calls).toEqual([[owner.suiAddress]]);
+    expect((await refusal(ownerWallet({ db, ownerId: '00000000-0000-4000-8000-000000000000', chain: untouchable }))).code).toBe('NO_OWNER');
   });
 });

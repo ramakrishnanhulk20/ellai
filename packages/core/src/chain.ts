@@ -26,6 +26,10 @@ const TATUM_GRAPHQL_URL = 'https://sui-mainnet.gateway.tatum.io/graphql';
 const API_KEY_HEADER = 'x-api-key';
 
 const SUI_TYPE = normalizeStructTag(SUI_TYPE_ARG);
+const USDC_COIN_TYPE = normalizeStructTag(`0x2::coin::Coin<${USDC_TYPE_MAINNET}>`);
+const SUI_COIN_TYPE = normalizeStructTag(`0x2::coin::Coin<${SUI_TYPE}>`);
+// Everything a transaction needs to name an owned coin, plus what the move summary shows.
+const COIN_PATHS = ['object_id', 'version', 'digest', 'object_type', 'owner', 'balance'];
 
 /** The Walrus system package's Blob type. Each Walrus Memory write leaves one of these at the owner's address. */
 export const WALRUS_BLOB_TYPE = normalizeStructTag(
@@ -46,7 +50,7 @@ const WALRUS_STATE_NAME = /^SystemStateInnerV[0-9]+$/;
 
 const { ExecutionError_ExecutionErrorKind: ExecutionErrorKind, SimulateTransactionRequest_TransactionChecks: SimulationChecks } =
   GrpcTypes;
-const { ChangedObject_IdOperation: IdOperation } = GrpcTypes;
+const { ChangedObject_IdOperation: IdOperation, Owner_OwnerKind: OwnerKind } = GrpcTypes;
 
 const FRAMEWORK_ADDRESS = normalizeSuiAddress('0x2');
 
@@ -133,6 +137,34 @@ export interface Balances {
   usdcCoinBalance: bigint;
   /** All SUI at the address, address balance and coins together. */
   suiTotal: bigint;
+}
+
+/** getBalances with SUI split into its two parts as well, from the same single read. */
+export interface WalletBalances {
+  usdcAddressBalance: bigint;
+  usdcCoinBalance: bigint;
+  /** SUI in the address balance, which pays gas only when it covers the whole budget. */
+  suiAddressBalance: bigint;
+  /** SUI held as Coin objects at the address. */
+  suiCoinBalance: bigint;
+}
+
+/** One Coin object an address owns, as a transaction must name it. */
+export interface OwnedCoin {
+  objectId: string;
+  /** Sui refuses a transaction that names any version but the coin's current one. */
+  version: bigint;
+  /** The coin's current object digest, base58. */
+  digest: string;
+  /** Atomic units of the coin's type it holds. */
+  balance: bigint;
+}
+
+export interface CoinListing {
+  /** At most LIMITS.ownedCoinsMax coins, in the order the gateway lists them. */
+  coins: OwnedCoin[];
+  /** True when the address may own coins of this type beyond these. */
+  more: boolean;
 }
 
 export interface BalanceChange {
@@ -248,6 +280,14 @@ export interface Chain {
   readonly graphql: SuiGraphQLClient;
   getReferenceGasPrice(): Promise<bigint>;
   getBalances(address: string): Promise<Balances>;
+  getWalletBalances(address: string): Promise<WalletBalances>;
+  /**
+   * The address's Sui Mainnet USDC Coin objects, the ones a move into its address balance takes:
+   * at most LIMITS.ownedCoinsMax, read in at most LIMITS.ownedCoinsMaxPages pages.
+   */
+  listUsdcCoins(address: string): Promise<CoinListing>;
+  /** The address's SUI Coin objects, the ones it can pay gas with, bounded as listUsdcCoins is. */
+  listSuiCoins(address: string): Promise<CoinListing>;
   getTransactionBalanceChanges(digest: string): Promise<BalanceChange[]>;
   getTransactionResult(digest: string): Promise<TransactionResult>;
   getCurrentEpoch(): Promise<bigint>;
@@ -815,14 +855,15 @@ export function createChain(opts: { apiKey?: string; beforeRequest?: BeforeTatum
     return price;
   }
 
-  async function getBalances(address: string): Promise<Balances> {
+  /** One ListBalances read, paged, with USDC and SUI each split into its address and coin parts. */
+  async function readBalances(operation: string, address: string): Promise<WalletBalances> {
     const owner = inputAddress(address);
     let usdc: { address: bigint; coin: bigint } | undefined;
-    let sui: bigint | undefined;
+    let sui: { address: bigint; coin: bigint } | undefined;
     let pageToken: Uint8Array | undefined;
 
     for (let page = 0; page < LIMITS.balanceMaxPages; page++) {
-      const { response } = await bounded('getBalances', (abort) =>
+      const { response } = await bounded(operation, (abort) =>
         grpc.stateService.listBalances({ owner, pageSize: LIMITS.balancePageSize, pageToken }, { abort }),
       );
       if (response.balances.length > LIMITS.balancePageSize) throw badResponse('more balances than the page size');
@@ -848,17 +889,93 @@ export function createChain(opts: { apiKey?: string; beforeRequest?: BeforeTatum
           if (usdc) throw badResponse('USDC listed twice');
           usdc = { address: inAddress, coin: inCoins };
         } else {
-          if (sui !== undefined) throw badResponse('SUI listed twice');
-          sui = total;
+          if (sui) throw badResponse('SUI listed twice');
+          sui = { address: inAddress, coin: inCoins };
         }
       }
 
       pageToken = response.nextPageToken?.length ? response.nextPageToken : undefined;
-      if (!pageToken || (usdc && sui !== undefined)) {
-        return { usdcAddressBalance: usdc?.address ?? 0n, usdcCoinBalance: usdc?.coin ?? 0n, suiTotal: sui ?? 0n };
+      if (!pageToken || (usdc && sui)) {
+        return {
+          usdcAddressBalance: usdc?.address ?? 0n,
+          usdcCoinBalance: usdc?.coin ?? 0n,
+          suiAddressBalance: sui?.address ?? 0n,
+          suiCoinBalance: sui?.coin ?? 0n,
+        };
       }
     }
-    throw new ChainError('LIMIT_EXCEEDED', `Tatum getBalances: more than ${LIMITS.balanceMaxPages} pages of coin types`);
+    throw new ChainError('LIMIT_EXCEEDED', `Tatum ${operation}: more than ${LIMITS.balanceMaxPages} pages of coin types`);
+  }
+
+  async function getBalances(address: string): Promise<Balances> {
+    const read = await readBalances('getBalances', address);
+    return { usdcAddressBalance: read.usdcAddressBalance, usdcCoinBalance: read.usdcCoinBalance, suiTotal: read.suiAddressBalance + read.suiCoinBalance };
+  }
+
+  /**
+   * The same single read as getBalances, with SUI split as USDC is: what decides whether an owner
+   * pays a transaction's gas from the address balance or with their SUI coins.
+   */
+  async function getWalletBalances(address: string): Promise<WalletBalances> {
+    return readBalances('getWalletBalances', address);
+  }
+
+  /**
+   * Reads the address's Coin objects of one coin type through Tatum gRPC (ListOwnedObjects with the
+   * coin type as the filter), pages of LIMITS.ownedCoinsMax, at most LIMITS.ownedCoinsMaxPages of
+   * them, stopping once LIMITS.ownedCoinsMax coins are read. Anyone can send coins to an address,
+   * so this never tries to read them all: `more` says when it stopped short.
+   * Every coin is held to what was asked for, the filter being the gateway's and not ours: exactly
+   * the coin type asked for, owned outright by this address (not shared, wrapped or held by
+   * consensus), listed once, with a version, a digest and a balance in range.
+   * Throws ChainError: INVALID_INPUT for a malformed address, BAD_RESPONSE for anything else the
+   * listing holds, or any transport code.
+   */
+  async function listCoins(operation: string, coinType: string, address: string): Promise<CoinListing> {
+    const owner = inputAddress(address);
+    const coins: OwnedCoin[] = [];
+    const seen = new Set<string>();
+    let pageToken: Uint8Array | undefined;
+
+    for (let page = 0; page < LIMITS.ownedCoinsMaxPages; page++) {
+      const { response } = await bounded(operation, (abort) =>
+        grpc.stateService.listOwnedObjects(
+          { owner, objectType: coinType, pageSize: LIMITS.ownedCoinsMax, pageToken, readMask: { paths: COIN_PATHS } },
+          { abort },
+        ),
+      );
+      if (response.objects.length > LIMITS.ownedCoinsMax) throw badResponse('more coins than the page size');
+
+      for (const object of response.objects) {
+        const objectId = chainAddress(object.objectId, 'coin object id');
+        if (chainStructTag(object.objectType, 'coin type') !== coinType) throw badResponse('an object of another type passed the coin type filter');
+        if (object.owner?.kind !== OwnerKind.ADDRESS || chainAddress(object.owner.address, 'coin owner') !== owner) {
+          throw badResponse('a listed coin is not owned outright by the address asked about');
+        }
+        if (seen.has(objectId)) throw badResponse('a coin is listed twice');
+        seen.add(objectId);
+        const version = parseUnsigned(object.version, 'coin version');
+        if (version === 0n || version > U64_MAX) throw badResponse('a coin version is out of range');
+        // Object digests and transaction digests share one form: 32 bytes in base58.
+        if (typeof object.digest !== 'string' || !isValidTransactionDigest(object.digest)) throw badResponse('a coin digest is not 32 bytes of base58');
+        const balance = parseUnsigned(object.balance, 'coin balance');
+        if (balance > U64_MAX) throw badResponse('a coin balance is out of range');
+        coins.push({ objectId, version, digest: object.digest, balance });
+      }
+
+      pageToken = response.nextPageToken?.length ? response.nextPageToken : undefined;
+      if (!pageToken) return { coins, more: false };
+      if (coins.length >= LIMITS.ownedCoinsMax) return { coins: coins.slice(0, LIMITS.ownedCoinsMax), more: true };
+    }
+    return { coins: coins.slice(0, LIMITS.ownedCoinsMax), more: true };
+  }
+
+  async function listUsdcCoins(address: string): Promise<CoinListing> {
+    return listCoins('listUsdcCoins', USDC_COIN_TYPE, address);
+  }
+
+  async function listSuiCoins(address: string): Promise<CoinListing> {
+    return listCoins('listSuiCoins', SUI_COIN_TYPE, address);
   }
 
   async function fetchTransaction(operation: string, digest: string, paths: string[]) {
@@ -1316,6 +1433,9 @@ export function createChain(opts: { apiKey?: string; beforeRequest?: BeforeTatum
     graphql,
     getReferenceGasPrice,
     getBalances,
+    getWalletBalances,
+    listUsdcCoins,
+    listSuiCoins,
     getTransactionBalanceChanges,
     getTransactionResult,
     getCurrentEpoch,

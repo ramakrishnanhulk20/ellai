@@ -4,10 +4,17 @@
 // hand-built tampering the work order names (amount, allowance, recipient, sender, gas
 // owner, an extra command) plus the funder, the coin, the gas budget, attached gas coins,
 // the nonce and garbage bytes; and refillDecision's three bounds, swept and fuzzed over
-// purse values around them.
+// purse values around them. The owner's move of USDC coins into the address balance: its commands
+// and gas, the same bytes for the same coins in any order, the coin cap, an empty list refused as
+// NOTHING_TO_MOVE, bad coin refs refused, and assertUsdcToAddress refusing another recipient,
+// another coin type, a third party's coin in place of or beside the owner's, another sender or gas
+// payer, an extra command, a bigger budget and attached gas coins. An owner paying gas with SUI
+// coins: the coins as gas payment in order with no expiration for both builds, bad gas coin lists
+// refused, and the move's byte check refusing gas paid another way than the facts say.
 // Does NOT cover: whether Sui accepts these transactions (prove:pay sends real ones),
 // whether the allowance on chain belongs to this owner and purse (getAllowance in
-// chain.test.ts reads that), or signing.
+// chain.test.ts reads that), whether the coins named are the owner's own at their current
+// versions (listUsdcCoins reads that), or signing.
 import { randomInt } from 'node:crypto';
 import { bcs } from '@mysten/sui/bcs';
 import { Transaction } from '@mysten/sui/transactions';
@@ -17,12 +24,17 @@ import {
   type AllowanceTerms,
   AllowanceError,
   assertRefill,
+  assertUsdcToAddress,
   buildIssueAllowance,
   buildRefill,
+  buildUsdcToAddress,
   type ChainFacts,
+  type CoinGasFacts,
   type RefillArgs,
   type RefillFacts,
   refillDecision,
+  type CoinRef,
+  type UsdcMoveArgs,
 } from '../src/allowance.js';
 import type { CanonicalPayment } from '../src/challenge.js';
 import { LIMITS } from '../src/limits.js';
@@ -279,6 +291,208 @@ describe('buildRefill and assertRefill', () => {
     const refillWindow = decoded(await buildRefill(REFILL, REFILL_FACTS)).v1.expiration;
     if (paymentWindow.$kind !== 'ValidDuring' || refillWindow.$kind !== 'ValidDuring') throw new Error('expected ValidDuring windows');
     expect(refillWindow.ValidDuring.chain).toBe(paymentWindow.ValidDuring.chain);
+  });
+});
+
+const coinRef = (byte: string, version: bigint): CoinRef => ({
+  objectId: normalizeSuiAddress(`0x${byte.repeat(32)}`),
+  version,
+  digest: toBase58(new Uint8Array(32).fill(Number.parseInt(byte, 16))),
+});
+const COIN_A = coinRef('c1', 11n);
+const COIN_B = coinRef('c2', 22n);
+const COIN_C = coinRef('c3', 33n);
+const THEIR_COIN = coinRef('c4', 44n);
+// Out of order on purpose: the build sorts by object id.
+const MOVE: UsdcMoveArgs = { owner: OWNER, coins: [COIN_B, COIN_C, COIN_A] };
+const byId = (a: CoinRef, b: CoinRef) => (a.objectId < b.objectId ? -1 : 1);
+
+describe('buildUsdcToAddress', () => {
+  it("merges every coin into the lowest id and sends that coin to the owner's own address balance, the owner paying gas from its address balance", async () => {
+    const { v1, ptb } = decoded(await buildUsdcToAddress(MOVE, FACTS));
+    expect(v1.sender).toBe(OWNER);
+    expect(v1.gasData).toEqual({ payment: [], owner: OWNER, price: '100', budget: String(LIMITS.usdcMoveGasBudgetMist) });
+    expect(v1.expiration).toEqual({
+      $kind: 'ValidDuring',
+      ValidDuring: { minEpoch: '1290', maxEpoch: '1291', minTimestamp: null, maxTimestamp: null, chain: MAINNET_CHAIN, nonce: FACTS.nonce },
+    });
+    expect(ptb.inputs.slice(0, 3)).toEqual(
+      [COIN_A, COIN_B, COIN_C].map((coin) => ({
+        $kind: 'Object',
+        Object: { $kind: 'ImmOrOwnedObject', ImmOrOwnedObject: { objectId: coin.objectId, version: String(coin.version), digest: coin.digest } },
+      })),
+    );
+    expect(normalizeSuiAddress(bcs.Address.parse(pureBytes(ptb, { Input: 3 })))).toBe(OWNER);
+    expect(ptb.inputs).toHaveLength(4);
+
+    const [merge, send, extra] = ptb.commands;
+    expect(extra).toBeUndefined();
+    if (merge?.$kind !== 'MergeCoins' || send?.$kind !== 'MoveCall') throw new Error('expected MergeCoins then a Move call');
+    expect(merge.MergeCoins.destination).toMatchObject({ $kind: 'Input', Input: 0 });
+    expect(merge.MergeCoins.sources).toMatchObject([{ $kind: 'Input', Input: 1 }, { $kind: 'Input', Input: 2 }]);
+    expect([send.MoveCall.package, send.MoveCall.module, send.MoveCall.function]).toEqual([normalizeSuiAddress('0x2'), 'coin', 'send_funds']);
+    expect(send.MoveCall.typeArguments).toEqual([USDC_TYPE_MAINNET]);
+    expect(send.MoveCall.arguments).toMatchObject([{ $kind: 'Input', Input: 0 }, { $kind: 'Input', Input: 3 }]);
+  });
+
+  it('sends a single coin with no merge, and builds the same bytes for the same coins in any order', async () => {
+    const single = decoded(await buildUsdcToAddress({ owner: OWNER, coins: [COIN_B] }, FACTS));
+    expect(single.ptb.commands.map((command) => command.$kind)).toEqual(['MoveCall']);
+    const sorted = await buildUsdcToAddress({ owner: OWNER, coins: [COIN_A, COIN_B, COIN_C] }, FACTS);
+    expect(await buildUsdcToAddress(MOVE, FACTS)).toEqual(sorted);
+    expect(await buildUsdcToAddress({ owner: OWNER, coins: [COIN_C, COIN_A, COIN_B] }, FACTS)).toEqual(sorted);
+    expect(await buildUsdcToAddress(MOVE, { ...FACTS, nonce: FACTS.nonce + 1 })).not.toEqual(sorted);
+  });
+
+  it('takes up to LIMITS.ownedCoinsMax coins, refuses one more, and refuses no coins at all as NOTHING_TO_MOVE', async () => {
+    const many = Array.from({ length: LIMITS.ownedCoinsMax + 1 }, (_, i) => ({
+      objectId: normalizeSuiAddress(`0x${(i + 1).toString(16).padStart(4, '0')}${'ee'.repeat(30)}`),
+      version: BigInt(i + 1),
+      digest: toBase58(new Uint8Array(32).fill(i + 1)),
+    }));
+    const atCap = decoded(await buildUsdcToAddress({ owner: OWNER, coins: many.slice(0, LIMITS.ownedCoinsMax) }, FACTS));
+    expect(atCap.ptb.inputs).toHaveLength(LIMITS.ownedCoinsMax + 1);
+    expect(atCap.ptb.commands.map((command) => command.$kind)).toEqual(['MergeCoins', 'MoveCall']);
+    const overCap = await refusalOf(buildUsdcToAddress({ owner: OWNER, coins: many }, FACTS));
+    expect([overCap.code, overCap.message]).toEqual(['BAD_ARGS', `a transaction names at most ${LIMITS.ownedCoinsMax} USDC coins`]);
+    const none = await refusalOf(buildUsdcToAddress({ owner: OWNER, coins: [] }, FACTS));
+    expect([none.code, none.message]).toEqual(['NOTHING_TO_MOVE', 'there are no USDC coins to move']);
+    expect((await refusalOf(assertUsdcToAddress(new Uint8Array([1]), { owner: OWNER, coins: [] }, FACTS))).code).toBe('NOTHING_TO_MOVE');
+  });
+
+  it('refuses a coin named twice, a version or digest out of form, a bad owner and facts out of range', async () => {
+    const move = (coins: unknown[], owner = OWNER, facts = FACTS) => refusalOf(buildUsdcToAddress({ owner, coins: coins as CoinRef[] }, facts));
+    expect((await move([COIN_A, { ...COIN_B, objectId: COIN_A.objectId }])).message).toBe('one of the USDC coins is named twice');
+    expect((await move([{ ...COIN_A, version: 0n }])).message).toBe('a version among the USDC coins is not a positive u64');
+    expect((await move([{ ...COIN_A, version: 11 }])).message).toBe('a version among the USDC coins is not a positive u64');
+    expect((await move([{ ...COIN_A, digest: toBase58(new Uint8Array(31)) }])).message).toBe('a digest among the USDC coins is not 32 bytes of base58');
+    expect((await move([{ ...COIN_A, objectId: '0x0' }])).message).toBe('an id among the USDC coins is the zero address');
+    expect((await move([null])).code).toBe('BAD_ARGS');
+    expect((await move([COIN_A], 'not an address')).message).toBe('the owner is not a Sui address');
+    expect((await move([COIN_A], OWNER, { ...FACTS, referenceGasPrice: BigInt(LIMITS.maxGasPriceMist) + 1n })).code).toBe('BAD_ARGS');
+    expect((await refusalOf(buildUsdcToAddress({ owner: OWNER, coins: 'all' as never }, FACTS))).message).toBe('the USDC coins are not a list');
+  });
+});
+
+const GAS_COIN_1 = coinRef('d1', 101n);
+const GAS_COIN_2 = coinRef('d2', 102n);
+// Not sorted: gas coins stay in the order given, the first being the one Sui merges the rest into.
+const COIN_GAS: CoinGasFacts = { referenceGasPrice: 100n, gasCoins: [GAS_COIN_2, GAS_COIN_1] };
+const asPayment = (coins: CoinRef[]) => coins.map((coin) => ({ objectId: coin.objectId, version: String(coin.version), digest: coin.digest }));
+
+describe('an owner paying gas with SUI coins', () => {
+  it('names the coins as gas payment in the order given, with no expiration, for the allowance and for the move', async () => {
+    const issue = decoded(await buildIssueAllowance({ owner: OWNER, spender: PURSE, terms: TERMS }, COIN_GAS));
+    expect(issue.v1.gasData).toEqual({ payment: asPayment([GAS_COIN_2, GAS_COIN_1]), owner: OWNER, price: '100', budget: String(LIMITS.issueGasBudgetMist) });
+    expect(issue.v1.expiration).toEqual({ $kind: 'None', None: true });
+    const fromBalance = decoded(await buildIssueAllowance({ owner: OWNER, spender: PURSE, terms: TERMS }, FACTS));
+    expect(issue.ptb).toEqual(fromBalance.ptb);
+
+    const built = await buildUsdcToAddress(MOVE, COIN_GAS);
+    const move = decoded(built);
+    expect(move.v1.gasData).toEqual({ payment: asPayment([GAS_COIN_2, GAS_COIN_1]), owner: OWNER, price: '100', budget: String(LIMITS.usdcMoveGasBudgetMist) });
+    expect(move.v1.expiration).toEqual({ $kind: 'None', None: true });
+    expect(move.ptb).toEqual(decoded(await buildUsdcToAddress(MOVE, FACTS)).ptb);
+    await expect(assertUsdcToAddress(built, MOVE, COIN_GAS)).resolves.toBeUndefined();
+  });
+
+  it('refuses no gas coins, too many, one named twice, and a gas coin that is also a USDC coin moved', async () => {
+    const issue = (gasCoins: CoinRef[]) => refusalOf(buildIssueAllowance({ owner: OWNER, spender: PURSE, terms: TERMS }, { referenceGasPrice: 100n, gasCoins }));
+    expect((await issue([])).message).toBe('a coin-paid transaction names no gas coins');
+    const many = Array.from({ length: LIMITS.ownedCoinsMax + 1 }, (_, i) => coinRef((i + 16).toString(16), 1n));
+    expect((await issue(many)).message).toBe(`a transaction names at most ${LIMITS.ownedCoinsMax} gas coins`);
+    expect((await issue([GAS_COIN_1, GAS_COIN_1])).message).toBe('one of the gas coins is named twice');
+    expect((await refusalOf(buildIssueAllowance({ owner: OWNER, spender: PURSE, terms: TERMS }, { ...COIN_GAS, referenceGasPrice: 0n }))).message).toBe('the gas price is outside the limits');
+    const overlap = await refusalOf(buildUsdcToAddress(MOVE, { referenceGasPrice: 100n, gasCoins: [COIN_A] }));
+    expect([overlap.code, overlap.message]).toEqual(['BAD_ARGS', 'a gas coin is also one of the USDC coins moved']);
+  });
+
+  it('refuses a move whose gas is paid another way than the facts say', async () => {
+    const coinPaid = await buildUsdcToAddress(MOVE, COIN_GAS);
+    const balancePaid = await buildUsdcToAddress(MOVE, FACTS);
+    const refusals: Array<[Uint8Array, CoinGasFacts | ChainFacts, string]> = [
+      [coinPaid, FACTS, 'the transaction carries gas coins'],
+      [balancePaid, COIN_GAS, 'the gas coins are not the ones built with'],
+      [coinPaid, { ...COIN_GAS, gasCoins: [GAS_COIN_1, GAS_COIN_2] }, 'the gas coins are not the ones built with'],
+      [coinPaid, { ...COIN_GAS, gasCoins: [GAS_COIN_2, { ...GAS_COIN_1, version: 103n }] }, 'the gas coins are not the ones built with'],
+      [coinPaid, { ...COIN_GAS, referenceGasPrice: 101n }, 'the gas price is not the price built with'],
+    ];
+    for (const [bytes, facts, reason] of refusals) {
+      const refusal = await refusalOf(assertUsdcToAddress(bytes, MOVE, facts));
+      expect([refusal.code, refusal.message]).toEqual(['MISMATCH', reason]);
+    }
+    const withWindow = Transaction.from(coinPaid);
+    withWindow.setExpiration({ ValidDuring: { minEpoch: '1290', maxEpoch: '1291', minTimestamp: null, maxTimestamp: null, chain: MAINNET_CHAIN, nonce: 1 } });
+    const windowed = await refusalOf(assertUsdcToAddress(await withWindow.build(), MOVE, COIN_GAS));
+    expect(windowed.message).toBe('a coin-paid transaction carries an expiration');
+  });
+});
+
+interface MoveTamper {
+  sender?: string;
+  gasOwner?: string;
+  recipient?: string;
+  coinType?: string;
+  coins?: CoinRef[];
+  budget?: number;
+  gasCoin?: boolean;
+  drainGasCoin?: boolean;
+}
+
+/** The same move as Ellai's, by hand, with one thing changed: what a tampered client would hand back. */
+async function handBuiltMove(tamper: MoveTamper = {}): Promise<Uint8Array> {
+  const coins = [...(tamper.coins ?? MOVE.coins)].sort(byId);
+  const tx = new Transaction();
+  tx.setSender(tamper.sender ?? OWNER);
+  const [first, ...rest] = coins.map((coin) => tx.objectRef({ objectId: coin.objectId, version: String(coin.version), digest: coin.digest }));
+  if (first === undefined) throw new Error('a move needs a coin');
+  if (rest.length > 0) tx.mergeCoins(first, rest);
+  tx.moveCall({ target: '0x2::coin::send_funds', typeArguments: [tamper.coinType ?? USDC_TYPE_MAINNET], arguments: [first, tx.pure.address(tamper.recipient ?? OWNER)] });
+  if (tamper.drainGasCoin) {
+    const [stolen] = tx.splitCoins(tx.gas, [1_000_000]);
+    if (stolen === undefined) throw new Error('splitCoins returned nothing');
+    tx.transferObjects([stolen], ATTACKER);
+  }
+  tx.setGasOwner(tamper.gasOwner ?? OWNER);
+  tx.setGasPrice(FACTS.referenceGasPrice);
+  tx.setGasBudget(tamper.budget ?? LIMITS.usdcMoveGasBudgetMist);
+  tx.setGasPayment(tamper.gasCoin ? [{ objectId: `0x${'0e'.repeat(32)}`, version: '7', digest: toBase58(new Uint8Array(32).fill(9)) }] : []);
+  tx.setExpiration({
+    ValidDuring: { minEpoch: String(FACTS.epoch), maxEpoch: String(FACTS.epoch + 1n), minTimestamp: null, maxTimestamp: null, chain: MAINNET_CHAIN, nonce: FACTS.nonce },
+  });
+  return tx.build();
+}
+
+describe('assertUsdcToAddress', () => {
+  it('passes a fresh build, and the hand-built control is that build, so each tampering below changes one thing only', async () => {
+    const built = await buildUsdcToAddress(MOVE, FACTS);
+    await expect(assertUsdcToAddress(built, MOVE, FACTS)).resolves.toBeUndefined();
+    expect(await handBuiltMove()).toEqual(built);
+  });
+
+  const tamperings: Array<[string, MoveTamper, string]> = [
+    ['another recipient', { recipient: ATTACKER }, "the coins are not sent to the owner's own address balance"],
+    ['another coin type', { coinType: SUI }, 'a call is not typed in Sui Mainnet USDC'],
+    ["a third party's coin in place of one of the owner's", { coins: [COIN_A, COIN_B, THEIR_COIN] }, 'an object in the transaction is not one of the coins named'],
+    ["a third party's coin beside the owner's", { coins: [...MOVE.coins, THEIR_COIN] }, 'the transaction has 5 inputs, this move has 4'],
+    ['another sender', { sender: ATTACKER }, 'the sender is not the owner'],
+    ['another gas payer', { gasOwner: ATTACKER }, 'the gas owner is not the owner'],
+    ['an extra command that drains the gas coin', { drainGasCoin: true }, 'the transaction has 4 commands, this move has 2'],
+    ['a bigger gas budget', { budget: LIMITS.usdcMoveGasBudgetMist * 10 }, 'the gas budget is not the move budget'],
+    ['an attached gas coin', { gasCoin: true }, 'the transaction carries gas coins'],
+  ];
+  for (const [what, tamper, reason] of tamperings) {
+    it(`refuses ${what}`, async () => {
+      const refusal = await refusalOf(assertUsdcToAddress(await handBuiltMove(tamper), MOVE, FACTS));
+      expect([refusal.code, refusal.message]).toEqual(['MISMATCH', reason]);
+    });
+  }
+
+  it('refuses bytes built for another nonce, garbage, and a refill in place of the move', async () => {
+    const built = await buildUsdcToAddress(MOVE, FACTS);
+    expect((await refusalOf(assertUsdcToAddress(built, MOVE, { ...FACTS, nonce: 1 }))).message).toBe('the nonce is not the one built with');
+    expect((await refusalOf(assertUsdcToAddress(Uint8Array.from([1, 2, 3]), MOVE, FACTS))).message).toBe('the bytes do not decode as a Sui transaction');
+    expect((await refusalOf(assertUsdcToAddress(await buildRefill(REFILL, REFILL_FACTS), MOVE, FACTS))).code).toBe('MISMATCH');
   });
 });
 

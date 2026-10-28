@@ -1,4 +1,3 @@
-import { randomInt } from 'node:crypto';
 import { buildIssueAllowance } from '@ellai/core/allowance';
 import type { Chain } from '@ellai/core/chain';
 import { canonicalSuiAddress } from '@ellai/core/keys';
@@ -8,15 +7,17 @@ import { toBase64 } from '@mysten/sui/utils';
 import type { Database } from '../db/client.js';
 import { formatUsdc } from '../decide/sentences.js';
 import { ownerDelegate } from '../memory/delegate.js';
+import { buildUsdcMoveStep, chooseOwnerGas } from './funds.js';
 import {
   ALREADY_DONE_MESSAGE,
   type AccountStep,
+  type BuildStep,
+  checkBuildStep,
   checkNow,
-  checkStep,
   loadOwner,
   OnboardingError,
-  type OnboardingStep,
   type OwnerRow,
+  USDC_MOVE_STEP,
 } from './state.js';
 
 /** Stored on chain next to Ellai's key on the owner's Walrus Memory account. */
@@ -28,14 +29,14 @@ export const DELEGATE_LABEL = 'Ellai';
  * already shows with findMemoryAccount (the registry and the owner's registry entry, the account
  * too for a delegate), then core's builder reads the registry and the entry again, the account too
  * for a delegate, and makes the one simulate call that resolves the transaction: 2 + 3 and 3 + 4.
- * An allowance reads the epoch and the gas price.
+ * An allowance chooses its gas source (chooseOwnerGas: the owner's balances, then the gas price and
+ * either the epoch or the owner's SUI coins), three calls. The USDC move lists the owner's USDC
+ * coins first, then chooses its gas source the same way: four.
  */
-export const BUILD_CHAIN_CALLS: Readonly<Record<OnboardingStep, number>> = { memory_account: 5, add_delegate: 7, allowance: 2 };
+export const BUILD_CHAIN_CALLS: Readonly<Record<BuildStep, number>> = { memory_account: 5, add_delegate: 7, allowance: 3, usdc_to_address: 4 };
 // A unit conversion: the owner sets how long the allowance runs as a count of days.
 const MS_PER_DAY = 86_400_000;
 const MAX_DAYS = Math.floor(LIMITS.onboardingAllowanceMaxMs / MS_PER_DAY);
-// The allowance's nonce field is a u32.
-const NONCE_RANGE = 2 ** 32;
 
 export interface AllowanceRequest {
   dailyLimitAtomic: bigint;
@@ -144,9 +145,9 @@ export async function buildAccountStep(args: {
 }
 
 /**
- * Builds the transaction the owner signs in their own wallet for one onboarding step, and a
- * plain list of what it does. Nothing is signed or sent, and nothing is recorded: the step
- * counts only once confirmOnboardingTx has read its result from chain.
+ * Builds the transaction the owner signs in their own wallet for one onboarding step or the USDC
+ * move, and a plain list of what it does. Nothing is signed or sent, and nothing is recorded: a
+ * step counts only once confirmOnboardingTx has read its result from chain.
  * - memory_account: create_account for the owner's own Walrus Memory account (core
  *   buildCreateAccountTx), refused with ALREADY_DONE when Sui already shows one (buildAccountStep).
  * - add_delegate: adds Ellai's derived delegate key for this owner, named "Ellai", to the
@@ -154,34 +155,43 @@ export async function buildAccountStep(args: {
  *   with ALREADY_DONE when Sui shows that account already holding the key.
  * - allowance: the owner lets their own purse draw Sui Mainnet USDC from the owner's address
  *   balance: at most dailyLimitAtomic per LIMITS.allowancePeriodMs (a fixed day),
- *   lifetimeCapAtomic in total, ending `days` whole days after `now` (core buildIssueAllowance, epoch and gas price read through
- *   `chain`). Daily limit in (0, LIMITS.onboardingDailyLimitMaxAtomic], total cap in
+ *   lifetimeCapAtomic in total, ending `days` whole days after `now` (core buildIssueAllowance).
+ *   Daily limit in (0, LIMITS.onboardingDailyLimitMaxAtomic], total cap in
  *   [daily limit, LIMITS.onboardingLifetimeCapMaxAtomic], days from 1 to the
- *   LIMITS.onboardingAllowanceMaxMs span. The owner pays gas, at most LIMITS.issueGasBudgetMist,
- *   from their SUI address balance, and the bytes are valid only in this epoch and the next.
+ *   LIMITS.onboardingAllowanceMaxMs span. The owner pays gas, at most LIMITS.issueGasBudgetMist, as
+ *   chooseOwnerGas picks from a live read: from their SUI address balance when it covers the budget,
+ *   the bytes then valid only in this epoch and the next, otherwise with the fewest of their SUI
+ *   coins that do.
+ * - usdc_to_address: moves the owner's USDC coins into their own address balance, gas chosen the
+ *   same way (buildUsdcMoveStep). Not a recorded step.
  * Owner, purse and account come from the owner row, never from the caller, and every
  * summary value is one of those or a validated term (C7, C15).
  * Throws OnboardingError: BAD_INPUT for a bad step, date, owner id or allowance term;
  * NO_OWNER; NOT_READY for add_delegate before the account is recorded; ALREADY_DONE for an
- * account step Sui already shows done. Throws MemoryError, AllowanceError or ChainError from
- * core when Sui refuses the build or Tatum cannot answer.
+ * account step Sui already shows done; NOTHING_TO_MOVE for the move when the owner holds no USDC
+ * coins; NOT_ENOUGH_SUI when the owner's SUI cannot cover the gas budget. Throws MemoryError,
+ * AllowanceError or ChainError from core when Sui refuses the build or Tatum cannot answer.
  */
 export async function buildOnboardingTx(args: {
   db: Database;
   ownerId: string;
-  step: OnboardingStep;
+  step: BuildStep;
   allowance?: AllowanceRequest;
   chain: Chain;
   masterSecretHex: string;
   now: Date;
 }): Promise<{ txBytesBase64: string; summary: SummaryLine[] }> {
-  const step = checkStep(args.step);
+  const step = checkBuildStep(args.step);
   const now = checkNow(args.now);
   const terms = step === 'allowance' ? checkAllowance(args.allowance, now) : null;
   const owner = await loadOwner(args.db, args.ownerId);
   const ownerAddress = canonicalSuiAddress(owner.suiAddress);
   const { chain } = args;
 
+  if (step === USDC_MOVE_STEP) {
+    const { bytes, summary } = await buildUsdcMoveStep(chain, ownerAddress);
+    return { txBytesBase64: toBase64(bytes), summary };
+  }
   if (step !== 'allowance') {
     const { bytes, summary } = await buildAccountStep({ chain, owner, step, masterSecretHex: args.masterSecretHex });
     return { txBytesBase64: toBase64(bytes), summary };
@@ -189,8 +199,7 @@ export async function buildOnboardingTx(args: {
 
   if (terms === null) bad('give the daily limit, the total cap and the number of days');
   const purseAddress = canonicalSuiAddress(owner.purseAddress);
-  const epoch = await chain.getCurrentEpoch();
-  const referenceGasPrice = await chain.getReferenceGasPrice();
+  const facts = await chooseOwnerGas(chain, ownerAddress, LIMITS.issueGasBudgetMist);
   const bytes = await buildIssueAllowance(
     {
       owner: ownerAddress,
@@ -202,7 +211,7 @@ export async function buildOnboardingTx(args: {
         expirationMs: BigInt(terms.expirationMs),
       },
     },
-    { epoch, referenceGasPrice, nonce: randomInt(0, NONCE_RANGE) },
+    facts,
   );
   return {
     txBytesBase64: toBase64(bytes),
