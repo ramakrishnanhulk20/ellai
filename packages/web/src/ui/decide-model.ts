@@ -30,7 +30,8 @@ export const STEP_COUNT = STEPS.length;
 export type Example = {
   amount: string;
   host: string;
-  digest: string | null;
+  /** Always set: the steps tell a payment story, so only a decision with a verified payment is picked. */
+  digest: string;
   /** The picked decision whole, because the card's badge is worked out from its rule and digest. */
   decision: MapDecision;
   /** All memories the decision cited. */
@@ -41,17 +42,17 @@ export type Example = {
 
 const MAX_DOTS = 3;
 
-/** 3 is a payment verified on Sui on a learned rule, 0 is a decision the story cannot be told with. */
+/** 2 is a payment verified on Sui on a learned rule, 1 is one on any other rule, 0 cannot tell the story. */
 function exampleRank(decision: MapDecision): number {
-  if (decision.outcome !== 'approved') return 0;
-  if (decision.rule === 'learned') return decision.digest ? 3 : 2;
-  return decision.rule === 'grant' && decision.digest ? 1 : 0;
+  if (decision.outcome !== 'approved' || !decision.digest) return 0;
+  return decision.rule === 'learned' ? 2 : 1;
 }
 
 /**
  * The newest approved learned decision with a verified payment. If there is none, the newest
- * approved learned decision without one, then the newest approved grant with a verified payment.
- * If there is none of those either, the steps are told with no numbers.
+ * approved decision on any other rule with a verified payment. An approval with no payment is
+ * never picked, because the steps say the purse paid and Sui confirmed. If there is none, the
+ * steps are told with no numbers.
  */
 export function pickExample(decisions: readonly MapDecision[]): Example | null {
   let best: MapDecision | null = null;
@@ -67,7 +68,7 @@ export function pickExample(decisions: readonly MapDecision[]): Example | null {
       bestTime = time;
     }
   }
-  if (!best) return null;
+  if (!best?.digest) return null;
   return {
     amount: formatUsdc(best.amountUsdc),
     host: best.host,
@@ -85,7 +86,7 @@ export function exampleSignature(example: Example | null): string {
     example.amount,
     example.host,
     example.decision.rule,
-    example.digest ?? '',
+    example.digest,
     example.citationCount,
     example.distances.join(','),
   ].join('|');

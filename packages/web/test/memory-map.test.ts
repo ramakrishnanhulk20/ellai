@@ -1,7 +1,8 @@
 // Covers: GET /api/public/memory-map called as Next would call it, on PGlite with a chain that
 // fails any touch: only owners who opted in, only their owner answers that Walrus Memory
 // confirmed, the tick found on chain and Walrus still stores, only decisions Sui or Walrus backs
-// (a verified payment, a citation of such an answer, or the question's own answer being one, C37),
+// (a verified payment, a citation of such an answer given about the decision's own host, or the
+// question's own answer being one, C37),
 // each decision's citations kept to
 // those answers with the distance decide stored (cut to what a real column holds) or none, a
 // digest only for a verified payment, the totals /proof shows, the exact key set at every level
@@ -342,6 +343,40 @@ describe('GET /api/public/memory-map', () => {
 
     const proof = (await (await proofRoute.GET()).json()) as { totals: { approvedByLearning: number; askedDecisions: number } };
     expect([proof.totals.approvedByLearning, proof.totals.askedDecisions]).toEqual([body.totals.learnedApprovals, body.totals.questionsAsked]);
+  });
+
+  it('lets a citation back a decision only at the host the cited answer named, so one refusal on chain cannot fill the map with other hosts, on the map and /proof alike (C37)', async () => {
+    const p = await party();
+    const refusal = await memory(p, 'refused-at-a', 'on_chain', { verdict: 'refuse', sellerHost: 'a.example' });
+    const approval = await memory(p, 'approved-at-a', 'on_chain', { sellerHost: 'a.example' });
+    const refusedAtA = await decision(p, { outcome: 'refused', rule: 'refused_recipient', status: 'refused', sellerHost: 'a.example', sellerUrl: 'https://a.example/v1/rooms', createdAt: at(90_000) });
+    await cite(p, refusedAtA, refusal, null);
+    const askedAtA = await decision(p, { sellerHost: 'a.example', sellerUrl: 'https://a.example/v1/rooms', createdAt: at(80_000) });
+    await cite(p, askedAtA, approval, 0.3);
+
+    // Rules match on the recipient alone, so the same answers back requests to that recipient at
+    // any host. None of these 51, all newer, may reach the page on the strength of an answer about a.example.
+    const askedElsewhere = await decision(p, { sellerHost: 'spam0.example', sellerUrl: 'https://spam0.example/v1/rooms', createdAt: at(70_000) });
+    await cite(p, askedElsewhere, approval, 0.3);
+    const spam = await handle.db
+      .insert(decisions)
+      .values(
+        Array.from({ length: 50 }, (_, i) =>
+          decisionValues(p, { outcome: 'refused', rule: 'refused_recipient', status: 'refused', sellerHost: `spam${i + 1}.example`, sellerUrl: `https://spam${i + 1}.example/v1/rooms`, createdAt: at(50_000 - i * 100) }),
+        ),
+      )
+      .returning({ id: decisions.id });
+    await handle.db.insert(decisionCitations).values(spam.map((row) => ({ decisionId: row.id, memoryId: refusal, ownerId: p.ownerId, distance: null })));
+
+    const { body } = await map();
+    expect(body.decisions.map((row) => [row.at, row.outcome, row.rule, row.host, row.citations.map((c) => c.blobId)])).toEqual([
+      [at(80_000).toISOString(), 'asked', 'no_match', 'a.example', ['approved-at-a']],
+      [at(90_000).toISOString(), 'refused', 'refused_recipient', 'a.example', ['refused-at-a']],
+    ]);
+    expect(body.totals).toEqual({ memories: 2, learnedApprovals: 0, questionsAsked: 1 });
+
+    const proof = (await (await proofRoute.GET()).json()) as { totals: { confirmedOwnerAnswers: number; approvedByLearning: number; askedDecisions: number } };
+    expect([proof.totals.confirmedOwnerAnswers, proof.totals.approvedByLearning, proof.totals.askedDecisions]).toEqual([body.totals.memories, body.totals.learnedApprovals, body.totals.questionsAsked]);
   });
 
   it('lists at most 200 answers and 50 decisions, newest first', async () => {

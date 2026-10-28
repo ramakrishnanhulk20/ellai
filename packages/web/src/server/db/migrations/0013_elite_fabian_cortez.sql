@@ -1,0 +1,2 @@
+ALTER TABLE "refills" DROP CONSTRAINT "refills_status_known";--> statement-breakpoint
+ALTER TABLE "refills" ADD CONSTRAINT "refills_status_known" CHECK ("refills"."status" in ('pending', 'verified', 'failed', 'mismatch'));

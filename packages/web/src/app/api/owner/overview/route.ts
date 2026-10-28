@@ -2,12 +2,11 @@ import { type Chain, ChainError } from '@ellai/core/chain';
 import { LIMITS } from '@ellai/core/limits';
 import { and, count, desc, eq, gte, inArray, sql } from 'drizzle-orm';
 import type { Database } from '../../../../server/db/client.js';
-import { decisions, owners, payments } from '../../../../server/db/schema.js';
+import { decisions, owners, payments, refills } from '../../../../server/db/schema.js';
 import { scoped } from '../../../../server/http/context.js';
 import { HttpError } from '../../../../server/http/errors.js';
 import { jsonResponse } from '../../../../server/http/json.js';
 import { limitOwnerChainCalls } from '../../../../server/http/owner-limits.js';
-import { ledgerBalanceAtomic } from '../../../../server/jobs/refill.js';
 import { onboardingState } from '../../../../server/onboarding/state.js';
 
 export const runtime = 'nodejs';
@@ -49,6 +48,16 @@ async function recentCounts(db: Database, ownerId: string, since: Date): Promise
   return { asked: decided?.asked ?? 0, approved: decided?.approved ?? 0, refused: decided?.refused ?? 0, paid: paid?.n ?? 0 };
 }
 
+// C38: whether the purse may hold USDC, as an upper bound. Ellai puts money in only by refills, and
+// a refill row is written before its bytes leave and never deleted, so an owner with no allowance
+// and no refill row of any status has never been sent USDC by Ellai. The ledger balance is a lower
+// bound and is not used here: a refill still pending, or one that ended as a mismatch, moved money
+// the ledger does not count.
+async function everRefilled(db: Database, ownerId: string): Promise<boolean> {
+  const [row] = await db.select({ id: refills.id }).from(refills).where(eq(refills.ownerId, ownerId)).limit(1);
+  return row !== undefined;
+}
+
 // How often Ellai still has to ask: of the latest decisions that let money move or wanted to,
 // how many needed the owner. Refusals are left out, since they never reach the owner.
 async function questionRate(db: Database, ownerId: string): Promise<{ asked: number; window: number }> {
@@ -64,20 +73,23 @@ async function questionRate(db: Database, ownerId: string): Promise<{ asked: num
 /**
  * The signed-in owner's dashboard: their settings, including publicProof (whether /proof lists
  * their payments and memories, off until they opt in), onboarding progress, the purse's USDC read
- * from chain (purse is null when the purse is not read, see below, or the chain cannot be read), counts
- * of asked, approved and refused decisions and verified payments over the last
- * LIMITS.overviewCountWindowMs (30 days), and questionsPer20: of the latest
+ * from chain (purse is null when the purse is not read, see below, or the chain cannot be read),
+ * purseRead (true exactly when this request tried to read the purse, whatever came back, so a
+ * screen can tell "not read" from "read failed", C38), counts of asked, approved and refused
+ * decisions and verified payments over the last LIMITS.overviewCountWindowMs (30 days), and
+ * questionsPer20: of the latest
  * LIMITS.overviewQuestionWindow (20) approved or asked decisions, how many were asked, with
  * `window` saying how many there were, and builtinAgent: 'ready' when the server holds an
  * Anthropic key and 'needs_key' when it does not, never the key itself. The owner comes from
  * the session alone (C13); 401 signed_out without one.
- * The purse is read through Tatum only for an owner with an allowance, whose purse Ellai fills, or
- * one whose purse by Ellai's own ledger (ledgerBalanceAtomic: verified refills in, unreleased
- * payments out) may still hold USDC after the allowance was forgotten (C38). Only then does the
- * request count toward limitOwnerChainCalls's budgets at one call (C22), answering with its 429 or
- * 503 beyond them. Any other owner costs no chain read; onboarding.allowance says whether an
- * allowance is recorded. Because of that one call, screens load the overview on demand (page load, after an
- * action), never on a timer; GET /api/owner/settings reads the settings with no chain call.
+ * The purse is read through Tatum whenever it may hold USDC (C38): the owner has an allowance
+ * recorded, whose purse Ellai fills, or any refill row at all, whatever its status, since that
+ * money can still be there after the allowance was forgotten. Only then does the request count
+ * toward limitOwnerChainCalls's budgets at one call (C22), answering with its 429 or 503 beyond
+ * them. Any other owner costs no chain read and gets purseRead false; onboarding.allowance says
+ * whether an allowance is recorded. Because of that one call, screens load the overview on demand
+ * (page load, after an action), never on a timer; GET /api/owner/settings reads the settings with
+ * no chain call.
  * The read is also counted by the Tatum meter, as this owner from this client; a refusal there
  * (ChainError BUDGET, nothing sent) is 503 chain_unavailable_today, not a blank purse, while any
  * other failed read blanks the purse. Atomic amounts are decimal strings.
@@ -103,9 +115,8 @@ export const GET = scoped('owner', async (request, ctx, { ownerId }): Promise<Re
   // if the session ended after the cookie was checked; that is treated as no session at all.
   if (row === undefined) throw new HttpError(401, 'signed_out');
   const { allowanceId, ...owner } = row;
-  // C38: forgetting an allowance stops refills, not the money already in the purse, so the owner
-  // still sees it while Ellai's own ledger says some may be there.
-  const readsPurse = allowanceId !== null || (await ledgerBalanceAtomic(ctx.db, ownerId)) > 0n;
+  // C38: forgetting an allowance stops refills, not the money already in the purse.
+  const readsPurse = allowanceId !== null || (await everRefilled(ctx.db, ownerId));
   if (readsPurse) {
     const limited = await limitOwnerChainCalls(ctx, request, ownerId, PURSE_READ_CALLS);
     if (limited !== null) return limited;
@@ -121,5 +132,5 @@ export const GET = scoped('owner', async (request, ctx, { ownerId }): Promise<Re
   if (purse === BUDGET_SPENT) throw new HttpError(503, 'chain_unavailable_today');
   // The same test the run route makes before it builds a client, so the two can never disagree.
   const builtinAgent = ctx.env.ANTHROPIC_API_KEY === undefined ? 'needs_key' : 'ready';
-  return jsonResponse({ owner, onboarding, purse, counts, questionsPer20, builtinAgent });
+  return jsonResponse({ owner, onboarding, purse, purseRead: readsPurse, counts, questionsPer20, builtinAgent });
 });

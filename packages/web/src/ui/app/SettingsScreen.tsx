@@ -578,7 +578,7 @@ function AutomaticPaymentsCard({ settings }: { settings: Settings }) {
 }
 
 const PUBLIC_PROOF_TEXT =
-  "Show my verified payments, my answers stored on Walrus, and the decisions behind them on Ellai's public proof page and the landing page's memory map. Amounts and seller names are shown. Your reasons and purposes never are.";
+  "Show my verified payments, my answers stored on Walrus, what Ellai recorded on Walrus about whether sellers delivered, and the decisions behind them on Ellai's public proof page and the landing page's memory map. Amounts and seller names are shown. Your reasons and purposes never are.";
 
 function PublicProofCard({ settings }: { settings: Settings }) {
   const { save, busy, error, saved, dialog } = useSaveChange(settings, () => {});

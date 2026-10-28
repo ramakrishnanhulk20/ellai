@@ -8,6 +8,8 @@
 // owner's, for this purse, in USDC, unexpired and with room under its cap and in its rate
 // window; never signs bytes that are not exactly the refill; keeps an unknown send pending and
 // reads that digest first next time, but marks one the Tatum budget kept from leaving failed;
+// ends a refill that landed moving anything else 'mismatch', pausing its owner, read on no later
+// tick with or without an allowance, and refilling that owner no more;
 // releases a lost refill only once its epoch window has closed and a call
 // LIMITS.paymentReleaseGapMs after the first that saw it missing misses it too, recording one a
 // later call finds, and leaves rows from before that window was kept
@@ -713,7 +715,7 @@ describe('refillIfNeeded', () => {
     expect(await refillRows(w.ownerId)).toHaveLength(0);
   });
 
-  it('marks a refill the chain failed as failed, and keeps one that moved anything else pending and refused', async () => {
+  it("marks a refill the chain failed as failed, and one that moved anything else 'mismatch' for good, pausing the owner, never reading it again and refilling no more (C38)", async () => {
     const w = await funded();
     const { chain, state } = stubFor(w, 0n);
     state.execute = (digest) => ({ digest, status: 'failure', errorCode: 'INSUFFICIENT_ADDRESS_BALANCE', balanceChanges: [], createdObjects: [] });
@@ -722,13 +724,21 @@ describe('refillIfNeeded', () => {
 
     const odd = await funded();
     const stub = stubFor(odd, 0n);
+    const logged = vi.spyOn(console, 'error').mockImplementation(() => undefined);
     // The dry run showed exactly the refill; what landed did not.
     stub.state.simulate = () => ({ status: 'success', errorCode: null, balanceChanges: refillChanges(odd) });
     stub.state.changes = [...refillChanges(odd), { address: randomAddress(), coinType: USDC_TYPE_MAINNET, amount: 1n }];
-    await expect(refill(odd, stub.chain)).rejects.toMatchObject({ name: 'RefillError', code: 'MISMATCH' });
-    expect(one(await refillRows(odd.ownerId)).status).toBe('pending');
-    await expect(refill(odd, stub.chain)).rejects.toMatchObject({ code: 'MISMATCH' });
+    await expect(refill(odd, stub.chain)).rejects.toEqual(new RefillError('MISMATCH', 'a refill landed but did not move exactly the refill'));
+    expect(one(await refillRows(odd.ownerId))).toMatchObject({ status: 'mismatch', verifiedAt: null });
+    expect(one(await db.select({ reason: owners.autoPausedReason, at: owners.autoPausedAt }).from(owners).where(eq(owners.id, odd.ownerId)))).toEqual({ reason: 'refill_mismatch', at: NOW });
+    expect(logged.mock.calls).toEqual([['[ellai refill] refill_mismatch']]);
+    logged.mockRestore();
+
+    stub.calls.length = 0;
+    expect(await refill(odd, stub.chain)).toBe('skipped_pending');
+    expect(stub.calls).toEqual([]);
     expect(stub.executions).toHaveLength(1);
+    expect(await refillRows(odd.ownerId)).toHaveLength(1);
   });
 
   it('fails a lost refill only once its epoch window has closed and a call LIMITS.paymentReleaseGapMs after the first that saw it closed misses it too, and may then refill', async () => {
@@ -935,6 +945,53 @@ describe('refillIfNeeded', () => {
     // Past the window's end the next spend opens a new window, so the same reading now has room.
     expect(await tickAt(3)).toMatchObject({ owners: 1, refills: 1, errors: [] });
     expect(notGas(calls).filter((call) => /^get(Balances|Allowance):/.test(call))).toEqual([`getBalances:${w.purse}`, `getAllowance:${w.allowanceId}`]);
+  });
+
+  it("ends a pending refill that landed moving the wrong amount 'mismatch', with or without an allowance, pauses its owner, then reads it on no later tick and refills that owner no more (C38)", async () => {
+    const on = await freshDb();
+    const kept = await funded(on, { allowanceCheckedAt: NOW });
+    // Its allowance was forgotten after the refill was sent.
+    const forgot: Funded = { ...(await world(on)), allowanceId: randomAddress() };
+    const keptRefill = await refillRow(kept, ago(60_000), 'pending', on);
+    const forgotRefill = await refillRow(forgot, ago(120_000), 'pending', on);
+    const { chain, state, calls } = stubFor(kept, LOW, on);
+    state.balances.set(forgot.purse, { usdcAddressBalance: LOW });
+    const wrong = new Map([
+      [keptRefill.digest, refillChanges(kept, REFILL - 1n)],
+      [forgotRefill.digest, refillChanges(forgot, REFILL - 1n)],
+    ]);
+    state.landed = (digest) => {
+      const changes = wrong.get(digest);
+      return changes === undefined ? null : { status: 'success', balanceChanges: changes };
+    };
+    const logged = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    const tickAt = ticker(on, chain);
+    const rows = async () => (await on.select({ ownerId: refills.ownerId, status: refills.status }).from(refills)).map((row) => [row.ownerId, row.status]).sort();
+    const pauses = async () =>
+      (await on.select({ id: owners.id, reason: owners.autoPausedReason, at: owners.autoPausedAt }).from(owners)).map((row) => [row.id, row.reason, row.at?.toISOString()]).sort();
+
+    const first = await tickAt(0);
+    expect(first).toMatchObject({ owners: 2, refills: 0 });
+    expect(first.errors).toHaveLength(2);
+    expect(first.errors).toEqual(expect.arrayContaining([kept, forgot].map((w) => ({ ownerId: w.ownerId, step: 'refill', code: 'REFILL_MISMATCH' }))));
+    expect(notGas(calls).sort()).toEqual([`getTransactionResult:${keptRefill.digest}`, `getTransactionResult:${forgotRefill.digest}`].sort());
+    expect(await rows()).toEqual([[kept.ownerId, 'mismatch'], [forgot.ownerId, 'mismatch']].sort());
+    expect(await pauses()).toEqual([kept, forgot].map((w) => [w.ownerId, 'refill_mismatch', NOW.toISOString()]).sort());
+    expect(logged.mock.calls).toEqual([['[ellai refill] refill_mismatch'], ['[ellai refill] refill_mismatch']]);
+    logged.mockRestore();
+
+    // The owner with an allowance is still visited and its purse still reads low, yet nothing is read or sent; the other is no work at all.
+    calls.length = 0;
+    for (const n of [1, 2]) expect(await tickAt(n)).toMatchObject({ owners: 1, refills: 0, errors: [] });
+    expect(notGas(calls)).toEqual([]);
+
+    // A new allowance does not lift the block either.
+    const fresh = randomAddress();
+    await on.update(owners).set({ allowanceId: fresh, allowanceCheckedAt: NOW }).where(eq(owners.id, forgot.ownerId));
+    state.allowances.set(fresh, allowanceFor({ ...forgot, allowanceId: fresh }));
+    expect(await tickAt(3)).toMatchObject({ owners: 2, refills: 0, errors: [] });
+    expect(notGas(calls)).toEqual([]);
+    expect(await rows()).toEqual([[kept.ownerId, 'mismatch'], [forgot.ownerId, 'mismatch']].sort());
   });
 });
 

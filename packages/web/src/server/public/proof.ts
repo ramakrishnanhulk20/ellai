@@ -21,8 +21,9 @@ export class ProofUnavailableError extends Error {
  * storing. The totals count those owners only. approvedByLearning counts decisions approved by
  * learned trust whose payment Ellai verified, and askedDecisions the questions asked of owners
  * the page shows, those with a verified payment or an on-chain memory, and only questions Sui or
- * Walrus backs: one that cites an owner answer on chain, or whose own answer is one (C37). So
- * neither grows from requests that never paid or questions never answered on Walrus.
+ * Walrus backs: one that cites an owner answer on chain given about its own host, or whose own
+ * answer is one (C37). So neither grows from requests that never paid or questions never answered
+ * about that host on Walrus.
  * It holds no memory sentence, no purpose, no reason, no agent label and no owner or purse
  * address, so nothing an owner or an agent wrote is public. A seller host is shown only as the
  * sentences show it (hostLabel). Atomic amounts are decimal strings and times ISO strings; a
@@ -58,9 +59,13 @@ function publicRules(db: Database) {
   );
   // C37: opting in must not let an owner put any host they like on the landing page. A decision is
   // public only when Sui or Walrus backs it: a payment Ellai verified, a citation of an owner answer
-  // on chain, or the owner's own answer to its question on chain (the answer memory names its
-  // decision through memories.decision_id). Limit refusals, unanswered questions and unpaid grants
-  // match none of the three.
+  // on chain given about the decision's own host, or the owner's own answer to its question on
+  // chain (the answer memory names its decision through memories.decision_id). Refusals and learned
+  // approvals match on the recipient alone, so one answer is cited by requests to that recipient at
+  // every host; only the host the answer named is backed by it. Both hosts are the stored
+  // decisions.seller_host text, which answerQuestion copies into the memory unchanged, so the
+  // comparison is exact. Limit refusals, unanswered questions, unpaid grants and decisions citing
+  // only answers about another host match none of the three.
   const backed = or(
     exists(db.select({ one: sql`1` }).from(payments).where(and(eq(payments.decisionId, decisions.id), eq(payments.ownerId, decisions.ownerId), verified))),
     exists(
@@ -68,7 +73,7 @@ function publicRules(db: Database) {
         .select({ one: sql`1` })
         .from(decisionCitations)
         .innerJoin(memories, and(eq(memories.id, decisionCitations.memoryId), eq(memories.ownerId, decisionCitations.ownerId)))
-        .where(and(eq(decisionCitations.decisionId, decisions.id), eq(decisionCitations.ownerId, decisions.ownerId), ownerAnswer)),
+        .where(and(eq(decisionCitations.decisionId, decisions.id), eq(decisionCitations.ownerId, decisions.ownerId), ownerAnswer, eq(memories.sellerHost, decisions.sellerHost))),
     ),
     exists(db.select({ one: sql`1` }).from(memories).where(and(eq(memories.decisionId, decisions.id), eq(memories.ownerId, decisions.ownerId), ownerAnswer))),
   );
@@ -109,9 +114,9 @@ async function learningTotals(db: Database, { shown, verified, onChain, onPage, 
  * (chain_confirmed_at set) and not expired there (chain_expired_at unset), newest first, by blob
  * id and kind only; and the totals, over the same owners, with an owner answer counted only while
  * it is so, a learned approval only once its payment is verified, and a question only for an owner
- * with a verified payment or an on-chain memory, and only when it cites an owner answer on chain or
- * its own answer is one (C37). A digest that is not a Sui transaction digest,
- * or a blob id that is not plain base64url, is left out rather than linked or shown.
+ * with a verified payment or an on-chain memory, and only when it cites an owner answer on chain
+ * given about its own host or its own answer is one (C37). A digest that is not a Sui transaction
+ * digest, or a blob id that is not plain base64url, is left out rather than linked or shown.
  */
 export async function readPublicProof(db: Database): Promise<PublicProof> {
   const rules = publicRules(db);
@@ -162,8 +167,9 @@ export async function readPublicProof(db: Database): Promise<PublicProof> {
  * What the landing page's memory map draws, from Ellai's own records and only for owners who
  * opted in (owners.public_proof): owner answers confirmed by Walrus Memory, found on chain and
  * not expired there, and recent decisions Sui or Walrus backs (C37): those with a payment Ellai
- * verified, those citing an owner answer on chain, and questions whose own answer is an owner
- * answer on chain. Limit refusals, unanswered questions and unpaid grants are never listed. Each
+ * verified, those citing an owner answer on chain given about the decision's own host, and
+ * questions whose own answer is an owner answer on chain. Limit refusals, unanswered questions,
+ * unpaid grants and decisions citing only answers about another host are never listed. Each
  * decision carries the shown answers it cited and how close recall found each one (null when the
  * citation came from an exact lookup, or was written before distances were kept). A decision's id
  * is its place in this answer, never its database id, and its digest is set only for a payment

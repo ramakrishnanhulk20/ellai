@@ -1,7 +1,7 @@
 // Covers: the words and colours a public decision wears. "Paid" only with a digest, the cause
 // only from the rule, a reason line for every rule the server writes, the landing page's second
-// counter counting only learned approvals, and the hero picking its example by the order
-// verified learned, learned, verified grant.
+// counter counting only learned approvals, and the hero picking its example only from approvals
+// with a verified payment, a learned one before any other rule.
 // Does NOT cover: how the components lay these words out, or what the server writes into a
 // decision (memory-map.test.ts and decide.test.ts).
 import { describe, expect, it } from 'vitest';
@@ -132,44 +132,66 @@ describe('pickExample', () => {
     expect(picked?.digest).toBe('new');
   });
 
-  it('falls to a learned approval with no payment, then to a verified grant', () => {
+  it('never picks an unpaid learned approval, even when it is the only approval', () => {
+    expect(pickExample([decision({ id: 'learned-open' })])).toBeNull();
+    expect(
+      pickExample([decision({ id: 'learned-open', at: newer }), decision({ id: 'learned-open-old', at: older })]),
+    ).toBeNull();
+  });
+
+  it('picks a verified grant over an unpaid learned approval', () => {
     expect(
       pickExample([
-        decision({ id: 'grant-paid', at: newer, rule: 'grant', digest: DIGEST }),
-        decision({ id: 'learned-open', at: older }),
-      ])?.decision.id,
-    ).toBe('learned-open');
-    expect(
-      pickExample([
-        decision({ id: 'grant-open', at: newer, rule: 'grant' }),
+        decision({ id: 'learned-open', at: newer }),
         decision({ id: 'grant-paid', at: older, rule: 'grant', digest: DIGEST }),
       ])?.decision.id,
     ).toBe('grant-paid');
   });
 
-  it('picks nothing from questions, refusals and unpaid grants', () => {
+  it('picks a verified learned approval over a verified grant, even when the grant is newer', () => {
+    expect(
+      pickExample([
+        decision({ id: 'grant-paid', at: newer, rule: 'grant', digest: DIGEST }),
+        decision({ id: 'learned-paid', at: older, digest: 'learned' }),
+      ])?.decision.id,
+    ).toBe('learned-paid');
+  });
+
+  it('takes a verified approval on any other rule when no learned one is verified, newest first', () => {
+    const picked = pickExample([
+      decision({ id: 'other-old', at: older, rule: 'something_new', digest: 'old' }),
+      decision({ id: 'other-new', at: newer, rule: 'something_new', digest: 'new' }),
+      decision({ id: 'learned-open', at: newer }),
+    ]);
+    expect(picked?.decision.id).toBe('other-new');
+    expect(picked?.digest).toBe('new');
+  });
+
+  it('picks nothing from questions, refusals, unpaid grants and unpaid learned approvals', () => {
     expect(
       pickExample([
         decision({ outcome: 'asked', rule: 'no_match' }),
+        decision({ outcome: 'asked', rule: 'no_match', digest: DIGEST }),
         decision({ outcome: 'refused', rule: 'refused_recipient' }),
+        decision({ outcome: 'refused', rule: 'refused_recipient', digest: DIGEST }),
         decision({ rule: 'grant' }),
+        decision({ rule: 'learned' }),
       ]),
     ).toBeNull();
     expect(pickExample([])).toBeNull();
   });
 
-  it('hands the card the picked decision, so its badge is never a fixed word', () => {
-    const picked = pickExample([decision({ rule: 'grant', digest: DIGEST })]);
-    expect(picked ? badgeFor(picked.decision).label : null).toBe('PAID WITH YOUR YES');
-    const open = pickExample([decision()]);
-    expect(open ? badgeFor(open.decision).label : null).toBe('APPROVED ON ITS OWN');
+  it('hands the card the picked decision, so its badge is the paid one for its rule', () => {
+    const grant = pickExample([decision({ rule: 'grant', digest: DIGEST })]);
+    expect(grant ? badgeFor(grant.decision).label : null).toBe('PAID WITH YOUR YES');
+    const learned = pickExample([decision({ digest: DIGEST })]);
+    expect(learned ? badgeFor(learned.decision).label : null).toBe('PAID ON ITS OWN');
   });
 
-  it('changes the example signature when the rule or the digest changes', () => {
-    const base = exampleSignature(pickExample([decision()]));
-    expect(exampleSignature(pickExample([decision({ digest: DIGEST })]))).not.toBe(base);
-    expect(exampleSignature(pickExample([decision({ rule: 'grant', digest: DIGEST })]))).not.toBe(
-      exampleSignature(pickExample([decision({ digest: DIGEST })])),
-    );
+  it('changes the example signature when the rule or the digest changes, and says none for no example', () => {
+    const base = exampleSignature(pickExample([decision({ digest: DIGEST })]));
+    expect(exampleSignature(pickExample([decision({ digest: 'another' })]))).not.toBe(base);
+    expect(exampleSignature(pickExample([decision({ rule: 'grant', digest: DIGEST })]))).not.toBe(base);
+    expect(exampleSignature(pickExample([decision()]))).toBe('none');
   });
 });

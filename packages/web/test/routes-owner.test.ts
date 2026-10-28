@@ -1,10 +1,11 @@
 // Covers: the owner routes called as Next would call them, with Request objects, on PGlite
 // with a stub chain: a cookie from the real sign-in routes opening the overview; the session
 // requirement on every owner route; the overview's settings, onboarding, purse, counts and
-// question rate, with bigints as strings, a chain failure as purse null but the Tatum budget's
-// refusal as 503 chain_unavailable_today, the purse still read and metered after the allowance is
-// forgotten while Ellai's ledger says it may hold USDC (C38), and no chain read at all for an owner
-// with neither; whether the built-in agent has a key, never the key; the question list
+// question rate, with bigints as strings, a chain failure as purse null with purseRead true but the
+// Tatum budget's refusal as 503 chain_unavailable_today, the purse still read and metered after the
+// allowance is forgotten for an owner with any refill row, whatever its status or Ellai's ledger
+// (C38), and no chain read at all, purseRead false, for an owner with neither; whether the
+// built-in agent has a key, never the key; the question list
 // with Ellai's payment facts apart from agent text; answering, with its memory and grant; one
 // owner never seeing or answering another's question; same origin on the answer; and that an
 // unexpected failure, including a real database error carrying SQL, is a bare 500.
@@ -308,6 +309,7 @@ describe('GET /api/owner/overview', () => {
       },
       onboarding: { memoryAccount: 'missing', delegate: 'missing', allowance: 'missing', purseAddress },
       purse: null,
+      purseRead: false,
       counts: { asked: 0, approved: 0, refused: 0, paid: 0 },
       questionsPer20: { asked: 0, window: 0 },
       builtinAgent: 'needs_key',
@@ -328,36 +330,56 @@ describe('GET /api/owner/overview', () => {
     const owner = await withAllowance(await signedInOwner());
     const purseAddress = canonicalSuiAddress(derivePurseKeypair(MASTER, owner.address).toSuiAddress());
     const body = (await (await overview(owner.cookie)).json()) as Record<string, unknown>;
-    expect(body.purse).toEqual({ usdcAtomic: '123456' });
+    expect([body.purse, body.purseRead]).toEqual([{ usdcAtomic: '123456' }, true]);
     expect(body.onboarding).toEqual({ memoryAccount: 'missing', delegate: 'missing', allowance: 'present', purseAddress });
-    expect(Object.keys(body)).toEqual(['owner', 'onboarding', 'purse', 'counts', 'questionsPer20', 'builtinAgent']);
+    expect(Object.keys(body)).toEqual(['owner', 'onboarding', 'purse', 'purseRead', 'counts', 'questionsPer20', 'builtinAgent']);
     expect(Object.keys(body.owner as object)).not.toContain('allowanceId');
     expect(getBalances.mock.calls).toEqual([[purseAddress]]);
   });
 
-  it("still reads the purse once the allowance is forgotten while Ellai's ledger says it may hold USDC, metered as with an allowance, and reads nothing for an owner never refilled (C38)", async () => {
+  it('reads the purse whenever it may hold USDC, an allowance recorded or any refill row whatever its status or the ledger, metered as with an allowance, and tells a failed read from no read (C38)', async () => {
     quiet();
-    const owner = await signedInOwner();
-    const purseAddress = canonicalSuiAddress(derivePurseKeypair(MASTER, owner.address).toSuiAddress());
-    // 0.10 USDC refilled and verified, 0.06 paid and not released, and the allowance it came from since forgotten.
-    await db.insert(refills).values({ ownerId: owner.ownerId, allowanceId: address(), amountAtomic: 100_000n, digest: hex(32), sentAt: ago(DAY_MS), status: 'verified', verifiedAt: ago(DAY_MS) });
-    const spent = await insertDecision(owner.ownerId, await agentFor(owner.ownerId), { status: 'paid', amountAtomic: 60_000n, createdAt: ago(60_000) });
-    await db.insert(payments).values({ decisionId: spent, ownerId: owner.ownerId, purseAddress, recipient: `0x${'11'.repeat(32)}`, amountAtomic: 60_000n, digest: hex(16), txBytesBase64: 'AA==', signedAt: ago(60_000), validUntilEpoch: 1n, settlement: 'verified' });
-    getBalances.mockResolvedValue({ usdcAddressBalance: 40_000n, usdcCoinBalance: 0n, suiTotal: 0n });
+    type Body = { purse: unknown; purseRead: unknown; onboarding: { allowance: string } };
+    const seen = async (owner: Owner) => {
+      const body = (await (await overview(owner.cookie)).json()) as Body;
+      return [body.purse, body.purseRead, body.onboarding.allowance];
+    };
+    const refilled = async (owner: Owner, status: 'pending' | 'verified' | 'failed') =>
+      db.insert(refills).values({ ownerId: owner.ownerId, allowanceId: address(), amountAtomic: 100_000n, digest: hex(32), sentAt: ago(DAY_MS), status, verifiedAt: status === 'verified' ? ago(DAY_MS) : null });
+    getBalances.mockResolvedValue({ usdcAddressBalance: 100_000n, usdcCoinBalance: 0n, suiTotal: 0n });
 
-    const body = (await (await overview(owner.cookie)).json()) as { purse: unknown; onboarding: { allowance: string } };
-    expect([body.purse, body.onboarding.allowance]).toEqual([{ usdcAtomic: '40000' }, 'missing']);
-    expect(getBalances.mock.calls).toEqual([[purseAddress]]);
+    // The first refill landed but Ellai has not read it back, and the allowance it came from was
+    // then forgotten: the ledger counts nothing in, while the purse holds 0.10 USDC.
+    const firstStillPending = await signedInOwner();
+    await refilled(firstStillPending, 'pending');
+    expect(await seen(firstStillPending)).toEqual([{ usdcAtomic: '100000' }, true, 'missing']);
+    expect(getBalances.mock.calls).toEqual([[canonicalSuiAddress(derivePurseKeypair(MASTER, firstStillPending.address).toSuiAddress())]]);
+
+    // A verified refill all spent puts the ledger at zero; a failed one is still a refill row.
+    const spentDown = await signedInOwner();
+    await refilled(spentDown, 'verified');
+    const spent = await insertDecision(spentDown.ownerId, await agentFor(spentDown.ownerId), { status: 'paid', amountAtomic: 100_000n, createdAt: ago(60_000) });
+    await db.insert(payments).values({ decisionId: spent, ownerId: spentDown.ownerId, purseAddress: address(), recipient: `0x${'11'.repeat(32)}`, amountAtomic: 100_000n, digest: hex(16), txBytesBase64: 'AA==', signedAt: ago(60_000), validUntilEpoch: 1n, settlement: 'verified' });
+    const onlyFailed = await signedInOwner();
+    await refilled(onlyFailed, 'failed');
+    for (const owner of [spentDown, onlyFailed]) expect(await seen(owner)).toEqual([{ usdcAtomic: '100000' }, true, 'missing']);
+
+    // A read that fails is still a read: the screen can say so instead of "not set up".
+    getBalances.mockRejectedValueOnce(new ChainError('UPSTREAM', 'network error', true));
+    expect(await seen(firstStillPending)).toEqual([null, true, 'missing']);
+
     // The same per-minute cap as an owner with an allowance: the 31st request is turned away before any read.
-    for (let i = 1; i < LIMITS.ownerChainReadsPerMinute; i += 1) expect((await overview(owner.cookie)).status).toBe(200);
-    expect((await overview(owner.cookie)).status).toBe(429);
-    expect(getBalances).toHaveBeenCalledTimes(LIMITS.ownerChainReadsPerMinute);
+    getBalances.mockClear();
+    for (let i = 2; i < LIMITS.ownerChainReadsPerMinute; i += 1) expect((await overview(firstStillPending.cookie)).status).toBe(200);
+    expect((await overview(firstStillPending.cookie)).status).toBe(429);
+    expect(getBalances).toHaveBeenCalledTimes(LIMITS.ownerChainReadsPerMinute - 2);
 
     const neverRefilled = await signedInOwner();
     getBalances.mockClear();
     for (let i = 0; i <= LIMITS.ownerChainReadsPerMinute; i += 1) {
       const response = await overview(neverRefilled.cookie);
-      expect([response.status, ((await response.json()) as { purse: unknown }).purse]).toEqual([200, null]);
+      const body = (await response.json()) as Body;
+      expect([response.status, body.purse, body.purseRead]).toEqual([200, null, false]);
     }
     expect(getBalances).not.toHaveBeenCalled();
   });
@@ -384,18 +406,23 @@ describe('GET /api/owner/overview', () => {
     expect(text).toContain('"purse":{"usdcAtomic":"18446744073709551615"}');
   });
 
-  it('gives purse null, not a 500, when the chain cannot be read, logging only a fixed code', async () => {
+  it('gives purse null with purseRead true, not a 500, when the chain cannot be read, logging only a fixed code (C38)', async () => {
     const owner = await withAllowance(await signedInOwner());
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
-    for (const failure of [new ChainError('TIMEOUT', 'timed out', true), new Error(MARKER)]) {
+    // Core reports a network failure as UPSTREAM 'network error'.
+    for (const failure of [new ChainError('UPSTREAM', 'network error', true), new ChainError('TIMEOUT', 'timed out', true), new Error(MARKER)]) {
       getBalances.mockRejectedValueOnce(failure);
       const response = await overview(owner.cookie);
       expect(response.status).toBe(200);
-      const body = (await response.json()) as { purse: unknown; owner: { suiAddress: string } };
-      expect(body.purse).toBeNull();
+      const body = (await response.json()) as { purse: unknown; purseRead: unknown; owner: { suiAddress: string } };
+      expect([body.purse, body.purseRead]).toEqual([null, true]);
       expect(body.owner.suiAddress).toBe(owner.address);
     }
-    expect(warn.mock.calls.map((call) => call.join(' '))).toEqual(['[ellai http] purse_balance_unavailable TIMEOUT', '[ellai http] purse_balance_unavailable UNEXPECTED']);
+    expect(warn.mock.calls.map((call) => call.join(' '))).toEqual([
+      '[ellai http] purse_balance_unavailable UPSTREAM',
+      '[ellai http] purse_balance_unavailable TIMEOUT',
+      '[ellai http] purse_balance_unavailable UNEXPECTED',
+    ]);
   });
 
   it("answers 503 chain_unavailable_today, not a blank purse, when Ellai's Tatum budget refused the purse read (C22)", async () => {

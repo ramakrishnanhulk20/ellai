@@ -46,7 +46,7 @@ function StackedStep({ index, example, still }: { index: number; example: Exampl
 
 /**
  * Section 6. On wide screens it pins for 400vh and the scroll moves through five steps, each
- * adding to one stage, told with Ellai's newest learned approval. On small screens, or for
+ * adding to one stage, told with Ellai's newest verified payment, a learned one first. On small screens, or for
  * people who ask for less motion, the five steps are stacked and nothing pins.
  */
 export function HowEllaiDecides() {

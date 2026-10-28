@@ -129,8 +129,8 @@ export function errorCode(error: unknown): string {
  * kept, which its scan fills in (lackingEndEpoch), pending payments, payments owed an outcome
  * memory (the memory the relayer is then sent), an allowance whose refill_not_before is unset or
  * past (refillMayStart), dated by when it was checked or, before that, when the owner joined,
- * a refill still pending, with or without an allowance recorded (C38),
- * and, when the tick holds a Walrus epoch reading, memories found on chain whose Blob that epoch
+ * a refill still pending, with or without an allowance recorded, but never one that ended
+ * 'mismatch' (C38), and, when the tick holds a Walrus epoch reading, memories found on chain whose Blob that epoch
  * has reached (chainExpiring). Open and asked decisions are not work: expireDecisions closes them
  * for every owner in one statement, so free sign-ins with a question each cannot push a paying
  * owner's turn back (C28). Ordering by the visit and not by the work is what lets every owner take
@@ -168,6 +168,7 @@ async function ownersWithWork(db: Database, now: Date, walrusEpoch: number | nul
     .select({ ownerId: owners.id, at: sql<Date>`coalesce(${owners.allowanceCheckedAt}, ${owners.createdAt})`.as('at') })
     .from(owners)
     .where(and(isNotNull(owners.allowanceId), refillMayStart(now)));
+  // A 'mismatch' refill is final and is never read again, so it is no work (C38).
   const refillWork = db
     .select({ ownerId: refills.ownerId, at: sql<Date>`min(${refills.sentAt})`.as('at') })
     .from(refills)
@@ -238,7 +239,10 @@ async function ownersWithWork(db: Database, now: Date, walrusEpoch: number | nul
  *    tick's clock after its reads: C7 and C23 at refill time. A lost refill is failed only by a
  *    later tick, so no tick waits on one. Any other owner gets resolvePendingRefill instead, the
  *    same digest and epoch reads in the same refills scope under the same deadline, so a refill
- *    pending when the allowance was forgotten still reaches its final state (C38);
+ *    pending when the allowance was forgotten still reaches its final state (C38). A refill that
+ *    landed as anything but the refill ends 'mismatch' and pauses the owner, with the step's
+ *    error REFILL_MISMATCH once; after that neither job reads it again, and it holds back every
+ *    later refill for that owner before any chain read;
  * 4. memory (only with a Walrus Memory account): submitPendingMemories, then confirmMemoryJobs,
  *    which is skipped when the submit ended with core's DELEGATE refusal, so that code is
  *    recorded once per owner per tick; then, for every owner, confirmBlobsOnChain checks

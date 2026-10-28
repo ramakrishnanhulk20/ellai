@@ -1,11 +1,11 @@
 // Covers: the rules the database itself enforces, proven on PGlite in memory. One payment
 // per decision and per digest, one live decision per identical request, one use per grant
 // and one grant per deciding decision, one live built-in agent per owner, unique refill
-// digests and seller challenges, owners never deleted from under their records, no row
-// linking one owner's records to another owner's, the answer and memory shape checks, the
-// text caps, a row lock inside a transaction, the history indexes the owner pages read
-// through, migration 0001 applied after 0000 both to an empty database and to one already
-// holding rows, and the refusal of an in-process database in production.
+// digests and seller challenges, the refill statuses ('mismatch' included), owners never deleted
+// from under their records, no row linking one owner's records to another owner's, the answer
+// and memory shape checks, the text caps, a row lock inside a transaction, the history indexes
+// the owner pages read through, migration 0001 applied after 0000 both to an empty database and
+// to one already holding rows, and the refusal of an in-process database in production.
 // Does NOT cover: Neon (nothing here opens a network connection); two connections racing
 // for one row (PGlite serves a single connection, so no lock is ever waited on); the
 // queries later modules write. The owner keys prove a row agrees with the records it links
@@ -23,6 +23,7 @@ import { migrate as migratePglite } from 'drizzle-orm/pglite/migrator';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { type Database, createDb, migrate } from '../src/server/db/client.js';
 import {
+  REFILL_STATUSES,
   TEXT_CAPS,
   agents,
   decisionCitations,
@@ -749,6 +750,16 @@ describe('refills and seller sales', () => {
     const refill = { ownerId: owner.id, allowanceId: suiAddress(), amountAtomic: 100_000n, digest: digest(), sentAt: new Date() };
     await db.insert(refills).values(refill);
     await expectRefusedBy(db.insert(refills).values(refill), 'refills_digest_unique');
+  });
+
+  it("accept every refill status, the final 'mismatch' included, and refuse any other (C38)", async () => {
+    expect(REFILL_STATUSES).toEqual(['pending', 'verified', 'failed', 'mismatch']);
+    const [check] = await rows<{ def: string }>(sql`select pg_get_constraintdef(oid) as def from pg_constraint where conname = 'refills_status_known'`);
+    expect(check?.def).toBe("CHECK ((status = ANY (ARRAY['pending'::text, 'verified'::text, 'failed'::text, 'mismatch'::text])))");
+    const owner = await newOwner();
+    const refill = (status: (typeof REFILL_STATUSES)[number]) => ({ ownerId: owner.id, allowanceId: suiAddress(), amountAtomic: 100_000n, digest: digest(), sentAt: new Date(), status });
+    for (const status of REFILL_STATUSES) expect(one(await db.insert(refills).values(refill(status)).returning()).status).toBe(status);
+    await expectRefusedBy(db.insert(refills).values(refill('lost' as never)), 'refills_status_known');
   });
 
   it('refuse a seller sale that reuses a challenge id', async () => {

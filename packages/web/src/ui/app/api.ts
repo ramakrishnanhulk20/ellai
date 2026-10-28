@@ -21,6 +21,8 @@ export type Overview = {
     purseAddress: string;
   };
   purse: { usdcAtomic: string } | null;
+  /** True exactly when the server tried to read the purse, so a null purse with this set means the read failed. */
+  purseRead: boolean;
   counts: { asked: number; approved: number; refused: number; paid: number };
   questionsPer20: { asked: number; window: number };
   builtinAgent: 'ready' | 'needs_key';

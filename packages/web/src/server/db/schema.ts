@@ -39,7 +39,8 @@ export const VERDICTS = ['approve', 'refuse'] as const;
 export const MEMORY_KINDS = ['owner_decision', 'outcome'] as const;
 export const MEMORY_STATUSES = ['pending', 'confirmed', 'failed'] as const;
 export const SETTLEMENTS = ['pending', 'verified', 'mismatch', 'not_landed'] as const;
-export const REFILL_STATUSES = ['pending', 'verified', 'failed'] as const;
+/** 'mismatch' is final: the refill landed but moved something other than what was built (C38). */
+export const REFILL_STATUSES = ['pending', 'verified', 'failed', 'mismatch'] as const;
 export const SALE_STATUSES = ['issued', 'settled', 'rejected'] as const;
 /** Owner actions that loosen what Ellai may do, and so need a fresh wallet signature on top of the session. */
 export const STEP_UP_ACTIONS = ['create_agent', 'loosen_settings'] as const;

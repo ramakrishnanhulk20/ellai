@@ -10,6 +10,8 @@ export const AUTO_PAUSE_TEXT: Record<string, string> = {
   settlement_mismatch: 'A payment landed that did not match what was agreed. Check History, then resume in Settings.',
   settlement_unverifiable: 'Ellai could not confirm a payment on Sui. Check History, then resume in Settings.',
   purse_key_mismatch: "Ellai's key for your purse did not match. Payments stay paused until this is fixed on Ellai's side.",
+  refill_mismatch:
+    "A refill to your purse landed that did not match what Ellai built, so refills stay stopped until it is checked on Ellai's side. You can resume in Settings to keep paying from what the purse already holds.",
 };
 
 function Banner({ border, title, text, action }: { border: string; title: string; text?: string; action?: ReactNode }) {

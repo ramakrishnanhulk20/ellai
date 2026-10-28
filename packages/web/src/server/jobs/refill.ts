@@ -8,11 +8,11 @@ import { bcs } from '@mysten/sui/bcs';
 import type { Ed25519Keypair } from '@mysten/sui/keypairs/ed25519';
 import { TransactionDataBuilder } from '@mysten/sui/transactions';
 import { SUI_TYPE_ARG, normalizeStructTag } from '@mysten/sui/utils';
-import { and, asc, count, eq, gte, isNull, lte, sql } from 'drizzle-orm';
+import { and, asc, count, eq, gte, inArray, isNull, lte, ne, or, sql } from 'drizzle-orm';
 import type { Database } from '../db/client.js';
-import { owners, payments, refills } from '../db/schema.js';
+import { type REFILL_STATUSES, owners, payments, refills } from '../db/schema.js';
 import { allowanceGone, forgetAllowance } from '../onboarding/state.js';
-import type { DbHandle } from '../pay/sign.js';
+import { type DbHandle, PURSE_KEY_MISMATCH } from '../pay/sign.js';
 
 export interface RefillJobArgs {
   db: Database;
@@ -41,6 +41,8 @@ export interface RefillJobArgs {
 }
 
 /**
+ * 'skipped_pending': a refill is still pending, or one ended 'mismatch', and either holds back
+ * every later refill for this owner.
  * 'resolved_pending': a refill pending from an earlier call was found landed in this call, and
  * this call stops there, so the next refill is decided on a balance read made after it landed.
  * 'deferred': the tick's deadline came before a read this call needed, so it stopped with nothing
@@ -61,9 +63,18 @@ export class RefillError extends Error {
   }
 }
 
+/**
+ * Set as the owner's auto_paused_reason when a refill landed and moved something other than the
+ * refill that was built (C38), as settlement_mismatch is for a payment.
+ */
+export const REFILL_MISMATCH = 'refill_mismatch';
+
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const U32_LIMIT = 2 ** 32;
 const SUI_TYPE = normalizeStructTag(SUI_TYPE_ARG);
+// A pending refill may still land, and a mismatched one needs a person, so either holds back the
+// next refill. Only pending ones are ever read again.
+const BLOCKING: ReadonlyArray<(typeof REFILL_STATUSES)[number]> = ['pending', 'mismatch'];
 
 
 interface OwnerFacts {
@@ -127,7 +138,8 @@ function checkedClock(read: () => Date): () => Date {
 }
 
 interface Ledger {
-  pending: boolean;
+  /** A refill is still pending, or one ended 'mismatch' (BLOCKING), so no refill may be sent. */
+  blocked: boolean;
   inWindow: number;
   /**
    * What Ellai's own records say the purse holds: every verified refill in, minus every signed
@@ -156,21 +168,21 @@ export async function ledgerBalanceAtomic(db: DbHandle, ownerId: string): Promis
 }
 
 /**
- * Whether a refill is still pending, every refill sent in the LIMITS.purseRefillWindowMs before
- * `now` (landed, failed, or not yet known), and the purse balance by Ellai's own records
- * (ledgerBalanceAtomic).
+ * Whether a refill still pending or one that ended 'mismatch' blocks the next, every refill sent
+ * in the LIMITS.purseRefillWindowMs before `now` (landed, failed, mismatched, or not yet known),
+ * and the purse balance by Ellai's own records (ledgerBalanceAtomic).
  */
 async function refillLedger(db: DbHandle, ownerId: string, now: Date): Promise<Ledger> {
-  const [pending] = await db
+  const [blocking] = await db
     .select({ id: refills.id })
     .from(refills)
-    .where(and(eq(refills.ownerId, ownerId), eq(refills.status, 'pending')))
+    .where(and(eq(refills.ownerId, ownerId), inArray(refills.status, [...BLOCKING])))
     .limit(1);
   const [sent] = await db
     .select({ n: count() })
     .from(refills)
     .where(and(eq(refills.ownerId, ownerId), gte(refills.sentAt, new Date(now.getTime() - LIMITS.purseRefillWindowMs))));
-  return { pending: pending !== undefined, inWindow: sent?.n ?? 0, balanceAtomic: await ledgerBalanceAtomic(db, ownerId) };
+  return { blocked: blocking !== undefined, inWindow: sent?.n ?? 0, balanceAtomic: await ledgerBalanceAtomic(db, ownerId) };
 }
 
 /**
@@ -287,19 +299,57 @@ async function markFailed(db: Database, refillId: string): Promise<void> {
 }
 
 /**
- * Records what the chain says a sent refill did: a failed transaction is 'failed'; a success
- * that moved exactly the refill is 'verified'. A success that moved anything else stays
- * 'pending', which blocks every later refill for this owner until a person looks, and throws.
+ * Marks a pending refill 'mismatch' and pauses its owner with REFILL_MISMATCH, by the path a
+ * mismatched payment takes in settlePayment: the owner row locked first, as every other writer
+ * takes it, the time read after the lock, and a purse key mismatch, which outranks any one
+ * transaction, never replaced. Any other pause takes this time, so a signed clear issued before
+ * it cannot lift it. True when this call made the change.
  */
-async function recordLanded(db: Database, refill: { id: string; amountAtomic: bigint }, result: TransactionResult, parties: Parties, now: Date): Promise<'verified' | 'failed'> {
+async function markMismatch(db: Database, ownerId: string, refillId: string, clock: () => Date): Promise<boolean> {
+  return db.transaction(async (tx) => {
+    await tx.select({ id: owners.id }).from(owners).where(eq(owners.id, ownerId)).for('update');
+    const at = clock();
+    const marked = await tx
+      .update(refills)
+      .set({ status: 'mismatch' })
+      .where(and(eq(refills.id, refillId), eq(refills.ownerId, ownerId), eq(refills.status, 'pending')))
+      .returning({ id: refills.id });
+    if (marked.length === 0) return false;
+    await tx
+      .update(owners)
+      .set({ autoPausedReason: REFILL_MISMATCH, autoPausedAt: at })
+      .where(and(eq(owners.id, ownerId), or(isNull(owners.autoPausedReason), ne(owners.autoPausedReason, PURSE_KEY_MISMATCH))));
+    return true;
+  });
+}
+
+/**
+ * Records what the chain says a sent refill did: a failed transaction is 'failed'; a success
+ * that moved exactly the refill is 'verified', at a `clock` reading. A success that moved anything
+ * else is 'mismatch', a final status (C38): it is never read again, the ledger never counts it,
+ * and it blocks every later refill for this owner until a person looks. The owner is paused with
+ * REFILL_MISMATCH (markMismatch), the fixed line `[ellai refill] refill_mismatch` is logged, and
+ * it throws RefillError MISMATCH.
+ */
+async function recordLanded(
+  db: Database,
+  ownerId: string,
+  refill: { id: string; amountAtomic: bigint },
+  result: TransactionResult,
+  parties: Parties,
+  clock: () => Date,
+): Promise<'verified' | 'failed'> {
   if (result.status !== 'success') {
     await markFailed(db, refill.id);
     return 'failed';
   }
-  if (!movedExactly(result, parties, refill.amountAtomic)) throw new RefillError('MISMATCH', 'a refill landed but did not move exactly the refill');
+  if (!movedExactly(result, parties, refill.amountAtomic)) {
+    if (await markMismatch(db, ownerId, refill.id, clock)) console.error('[ellai refill] refill_mismatch');
+    throw new RefillError('MISMATCH', 'a refill landed but did not move exactly the refill');
+  }
   await db
     .update(refills)
-    .set({ status: 'verified', verifiedAt: now })
+    .set({ status: 'verified', verifiedAt: clock() })
     .where(and(eq(refills.id, refill.id), eq(refills.status, 'pending')));
   return 'verified';
 }
@@ -326,7 +376,8 @@ function maxEpochOf(txBytes: Uint8Array): bigint {
  * Reads the oldest pending refill's digest and records the outcome: 'blocked' while it still
  * blocks the next refill, because the chain does not have it and cannot yet be shown never to;
  * 'verified' when it landed and moved exactly the refill; 'clear' when there was none, or it
- * is now 'failed'.
+ * is now 'failed'. One that landed and moved anything else ends 'mismatch' and throws
+ * (recordLanded). Only 'pending' rows are read, so a 'mismatch' one is never read again.
  *
  * A refill missing once the chain's epoch is past its valid_until_epoch can no longer land, but
  * one lagging node must not release a refill that landed in the last moments of its window, so
@@ -361,7 +412,7 @@ async function resolvePending(
   if (pending === undefined) return 'clear';
   if (!canStart()) return 'deferred';
   const landed = await readLanded(chain, pending.digest);
-  if (landed !== null) return (await recordLanded(db, pending, landed, parties, clock())) === 'verified' ? 'verified' : 'clear';
+  if (landed !== null) return (await recordLanded(db, ownerId, pending, landed, parties, clock)) === 'verified' ? 'verified' : 'clear';
   if (pending.validUntilEpoch === null) return 'blocked';
   if (!canStart()) return 'deferred';
   if ((await chain.getCurrentEpoch()) <= pending.validUntilEpoch) return 'blocked';
@@ -401,9 +452,10 @@ export interface PendingRefillArgs {
  * allowance, and builds and sends nothing. 'verified' when the refill landed and moved exactly the
  * refill; 'clear' when there was none (or no such owner), or it is now 'failed'; 'blocked' while
  * the chain does not have it and cannot yet be shown never to; 'deferred' when `canStart` said no
- * before a read.
+ * before a read. A refill that ended 'mismatch' is not pending, so it is skipped and never read.
  * Throws for an owner id that is not a uuid or a clock reading that is not a date; ChainError from
- * the reads; RefillError MISMATCH when the refill landed and moved anything but the refill.
+ * the reads; RefillError MISMATCH when the refill landed and moved anything but the refill, once
+ * it is recorded 'mismatch' and the owner paused with REFILL_MISMATCH.
  */
 export async function resolvePendingRefill(args: PendingRefillArgs): Promise<'blocked' | 'verified' | 'clear' | 'deferred'> {
   if (typeof args.ownerId !== 'string' || !UUID.test(args.ownerId)) throw new Error('the owner id is not a uuid');
@@ -421,15 +473,17 @@ export async function resolvePendingRefill(args: PendingRefillArgs): Promise<'bl
  *
  * 1. A refill still pending from an earlier call is read by its stored digest first, before
  *    anything else is read or built: landed and exact is 'verified' and this call returns
- *    'resolved_pending' without refilling again; failed is 'failed'; not on chain yet is
- *    'skipped_pending'. Once the chain's epoch is past the refill's valid_until_epoch, the first
- *    call that misses it stamps missing_since and is still 'skipped_pending'; a call at least
+ *    'resolved_pending' without refilling again; landed and anything else is 'mismatch', with the
+ *    owner paused with REFILL_MISMATCH and RefillError MISMATCH thrown; failed is 'failed'; not on
+ *    chain yet is 'skipped_pending'. Once the chain's epoch is past the refill's
+ *    valid_until_epoch, the first call that misses it stamps missing_since and is still
+ *    'skipped_pending'; a call at least
  *    LIMITS.paymentReleaseGapMs after that stamp that misses it too makes it 'failed', the same
  *    release rule as a payment's (C4, C27), and goes on as if nothing were pending.
  * 2. The owner's recorded purse must be the purse derived from the master secret; otherwise
  *    'refused' and nothing is read.
- * 3. Ellai's ledger comes before any other chain read (C22, C23): with a refill still pending the
- *    answer is 'skipped_pending', and when the ledger alone rules a refill out (ledgerRulesOut: a
+ * 3. Ellai's ledger comes before any other chain read (C22, C23): with a refill still pending, or
+ *    one that ended 'mismatch', the answer is 'skipped_pending', and when the ledger alone rules a refill out (ledgerRulesOut: a
  *    balance at or above LIMITS.purseRefillBelowAtomic, or LIMITS.purseMaxRefillsPerDay already
  *    sent) it is 'not_needed' with nothing read from chain. That answer is exact, since step 4
  *    decides on the larger of the read and the ledger, so an idle owner costs no Tatum call.
@@ -452,8 +506,8 @@ export async function resolvePendingRefill(args: PendingRefillArgs): Promise<'bl
  *    allowance_index_lag is logged, and the next visit reads it again. Then the chain facts
  *    (epoch, gas price, the allowance's initial shared version, a random nonce) are read, all
  *    before any lock.
- * 6. In one transaction holding the owner row FOR UPDATE: any refill still pending is
- *    'skipped_pending', so two calls can never refill twice; `clock` is read, every refill sent
+ * 6. In one transaction holding the owner row FOR UPDATE: any refill still pending or ended
+ *    'mismatch' is 'skipped_pending', so two calls can never refill twice; `clock` is read, every refill sent
  *    in the LIMITS.purseRefillWindowMs before that reading is counted, and core's refillDecision
  *    decides again on the larger of the balance read and Ellai's ledger (purseForDecision),
  *    'not_needed' when it says no (C23, C26). The refill is
@@ -468,16 +522,17 @@ export async function resolvePendingRefill(args: PendingRefillArgs): Promise<'bl
  *    hour) ahead, while the owner still holds this allowance, so the tick does not try again
  *    sooner (C22).
  * 8. Then the bytes are sent. A failure the chain reports is 'failed' and throws RefillError
- *    FAILED. A success is read back by its digest: exactly the refill is 'verified'; not
- *    readable yet stays 'pending' for the next call. Either way 'refilled'. An unknown send
+ *    FAILED. A success is read back by its digest: exactly the refill is 'verified'; anything
+ *    else is 'mismatch' as in step 1; not readable yet stays 'pending' for the next call. Either
+ *    way, short of a mismatch, 'refilled'. An unknown send
  *    outcome stays 'pending' and the ChainError is thrown. A send core reports as never sent,
  *    INVALID_INPUT or BUDGET (Ellai's Tatum budget refused it), is 'failed' and its ChainError
  *    is thrown, so no refill waits on bytes that never left.
  *
- * The ledger counts this purse's money in as its 'verified' refills, and this function is the
- * only way Ellai puts money in: the first refill after onboarding is this call's too, made by the
- * first tick once confirmOnboardingTx has recorded the allowance, and it is 'verified' once it
- * lands. Money anyone else sends shows only in the read, which can only raise the decision.
+ * The ledger counts this purse's money in as its 'verified' refills, never a 'mismatch' one,
+ * whose movement is unknown, and this function is the only way Ellai puts money in: the first
+ * refill after onboarding is this call's too, made by the first tick once confirmOnboardingTx has
+ * recorded the allowance, and it is 'verified' once it lands. Money anyone else sends shows only in the read, which can only raise the decision.
  *
  * `canStart` is asked before every chain read in steps 1 to 5 and once more before step 6; when
  * it says no the call answers 'deferred' with nothing built, written or sent. Steps 7 and 8 are
@@ -487,7 +542,7 @@ export async function resolvePendingRefill(args: PendingRefillArgs): Promise<'bl
  *
  * Throws for an owner id that is not a uuid or a time that is not a date; ChainError from
  * the reads; AllowanceError from the build; RefillError MISMATCH when a refill landed and
- * moved anything but the refill.
+ * moved anything but the refill, once it is recorded 'mismatch' and the owner paused.
  */
 export async function refillIfNeeded(args: RefillJobArgs): Promise<RefillOutcome> {
   if (typeof args.ownerId !== 'string' || !UUID.test(args.ownerId)) throw new Error('the owner id is not a uuid');
@@ -514,7 +569,7 @@ export async function refillIfNeeded(args: RefillJobArgs): Promise<RefillOutcome
   // refill can happen now; a payment signed before the lock can only lower the ledger, and the
   // next call sees that.
   const early = await refillLedger(db, ownerId, clock());
-  if (early.pending) return 'skipped_pending';
+  if (early.blocked) return 'skipped_pending';
   if (ledgerRulesOut(early)) return 'not_needed';
 
   if (!canStart()) return 'deferred';
@@ -581,7 +636,7 @@ export async function refillIfNeeded(args: RefillJobArgs): Promise<RefillOutcome
     // sent_at both stand at the moment the refill is decided (C26).
     const lockedAt = clock();
     const ledger = await refillLedger(tx, ownerId, lockedAt);
-    if (ledger.pending) return 'skipped_pending' as const;
+    if (ledger.blocked) return 'skipped_pending' as const;
     const decision = refillDecision({ purseUsdcAtomic: purseForDecision(purseReadAtomic, ledger), refillsInWindow: ledger.inWindow });
     if (!decision.refill) return 'not_needed' as const;
 
@@ -644,6 +699,6 @@ export async function refillIfNeeded(args: RefillJobArgs): Promise<RefillOutcome
     // Tatum's nodes can lag a moment behind the one that ran it; the next call reads it again.
     return 'refilled';
   }
-  if ((await recordLanded(db, prepared.row, landed, parties, clock())) === 'failed') throw new RefillError('FAILED', 'the refill did not land');
+  if ((await recordLanded(db, ownerId, prepared.row, landed, parties, clock)) === 'failed') throw new RefillError('FAILED', 'the refill did not land');
   return 'refilled';
 }

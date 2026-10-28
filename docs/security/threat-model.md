@@ -329,11 +329,13 @@ Each invariant names the risk it closes. Every backend work order carries the in
 - **C35 (A6, G3). Revoke and sign share the owner lock.** Revoking an agent takes the owner row lock that signing takes, so a revoke lands either before a signature, which then refuses, or after it, when that payment is counted and verified like any other.
 - **C37 (A8, G2). Public words come from the right field.** (Added after the section 13 review, 2026-10-28.)
   - A public page says money moved only for a decision with a payment Ellai verified on chain by its own digest, and states a decision's cause only from its stored rule, never from its outcome alone.
-  - A decision reaches a public page only when it has a verified payment, cites at least one owner answer that is on chain, or its own question's answer is an owner answer on chain. Limit refusals, unanswered questions and unpaid grants stay private. So an opted-in owner cannot put a host on the landing page without either paying it or answering about it on Walrus.
+  - A decision reaches a public page only when it has a verified payment, cites at least one owner answer that is on chain and was given about that same host, or its own question's answer is an owner answer on chain. Rules trust the recipient, not the host, so a citation backs a decision publicly only for the host the cited answer named. Limit refusals, unanswered questions, unpaid grants and decisions backed only by an answer about another host stay private. So an opted-in owner cannot put a host on the landing page without either paying it or answering about that host on Walrus.
+  - A public page tells a payment story (the purse paying, Sui confirming) only for a decision with a verified payment.
   - The opt-in text names every kind of row it puts on a public page.
 - **C38 (A6, A8, G4). The purse is never out of sight.**
-  - The owner sees the purse's USDC whenever Ellai's ledger says it may hold any, with or without an allowance recorded.
-  - Every pending refill reaches a final state, whether or not an allowance is still recorded; forgetting an allowance never strands a refill row.
+  - The owner sees the purse's USDC whenever it may hold any, with or without an allowance recorded. "May hold" is an upper bound: an allowance is recorded, or any refill was ever sent to the purse. A lower bound such as the ledger balance is never the test.
+  - The owner app tells "not read" apart from "read failed": a purse Ellai tried and failed to read says so, never "not set up".
+  - Every refill reaches a final state, whether or not an allowance is still recorded; forgetting an allowance never strands a refill row. A refill that landed but moved something other than what was built gets a final status of its own and pauses the owner, as a mismatched payment does, and is not read again.
 - **C39 (A6, A9, G3). Ellai relays owner-signed transactions only as it built them.**
   - Ellai sends a transaction the owner signed in the app only when the bytes equal a fresh build for that owner and step, from the owner row, with the owner as sender and gas owner, metered under C22.
   - Fields the relay does not check, by design: on the Walrus Memory account steps, the gas coins, gas price and expiry the owner's wallet chose. The owner signed them and pays for them; a stolen session cannot produce the signature.

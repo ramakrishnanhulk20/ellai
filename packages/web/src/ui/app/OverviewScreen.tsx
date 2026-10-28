@@ -50,23 +50,23 @@ function BigNumber({ children, unit }: { children: ReactNode; unit?: string }) {
 }
 
 // A purse that did answer is always shown, because money left in it after an allowance ends is still
-// there. With no allowance a line says so. A purse that comes back null with no allowance is not set up,
-// and null with an allowance means the read failed.
+// there. With no allowance a line says so. A purse that comes back null was either never read, which
+// is "Not set up", or read and failed, which must never be called "Not set up".
 function PurseTile({ overview }: { overview: Overview }) {
-  const { purse, onboarding } = overview;
+  const { purse, purseRead, onboarding } = overview;
   if (purse !== null) {
     return (
       <>
         <BigNumber unit="USDC">{atomicToUsdc(purse.usdcAtomic)}</BigNumber>
         {onboarding.allowance === 'missing' ? (
           <p className="mt-2 text-[14px] leading-[1.4] text-faint">
-            No allowance. Ellai can still pay from this under your rules.
+            No allowance. Ellai can still pay from what it put in this purse, under your rules.
           </p>
         ) : null}
       </>
     );
   }
-  if (onboarding.allowance === 'missing') return <p className="text-[20px] leading-[1.2] text-muted">Not set up</p>;
+  if (!purseRead) return <p className="text-[20px] leading-[1.2] text-muted">Not set up</p>;
   return (
     <>
       <p className="text-[20px] leading-[1.2] text-muted">Could not read</p>
