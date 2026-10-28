@@ -60,7 +60,7 @@ function PurseTile({ overview }: { overview: Overview }) {
         <BigNumber unit="USDC">{atomicToUsdc(purse.usdcAtomic)}</BigNumber>
         {onboarding.allowance === 'missing' ? (
           <p className="mt-2 text-[14px] leading-[1.4] text-faint">
-            No allowance. Ellai can still pay from what it put in this purse, under your rules.
+            No allowance. Ellai pays only from refills it verified, under your rules.
           </p>
         ) : null}
       </>

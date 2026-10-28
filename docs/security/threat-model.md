@@ -336,6 +336,8 @@ Each invariant names the risk it closes. Every backend work order carries the in
   - The owner sees the purse's USDC whenever it may hold any, with or without an allowance recorded. "May hold" is an upper bound: an allowance is recorded, or any refill was ever sent to the purse. A lower bound such as the ledger balance is never the test.
   - The owner app tells "not read" apart from "read failed": a purse Ellai tried and failed to read says so, never "not set up".
   - Every refill reaches a final state, whether or not an allowance is still recorded; forgetting an allowance never strands a refill row. A refill that landed but moved something other than what was built gets a final status of its own and pauses the owner, as a mismatched payment does, and is not read again.
+  - Owner-facing text that says purse money can be spent uses the bound signing spends against (the ledger of verified refills), not the displayed balance.
+  - Known gap, accepted 2026-10-28: once the owner clears a refill_mismatch pause, the app no longer shows that refills are blocked. A mismatched refill means a chain or Ellai bug, so Ellai's operator checks every one by hand.
 - **C39 (A6, A9, G3). Ellai relays owner-signed transactions only as it built them.**
   - Ellai sends a transaction the owner signed in the app only when the bytes equal a fresh build for that owner and step, from the owner row, with the owner as sender and gas owner, metered under C22.
   - Fields the relay does not check, by design: on the Walrus Memory account steps, the gas coins, gas price and expiry the owner's wallet chose. The owner signed them and pays for them; a stolen session cannot produce the signature.
