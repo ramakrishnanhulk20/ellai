@@ -33,3 +33,4 @@ coverage/
 REVIEW-BACKEND.md
 # next dev writes an agent rules file into the app folder on every run
 packages/web/AGENTS.md
+local-db/

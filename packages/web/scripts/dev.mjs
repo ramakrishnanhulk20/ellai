@@ -11,9 +11,9 @@ const here = dirname(fileURLToPath(import.meta.url));
 const app = resolve(here, '..');
 const rootEnv = resolve(app, '../../.env');
 const loaded = existsSync(rootEnv) ? parseEnv(readFileSync(rootEnv, 'utf8')) : {};
-// The root .env's DATABASE_URL is the live database the deploy scripts write to. The preview keeps
-// the local one from .env.development.local, which a variable passed in here would override.
-delete loaded.DATABASE_URL;
+// A Postgres DATABASE_URL in the root .env is the live database the deploy scripts write to, so the
+// preview drops it and keeps a local pglite: one, from here or from .env.development.local.
+if (loaded.DATABASE_URL !== undefined && !loaded.DATABASE_URL.startsWith('pglite:')) delete loaded.DATABASE_URL;
 const port = process.env.PORT ?? '3001';
 const next = createRequire(import.meta.url).resolve('next/dist/bin/next');
 
