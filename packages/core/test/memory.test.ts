@@ -6,7 +6,10 @@
 // or refused at once when told not to wait (on fake timers).
 // submitSentences sending exactly once without waiting, and checkJobs mapping each relayer
 // state and refusing every malformed status answer. Against a stand-in chain: a gRPC refusal wrapped in a SimulationError keeping the failing
-// step's own code, and Tatum being paced at the anonymous rate only without an API key.
+// step's own code, Tatum being paced at the anonymous rate only without an API key, and a Tatum
+// rate limit waited out for seconds with a key and for the full minute only without one (on fake
+// timers). Against a local gRPC server that never answers: an account build ending as TIMEOUT
+// within LIMITS.tatumTimeoutMs.
 // The unsigned builders: bytes that decode to exactly the expected Move call with the owner
 // as sender, nothing sent, refusals before building, and tampered resolutions refused by
 // assertSignable; findMemoryAccount's null, found and other-owner answers.
@@ -25,6 +28,7 @@ import { RpcError } from '@protobuf-ts/runtime-rpc';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { type Chain, ChainError } from '../src/chain.js';
 import { LIMITS } from '../src/limits.js';
+import { loadDialing, localGrpcServer } from './local-grpc.js';
 import {
   buildAddDelegateTx,
   buildCreateAccountTx,
@@ -505,6 +509,54 @@ describe('ensureMemoryAccount against a stand-in chain', () => {
       expect(await fakeMsFor(false)).toBeGreaterThanOrEqual(LIMITS.tatumPacingWindowMs);
     } finally {
       vi.resetModules();
+    }
+  });
+
+  it('waits out a Tatum rate limit for seconds on a keyed chain, and for the full minute only on the anonymous gateway', async () => {
+    // What grpc-js made of the HTTP 429 Tatum answered a 5-request burst on the key with, on 2026-10-28.
+    const rateLimited = () => new RpcError('Received HTTP status code 429', 'UNAVAILABLE');
+    const owner = normalizeSuiAddress(`0x${'b2'.repeat(32)}`);
+    const fakeRun = async (usesApiKey: boolean, refusals: number) => {
+      // A fresh module, so each run starts from an empty pacing ledger.
+      vi.resetModules();
+      const fresh = await import('../src/memory.js');
+      const getObjects = vi.fn(async () => ({ objects: [notFound()] }));
+      for (let i = 0; i < refusals; i++) getObjects.mockRejectedValueOnce(rateLimited());
+      const chain = { usesApiKey, grpc: { getObjects } } as unknown as Chain;
+      return withFakeTimers(async () => {
+        const started = Date.now();
+        // A registry that is not found ends the call after its first answered read.
+        const failure = await fresh.findMemoryAccount(chain, owner).then(
+          () => null,
+          (error: unknown) => error as MemoryError,
+        );
+        return { ms: Date.now() - started, code: failure?.code, reads: getObjects.mock.calls.length };
+      });
+    };
+    try {
+      expect(await fakeRun(true, 1)).toEqual({ ms: LIMITS.tatumRetryDelayMs, code: 'ACCOUNT', reads: 2 });
+      const allRefused = LIMITS.tatumRateLimitRetries + 1;
+      const waits = Array.from({ length: LIMITS.tatumRateLimitRetries }, (_, retry) => LIMITS.tatumRetryDelayMs * 2 ** retry);
+      expect(await fakeRun(true, allRefused)).toEqual({ ms: waits.reduce((a, b) => a + b, 0), code: 'RATE_LIMITED', reads: allRefused });
+      expect(await fakeRun(false, 1)).toEqual({ ms: LIMITS.tatumRateLimitWaitMs, code: 'ACCOUNT', reads: 2 });
+    } finally {
+      vi.resetModules();
+    }
+  });
+
+  it('ends an account build within LIMITS.tatumTimeoutMs as TIMEOUT when the gateway takes the call and never answers', { timeout: LIMITS.tatumTimeoutMs + 10_000 }, async () => {
+    const server = await localGrpcServer();
+    const fresh = await loadDialing(server.address, async () => ({ chain: await import('../src/chain.js'), memory: await import('../src/memory.js') }));
+    const chain = fresh.chain.createChain({ apiKey: 'stand-in-key', beforeRequest: async () => undefined });
+    const started = Date.now();
+    try {
+      // Matched by shape: the freshly loaded module has its own MemoryError class.
+      await expect(fresh.memory.buildCreateAccountTx({ chain, owner: normalizeSuiAddress(`0x${'5e'.repeat(32)}`) })).rejects.toMatchObject({ name: 'MemoryError', code: 'TIMEOUT' });
+      expect(Date.now() - started).toBeLessThan(LIMITS.tatumTimeoutMs + 2_000);
+      expect(server.calls).toEqual(['BatchGetObjects']);
+    } finally {
+      chain.close();
+      await server.close();
     }
   });
 

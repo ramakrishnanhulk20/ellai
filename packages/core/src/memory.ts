@@ -111,7 +111,8 @@ function sameBytes(a: Uint8Array, b: Uint8Array): boolean {
 // Calls made through chain.grpc directly get the transport timeout but no retries and no
 // pacing, and anonymous Tatum allows 5 requests a minute. Every account step goes through
 // here so a first run, about a dozen requests, never bursts past that. A chain with an API
-// key is not held to the anonymous rate; a rate limit there is still retried by tatumStep.
+// key is not held to the anonymous rate; a rate limit there is still retried by tatumStep,
+// after a wait of seconds (rateLimitWaitMs).
 const tatumRequestTimes: number[] = [];
 
 async function reserveTatum(chain: Chain, requests: number): Promise<void> {
@@ -176,7 +177,18 @@ function tatumFailure(error: unknown, fallback: MemoryErrorCode): MemoryError {
   return new MemoryError(fallback, 'a Walrus Memory account step failed');
 }
 
-/** One Tatum step: paced when the chain is anonymous, and tried again after a rate limit up to LIMITS.tatumRateLimitRetries times. */
+/**
+ * The wait before the `retry`-th retry of a step Tatum rate limited. The anonymous gateway counts
+ * requests a minute, so the wait outlasts that window. A key is limited per second (about 3 on the
+ * free plan, DECISIONS.md 2026-10-24), and building an account step after findMemoryAccount sends 5
+ * to 7 requests back to back, so the minute's wait held the owner a minute per rate limit for a
+ * limit that clears in about a second: a keyed chain waits as chain.ts's bounded() does.
+ */
+function rateLimitWaitMs(chain: Chain, retry: number): number {
+  return chain.usesApiKey ? LIMITS.tatumRetryDelayMs * 2 ** retry : LIMITS.tatumRateLimitWaitMs;
+}
+
+/** One Tatum step: paced when the chain is anonymous, and tried again after a rate limit up to LIMITS.tatumRateLimitRetries times, each after rateLimitWaitMs. */
 async function tatumStep<T>(chain: Chain, fallback: MemoryErrorCode, requests: number, run: () => PromiseLike<T>): Promise<T> {
   for (let retry = 0; ; retry++) {
     await reserveTatum(chain, requests);
@@ -185,7 +197,7 @@ async function tatumStep<T>(chain: Chain, fallback: MemoryErrorCode, requests: n
     } catch (error) {
       const failure = tatumFailure(error, fallback);
       if (failure.code !== 'RATE_LIMITED' || retry >= LIMITS.tatumRateLimitRetries) throw failure;
-      await sleep(LIMITS.tatumRateLimitWaitMs);
+      await sleep(rateLimitWaitMs(chain, retry));
     }
   }
 }

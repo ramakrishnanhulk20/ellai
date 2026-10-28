@@ -25,7 +25,10 @@
 // finding the cap that names the allowance, answering null past LIMITS.allowanceCapMaxPages pages with
 // one beforeRequest call a page, and refusing another type, another owner, a cap listed twice and a
 // cap out of form.
-// Does NOT cover: findAllowanceCap against the live gateway (prove:end reads a real cap),
+// Offline too, against a local gRPC server that takes every call and never answers: a raw read and
+// a raw transaction build on chain.grpc each ending at the transport's deadline, read as TIMEOUT.
+// Does NOT cover: a connection the network silently drops (a scratch check, WO-E1c, showed each
+// call on one still ends at the deadline, while grpc-js keeps using it), findAllowanceCap against the live gateway (prove:end reads a real cap),
 // listUsdcCoins against the live gateway, an address holding more coins than one
 // move takes on mainnet, the hook against the live gateway (no live test passes one), whether Tatum ever
 // answers a missing digest with an empty OK (the live made-up digest test fails if it does), a paid key's rate limits, the Walrus blob listing or scan against the live
@@ -49,6 +52,7 @@ import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { ChainError, type TatumCall, WALRUS_BLOB_TYPE, WALRUS_SYSTEM_OBJECT_ID, createChain } from '../src/chain.js';
 import { LIMITS } from '../src/limits.js';
 import { USDC_TYPE_MAINNET } from '../src/usdc.js';
+import { loadDialing, localGrpcServer } from './local-grpc.js';
 
 const FILE_STARTED_AT = Date.now();
 
@@ -272,6 +276,57 @@ describe('createChain options', () => {
       expect(chains.map((each) => each.usesApiKey)).toEqual([false, false, true]);
     } finally {
       for (const each of chains) each.close();
+    }
+  });
+});
+
+// The most a call may run past LIMITS.tatumTimeoutMs before it counts as stalled.
+const STALL_SLACK_MS = 2_000;
+
+/** How long `call` took to settle and what it failed with, or a time of Infinity when it was still waiting at `limitMs`. */
+async function settleWithin(call: () => PromiseLike<unknown>, limitMs: number): Promise<{ ms: number; error: unknown }> {
+  const started = Date.now();
+  let timer: NodeJS.Timeout | undefined;
+  const cutOff = new Promise<{ ms: number; error: unknown }>((resolve) => {
+    timer = setTimeout(() => resolve({ ms: Number.POSITIVE_INFINITY, error: null }), limitMs);
+  });
+  const settled = Promise.resolve()
+    .then(call)
+    .then(
+      () => ({ ms: Date.now() - started, error: null }),
+      (error: unknown) => ({ ms: Date.now() - started, error }),
+    );
+  try {
+    return await Promise.race([settled, cutOff]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+describe('raw calls on chain.grpc, against a local gRPC server that takes every call and never answers', () => {
+  it('end within LIMITS.tatumTimeoutMs, a read and a transaction build alike, and read as TIMEOUT', { timeout: 2 * (LIMITS.tatumTimeoutMs + STALL_SLACK_MS) + 5_000 }, async () => {
+    const server = await localGrpcServer();
+    const fresh = await loadDialing(server.address, () => import('../src/chain.js'));
+    // A hook, as the web app always passes one, so the admitting interceptor is in the path too.
+    const local = fresh.createChain({ apiKey: 'stand-in-key', beforeRequest: async () => undefined });
+    try {
+      const read = await settleWithin(() => local.grpc.getObjects({ objectIds: [normalizeSuiAddress(`0x${'5e'.repeat(32)}`)] }), LIMITS.tatumTimeoutMs + STALL_SLACK_MS);
+      const tx = new Transaction();
+      tx.setSender(normalizeSuiAddress(`0x${'a1'.repeat(32)}`));
+      tx.moveCall({ target: '0x2::transfer::public_share_object', typeArguments: ['0x2::coin::Coin<0x2::sui::SUI>'], arguments: [tx.object(normalizeSuiAddress(`0x${'5f'.repeat(32)}`))] });
+      const build = await settleWithin(() => tx.build({ client: local.grpc }), LIMITS.tatumTimeoutMs + STALL_SLACK_MS);
+      expect(server.calls).toEqual(['BatchGetObjects', 'SimulateTransaction']);
+      for (const [what, { ms, error }] of [['read', read], ['build', build]] as const) {
+        // Ended by the transport's own deadline, not by anything quicker such as a refused connection.
+        expect(ms, what).toBeGreaterThanOrEqual(LIMITS.tatumTimeoutMs - 1_000);
+        expect(ms, what).toBeLessThan(LIMITS.tatumTimeoutMs + STALL_SLACK_MS);
+        // The SDK hands a build's gRPC failure on as the cause of its own error, as memory.ts reads it.
+        const rpc = (error as { cause?: unknown }).cause ?? error;
+        expect([(rpc as { code?: unknown }).code, fresh.classifyChainError(rpc).code], what).toEqual(['DEADLINE_EXCEEDED', 'TIMEOUT']);
+      }
+    } finally {
+      local.close();
+      await server.close();
     }
   });
 });

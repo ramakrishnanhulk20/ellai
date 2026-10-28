@@ -140,7 +140,11 @@ export const LIMITS = {
   chainReadAfterWriteDelayMs: 3_000,
   /** The span the anonymous Tatum allowance is counted over: one minute plus two seconds of slack. */
   tatumPacingWindowMs: 62_000,
-  /** Wait after Tatum answers "rate limited" before the same step is tried again. Longer than one pacing window. */
+  /**
+   * Wait after the anonymous gateway answers "rate limited" before the same step is tried again.
+   * Longer than one pacing window. With a key the limit is per second, so a Walrus Memory account
+   * step waits tatumRetryDelayMs, doubling, instead.
+   */
   tatumRateLimitWaitMs: 65_000,
   /** Further tries of one Walrus Memory account step after a Tatum rate limit. */
   tatumRateLimitRetries: 2,

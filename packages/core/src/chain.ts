@@ -285,7 +285,12 @@ export interface AllowanceCapRef {
 export interface Chain {
   /** True when an API key is sent with every request; false for the anonymous gateway. */
   readonly usesApiKey: boolean;
-  /** Raw gRPC client. Calls made on it directly get the transport timeout and the beforeRequest hook, but no retries. */
+  /**
+   * Raw gRPC client. Each call made on it directly passes the beforeRequest hook and then ends
+   * within LIMITS.tatumTimeoutMs, the transport's deadline, whatever state the connection is in,
+   * but is never retried. An SDK helper that makes several calls, such as a transaction build,
+   * gets that bound per call, not in total, and hands a call's failure on as its own error's cause.
+   */
   readonly grpc: SuiGrpcClient;
   /** Raw GraphQL client. Calls made on it directly get the fetch timeout and the beforeRequest hook, but no retries. */
   readonly graphql: SuiGraphQLClient;
