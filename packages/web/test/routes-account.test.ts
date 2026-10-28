@@ -1608,7 +1608,7 @@ describe('the limits on routes that read Sui', () => {
     vi.mocked(findMemoryAccount).mockResolvedValue({ accountId: address(), delegates: [] });
     vi.mocked(buildAddDelegateTx).mockResolvedValue(ACCOUNT_BYTES);
     expect(BUILD_CHAIN_CALLS).toEqual({ memory_account: 5, add_delegate: 7, allowance: 3, usdc_to_address: 4, end_allowance: 6 });
-    expect(CONFIRM_CHAIN_CALLS).toEqual({ memory_account: 5, add_delegate: 5, allowance: 3, end_allowance: 1 });
+    expect(CONFIRM_CHAIN_CALLS).toEqual({ memory_account: 5, add_delegate: 5, allowance: 3, end_allowance: 2 });
 
     // 26 confirms are 130 calls; 10 delegate builds a minute later bring the day to exactly 200.
     for (let i = 0; i < 26; i += 1) expect((await confirm({ step: 'memory_account', digest: DIGEST }, { cookie: owner.cookie })).status).toBe(200);

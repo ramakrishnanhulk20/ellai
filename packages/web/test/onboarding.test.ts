@@ -13,8 +13,10 @@
 // NOT_ENOUGH_SUI when neither does. The USDC move builds from the coins Sui lists for the owner with
 // its exact summary, NOTHING_TO_MOVE coming before any gas read; ownerWallet reads the owner's own
 // address and splits USDC and SUI. Ending the allowance, through the build, submit and confirm
-// routes: no allowance recorded is 409 not_ready and the body cannot name one; an allowance Sui no
-// longer has is forgotten and 409 already_done; no cap in the owner's wallet is 409 not_ready; the
+// routes: no allowance recorded is 409 not_ready and the body cannot name one; an allowance both
+// getAllowance and objectExists say is gone is forgotten and 409 already_done at build and submit; one
+// only getAllowance misses is kept, with build, submit and confirm answering 503 chain_unavailable
+// and the steps below them ChainError UPSTREAM; no cap in the owner's wallet is 409 not_ready; the
 // build is one revoke of the recorded allowance with the listed cap, summarised from the row and
 // fixed text, at its pinned chain-call counts; signed bytes naming another allowance or cap are 400
 // bad_transaction with nothing sent; a landed revoke is 200 ended and forgets the allowance; a
@@ -52,6 +54,7 @@ import { CONFIRM_CHAIN_CALLS, confirmExistingStep, confirmOnboardingTx } from '.
 import { fewestCovering, ownerWallet } from '../src/server/onboarding/funds.js';
 import {
   ALLOWANCE_ENDED_MESSAGE,
+  ALLOWANCE_INDEX_LAG_MESSAGE,
   type BuildStep,
   NO_ALLOWANCE_CAP_MESSAGE,
   NO_ALLOWANCE_MESSAGE,
@@ -137,8 +140,10 @@ interface ChainSetup {
   wallet?: Partial<WalletBalances>;
   suiCoins?: OwnedCoin[];
   usdcCoins?: OwnedCoin[];
-  /** getAllowance answers NOT_FOUND, as it does once the allowance is revoked. */
+  /** getAllowance answers NOT_FOUND and objectExists false, as both do once the allowance is revoked. */
   allowanceGone?: boolean;
+  /** getAllowance answers NOT_FOUND while objectExists still answers true, as during a GraphQL index stall. */
+  indexLag?: boolean;
   /** What findAllowanceCap answers; OWNER_CAP unless a test says otherwise. */
   cap?: AllowanceCapRef | null;
   /** How a relayed transaction ends on chain. */
@@ -176,9 +181,10 @@ function stubChain(owner: Owner, setup: ChainSetup = {}) {
     },
   }));
   const getAllowance = vi.fn(async (_id: string) => {
-    if (setup.allowanceGone) throw new ChainError('NOT_FOUND', 'stand-in not found');
+    if (setup.allowanceGone || setup.indexLag) throw new ChainError('NOT_FOUND', 'stand-in not found');
     return { ...goodAllowance(owner), ...setup.allowance };
   });
+  const objectExists = vi.fn(async (_id: string) => !setup.allowanceGone);
   const findAllowanceCap = vi.fn(async (_owner: string, _allowanceId: string) => (setup.cap === undefined ? OWNER_CAP : setup.cap));
   // One SUI in the address balance unless a test says otherwise, so a fee is paid from it.
   const getWalletBalances = vi.fn(async () => ({ usdcAddressBalance: 0n, usdcCoinBalance: 0n, suiAddressBalance: 1_000_000_000n, suiCoinBalance: 0n, ...setup.wallet }));
@@ -195,6 +201,7 @@ function stubChain(owner: Owner, setup: ChainSetup = {}) {
     usesApiKey: true,
     getTransactionResult,
     getAllowance,
+    objectExists,
     findAllowanceCap,
     getWalletBalances,
     listSuiCoins,
@@ -204,7 +211,7 @@ function stubChain(owner: Owner, setup: ChainSetup = {}) {
     getReferenceGasPrice: async () => 100n,
     grpc: { ledgerService: { getTransaction } },
   } as unknown as Chain;
-  return { chain, getTransactionResult, getTransaction, getAllowance, findAllowanceCap, getWalletBalances, listSuiCoins, listUsdcCoins, executeTransaction };
+  return { chain, getTransactionResult, getTransaction, getAllowance, objectExists, findAllowanceCap, getWalletBalances, listSuiCoins, listUsdcCoins, executeTransaction };
 }
 
 const untouchable = new Proxy({}, {
@@ -639,14 +646,50 @@ describe('ending the allowance, through the build, submit and confirm routes', (
     expect((await build(owner, { step: 'end_allowance', allowanceId: address() })).status).toBe(400);
   });
 
-  it('forgets an allowance Sui no longer has and answers 409 already_done, never looking for a cap', async () => {
+  it("forgets an allowance both of Tatum's views say is gone and answers 409 already_done, at build and at submit, never looking for a cap or sending", async () => {
     const owner = await signedIn();
     const stub = stubChain(owner.row, { allowanceGone: true });
     routeChain = stub.chain;
     expect(await answer(await build(owner))).toEqual([409, { error: 'already_done', message: ALLOWANCE_ENDED_MESSAGE }]);
     expect(stub.getAllowance.mock.calls).toEqual([[owner.row.allowanceId]]);
+    expect(stub.objectExists.mock.calls).toEqual([[owner.row.allowanceId]]);
     expect(stub.findAllowanceCap).not.toHaveBeenCalled();
     expect(await reread(owner.row)).toMatchObject({ allowanceId: null, allowanceCheckedAt: null, refillNotBefore: null });
+
+    const other = await signedIn();
+    const atSubmit = stubChain(other.row, { allowanceGone: true });
+    routeChain = atSubmit.chain;
+    expect(await answer(await submit(other, await signed(other, await revokeBytes(other))))).toEqual([409, { error: 'already_done', message: ALLOWANCE_ENDED_MESSAGE }]);
+    expect(atSubmit.objectExists.mock.calls).toEqual([[other.row.allowanceId]]);
+    expect(atSubmit.executeTransaction).not.toHaveBeenCalled();
+    expect((await reread(other.row)).allowanceId).toBeNull();
+  });
+
+  it('keeps an allowance only GraphQL misses while gRPC still holds it: build, submit and confirm answer 503 chain_unavailable, forgetting and sending nothing', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    try {
+      const owner = await signedIn();
+      const stub = stubChain(owner.row, { indexLag: true });
+      routeChain = stub.chain;
+      const unavailable = [503, { error: 'chain_unavailable', message: 'Ellai could not read Sui just now. Try again in a minute.' }];
+      expect(await answer(await build(owner))).toEqual(unavailable);
+      expect(await answer(await submit(owner, await signed(owner, await revokeBytes(owner))))).toEqual(unavailable);
+      expect(await answer(await confirm(owner))).toEqual(unavailable);
+      expect(stub.objectExists.mock.calls).toEqual(Array.from({ length: 3 }, () => [owner.row.allowanceId]));
+      expect(stub.findAllowanceCap).not.toHaveBeenCalled();
+      expect(stub.executeTransaction).not.toHaveBeenCalled();
+      expect(await reread(owner.row)).toMatchObject({ allowanceId: owner.row.allowanceId, allowanceCheckedAt: NOW, refillNotBefore: owner.row.refillNotBefore });
+
+      // Below the routes, each step fails with the one sentence that says why.
+      const lagging = { name: 'ChainError', code: 'UPSTREAM', message: ALLOWANCE_INDEX_LAG_MESSAGE };
+      const common = { db, ownerId: owner.row.id, chain: stub.chain, masterSecretHex: MASTER, now: NOW };
+      await expect(buildOnboardingTx({ ...common, step: 'end_allowance' })).rejects.toMatchObject(lagging);
+      await expect(submitOnboardingTx({ ...common, step: 'end_allowance', txBytesBase64: toBase64(await revokeBytes(owner)), signature: 'AA==' })).rejects.toMatchObject(lagging);
+      await expect(confirmOnboardingTx({ ...common, step: 'end_allowance', digest: DIGEST })).rejects.toMatchObject(lagging);
+      expect((await reread(owner.row)).allowanceId).toBe(owner.row.allowanceId);
+    } finally {
+      warn.mockRestore();
+    }
   });
 
   it("answers 409 not_ready when Sui shows no cap for the allowance in the owner's wallet, keeping the allowance", async () => {
@@ -679,8 +722,9 @@ describe('ending the allowance, through the build, submit and confirm routes', (
     ]);
     expect(stub.getAllowance.mock.calls).toEqual([[owner.row.allowanceId]]);
     expect(stub.findAllowanceCap.mock.calls).toEqual([[owner.row.suiAddress, owner.row.allowanceId]]);
-    // Build: one allowance read, two cap pages at most, three gas reads. Submit: the same two re-reads, a SUI coin re-read, the send. Confirm: one read.
-    expect([BUILD_CHAIN_CALLS.end_allowance, SUBMIT_CHAIN_CALLS.end_allowance, CONFIRM_CHAIN_CALLS.end_allowance]).toEqual([6, 5, 1]);
+    // Build: one allowance read, two cap pages at most, three gas reads. Submit: the same two re-reads, a SUI coin re-read, the send.
+    // A missed allowance read stops either at the gRPC check, two calls. Confirm: the read, then that check once it misses.
+    expect([BUILD_CHAIN_CALLS.end_allowance, SUBMIT_CHAIN_CALLS.end_allowance, CONFIRM_CHAIN_CALLS.end_allowance]).toEqual([6, 5, 2]);
   });
 
   it('refuses signed bytes naming another allowance or another cap with 400 bad_transaction, sending nothing (C6, C7)', async () => {
@@ -734,6 +778,7 @@ describe('ending the allowance, through the build, submit and confirm routes', (
     routeChain = gone.chain;
     expect(await answer(await confirm(owner))).toEqual([200, { recorded: 'ended' }]);
     expect(gone.getAllowance.mock.calls).toEqual([[owner.row.allowanceId]]);
+    expect(gone.objectExists.mock.calls).toEqual([[owner.row.allowanceId]]);
     expect((await reread(owner.row)).allowanceId).toBeNull();
     // Already forgotten: nothing is read, and the answer is the same.
     routeChain = untouchable;

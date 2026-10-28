@@ -320,6 +320,12 @@ export interface Chain {
   executeTransaction(txBytes: Uint8Array, signatures: string[]): Promise<ExecutionResult>;
   getAllowance(objectId: string): Promise<AllowanceReading>;
   /**
+   * Whether Sui's gRPC view holds a live object with this id now: false only on the node's own
+   * NOT_FOUND, which is what a deleted object answers. Read through a different Tatum index than
+   * getAllowance, so a caller can check a GraphQL NOT_FOUND against it before acting on it.
+   */
+  objectExists(objectId: string): Promise<boolean>;
+  /**
    * The owner's Sui Mainnet USDC AllowanceCap whose allowance field is `allowanceId`, the one key
    * that ends that allowance, or null when it is not among the first LIMITS.allowanceCapMaxPages
    * pages of the owner's caps.
@@ -848,7 +854,15 @@ export function createChain(opts: { apiKey?: string; beforeRequest?: BeforeTatum
     host: TATUM_GRPC_HOST,
     channelCredentials: ChannelCredentials.createSsl(),
     timeout: LIMITS.tatumTimeoutMs,
-    clientOptions: { 'grpc.max_receive_message_length': LIMITS.grpcMaxReceiveBytes },
+    clientOptions: {
+      'grpc.max_receive_message_length': LIMITS.grpcMaxReceiveBytes,
+      // A ping time plus its timeout under tatumTimeoutMs, so a silently dead connection fails the
+      // call on it as UNAVAILABLE in time for bounded() to retry on a new one (C21). No pings while
+      // idle: a gRPC server may answer those with GOAWAY too_many_pings.
+      'grpc.keepalive_time_ms': LIMITS.grpcKeepaliveTimeMs,
+      'grpc.keepalive_timeout_ms': LIMITS.grpcKeepaliveTimeoutMs,
+      'grpc.keepalive_permit_without_calls': 0,
+    },
     ...(apiKey ? { meta: { [API_KEY_HEADER]: apiKey } } : {}),
     ...(admit ? { interceptors: [admittingInterceptor(admit)] } : {}),
   });
@@ -1491,6 +1505,32 @@ export function createChain(opts: { apiKey?: string; beforeRequest?: BeforeTatum
   }
 
   /**
+   * Asks Tatum gRPC (GetObject, latest version, the object id alone in the read mask) whether an
+   * object with this id is live on Sui Mainnet now, with the usual timeout, retries and gRPC
+   * message cap, each request passing beforeRequest. Returns true when the node answers with that
+   * object, false only when it answers NOT_FOUND, which is what it gives for a deleted object as
+   * well as one never made. An answer with no object in it, or another object, is BAD_RESPONSE,
+   * never false, so only the node's own word can say an object is gone.
+   * Throws ChainError: INVALID_INPUT for a malformed id, BAD_RESPONSE, or any transport code.
+   */
+  async function objectExists(objectId: string): Promise<boolean> {
+    const id = inputAddress(objectId);
+    let object: GrpcTypes.Object | undefined;
+    try {
+      const { response } = await bounded('objectExists', (abort) =>
+        grpc.ledgerService.getObject({ objectId: id, readMask: { paths: ['object_id'] } }, { abort }),
+      );
+      object = response.object;
+    } catch (error) {
+      if (error instanceof ChainError && error.code === 'NOT_FOUND') return false;
+      throw error;
+    }
+    if (!object) throw badResponse('the object read answered with no object');
+    if (chainAddress(object.objectId, 'object id') !== id) throw badResponse('the object returned is not the one asked for');
+    return true;
+  }
+
+  /**
    * Looks through the owner's Sui Mainnet USDC AllowanceCap objects through Tatum GraphQL, at most
    * LIMITS.allowanceCapMaxPages pages of LIMITS.allowanceCapPageSize, for the one whose allowance
    * field is `allowanceId`, and returns it as an owned object reference, or null when it is not in
@@ -1569,6 +1609,7 @@ export function createChain(opts: { apiKey?: string; beforeRequest?: BeforeTatum
     getWalrusEpoch,
     executeTransaction,
     getAllowance,
+    objectExists,
     findAllowanceCap,
     close: () => transport.close(),
   };

@@ -7,7 +7,9 @@
 //      (findAllowanceCap), the cap held to the one the issue itself created
 //   4. the revoke is built (buildRevokeAllowance), checked (assertRevokeAllowance), dry-run,
 //      signed with the test owner key and sent through Tatum; its gas is read from its effects
-//   5. getAllowance on the id answers NOT_FOUND, and the owner's cap for it is gone
+//   5. getAllowance on the id answers NOT_FOUND, and the owner's cap for it is gone; then
+//      objectExists (gRPC) answers false for an allowance an earlier revoke deleted and true for
+//      the test owner's live one
 // Neither transaction may change any USDC balance; one that does stops the run.
 // Every stage is idempotent through scratchpad/slice-state-end.json, written before anything is
 // sent and updated after, so a run that stopped part way resumes with the same allowance and never
@@ -54,6 +56,13 @@ const RATE_LIMIT_WAIT_MS = 65_000;
 // wait up to ten minutes instead of LIMITS.chainReadAfterWriteTries.
 const INDEX_READ_TRIES = 40;
 const INDEX_READ_DELAY_MS = 15_000;
+// The two answers Ellai's index-lag check (objectExists) must tell apart: an allowance a revoke
+// deleted on 2026-10-28, read from that transaction's effects, and the test owner's allowance in use.
+const REVOKED_ALLOWANCE = {
+  id: '0x5bfefb0eaee7f21a326993506fbbd77dad767e3a4e25f8694be97a79a7b13f0a',
+  revokeDigest: '242q2vg9KZUBmn3xYJ1vRazc5Dnk4GY9bX5yUsQtnU46',
+};
+const LIVE_ALLOWANCE = '0xd2b941082590b7d9d0a04482109670f94c290714889b67e8ef2c60ec6d9699c8';
 
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
@@ -423,6 +432,10 @@ async function stageGone(run: Run, allowanceId: string): Promise<void> {
   const cap = await read(() => run.chain.findAllowanceCap(run.ownerAddress, allowanceId));
   if (cap !== null) throw new Stop(`findAllowanceCap still lists cap ${cap.objectId} for the ended allowance. Stopping.`);
   console.log('  findAllowanceCap finds no cap for it in the owner\'s wallet');
+  const revokedHeld = await read(() => run.chain.objectExists(REVOKED_ALLOWANCE.id));
+  const liveHeld = await read(() => run.chain.objectExists(LIVE_ALLOWANCE));
+  if (revokedHeld || !liveHeld) throw new Stop(`objectExists answered ${revokedHeld} for the revoked allowance and ${liveHeld} for the live one, not false and true. Stopping.`);
+  console.log(`  objectExists through gRPC: ${REVOKED_ALLOWANCE.id} (revoked in ${REVOKED_ALLOWANCE.revokeDigest}) answers false, the test owner's live allowance ${LIVE_ALLOWANCE} answers true`);
 }
 
 async function main(): Promise<void> {

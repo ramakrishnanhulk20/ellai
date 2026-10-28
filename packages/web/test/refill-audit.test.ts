@@ -6,7 +6,9 @@
 // that fails holds the allowance off for LIMITS.refillDryRunWaitMs, an hour, only while the owner
 // still holds that allowance, and a dry run with no verdict does not (D-1, C22); an allowance expiring within
 // LIMITS.allowanceExpiryMarginMs of the clock read after it, or of the end of a full rate window,
-// is forgotten and nothing is built (A-F6, C30).
+// is forgotten and nothing is built (A-F6, C30); an allowance getAllowance cannot find is forgotten
+// only when objectExists agrees it is gone, and is otherwise left as it is with one warning line,
+// a failed check or a passed deadline forgetting nothing (WO-E1b, C7, C22).
 // Does NOT cover: the jobs tick that calls refillIfNeeded (jobs.test.ts), the real Sui chain or
 // Tatum, or two connections racing on the owner lock (PGlite serves one).
 import { randomBytes } from 'node:crypto';
@@ -19,7 +21,7 @@ import { Ed25519Keypair } from '@mysten/sui/keypairs/ed25519';
 import { TransactionDataBuilder } from '@mysten/sui/transactions';
 import { SUI_TYPE_ARG, normalizeStructTag } from '@mysten/sui/utils';
 import { eq } from 'drizzle-orm';
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { type Database, createDb, migrate } from '../src/server/db/client.js';
 import { agents, decisions, owners, payments, refills } from '../src/server/db/schema.js';
 import { RefillError, refillIfNeeded } from '../src/server/jobs/refill.js';
@@ -103,11 +105,14 @@ function stubChain(w: Funded) {
     allowance: allowanceFor(w) as AllowanceReading | Error,
     simulate: (): SimulationResult => ({ status: 'success', errorCode: null, balanceChanges: refillChanges(w) }),
     onAllowanceRead: async () => undefined as void,
+    /** What objectExists answers: whether gRPC still holds the allowance, or the error it throws. */
+    grpcHolds: true as boolean | Error,
     /** Digests the chain shows as landed refills besides the ones sent here. */
     landed: new Set<string>(),
   };
   const executions: string[] = [];
   const reads: string[] = [];
+  const objectReads: string[] = [];
   const chain = {
     usesApiKey: false,
     getCurrentEpoch: async () => state.epoch,
@@ -117,6 +122,11 @@ function stubChain(w: Funded) {
       await state.onAllowanceRead();
       if (state.allowance instanceof Error) throw state.allowance;
       return state.allowance;
+    },
+    objectExists: async (id: string) => {
+      objectReads.push(id);
+      if (state.grpcHolds instanceof Error) throw state.grpcHolds;
+      return state.grpcHolds;
     },
     simulate: async () => state.simulate(),
     executeTransaction: async (txBytes: Uint8Array) => {
@@ -131,7 +141,7 @@ function stubChain(w: Funded) {
       return { status: 'success', balanceChanges: refillChanges(w) };
     },
   } as unknown as Chain;
-  return { chain, state, executions, reads };
+  return { chain, state, executions, reads, objectReads };
 }
 
 const refillRows = (ownerId: string) => db.select().from(refills).where(eq(refills.ownerId, ownerId));
@@ -183,7 +193,7 @@ async function spent(w: Funded, amount: bigint) {
   });
 }
 
-const refill = (w: Funded, chain: Chain, extra: { clock?: () => Date } = {}) =>
+const refill = (w: Funded, chain: Chain, extra: { clock?: () => Date; canStart?: () => boolean } = {}) =>
   refillIfNeeded({ db, chain, ownerId: w.ownerId, masterSecretHex: MASTER, gasKeypair: GAS, now: NOW, ...extra });
 
 describe('refillIfNeeded, the money-path audit fixes', () => {
@@ -333,5 +343,50 @@ describe('refillIfNeeded, the money-path audit fixes', () => {
     expect(await attempt({ ...full, expirationMs: BigInt(windowEnd + MARGIN - 1) })).toMatchObject({ outcome: 'refused', sent: 0, recorded: forgotten });
     const waits = await attempt({ ...full, expirationMs: BigInt(windowEnd + MARGIN) });
     expect(waits).toMatchObject({ outcome: 'refused', sent: 0, recorded: { allowanceId: waits.w.allowanceId, refillNotBefore: new Date(windowEnd) } });
+  });
+
+  it('forgets an allowance GraphQL cannot find only when gRPC agrees it is gone, and otherwise leaves the owner as is with one warning that names no id (C7, C22)', async () => {
+    const missing = () => new ChainError('NOT_FOUND', 'Allowance was not found on Sui mainnet');
+    const visit = async (grpcHolds: boolean | Error, canStart?: () => boolean, onAllowanceRead?: () => Promise<void>) => {
+      const w = await funded();
+      const stub = stubChain(w);
+      stub.state.allowance = missing();
+      stub.state.grpcHolds = grpcHolds;
+      if (onAllowanceRead) stub.state.onAllowanceRead = onAllowanceRead;
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+      let outcome: unknown;
+      let lines: string[];
+      try {
+        outcome = await refill(w, stub.chain, canStart ? { canStart } : {}).catch((error: unknown) => error);
+        lines = warn.mock.calls.map((call) => call.join(' '));
+      } finally {
+        warn.mockRestore();
+      }
+      const owner = await ownerRow(w.ownerId);
+      expect(stub.executions).toEqual([]);
+      expect(await refillRows(w.ownerId)).toHaveLength(0);
+      return { w, outcome, lines, objectReads: stub.objectReads, recorded: { allowanceId: owner.allowanceId, allowanceCheckedAt: owner.allowanceCheckedAt, refillNotBefore: owner.refillNotBefore } };
+    };
+
+    const lag = await visit(true);
+    expect(lag).toMatchObject({ outcome: 'refused', lines: ['[ellai refill] allowance_index_lag'], objectReads: [lag.w.allowanceId] });
+    expect(lag.recorded).toEqual({ allowanceId: lag.w.allowanceId, allowanceCheckedAt: NOW, refillNotBefore: null });
+
+    const gone = await visit(false);
+    expect(gone).toMatchObject({ outcome: 'refused', lines: [], objectReads: [gone.w.allowanceId] });
+    expect(gone.recorded).toEqual({ allowanceId: null, allowanceCheckedAt: null, refillNotBefore: null });
+
+    // A check that cannot answer forgets nothing; the tick records the failure and the next visit reads again.
+    const unanswered = await visit(new ChainError('TIMEOUT', 'Tatum objectExists: timed out', true));
+    expect(unanswered.outcome).toMatchObject({ name: 'ChainError', code: 'TIMEOUT' });
+    expect(unanswered.recorded.allowanceId).toBe(unanswered.w.allowanceId);
+
+    // The check is a chain read like any other, so a deadline that passed during the allowance read stops it.
+    let open = true;
+    const late = await visit(false, () => open, async () => {
+      open = false;
+    });
+    expect(late).toMatchObject({ outcome: 'deferred', objectReads: [] });
+    expect(late.recorded.allowanceId).toBe(late.w.allowanceId);
   });
 });

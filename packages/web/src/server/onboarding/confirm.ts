@@ -12,6 +12,8 @@ import { ownerDelegate } from '../memory/delegate.js';
 import {
   ACCOUNT_STEPS,
   type AccountStep,
+  ALLOWANCE_INDEX_LAG_MESSAGE,
+  allowanceGone,
   checkConfirmStep,
   checkNow,
   checkStep,
@@ -28,9 +30,10 @@ import {
  * The Tatum calls confirmOnboardingTx's success path makes for each step, which the confirm route
  * counts against the day's budgets before any of them (C22): the transaction's result and its
  * facts, then findMemoryAccount's registry, registry entry and account, or the allowance itself
- * (one GraphQL call). Ending the allowance reads only the allowance on the owner row: one call.
+ * (one GraphQL call). Ending the allowance reads the allowance on the owner row, and once that read
+ * misses it, as it does when the end succeeded, checks it is gone through gRPC: two calls.
  */
-export const CONFIRM_CHAIN_CALLS: Readonly<Record<ConfirmStep, number>> = { memory_account: 5, add_delegate: 5, allowance: 3, end_allowance: 1 };
+export const CONFIRM_CHAIN_CALLS: Readonly<Record<ConfirmStep, number>> = { memory_account: 5, add_delegate: 5, allowance: 3, end_allowance: 2 };
 
 /** What confirm answers for end_allowance: Sui no longer has the owner's allowance, and Ellai has forgotten it. */
 export const ENDED_RECORD = 'ended';
@@ -217,9 +220,11 @@ async function confirmAllowance(
 
 /**
  * Records that the owner's allowance has ended, from what Sui shows for the allowance on the owner
- * row, never an id the caller names (C7): when getAllowance answers NOT_FOUND it is forgotten
- * (forgetAllowance). A row with no allowance has nothing left to forget.
- * Throws OnboardingError NOT_LANDED while Sui still shows the allowance; ChainError from the read.
+ * row, never an id the caller names (C7): when getAllowance (GraphQL) answers NOT_FOUND and
+ * allowanceGone (one gRPC read) agrees, it is forgotten (forgetAllowance). A row with no allowance
+ * has nothing left to forget.
+ * Throws OnboardingError NOT_LANDED while GraphQL still shows the allowance; ChainError UPSTREAM with
+ * ALLOWANCE_INDEX_LAG_MESSAGE, the allowance kept, while only GraphQL misses it; ChainError from the reads.
  */
 async function confirmEnded(db: Database, owner: OwnerRow, chain: Chain): Promise<string> {
   const recordedId = owner.allowanceId;
@@ -229,6 +234,7 @@ async function confirmEnded(db: Database, owner: OwnerRow, chain: Chain): Promis
     await chain.getAllowance(allowanceId);
   } catch (error) {
     if (error instanceof ChainError && error.code === 'NOT_FOUND') {
+      if (!(await allowanceGone(chain, allowanceId))) throw new ChainError('UPSTREAM', ALLOWANCE_INDEX_LAG_MESSAGE, true);
       await forgetAllowance(db, owner.id, recordedId);
       return ENDED_RECORD;
     }
@@ -253,8 +259,9 @@ async function confirmEnded(db: Database, owner: OwnerRow, chain: Chain): Promis
  *   cleared, so the jobs tick reads the new allowance at its next visit. The allowance id comes
  *   from the transaction's effects, never from the caller.
  * - end_allowance: the digest is only checked for its form and is not read. What is recorded is
- *   what Sui shows for the allowance on the owner row (confirmEnded): gone, and then forgotten, so
- *   the tick stops visiting the owner for refills; still there is NOT_LANDED. One read.
+ *   what Sui shows for the allowance on the owner row (confirmEnded): gone by both of Tatum's views,
+ *   and then forgotten, so the tick stops visiting the owner for refills; still there is
+ *   NOT_LANDED; gone only from GraphQL is ChainError UPSTREAM, the allowance kept. At most two reads.
  * Anything else refuses and records nothing. Idempotent: confirming the same step again
  * records the same values.
  * Returns what was recorded: the account id, the delegate public key as hex, the allowance id, or

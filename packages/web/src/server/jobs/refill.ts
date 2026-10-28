@@ -11,7 +11,7 @@ import { SUI_TYPE_ARG, normalizeStructTag } from '@mysten/sui/utils';
 import { and, asc, count, eq, gte, isNull, lte, sql } from 'drizzle-orm';
 import type { Database } from '../db/client.js';
 import { owners, payments, refills } from '../db/schema.js';
-import { forgetAllowance } from '../onboarding/state.js';
+import { allowanceGone, forgetAllowance } from '../onboarding/state.js';
 import type { DbHandle } from '../pay/sign.js';
 
 export interface RefillJobArgs {
@@ -398,8 +398,11 @@ async function resolvePending(
  *    again has allowance_id, allowance_checked_at and refill_not_before cleared in one update, and
  *    one whose current rate window alone is short sets refill_not_before to the window's end,
  *    which the jobs tick waits for. Either update touches the owner only while it still holds this
- *    allowance id. Then the chain facts (epoch, gas price, the allowance's initial shared
- *    version, a random nonce) are read, all before any lock.
+ *    allowance id. Gone means getAllowance (GraphQL) answers NOT_FOUND and allowanceGone (one gRPC
+ *    read) agrees; while gRPC still holds it, nothing is written, one console.warn line
+ *    allowance_index_lag is logged, and the next visit reads it again. Then the chain facts
+ *    (epoch, gas price, the allowance's initial shared version, a random nonce) are read, all
+ *    before any lock.
  * 6. In one transaction holding the owner row FOR UPDATE: any refill still pending is
  *    'skipped_pending', so two calls can never refill twice; `clock` is read, every refill sent
  *    in the LIMITS.purseRefillWindowMs before that reading is counted, and core's refillDecision
@@ -490,8 +493,13 @@ export async function refillIfNeeded(args: RefillJobArgs): Promise<RefillOutcome
   try {
     allowance = await chain.getAllowance(allowanceId);
   } catch (error) {
-    // Revoked, or never there: nothing to spend from.
     if (error instanceof ChainError && error.code === 'NOT_FOUND') {
+      if (!canStart()) return 'deferred';
+      // GraphQL alone can miss a live allowance while its index lags, so gRPC must agree it is gone.
+      if (!(await allowanceGone(chain, allowanceId))) {
+        console.warn('[ellai refill] allowance_index_lag');
+        return 'refused';
+      }
       await forgetAllowance(db, ownerId, allowanceId);
       return 'refused';
     }

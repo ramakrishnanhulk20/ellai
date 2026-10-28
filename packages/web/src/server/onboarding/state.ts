@@ -1,3 +1,4 @@
+import type { Chain } from '@ellai/core/chain';
 import { and, eq } from 'drizzle-orm';
 import type { Database } from '../db/client.js';
 import { owners } from '../db/schema.js';
@@ -57,6 +58,9 @@ export const ALLOWANCE_ENDED_MESSAGE = 'This allowance has already ended on Sui.
 
 /** NOT_READY for end_allowance when Sui shows no AllowanceCap for the recorded allowance in the owner's wallet. */
 export const NO_ALLOWANCE_CAP_MESSAGE = 'Sui shows no key to end this allowance in your wallet.';
+
+/** The ChainError UPSTREAM an onboarding step throws when getAllowance misses the allowance but gRPC still holds it (allowanceGone). */
+export const ALLOWANCE_INDEX_LAG_MESSAGE = "Sui's indexes disagree about this allowance just now. Try again in a minute.";
 
 /**
  * Every refusal from onboarding. The message is fixed text plus limits and ids Ellai read or
@@ -126,6 +130,18 @@ export async function forgetAllowance(db: Database, ownerId: string, allowanceId
     .update(owners)
     .set({ allowanceId: null, allowanceCheckedAt: null, refillNotBefore: null })
     .where(and(eq(owners.id, ownerId), eq(owners.allowanceId, allowanceId)));
+}
+
+/**
+ * Asked after getAllowance answers NOT_FOUND, before anything forgets the allowance: true only
+ * when Tatum gRPC (chain.objectExists, one call) also says Sui has no such object. getAllowance
+ * reads Tatum's GraphQL index, which stalled for an hour on 2026-10-28 while gRPC kept up, and a
+ * lagging replica that has not indexed a fresh allowance answers NOT_FOUND too, so that answer
+ * alone would make Ellai forget a live allowance (C7, C22).
+ * Throws any ChainError from the read; a caller then keeps the allowance.
+ */
+export async function allowanceGone(chain: Chain, allowanceId: string): Promise<boolean> {
+  return !(await chain.objectExists(allowanceId));
 }
 
 export interface OnboardingState {

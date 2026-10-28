@@ -537,7 +537,6 @@ export async function assertRefill(txBytes: Uint8Array, args: RefillArgs, facts:
   if (!sameBytes(txBytes, expectedBytes)) fail('MISMATCH', 'the bytes differ from a fresh build of the refill');
 }
 
-/** Names the first way the decoded transaction differs from the move these terms describe, or null. */
 /** Names the first way the gas payment, price or expiration differs from how the owner was to pay, or null. */
 function firstOwnerGasDifference(v1: DecodedV1, gas: OwnerGasFacts): string | null {
   if (!paysWithCoins(gas)) {

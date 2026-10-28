@@ -1,5 +1,5 @@
 import { createServer, type ServerHttp2Session, type ServerHttp2Stream } from 'node:http2';
-import type { AddressInfo } from 'node:net';
+import { type AddressInfo, createConnection, createServer as createTcpServer, type Socket } from 'node:net';
 import { ChannelCredentials } from '@grpc/grpc-js';
 import { vi } from 'vitest';
 
@@ -49,6 +49,53 @@ export async function localGrpcServer(answer?: (stream: ServerHttp2Stream, metho
 /** Answers a gRPC call with `code` and no message, as the gateway answers a refusal. */
 export function refuseCall(stream: ServerHttp2Stream, code: number, message: string): void {
   stream.respond({ ':status': 200, 'content-type': 'application/grpc', 'grpc-status': String(code), 'grpc-message': encodeURIComponent(message) }, { endStream: true });
+}
+
+/** Answers a gRPC call with OK and one message, its protobuf bytes in an uncompressed gRPC frame. */
+export function answerCall(stream: ServerHttp2Stream, message: Uint8Array): void {
+  const frame = Buffer.alloc(5 + message.length);
+  frame.writeUInt32BE(message.length, 1);
+  frame.set(message, 5);
+  stream.respond({ ':status': 200, 'content-type': 'application/grpc' }, { waitForTrailers: true });
+  stream.on('wantTrailers', () => stream.sendTrailers({ 'grpc-status': '0' }));
+  stream.end(frame);
+}
+
+export interface BlackHoleProxy {
+  /** host:port to dial. */
+  address: string;
+  /** Every connection open now stops passing bytes either way and stays open, as a NAT that forgot it does. New connections still work. */
+  drop(): void;
+  /** Connections made through the proxy so far. */
+  connections(): number;
+  close(): void;
+}
+
+/** A TCP proxy in front of `target`, so a test can drop a connection silently: no FIN, no RST. */
+export async function blackHoleProxy(target: string): Promise<BlackHoleProxy> {
+  const [host, port] = target.split(':');
+  const pairs: Array<{ open: boolean; sockets: Socket[] }> = [];
+  const server = createTcpServer((client) => {
+    const upstream = createConnection({ host, port: Number(port) });
+    const pair = { open: true, sockets: [client, upstream] };
+    pairs.push(pair);
+    client.on('data', (chunk) => pair.open && upstream.write(chunk));
+    upstream.on('data', (chunk) => pair.open && client.write(chunk));
+    client.on('error', () => undefined);
+    upstream.on('error', () => undefined);
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  return {
+    address: `127.0.0.1:${(server.address() as AddressInfo).port}`,
+    drop: () => {
+      for (const pair of pairs) pair.open = false;
+    },
+    connections: () => pairs.length,
+    close: () => {
+      for (const pair of pairs) for (const socket of pair.sockets) socket.destroy();
+      server.close();
+    },
+  };
 }
 
 /**

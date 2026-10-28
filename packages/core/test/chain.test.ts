@@ -24,11 +24,17 @@
 // Offline too, against stand-in GraphQL pages: findAllowanceCap asking for exactly the USDC cap type,
 // finding the cap that names the allowance, answering null past LIMITS.allowanceCapMaxPages pages with
 // one beforeRequest call a page, and refusing another type, another owner, a cap listed twice and a
-// cap out of form.
+// cap out of form. Offline too, against a stand-in gRPC transport: objectExists asking GetObject for
+// the id alone, once through beforeRequest, true for a live object, false only on NOT_FOUND, and
+// throwing for any other failure, an empty answer or another object.
 // Offline too, against a local gRPC server that takes every call and never answers: a raw read and
 // a raw transaction build on chain.grpc each ending at the transport's deadline, read as TIMEOUT.
-// Does NOT cover: a connection the network silently drops (a scratch check, WO-E1c, showed each
-// call on one still ends at the deadline, while grpc-js keeps using it), findAllowanceCap against the live gateway (prove:end reads a real cap),
+// Offline too, through a proxy that silently black-holes a warm connection: the next bounded read
+// failing at most once, when its keepalive ping goes unanswered, and answering on the retry over a
+// fresh connection inside one deadline, the retry wait and 2 s.
+// Does NOT cover: whether Tatum tolerates the keepalive pings over hours (a five-minute live
+// scratch check, WO-E1b, saw them answered), objectExists against the live gateway (prove:end reads
+// a deleted and a live allowance), findAllowanceCap against the live gateway (prove:end reads a real cap),
 // listUsdcCoins against the live gateway, an address holding more coins than one
 // move takes on mainnet, the hook against the live gateway (no live test passes one), whether Tatum ever
 // answers a missing digest with an empty OK (the live made-up digest test fails if it does), a paid key's rate limits, the Walrus blob listing or scan against the live
@@ -52,7 +58,7 @@ import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { ChainError, type TatumCall, WALRUS_BLOB_TYPE, WALRUS_SYSTEM_OBJECT_ID, createChain } from '../src/chain.js';
 import { LIMITS } from '../src/limits.js';
 import { USDC_TYPE_MAINNET } from '../src/usdc.js';
-import { loadDialing, localGrpcServer } from './local-grpc.js';
+import { answerCall, blackHoleProxy, loadDialing, localGrpcServer } from './local-grpc.js';
 
 const FILE_STARTED_AT = Date.now();
 
@@ -326,6 +332,35 @@ describe('raw calls on chain.grpc, against a local gRPC server that takes every 
       }
     } finally {
       local.close();
+      await server.close();
+    }
+  });
+});
+
+describe('a warm connection the network silently drops, against a local gRPC server behind a proxy that black-holes it', () => {
+  // The worst case with no keepalive: every try waits out its deadline on the dead connection.
+  const REDLINE_MS = (LIMITS.tatumRetries + 1) * LIMITS.tatumTimeoutMs + RETRY_WAITS_MS.reduce((a, b) => a + b, 0);
+
+  it('fails the next bounded read at most once and answers on the retry over a fresh connection, inside one deadline, the retry wait and 2 s', { timeout: REDLINE_MS + 20_000 }, async () => {
+    const server = await localGrpcServer((stream) => answerCall(stream, GrpcTypes.GetEpochResponse.toBinary({ epoch: { epoch: 900n } })));
+    const proxy = await blackHoleProxy(server.address);
+    const fresh = await loadDialing(proxy.address, () => import('../src/chain.js'));
+    const tries: string[] = [];
+    const local = fresh.createChain({ apiKey: 'stand-in-key', beforeRequest: async (call) => void tries.push(call.method) });
+    try {
+      expect(await local.getCurrentEpoch()).toBe(900n);
+      proxy.drop();
+      // Idle a while first, as a connection is between two reads.
+      await sleep(3_000);
+      tries.length = 0;
+      const read = await settleWithin(() => local.getCurrentEpoch(), REDLINE_MS + 5_000);
+      expect(read.error).toBeNull();
+      expect(read.ms).toBeLessThan(LIMITS.tatumTimeoutMs + LIMITS.tatumRetryDelayMs + STALL_SLACK_MS);
+      expect(tries.length).toBeLessThanOrEqual(2);
+      expect(proxy.connections()).toBe(2);
+    } finally {
+      local.close();
+      proxy.close();
       await server.close();
     }
   });
@@ -1097,6 +1132,69 @@ describe('beforeRequest, against a stand-in gRPC transport and stand-in GraphQL 
       }
     });
     expect(refused.calls).toEqual([{ transport: 'grpc', method: 'VerifySignature' }]);
+  });
+});
+
+describe('objectExists, against a stand-in gRPC transport', () => {
+  // The not-found answer Tatum gRPC gave for a revoked allowance on 2026-10-28 (scratchpad/e1b-object-exists.mts).
+  const notFound: GrpcAnswer = () => Promise.reject(rpcError('NOT_FOUND'));
+  const onLocal = async <T>(beforeRequest: ((call: TatumCall) => Promise<void>) | undefined, run: (local: ReturnType<typeof createChain>) => Promise<T>): Promise<T> => {
+    const local = createChain({ beforeRequest });
+    try {
+      return await run(local);
+    } finally {
+      local.close();
+    }
+  };
+
+  it('asks GetObject for the object id alone, once through beforeRequest, and answers true for a live object', async () => {
+    const short = `0x${'5A'.repeat(32)}`;
+    const asked = await withCoinPages([{ object: { objectId: STAND_IN_ALLOWANCE, version: 7n } }], async (calls) => {
+      expect(await onLocal(undefined, (local) => local.objectExists(short))).toBe(true);
+      return calls;
+    });
+    expect(asked).toEqual([{ method: 'GetObject', objectId: STAND_IN_ALLOWANCE, readMask: { paths: ['object_id'] } }]);
+
+    const { calls, beforeRequest } = hookRecorder();
+    await withGrpcAnswers([async () => ({ object: { objectId: STAND_IN_ALLOWANCE } })], async (sent) => {
+      expect(await onLocal(beforeRequest, (local) => local.objectExists(STAND_IN_ALLOWANCE))).toBe(true);
+      expect(sent).toEqual(['GetObject']);
+    });
+    expect(calls).toEqual([{ transport: 'grpc', method: 'GetObject' }]);
+  });
+
+  it("answers false only on the node's own NOT_FOUND, sent once and never retried", async () => {
+    const { calls, beforeRequest } = hookRecorder();
+    await withGrpcAnswers([notFound], async (sent) => {
+      expect(await onLocal(beforeRequest, (local) => local.objectExists(STAND_IN_ALLOWANCE))).toBe(false);
+      expect(sent).toEqual(['GetObject']);
+    });
+    expect(calls).toEqual([{ transport: 'grpc', method: 'GetObject' }]);
+  });
+
+  it('throws for any other failure, an empty answer or another object, and refuses a bad id without asking, never answering false', async () => {
+    const failures = await withGrpcAnswers(
+      [() => Promise.reject(rpcError('PERMISSION_DENIED')), async () => ({}), async () => ({ object: { objectId: normalizeSuiAddress('0x77') } }), unavailable, notFound],
+      async (sent) => {
+        const read = (id = STAND_IN_ALLOWANCE) => onLocal(undefined, (local) => failureOf(local.objectExists(id)));
+        const refused = [await read(), await read(), await read(), await read('not an id')];
+        expect(sent).toEqual(['GetObject', 'GetObject', 'GetObject']);
+        // A failure that can clear is retried, and the retry's answer is the one that counts.
+        expect(await onLocal(undefined, (local) => local.objectExists(STAND_IN_ALLOWANCE))).toBe(false);
+        expect(sent).toEqual(['GetObject', 'GetObject', 'GetObject', 'GetObject', 'GetObject']);
+        return refused;
+      },
+    );
+    expect(failures.map((failure) => failure.code)).toEqual(['UNAUTHORIZED', 'BAD_RESPONSE', 'BAD_RESPONSE', 'INVALID_INPUT']);
+  });
+
+  it('sends nothing and fails as BUDGET when beforeRequest refuses', async () => {
+    const { calls, beforeRequest } = hookRecorder(true);
+    await withGrpcAnswers([], async (sent) => {
+      expect(await onLocal(beforeRequest, (local) => failureOf(local.objectExists(STAND_IN_ALLOWANCE)))).toMatchObject({ code: 'BUDGET', retryable: false });
+      expect(sent).toEqual([]);
+    });
+    expect(calls).toEqual([{ transport: 'grpc', method: 'GetObject' }]);
   });
 });
 

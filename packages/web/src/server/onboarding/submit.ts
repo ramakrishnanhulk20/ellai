@@ -33,7 +33,8 @@ import {
  * one read of the allowance it created; for the USDC move, the re-read of the owner's USDC coins,
  * that same SUI coin re-read, and the send; for ending the allowance, the re-read of the allowance,
  * its cap (at most LIMITS.allowanceCapMaxPages pages, counted at that most), that same SUI coin
- * re-read, and the send.
+ * re-read, and the send. An allowance the re-read misses costs one gRPC check more (allowanceGone)
+ * and stops there at two calls, so five is still the most.
  */
 export const SUBMIT_CHAIN_CALLS: Readonly<Record<BuildStep, number>> = {
   memory_account: 9,
@@ -209,7 +210,8 @@ async function checkAllowanceStep(bytes: Uint8Array, decoded: Decoded, owner: Ow
  * (core assertRevokeAllowance) for the allowance on the owner row and the owner's cap for it, both
  * re-read now (readAllowanceToEnd), with the gas source the bytes carry; then, when the bytes pay
  * with SUI coins, those coins re-read as the owner's own. So another allowance, another cap, an
- * extra command or a third party's gas coin is refused before anything is sent (C6, C7).
+ * extra command or a third party's gas coin is refused before anything is sent (C6, C7). An
+ * allowance the re-read misses is forgotten only when gRPC agrees it is gone (readAllowanceToEnd).
  * Returns the row's allowance id as stored, for forgetAllowance once the revoke lands.
  */
 async function checkEndAllowanceStep(db: Database, owner: OwnerRow, bytes: Uint8Array, facts: OwnerGasFacts, chain: Chain): Promise<string> {
@@ -256,9 +258,11 @@ function unknownOutcome(digest: string, why: string): SubmitOutcome {
  * Returns SubmitOutcome. Throws OnboardingError: BAD_INPUT for a bad step, date or owner id;
  * NO_OWNER; BAD_TRANSACTION for bytes or a signature refused as above, nothing sent; NOT_READY and
  * ALREADY_DONE from the account build, and from end_allowance with no allowance recorded, no cap
- * for it, or an allowance Sui no longer has (then forgotten); NOTHING_TO_MOVE for the move when the
- * owner holds no USDC coins now. Throws ChainError BUDGET when Ellai's Tatum budget refused the send
- * before it left, and MemoryError or ChainError when the fresh build or a re-read cannot be made.
+ * for it, or an allowance Sui no longer has by both of Tatum's views (then forgotten); NOTHING_TO_MOVE
+ * for the move when the owner holds no USDC coins now. Throws ChainError BUDGET when Ellai's Tatum
+ * budget refused the send before it left, ChainError UPSTREAM with ALLOWANCE_INDEX_LAG_MESSAGE when
+ * only GraphQL misses the allowance (kept, nothing sent), and MemoryError or ChainError when the
+ * fresh build or a re-read cannot be made.
  */
 export async function submitOnboardingTx(args: {
   db: Database;

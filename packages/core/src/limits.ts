@@ -32,6 +32,16 @@ export const LIMITS = {
    * coin types is about 250 KB; grpc-js would otherwise allow 4 MiB.
    */
   grpcMaxReceiveBytes: 1_048_576,
+  /**
+   * How long a gRPC connection carries calls before grpc-js pings it to check the far end is still
+   * there; pings go out only while a call is open. grpc-js sends none by default, so a connection
+   * the network dropped without a word (a NAT that forgot it, a serverless instance thawing) failed
+   * every call at tatumTimeoutMs. With grpcKeepaliveTimeoutMs this notices a dead connection inside
+   * one call's deadline, so bounded() sends its retry on a fresh one.
+   */
+  grpcKeepaliveTimeMs: 5_000,
+  /** How long grpc-js waits for a keepalive ping's answer before it drops the connection. Tatum answers in about 0.3 s. */
+  grpcKeepaliveTimeoutMs: 3_000,
   /** Requests a minute Tatum allows without an API key. The probes and live tests pace themselves to it. */
   tatumAnonymousRequestsPerMinute: 5,
   /** Ceiling on one request to a seller, from DNS lookup to the last body byte. */
@@ -116,12 +126,13 @@ export const LIMITS = {
   /** Pages of caps read before giving up on finding the one for an allowance, so a wallet sent many objects cannot keep us looping. */
   allowanceCapMaxPages: 2,
   /**
-   * Gas budget the owner signs for when ending their allowance: 0.0003 SUI, about three times what
-   * one revoke was charged in a mainnet dry run (DECISIONS.md, 2026-10-28). Deleting the allowance
-   * and its cap returns more storage rebate than the revoke costs. The charge is a fixed 1,000 gas
-   * units, so this covers it only while the reference gas price is at most 300 MIST.
+   * Gas budget the owner signs for when ending their allowance: 0.003 SUI. The revoke's computation
+   * charge is a fixed 1,000 gas units (DECISIONS.md, 2026-10-28), so at maxGasPriceMist, the highest
+   * price Ellai builds with, it is 1,000,000 MIST, and this leaves room beside it for the storage the
+   * transaction writes. Deleting the allowance and its cap returns more storage rebate than the
+   * revoke costs, so the owner pays far less than this.
    */
-  revokeGasBudgetMist: 300_000,
+  revokeGasBudgetMist: 3_000_000,
   /** Highest gas price Ellai builds with, in MIST per unit. Mainnet's reference price was 100 on 2026-10-20. */
   maxGasPriceMist: 1_000,
   /** Settlement reads for one payment before it is reported unsettled. */

@@ -324,6 +324,12 @@ function stubChain(on: Database = db) {
       if (allowance instanceof Error) throw allowance;
       return allowance;
     },
+    // gRPC's view of the same allowances: gone exactly when getAllowance would answer NOT_FOUND.
+    objectExists: async (id: string) => {
+      calls.push(`objectExists:${id}`);
+      const allowance = state.allowances.get(id);
+      return allowance !== undefined && !(allowance instanceof ChainError && allowance.code === 'NOT_FOUND');
+    },
     getTransactionResult: async (digest: string) => {
       calls.push(`getTransactionResult:${digest}`);
       const result = state.landed(digest);
@@ -551,8 +557,9 @@ describe('refillIfNeeded', () => {
       const { chain, state, calls, executions } = stubFor(w, 0n);
       state.allowances.set(w.allowanceId, variant instanceof Error ? variant : allowanceFor(w, variant));
       expect(await refill(w, chain)).toBe('refused');
-      // The allowance is read only once the balance says a refill will be sent.
-      expect(calls).toEqual([`getBalances:${w.purse}`, `getAllowance:${w.allowanceId}`]);
+      // The allowance is read only once the balance says a refill will be sent, and a NOT_FOUND is checked through gRPC before it is forgotten.
+      const missing = variant instanceof ChainError && variant.code === 'NOT_FOUND';
+      expect(calls).toEqual([`getBalances:${w.purse}`, `getAllowance:${w.allowanceId}`, ...(missing ? [`objectExists:${w.allowanceId}`] : [])]);
       expect(executions).toHaveLength(0);
       expect(await refillRows(w.ownerId)).toHaveLength(0);
       return { w, recorded: await allowanceOf(w) };

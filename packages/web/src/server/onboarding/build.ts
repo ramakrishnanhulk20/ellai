@@ -10,7 +10,9 @@ import { ownerDelegate } from '../memory/delegate.js';
 import { buildUsdcMoveStep, chooseOwnerGas } from './funds.js';
 import {
   ALLOWANCE_ENDED_MESSAGE,
+  ALLOWANCE_INDEX_LAG_MESSAGE,
   ALREADY_DONE_MESSAGE,
+  allowanceGone,
   type AccountStep,
   type BuildStep,
   checkBuildStep,
@@ -38,7 +40,9 @@ export const DELEGATE_LABEL = 'Ellai';
  * either the epoch or the owner's SUI coins), three calls. The USDC move lists the owner's USDC
  * coins first, then chooses its gas source the same way: four. Ending the allowance reads it
  * (getAllowance, one call), looks for its cap (findAllowanceCap, at most
- * LIMITS.allowanceCapMaxPages pages, counted at that most), then chooses its gas source: six.
+ * LIMITS.allowanceCapMaxPages pages, counted at that most), then chooses its gas source: six. When
+ * getAllowance misses it, the one gRPC check allowanceGone makes ends the step at two calls, so
+ * six is still the most.
  */
 export const BUILD_CHAIN_CALLS: Readonly<Record<BuildStep, number>> = {
   memory_account: 5,
@@ -163,10 +167,13 @@ export async function buildAccountStep(args: {
  * owner, and the owner's AllowanceCap for it (findAllowanceCap, bounded at
  * LIMITS.allowanceCapMaxPages pages, C21). `recordedId` is the row's allowance id exactly as
  * stored, for forgetAllowance. An allowance Sui no longer has is forgotten here, so the tick stops
- * visiting the owner for refills.
+ * visiting the owner for refills, but only when Tatum's two views agree: getAllowance (GraphQL)
+ * answers NOT_FOUND and allowanceGone (one gRPC read) confirms it. While gRPC still holds it the
+ * allowance is kept and the step fails as ChainError UPSTREAM, ALLOWANCE_INDEX_LAG_MESSAGE.
  * Throws OnboardingError: NOT_READY when the row records no allowance, or Sui shows no cap for it in
  * the owner's wallet; ALREADY_DONE when Sui no longer has the allowance. Throws ChainError
- * BAD_RESPONSE when the allowance draws from another address, and any ChainError from the reads.
+ * BAD_RESPONSE when the allowance draws from another address, UPSTREAM when the two views disagree,
+ * and any ChainError from the reads.
  */
 export async function readAllowanceToEnd(db: Database, owner: OwnerRow, chain: Chain): Promise<{ args: RevokeArgs; recordedId: string }> {
   const recordedId = owner.allowanceId;
@@ -178,6 +185,7 @@ export async function readAllowanceToEnd(db: Database, owner: OwnerRow, chain: C
     allowance = await chain.getAllowance(allowanceId);
   } catch (error) {
     if (error instanceof ChainError && error.code === 'NOT_FOUND') {
+      if (!(await allowanceGone(chain, allowanceId))) throw new ChainError('UPSTREAM', ALLOWANCE_INDEX_LAG_MESSAGE, true);
       await forgetAllowance(db, owner.id, recordedId);
       throw new OnboardingError('ALREADY_DONE', ALLOWANCE_ENDED_MESSAGE);
     }
@@ -234,7 +242,8 @@ async function buildEndAllowanceStep(db: Database, owner: OwnerRow, chain: Chain
  *   same way (buildUsdcMoveStep). Not a recorded step.
  * - end_allowance: ends the allowance on the owner row with the owner's cap for it, one revoke
  *   call, gas chosen the same way at most LIMITS.revokeGasBudgetMist (buildEndAllowanceStep). An
- *   allowance Sui no longer has is forgotten and answered ALREADY_DONE. Not a recorded step.
+ *   allowance Sui no longer has, by both of Tatum's views, is forgotten and answered ALREADY_DONE;
+ *   one only GraphQL misses is kept and answered ChainError UPSTREAM. Not a recorded step.
  * Owner, purse, account and allowance come from the owner row, never from the caller, and every
  * summary value is one of those or a validated term (C7, C15).
  * Throws OnboardingError: BAD_INPUT for a bad step, date, owner id or allowance term;
