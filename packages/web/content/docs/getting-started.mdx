@@ -8,8 +8,8 @@ This page walks an owner from an empty wallet to a first paid call. Everything r
 ## What you need
 
 - A Sui wallet that can connect to a web app and sign messages and transactions.
-- A little SUI. Each of the three setup transactions caps its network fee at 0.05 SUI, and creating the Walrus Memory account reserved about 0.004 SUI when measured. The allowance transaction pays its fee from your SUI address balance, with no gas coin attached.
-- USDC on Sui Mainnet in your wallet, held as an address balance. An allowance can draw only from the address balance part of your USDC, not from separate coin objects. You do not deposit anything into Ellai. The USDC stays at your address until the purse draws it.
+- A little SUI. Each of the three setup transactions caps its network fee at 0.05 SUI, and creating the Walrus Memory account reserved about 0.004 SUI when measured. Ellai pays each fee from your SUI address balance when it covers the cap, and otherwise from your SUI coins. The setup page shows where your SUI sits and warns you when neither can pay.
+- USDC on Sui Mainnet in your wallet, held as an address balance. An allowance can draw only from the address balance part of your USDC, not from separate coin objects. If your wallet holds USDC as coins, the setup page offers one extra signature that moves it into your own address balance. It never leaves your wallet. You do not deposit anything into Ellai. The USDC stays at your address until the purse draws it.
 
 ## 1. Sign in
 

@@ -327,6 +327,16 @@ Each invariant names the risk it closes. Every backend work order carries the in
   - Answering questions and starting a built-in agent task need only the session, by Ram's choice: a stolen session can approve what agents ask for and run the built-in agent, which buys only from its catalog, up to the daily budget. It cannot pay anyone outside the catalog or past the budget, every payment is in the owner's history, and the owner can end every session at once or pause.
   - A stolen session cannot use up the owner's step-up or agent-create allowance: each is counted per session as well as per owner.
 - **C35 (A6, G3). Revoke and sign share the owner lock.** Revoking an agent takes the owner row lock that signing takes, so a revoke lands either before a signature, which then refuses, or after it, when that payment is counted and verified like any other.
+- **C37 (A8, G2). Public words come from the right field.** (Added after the section 13 review, 2026-10-28.)
+  - A public page says money moved only for a decision with a payment Ellai verified on chain by its own digest, and states a decision's cause only from its stored rule, never from its outcome alone.
+  - A decision reaches a public page only when it has a verified payment, cites at least one owner answer that is on chain, or its own question's answer is an owner answer on chain. Limit refusals, unanswered questions and unpaid grants stay private. So an opted-in owner cannot put a host on the landing page without either paying it or answering about it on Walrus.
+  - The opt-in text names every kind of row it puts on a public page.
+- **C38 (A6, A8, G4). The purse is never out of sight.**
+  - The owner sees the purse's USDC whenever Ellai's ledger says it may hold any, with or without an allowance recorded.
+  - Every pending refill reaches a final state, whether or not an allowance is still recorded; forgetting an allowance never strands a refill row.
+- **C39 (A6, A9, G3). Ellai relays owner-signed transactions only as it built them.**
+  - Ellai sends a transaction the owner signed in the app only when the bytes equal a fresh build for that owner and step, from the owner row, with the owner as sender and gas owner, metered under C22.
+  - Fields the relay does not check, by design: on the Walrus Memory account steps, the gas coins, gas price and expiry the owner's wallet chose. The owner signed them and pays for them; a stolen session cannot produce the signature.
 
 **1. Primitives over lists**
 - **Addresses and coin types:** one normaliser from the Sui SDK on every side (`normalizeSuiAddress`, `normalizeStructTag`).
