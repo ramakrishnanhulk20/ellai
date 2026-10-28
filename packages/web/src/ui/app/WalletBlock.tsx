@@ -38,7 +38,7 @@ type Flow =
   | { kind: 'checking' };
 
 /** Moves the owner's USDC coins into their address balance: review, sign in the wallet, send, then read the wallet again. */
-function MoveUsdc({ coinsText, onMoved, onSent }: { coinsText: string; onMoved: () => Promise<void>; onSent: () => Promise<void> }) {
+function MoveUsdc({ coinsText, onMoved, onReread }: { coinsText: string; onMoved: () => Promise<void>; onReread: () => Promise<void> }) {
   const wallet = useOwnerWallet();
   const { mutateAsync: signTransaction } = useSignTransaction();
   const [flow, setFlow] = useState<Flow>({ kind: 'idle' });
@@ -64,7 +64,10 @@ function MoveUsdc({ coinsText, onMoved, onSent }: { coinsText: string; onMoved: 
       if (!alive.current) return;
       setFlow({ kind: 'summary', built });
     } catch (caught) {
-      if (alive.current) fail(caught);
+      if (!alive.current) return;
+      fail(caught);
+      // The coins are already gone, so the note on the screen is stale. One fresh read replaces it.
+      if (isApiError(caught) && caught.code === 'nothing_to_move') await onReread();
     }
   }
 
@@ -96,7 +99,7 @@ function MoveUsdc({ coinsText, onMoved, onSent }: { coinsText: string; onMoved: 
       await sleep(RECHECK_MS);
       if (!alive.current) return;
       setFlow({ kind: 'idle' });
-      await onSent();
+      await onReread();
     } catch (caught) {
       if (alive.current) fail(caught);
     }
@@ -220,7 +223,7 @@ export function WalletBlock() {
                 {atomicToUsdc(funds.usdcCoinAtomic)} USDC in your wallet is held as coins. A Sui allowance can only draw from
                 your address balance, so move it first. One signature.
               </p>
-              <MoveUsdc coinsText={atomicToUsdc(funds.usdcCoinAtomic)} onMoved={onMoved} onSent={readAgain} />
+              <MoveUsdc coinsText={atomicToUsdc(funds.usdcCoinAtomic)} onMoved={onMoved} onReread={readAgain} />
             </>
           ) : null}
 
