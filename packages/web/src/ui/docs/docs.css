@@ -1,0 +1,248 @@
+/*
+ * Ellai's skin over Fumadocs. Fumadocs' own stylesheet is loaded first and sits in a CSS layer, so these
+ * plain rules win without any !important. Everything that styles page content hangs off .ellai-docs,
+ * and the colour variables go on :root because the search box opens outside that wrapper.
+ */
+
+:root {
+  --color-fd-background: #08090a;
+  --color-fd-foreground: #f2f2ee;
+  --color-fd-card: #0d0f11;
+  --color-fd-card-foreground: #f2f2ee;
+  --color-fd-popover: #0d0f11;
+  --color-fd-popover-foreground: #f2f2ee;
+  --color-fd-muted: #0d0f11;
+  --color-fd-muted-foreground: rgba(242, 242, 238, 0.56);
+  --color-fd-border: rgba(242, 242, 238, 0.12);
+  --color-fd-primary: #c8ff3d;
+  --color-fd-primary-foreground: #08090a;
+  --color-fd-secondary: rgba(242, 242, 238, 0.06);
+  --color-fd-secondary-foreground: #f2f2ee;
+  --color-fd-accent: rgba(242, 242, 238, 0.06);
+  --color-fd-accent-foreground: #f2f2ee;
+  --color-fd-ring: #c8ff3d;
+  --color-fd-overlay: rgba(8, 9, 10, 0.64);
+
+  /* Fumadocs' stylesheet resets these fonts to system fonts. Putting back the app's own keeps every page the same. */
+  --font-sans: var(--font-geist-sans), ui-sans-serif, system-ui, sans-serif;
+  --font-mono: var(--font-geist-mono), ui-monospace, monospace;
+}
+
+/* The film grain belongs to the landing page and the app, not to a page people read for a while. */
+body:has(.ellai-docs)::after {
+  display: none;
+}
+
+.ellai-docs {
+  /* Tells Fumadocs how tall the bar above its layout is, so the sidebar and the page contents stick below it. */
+  --fd-banner-height: 56px;
+  font-family: var(--font-geist-sans), ui-sans-serif, system-ui, sans-serif;
+}
+
+.ellai-docs-bar {
+  background-color: rgba(8, 9, 10, 0.72);
+  -webkit-backdrop-filter: blur(12px);
+  backdrop-filter: blur(12px);
+}
+
+/* Sidebar: the same rows as the app's sidebar. The open page has the lime bar and the soft fill. */
+#nd-sidebar a[data-active],
+#nd-sidebar-mobile a[data-active] {
+  position: relative;
+  min-height: 40px;
+  padding: 0 12px;
+  border-radius: 8px;
+  font-size: 15px;
+  color: var(--muted);
+  transition:
+    color 160ms ease-out,
+    background-color 160ms ease-out;
+}
+
+#nd-sidebar a[data-active]:hover,
+#nd-sidebar-mobile a[data-active]:hover {
+  background-color: rgba(242, 242, 238, 0.04);
+  color: var(--fg);
+}
+
+#nd-sidebar a[data-active='true'],
+#nd-sidebar-mobile a[data-active='true'] {
+  background-color: rgba(242, 242, 238, 0.06);
+  color: var(--fg);
+}
+
+#nd-sidebar a[data-active='true']::before,
+#nd-sidebar-mobile a[data-active='true']::before {
+  content: '';
+  position: absolute;
+  inset: 8px auto 8px 0;
+  width: 2px;
+  border-radius: 9999px;
+  background-color: var(--accent);
+}
+
+.ellai-sidebar-title {
+  font-family: var(--font-bricolage), ui-sans-serif, system-ui, sans-serif;
+  font-weight: 600;
+}
+
+/* Page text. Paragraphs and lists stop at 72 characters. Code, tables and diagrams use the whole column. */
+.ellai-docs .prose {
+  --tw-prose-body: var(--fg);
+  --tw-prose-headings: var(--fg);
+  --tw-prose-bold: var(--fg);
+  --tw-prose-links: var(--accent);
+  --tw-prose-counters: var(--muted);
+  --tw-prose-bullets: var(--muted);
+  --tw-prose-code: var(--fg);
+  font-size: 16px;
+  line-height: 1.65;
+}
+
+.ellai-docs .prose > p,
+.ellai-docs .prose > ul,
+.ellai-docs .prose > ol,
+.ellai-docs .prose > h2,
+.ellai-docs .prose > h3 {
+  max-width: 72ch;
+}
+
+.ellai-docs .prose strong {
+  font-weight: 600;
+}
+
+.ellai-docs #nd-page h1 {
+  font-family: var(--font-bricolage), ui-sans-serif, system-ui, sans-serif;
+  font-size: 44px;
+  font-weight: 600;
+  line-height: 1.05;
+}
+
+.ellai-docs #nd-page > p {
+  max-width: 72ch;
+}
+
+.ellai-docs .prose h2,
+.ellai-docs .prose h3 {
+  font-family: var(--font-bricolage), ui-sans-serif, system-ui, sans-serif;
+  font-weight: 600;
+  scroll-margin-top: calc(var(--fd-docs-row-3, 0px) + 24px);
+}
+
+.ellai-docs .prose h2 {
+  font-size: 28px;
+  line-height: 1.2;
+}
+
+.ellai-docs .prose h3 {
+  font-size: 20px;
+  line-height: 1.3;
+}
+
+.ellai-docs .prose h2 code,
+.ellai-docs .prose h3 code {
+  font-size: 0.8em;
+}
+
+/* Inline code */
+.ellai-docs .prose :not(pre) > code {
+  font-family: var(--font-geist-mono), ui-monospace, monospace;
+  font-size: 0.875em;
+  border-radius: 6px;
+  background: var(--panel);
+  border-color: var(--line);
+}
+
+/* Code blocks */
+.ellai-docs figure.shiki {
+  margin: 24px 0;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel);
+  font-family: var(--font-geist-mono), ui-monospace, monospace;
+  font-size: 14px;
+  line-height: 1.6;
+}
+
+.ellai-docs figure.shiki > div[role='region'] {
+  font-size: 14px;
+}
+
+.ellai-docs figure.shiki pre,
+.ellai-docs figure.shiki code {
+  font-family: var(--font-geist-mono), ui-monospace, monospace;
+  font-size: 14px;
+}
+
+/* Tables scroll inside their own wrapper, so a wide one never widens the page. */
+.ellai-docs .prose table {
+  margin: 0;
+  border-radius: 8px;
+  background: transparent;
+}
+
+.ellai-docs .prose th {
+  background: var(--panel);
+  font-family: var(--font-geist-mono), ui-monospace, monospace;
+  font-size: 12px;
+  font-weight: 400;
+  line-height: 1.5;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.ellai-docs .prose td,
+.ellai-docs .prose th {
+  vertical-align: top;
+}
+
+/* Diagrams */
+.ellai-mermaid {
+  margin: 24px 0;
+  padding: 24px 16px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel);
+  min-height: 160px;
+  overflow-x: auto;
+}
+
+.ellai-mermaid-svg svg {
+  display: block;
+  max-width: none;
+  margin-inline: auto;
+}
+
+.ellai-mermaid-source {
+  margin: 24px 0;
+  padding: 16px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel);
+  color: var(--muted);
+  font-family: var(--font-geist-mono), ui-monospace, monospace;
+  font-size: 14px;
+  line-height: 1.6;
+  overflow-x: auto;
+}
+
+.ellai-mermaid .ellai-mermaid-source {
+  margin: 0;
+  border: 0;
+  padding: 0;
+}
+
+/* Fumadocs slides and fades its own panels. With reduced motion they simply appear. */
+@media (prefers-reduced-motion: reduce) {
+  [class*='animate-fd-'] {
+    animation: none !important;
+  }
+
+  .ellai-docs *,
+  .ellai-docs *::before,
+  .ellai-docs *::after {
+    transition: none !important;
+  }
+}

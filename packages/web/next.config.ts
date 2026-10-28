@@ -1,4 +1,8 @@
+import { createMDX } from 'fumadocs-mdx/next';
 import type { NextConfig } from 'next';
+
+// The generated content index imports the config file, and this project's TypeScript needs the .js ending to find it.
+const withMDX = createMDX({ index: { addJsExtension: true } });
 
 const config: NextConfig = {
   // Loaded by Node at run time instead of bundled: PGlite reads its WebAssembly and data files
@@ -6,4 +10,4 @@ const config: NextConfig = {
   serverExternalPackages: ['@electric-sql/pglite', '@grpc/grpc-js'],
 };
 
-export default config;
+export default withMDX(config);

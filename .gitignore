@@ -21,6 +21,8 @@ reference/
 node_modules/
 .next/
 .next-verify/
+# Fumadocs rewrites its content index here on every dev start and build
+.source/
 # Next rewrites this on every switch between next dev and next build
 next-env.d.ts
 dist/
