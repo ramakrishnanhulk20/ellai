@@ -1,6 +1,6 @@
 'use client';
 
-import { useCurrentAccount, useSignPersonalMessage } from '@mysten/dapp-kit';
+import { useSignPersonalMessage } from '@mysten/dapp-kit';
 import { useEffect, useRef, useState } from 'react';
 import {
   isApiError,
@@ -11,8 +11,9 @@ import {
   type StepUpRequest,
 } from './api.js';
 import { Modal } from './Modal.js';
+import { ConnectWalletButton, WrongWalletNote, useOwnerWallet } from './OwnerWallet.js';
 import { Button, ErrorLine, Ring } from './ui.js';
-import { DECLINED, NOT_CONNECTED } from './wallet-messages.js';
+import { DECLINED } from './wallet-messages.js';
 
 type Phase = 'requesting' | 'ready' | 'waiting' | 'sending' | 'failed';
 
@@ -45,7 +46,7 @@ type Props = {
  * in a fresh request, never a retry of the old message.
  */
 export function StepUpDialog({ request, send, onDone, onCancel, handoff }: Props) {
-  const account = useCurrentAccount();
+  const wallet = useOwnerWallet();
   const { mutateAsync: signPersonalMessage } = useSignPersonalMessage();
   const [phase, setPhase] = useState<Phase>('requesting');
   const [issued, setIssued] = useState<StepUpIssued | null>(null);
@@ -100,12 +101,7 @@ export function StepUpDialog({ request, send, onDone, onCancel, handoff }: Props
   }, []);
 
   async function sign() {
-    if (issued === null) return;
-    if (!account) {
-      setError(NOT_CONNECTED);
-      setPhase('failed');
-      return;
-    }
+    if (issued === null || wallet.kind !== 'ready') return;
     const mine = ++attempt.current;
     setError(null);
     setPhase('waiting');
@@ -161,20 +157,30 @@ export function StepUpDialog({ request, send, onDone, onCancel, handoff }: Props
       ) : null}
 
       <div className="mt-6 flex flex-wrap items-center gap-3">
-        <Button
-          variant="primary"
-          size="lg"
-          className="min-w-[160px] flex-1"
-          disabled={phase !== 'ready'}
-          busy={working}
-          onClick={() => void sign()}
-        >
-          {phase === 'waiting' ? 'Waiting for your wallet...' : 'Sign with wallet'}
-        </Button>
+        {wallet.kind !== 'ready' && !working ? (
+          <ConnectWalletButton wallet={wallet} />
+        ) : (
+          <Button
+            variant="primary"
+            size="lg"
+            className="min-w-[160px] flex-1"
+            disabled={phase !== 'ready'}
+            busy={working}
+            onClick={() => void sign()}
+          >
+            {phase === 'waiting' ? 'Waiting for your wallet...' : 'Sign with wallet'}
+          </Button>
+        )}
         <Button size="lg" disabled={phase === 'sending'} onClick={cancel}>
           Cancel
         </Button>
       </div>
+
+      {wallet.kind === 'wrong' && !working ? (
+        <div className="mt-4">
+          <WrongWalletNote wallet={wallet} />
+        </div>
+      ) : null}
 
       {error ? (
         <div className="mt-4 flex flex-col items-start gap-2">

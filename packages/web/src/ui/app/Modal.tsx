@@ -36,6 +36,9 @@ export function Modal({
     panel.current?.focus();
 
     function onKey(event: KeyboardEvent) {
+      // The wallet picker draws its own dialog above this one. Keys typed inside it are not ours.
+      const from = event.target;
+      if (from instanceof Node && from !== document.body && panel.current && !panel.current.contains(from)) return;
       if (event.key === 'Escape') {
         if (escape.current) {
           event.preventDefault();

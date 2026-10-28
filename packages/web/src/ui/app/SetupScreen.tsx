@@ -1,6 +1,6 @@
 'use client';
 
-import { useCurrentAccount, useSignTransaction } from '@mysten/dapp-kit';
+import { useSignTransaction } from '@mysten/dapp-kit';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { useEffect, useRef, useState } from 'react';
 import {
@@ -18,9 +18,10 @@ import { ButtonLink } from './ButtonLink.js';
 import { TextField } from './controls.js';
 import { CheckIcon } from './icons.js';
 import { ALLOWANCE_HINTS, checkAllowance, type AllowanceInput } from './limits.js';
+import { ConnectWalletButton, WrongWalletNote, useOwnerWallet } from './OwnerWallet.js';
 import { APP_KEY, usePatchOverview, useReloadOverview } from './session.js';
 import { Button, Card, ErrorLine, PageShell, Ring, Skeleton } from './ui.js';
-import { DECLINED, NOT_CONNECTED } from './wallet-messages.js';
+import { DECLINED } from './wallet-messages.js';
 
 const ONBOARDING_KEY = [APP_KEY, 'onboarding'] as const;
 const POLL_MS = 5_000;
@@ -164,7 +165,7 @@ function StepFlow({
   locked: boolean;
   onFinished: () => Promise<void>;
 }) {
-  const account = useCurrentAccount();
+  const wallet = useOwnerWallet();
   const { mutateAsync: signTransaction } = useSignTransaction();
   const [flow, setFlow] = useState<Flow>({ kind: 'idle' });
   const [error, setError] = useState<string | null>(null);
@@ -259,10 +260,7 @@ function StepFlow({
   }
 
   async function sign(built: BuiltStep) {
-    if (!account) {
-      setError(NOT_CONNECTED);
-      return;
-    }
+    if (wallet.kind !== 'ready') return;
     setError(null);
     setFlow({ kind: 'signing', built });
     let signed;
@@ -333,19 +331,24 @@ function StepFlow({
         <>
           <Summary rows={summaryFlow.built.summary} />
           <div className="flex flex-wrap items-center gap-3">
-            <Button
-              variant="primary"
-              size="lg"
-              className="min-w-[160px]"
-              busy={working}
-              onClick={() => void sign(summaryFlow.built)}
-            >
-              {flow.kind === 'signing' ? 'Waiting for your wallet...' : 'Sign in wallet'}
-            </Button>
+            {wallet.kind !== 'ready' && !working ? (
+              <ConnectWalletButton wallet={wallet} />
+            ) : (
+              <Button
+                variant="primary"
+                size="lg"
+                className="min-w-[160px]"
+                busy={working}
+                onClick={() => void sign(summaryFlow.built)}
+              >
+                {flow.kind === 'signing' ? 'Waiting for your wallet...' : 'Sign in wallet'}
+              </Button>
+            )}
             <Button size="lg" disabled={working} onClick={() => setFlow({ kind: 'idle' })}>
               Back
             </Button>
           </div>
+          {wallet.kind === 'wrong' && !working ? <WrongWalletNote wallet={wallet} /> : null}
         </>
       ) : null}
 

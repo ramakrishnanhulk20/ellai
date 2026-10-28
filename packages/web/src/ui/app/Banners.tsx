@@ -1,5 +1,6 @@
 'use client';
 
+import { usePathname } from 'next/navigation';
 import type { ReactNode } from 'react';
 import type { Overview } from './api.js';
 import { useOverview } from './session.js';
@@ -38,6 +39,7 @@ function stepsDone(onboarding: Overview['onboarding']): number {
 /** What the whole account needs you to know, shown under every page's header. Reads the overview once; it never polls. */
 export function Banners() {
   const { data } = useOverview();
+  const pathname = usePathname();
   if (!data) return null;
   const { owner, onboarding } = data;
   const done = stepsDone(onboarding);
@@ -60,7 +62,7 @@ export function Banners() {
         action={<SettingsLink />}
       />
     ) : null,
-    done < 3 ? (
+    done < 3 && pathname !== '/app/setup' ? (
       <Banner
         key="setup"
         border="border-accent/40"
