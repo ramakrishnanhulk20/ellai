@@ -5,7 +5,7 @@ import { formatUsdc } from './format-usdc.js';
 import type { MapDecision } from './memory-map.js';
 import { usePrefersReducedMotion } from './useMediaQuery.js';
 
-const BADGES = {
+export const BADGES = {
   approved: { label: 'PAID ON ITS OWN', tone: 'border-paid text-paid' },
   asked: { label: 'ASKED YOU', tone: 'border-asked text-asked' },
   refused: { label: 'REFUSED', tone: 'border-refused text-refused' },

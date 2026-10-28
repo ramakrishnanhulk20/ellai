@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+import { createContext, createElement, useContext, useEffect, useState, type ReactNode } from 'react';
 import { parseMemoryMap, type MemoryMap } from './memory-map.js';
 
 const ENDPOINT = '/api/public/memory-map';
@@ -16,7 +16,7 @@ export type MemoryMapState =
  * requests, and a tab that comes back after a minute away refreshes at once. A failed
  * refresh keeps the last good data: only a first load that fails shows the error state.
  */
-export function useMemoryMap(): MemoryMapState {
+function useMemoryMapRead(): MemoryMapState {
   const [state, setState] = useState<MemoryMapState>({ status: 'loading' });
 
   useEffect(() => {
@@ -63,5 +63,19 @@ export function useMemoryMap(): MemoryMapState {
     };
   }, []);
 
+  return state;
+}
+
+const MemoryMapContext = createContext<MemoryMapState | null>(null);
+
+/** Reads the map once for everything below it, so the hero and the scroll stories share one fetch. */
+export function MemoryMapProvider({ children }: { children: ReactNode }) {
+  const state = useMemoryMapRead();
+  return createElement(MemoryMapContext, { value: state }, children);
+}
+
+export function useMemoryMap(): MemoryMapState {
+  const state = useContext(MemoryMapContext);
+  if (!state) throw new Error('useMemoryMap needs a MemoryMapProvider above it');
   return state;
 }

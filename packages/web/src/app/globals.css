@@ -205,6 +205,81 @@ body[data-scrolled] .top-bar {
   }
 }
 
+/* Timeline marks wait hidden until the playhead reaches them, then grow in. While hidden they also leave the tab order. */
+.tl-node {
+  visibility: hidden;
+  transition: visibility 0s linear 300ms;
+}
+
+.tl-node[data-on] {
+  visibility: visible;
+  transition-delay: 0s;
+}
+
+.tl-mark {
+  display: grid;
+  place-items: center;
+  transform: scale(0);
+  transition: transform 300ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.tl-node[data-on] .tl-mark {
+  transform: scale(1);
+}
+
+/* The card above a mark shows on hover or keyboard focus, and rises 4px as it fades in. */
+.tl-tip {
+  visibility: hidden;
+  opacity: 0;
+  translate: 0 4px;
+  pointer-events: none;
+  transition:
+    opacity 160ms ease-out,
+    translate 160ms ease-out,
+    visibility 0s linear 160ms;
+}
+
+.tl-node:hover .tl-tip,
+.tl-node:focus-within .tl-tip {
+  visibility: visible;
+  opacity: 1;
+  translate: 0 0;
+  transition-delay: 0s;
+}
+
+/* The playhead position comes from --progress, which the pinned section writes on every scroll tick. */
+.tl-playhead {
+  position: absolute;
+  top: 0;
+  left: calc(var(--progress, 0) * 100%);
+  z-index: 5;
+  width: 1px;
+  height: 48px;
+  background: var(--fg);
+  translate: -50% -50%;
+  pointer-events: none;
+}
+
+.tl-playhead::after {
+  content: '';
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 6px;
+  height: 6px;
+  border-radius: 9999px;
+  background: var(--fg);
+  translate: -50% -50%;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .tl-node,
+  .tl-mark,
+  .tl-tip {
+    transition: none;
+  }
+}
+
 html.lenis,
 html.lenis body {
   height: auto;
