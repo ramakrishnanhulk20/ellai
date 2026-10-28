@@ -50,7 +50,7 @@ flowchart TD
   D -->|owner answers become memories| WM
 ```
 
-Your agent calls Ellai. Ellai's decision step applies fixed rules and recalls your past answers from your Walrus Memory account. If it needs you, the question goes to the owner app and your yes or no comes back. If it pays, the money moves from your allowance to your purse and from the purse to the seller. Ellai reads Sui only through Tatum.
+Your agent calls Ellai. Ellai's decision step applies fixed rules and recalls your past answers from your Walrus Memory account. If it needs you, the question goes to the owner app and your yes or no comes back. If it pays, the money moves from your allowance to your purse and from the purse to the seller. Ellai reads and sends on Sui through Tatum. The one exception sits inside the Walrus Memory library: when it sets up encryption for a write or a search, it reads Sui once from the endpoint the Walrus Memory service names.
 
 Ellai keeps two stores. Walrus Memory holds your decisions as plain sentences that you own and can read. A Postgres database holds what has to be current: sessions, agent keys (stored as hashes), decisions, answers, payments, the daily budget ledger, and a structured copy of every memory Ellai wrote. The rules read that structured copy, never the sentence text.
 

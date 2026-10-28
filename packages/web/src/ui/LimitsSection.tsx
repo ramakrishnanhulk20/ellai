@@ -6,7 +6,7 @@ const FACTS = [
   { label: 'DAILY LIMIT', text: 'You choose it. Sui enforces it, not Ellai.' },
   { label: 'CAP AND END DATE', text: 'The allowance stops at your total cap or your end date, whichever comes first.' },
   { label: 'THE PURSE', text: "At most 0.20 USDC sits ready to pay at any time. Sui's limits cap everything else." },
-  { label: 'END IT ANY TIME', text: 'One signature in your wallet revokes the allowance. Ellai can take nothing after that.' },
+  { label: 'END IT ANY TIME', text: 'One signature in your wallet ends the allowance. Your purse can draw nothing more from your wallet after that.' },
   {
     label: 'SIGN TO LOOSEN',
     text: "Raising a limit or adding an agent needs your wallet's signature, so a stolen login cannot do either.",

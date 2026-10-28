@@ -47,7 +47,7 @@ The learning loop is on chain too. One payment was approved as "learned", citing
 
 ## Which Tatum call powers which feature
 
-Ellai reads and sends on Sui only through Tatum's Sui gateway, using gRPC for balances, transactions and sending, and GraphQL for objects. The code is in `packages/core/src/chain.ts`.
+Ellai's own code reads and sends on Sui only through Tatum's Sui gateway, using gRPC for balances, transactions and sending, and GraphQL for objects. The code is in `packages/core/src/chain.ts`. One read happens outside it: when the Walrus Memory library sets up encryption for a write or a search, it reads Sui from the endpoint the Walrus Memory service names, and the library picks that endpoint itself.
 
 | Feature | Tatum call | Transport |
 |---|---|---|
