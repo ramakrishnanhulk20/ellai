@@ -11,6 +11,7 @@ import { SUI_TYPE_ARG, normalizeStructTag } from '@mysten/sui/utils';
 import { and, asc, count, eq, gte, isNull, lte, sql } from 'drizzle-orm';
 import type { Database } from '../db/client.js';
 import { owners, payments, refills } from '../db/schema.js';
+import { forgetAllowance } from '../onboarding/state.js';
 import type { DbHandle } from '../pay/sign.js';
 
 export interface RefillJobArgs {
@@ -225,18 +226,6 @@ function allowanceVerdict(allowance: AllowanceReading, owner: OwnerFacts, now: D
   if (endMs === null || endMs > LAST_DATE_MS) return 'never';
   if (allowance.expirationMs !== null && allowance.expirationMs < endMs + margin) return 'never';
   return new Date(Number(endMs));
-}
-
-/**
- * Forgets an allowance that can never pay again, so onboarding shows it missing and the tick stops
- * visiting this owner for refills (C22). Only the allowance read is cleared: one recorded since
- * then stays.
- */
-async function forgetAllowance(db: Database, ownerId: string, allowanceId: string): Promise<void> {
-  await db
-    .update(owners)
-    .set({ allowanceId: null, allowanceCheckedAt: null, refillNotBefore: null })
-    .where(and(eq(owners.id, ownerId), eq(owners.allowanceId, allowanceId)));
 }
 
 /**

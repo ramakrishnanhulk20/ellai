@@ -30,6 +30,8 @@ const body = z.strictObject({
  * - 200 { recorded, digest }: it succeeded on chain and the step is recorded as confirm records it.
  *   For usdc_to_address, which records nothing, recorded is { movedAtomic }: what the coins held,
  *   as Ellai read them just before the send, now in the owner's address balance.
+ * - 200 { ended: true, digest }: for end_allowance, the revoke succeeded, Sui deleted the allowance
+ *   and Ellai has forgotten it, so nothing more is drawn from the owner's wallet.
  * - 202 { digest }: it was sent, but the outcome is unknown or Sui does not show the result yet;
  *   call confirm with { step, digest } later to record it, or for usdc_to_address read the wallet
  *   route again.
@@ -38,8 +40,8 @@ const body = z.strictObject({
  * its body is read each request counts toward limitOwnerChainCalls's budgets at its step's
  * SUBMIT_CHAIN_CALLS (C22). 403 cross_origin, 401 signed_out, 429 past this owner's or this
  * client's caps, 400 for a bad body, 400 bad_transaction for refused bytes or signature, 409
- * not_ready or already_done for an account step, 409 nothing_to_move for the move when the owner
- * holds no USDC coins now, 503 chain_unavailable when Sui cannot be read
+ * not_ready or already_done for an account step or end_allowance, 409 nothing_to_move for the move
+ * when the owner holds no USDC coins now, 503 chain_unavailable when Sui cannot be read
  * for the check, 503 chain_unavailable_today once the day's budget is spent, before anything is sent.
  */
 export const POST = scoped('owner', async (request, ctx, { ownerId }): Promise<Response> => {
@@ -51,6 +53,7 @@ export const POST = scoped('owner', async (request, ctx, { ownerId }): Promise<R
     const outcome = await submitOnboardingTx({ db: ctx.db, ownerId, step, txBytesBase64, signature, chain: ctx.chain, masterSecretHex: ctx.env.ELLAI_MASTER_SECRET, now: ctx.now() });
     if (outcome.status === 'recorded') return jsonResponse({ recorded: outcome.recorded, digest: outcome.digest });
     if (outcome.status === 'moved') return jsonResponse({ recorded: { movedAtomic: outcome.movedAtomic }, digest: outcome.digest });
+    if (outcome.status === 'ended') return jsonResponse({ ended: true, digest: outcome.digest });
     if (outcome.status === 'sent') return jsonResponse({ digest: outcome.digest }, { status: 202 });
     throw new HttpError(422, 'chain_refused');
   } catch (error) {

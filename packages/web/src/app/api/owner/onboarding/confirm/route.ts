@@ -5,13 +5,13 @@ import { scoped } from '../../../../../server/http/context.js';
 import { jsonResponse, readJson } from '../../../../../server/http/json.js';
 import { limitOwnerChainCalls, onboardingChainFailure } from '../../../../../server/http/owner-limits.js';
 import { CONFIRM_CHAIN_CALLS, CONFIRM_EXISTING_CHAIN_CALLS, confirmExistingStep, confirmOnboardingTx } from '../../../../../server/onboarding/confirm.js';
-import { ACCOUNT_STEPS, ONBOARDING_STEPS } from '../../../../../server/onboarding/state.js';
+import { ACCOUNT_STEPS, CONFIRM_STEPS } from '../../../../../server/onboarding/state.js';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 
 // confirmOnboardingTx decides whether the digest is a Sui digest; this only bounds its length.
-const byDigest = z.strictObject({ step: z.enum(ONBOARDING_STEPS), digest: z.string().max(TEXT_CAPS.digest) });
+const byDigest = z.strictObject({ step: z.enum(CONFIRM_STEPS), digest: z.string().max(TEXT_CAPS.digest) });
 // Strict on both sides, so a body naming a digest and existing together, or any id, is refused.
 const existing = z.strictObject({ step: z.enum(ACCOUNT_STEPS), existing: z.literal(true) });
 const body = z.union([byDigest, existing]);
@@ -21,7 +21,8 @@ const body = z.union([byDigest, existing]);
  * - { step, digest }: the owner's transaction did it. { recorded } out, recorded being the
  *   account id, Ellai's delegate key as hex, or the allowance id, all read from chain by
  *   confirmOnboardingTx and never taken from the caller (C7, C8), counted at the step's
- *   CONFIRM_CHAIN_CALLS.
+ *   CONFIRM_CHAIN_CALLS. For end_allowance recorded is 'ended' once Sui no longer has the
+ *   allowance on the owner row, which is then forgotten; 409 not_landed while Sui still shows it.
  * - { step: 'memory_account' | 'add_delegate', existing: true }: Sui already showed the step done
  *   when the owner asked to build it (409 already_done there), so there is no transaction. The
  *   account is read from Sui by the owner's address alone (confirmExistingStep) and recorded the

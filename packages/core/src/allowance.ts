@@ -79,6 +79,15 @@ export interface UsdcMoveArgs {
   coins: CoinRef[];
 }
 
+export interface RevokeArgs {
+  /** The allowance's funder: the sender, the gas payer, and the holder of the cap. */
+  owner: string;
+  /** The shared allowance as getAllowance read it. Revoke deletes it. */
+  allowance: { objectId: string; initialSharedVersion: bigint };
+  /** The owner's AllowanceCap for that allowance as findAllowanceCap read it. Revoke deletes it too. */
+  cap: { objectId: string; version: bigint; digest: string };
+}
+
 export type AllowanceErrorCode = 'BAD_TERMS' | 'BAD_ARGS' | 'BUILD_FAILED' | 'MISMATCH' | 'NOTHING_TO_MOVE';
 
 /**
@@ -100,6 +109,9 @@ const PERIODIC_RATE_LIMIT = '0x2::allowance::periodic_rate_limit';
 const OPTION_SOME = '0x1::option::some';
 const RATE_LIMIT_TYPE = '0x2::allowance::RateLimit';
 const BALANCE_SPEND = '0x2::allowance::balance_spend';
+// public fun revoke<T>(self: AllowanceCap<T>, allowance: Allowance<T>), from the Sui framework's allowance module.
+const ALLOWANCE_REVOKE = '0x2::allowance::revoke';
+const FRAMEWORK_ADDRESS = normalizeSuiAddress('0x2');
 const SEND_FUNDS = '0x2::balance::send_funds';
 // public fun send_funds<T>(coin: Coin<T>, recipient: address), read from Sui Mainnet on 2026-10-28.
 const COIN_SEND_FUNDS = '0x2::coin::send_funds';
@@ -600,6 +612,159 @@ export async function assertUsdcToAddress(txBytes: Uint8Array, args: UsdcMoveArg
   const difference = firstUsdcMoveDifference(decode(txBytes), decode(expectedBytes), terms);
   if (difference !== null) fail('MISMATCH', difference);
   if (!sameBytes(txBytes, expectedBytes)) fail('MISMATCH', 'the bytes differ from a fresh build of the move');
+}
+
+interface RevokeTerms {
+  owner: string;
+  allowance: { objectId: string; initialSharedVersion: bigint };
+  cap: CoinRef;
+  gas: OwnerGasFacts;
+}
+
+function revokeTerms(args: RevokeArgs, facts: OwnerGasFacts): RevokeTerms {
+  const owner = addressOrFail(args?.owner, 'the owner');
+  const allowanceId = addressOrFail(args.allowance?.objectId, 'the allowance id');
+  if (!isU64(args.allowance.initialSharedVersion, 1n)) fail('BAD_ARGS', "the allowance's shared version is not a positive u64");
+  const capId = addressOrFail(args.cap?.objectId, 'the cap id');
+  if (!isU64(args.cap.version, 1n)) fail('BAD_ARGS', "the cap's version is not a positive u64");
+  // Object digests and transaction digests share one form: 32 bytes in base58.
+  if (typeof args.cap.digest !== 'string' || !isValidTransactionDigest(args.cap.digest)) fail('BAD_ARGS', "the cap's digest is not 32 bytes of base58");
+  if (capId === allowanceId) fail('BAD_ARGS', 'the cap and the allowance are the same object');
+  const gas = checkOwnerGasFacts(facts);
+  if (paysWithCoins(gas) && gas.gasCoins.some((coin) => coin.objectId === capId || coin.objectId === allowanceId)) {
+    fail('BAD_ARGS', 'a gas coin is the cap or the allowance');
+  }
+  return {
+    owner,
+    allowance: { objectId: allowanceId, initialSharedVersion: args.allowance.initialSharedVersion },
+    cap: { objectId: capId, version: args.cap.version, digest: args.cap.digest },
+    gas,
+  };
+}
+
+function revokeTransaction(terms: RevokeTerms): Transaction {
+  const tx = new Transaction();
+  tx.setSender(terms.owner);
+  const cap = tx.objectRef({ objectId: terms.cap.objectId, version: String(terms.cap.version), digest: terms.cap.digest });
+  // Revoke takes the allowance by value and deletes it, so it is named as a mutable shared input.
+  const allowance = tx.sharedObjectRef({
+    objectId: terms.allowance.objectId,
+    initialSharedVersion: String(terms.allowance.initialSharedVersion),
+    mutable: true,
+  });
+  tx.moveCall({ target: ALLOWANCE_REVOKE, typeArguments: [ALLOWANCE_BALANCE_TYPE], arguments: [cap, allowance] });
+  payOwnerGas(tx, terms.owner, terms.gas, LIMITS.revokeGasBudgetMist);
+  return tx;
+}
+
+/**
+ * Builds the unsigned transaction in which the owner ends their allowance: exactly one Move call,
+ * 0x2::allowance::revoke<Balance<USDC>>(cap, allowance), with the cap as an owned object at the
+ * version and digest given and the allowance as a mutable shared object at its initial shared
+ * version. The chain deletes both, after checking the cap names that allowance. The owner sends it
+ * and pays its gas, at most LIMITS.revokeGasBudgetMist, from their SUI address balance inside the
+ * epoch window ChainFacts name, or with the SUI coins CoinGasFacts name and no expiration. Offline
+ * and deterministic for the same args and facts.
+ * Preconditions: the allowance was read with getAllowance and the cap with findAllowanceCap just
+ * before, both for this owner, and gas coins among the facts are the owner's own.
+ * Throws AllowanceError: BAD_ARGS for an owner, allowance or cap id that is not a Sui address or is
+ * the zero address, a shared version, cap version or cap digest out of form, the cap and the
+ * allowance being one object, a gas coin that is either of them, or facts out of range; BUILD_FAILED.
+ */
+export async function buildRevokeAllowance(args: RevokeArgs, facts: OwnerGasFacts): Promise<Uint8Array> {
+  return offlineBuild(revokeTransaction(revokeTerms(args, facts)));
+}
+
+function isBalanceOfUsdc(type: string): boolean {
+  try {
+    return normalizeStructTag(type) === ALLOWANCE_BALANCE_TYPE;
+  } catch {
+    return false;
+  }
+}
+
+/** Names the way one decoded input differs from the cap or the allowance named, or null. */
+function revokeInputDifference(input: DecodedPtb['inputs'][number], terms: RevokeTerms): string | null {
+  if (input.$kind !== 'Object') return 'an input is not the cap or the allowance';
+  const object = input.Object;
+  if (object.$kind === 'ImmOrOwnedObject') {
+    const ref = object.ImmOrOwnedObject;
+    const named = terms.cap;
+    if (normalizeSuiAddress(ref.objectId) !== named.objectId || BigInt(ref.version) !== named.version || ref.digest !== named.digest) {
+      return 'the cap is not the one named';
+    }
+    return null;
+  }
+  if (object.$kind === 'SharedObject') {
+    const shared = object.SharedObject;
+    if (normalizeSuiAddress(shared.objectId) !== terms.allowance.objectId || BigInt(shared.initialSharedVersion) !== terms.allowance.initialSharedVersion) {
+      return 'the allowance is not the one named';
+    }
+    if (shared.mutable !== true) return 'the allowance is not passed as mutable';
+    return null;
+  }
+  return 'an input is not the cap or the allowance';
+}
+
+function firstRevokeDifference(actual: Decoded, expected: Decoded, terms: RevokeTerms): string | null {
+  const { v1, ptb } = actual;
+  if (!sameAddress(v1.sender, terms.owner)) return 'the sender is not the owner';
+  if (!sameAddress(v1.gasData.owner, terms.owner)) return 'the gas owner is not the owner';
+  if (BigInt(v1.gasData.budget) !== BigInt(LIMITS.revokeGasBudgetMist)) return 'the gas budget is not the revoke budget';
+  const gas = firstOwnerGasDifference(v1, terms.gas);
+  if (gas !== null) return gas;
+
+  if (ptb.commands.length !== expected.ptb.commands.length) {
+    return `the transaction has ${ptb.commands.length} commands, a revoke has ${expected.ptb.commands.length}`;
+  }
+  if (ptb.inputs.length !== expected.ptb.inputs.length) {
+    return `the transaction has ${ptb.inputs.length} inputs, a revoke has ${expected.ptb.inputs.length}`;
+  }
+  const [call] = ptb.commands;
+  if (call?.$kind !== 'MoveCall') return 'the command is not a Move call';
+  const { package: target, module, function: name, typeArguments } = call.MoveCall;
+  if (normalizeSuiAddress(target) !== FRAMEWORK_ADDRESS || module !== 'allowance' || name !== 'revoke') return 'the call is not the allowance revoke';
+  const [typeArgument] = typeArguments;
+  if (typeArguments.length !== 1 || typeArgument === undefined || !isBalanceOfUsdc(typeArgument)) {
+    return 'the revoke is not typed in the Balance of Sui Mainnet USDC';
+  }
+  for (const input of ptb.inputs) {
+    const difference = revokeInputDifference(input, terms);
+    if (difference !== null) return difference;
+  }
+
+  for (const [index, command] of ptb.commands.entries()) {
+    if (!isDeepStrictEqual(command, expected.ptb.commands[index])) return `command ${index} is not the expected call`;
+  }
+  for (const [index, input] of ptb.inputs.entries()) {
+    if (!isDeepStrictEqual(input, expected.ptb.inputs[index])) return `input ${index} is not the expected input`;
+  }
+  return null;
+}
+
+/**
+ * Proves txBytes are the revoke these args and facts describe and nothing else: equal, byte for
+ * byte, to buildRevokeAllowance with the same args and facts (standard 1). Both sides are first
+ * decoded by the same SDK parser and compared field by field, so a refusal names the first
+ * difference: sender, gas owner, gas budget, how gas is paid (as assertUsdcToAddress reads it), the
+ * command and input counts, the one call being 0x2::allowance::revoke typed in the Balance of Sui
+ * Mainnet USDC, the cap at the version and digest named, the allowance named at its shared version
+ * and passed as mutable, then each command and input in order.
+ * Covers: another sender or gas payer, another allowance or cap, the allowance passed read-only,
+ * another call or type, extra commands (including any use of the gas coin), a larger gas budget,
+ * gas paid another way than the facts say.
+ * Does not cover: whether the allowance and the cap are this owner's on chain now; the caller reads
+ * them through Tatum first (getAllowance, findAllowanceCap) and passes exactly those (C7).
+ * Throws AllowanceError: MISMATCH for any difference; BAD_ARGS or BUILD_FAILED when the expected
+ * revoke itself cannot be built.
+ */
+export async function assertRevokeAllowance(txBytes: Uint8Array, args: RevokeArgs, facts: OwnerGasFacts): Promise<void> {
+  if (!(txBytes instanceof Uint8Array)) fail('MISMATCH', 'the revoke bytes are missing');
+  const terms = revokeTerms(args, facts);
+  const expectedBytes = await offlineBuild(revokeTransaction(terms));
+  const difference = firstRevokeDifference(decode(txBytes), decode(expectedBytes), terms);
+  if (difference !== null) fail('MISMATCH', difference);
+  if (!sameBytes(txBytes, expectedBytes)) fail('MISMATCH', 'the bytes differ from a fresh build of the revoke');
 }
 
 const NO_REFILL = Object.freeze({ refill: false, amountAtomic: 0n });

@@ -11,7 +11,8 @@
     "probe:pay": "tsx --env-file-if-exists=../../.env scripts/probe-pay.ts",
     "prove:memory": "tsx --env-file-if-exists=../../.env scripts/prove-memory.ts",
     "prove:pay": "tsx --env-file-if-exists=../../.env scripts/prove-pay.ts",
-    "prove:multisig": "tsx --env-file-if-exists=../../.env scripts/prove-multisig.ts"
+    "prove:multisig": "tsx --env-file-if-exists=../../.env scripts/prove-multisig.ts",
+    "prove:end": "tsx --env-file-if-exists=../../.env scripts/prove-end.ts"
   },
   "dependencies": {
     "@ellai/core": "*",

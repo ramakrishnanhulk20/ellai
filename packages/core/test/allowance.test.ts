@@ -10,11 +10,15 @@
 // another coin type, a third party's coin in place of or beside the owner's, another sender or gas
 // payer, an extra command, a bigger budget and attached gas coins. An owner paying gas with SUI
 // coins: the coins as gas payment in order with no expiration for both builds, bad gas coin lists
-// refused, and the move's byte check refusing gas paid another way than the facts say.
-// Does NOT cover: whether Sui accepts these transactions (prove:pay sends real ones),
+// refused, and the move's byte check refusing gas paid another way than the facts say. The owner's
+// revoke: one revoke call typed in the Balance of USDC with the cap owned and the allowance shared
+// and mutable, paid either way, and assertRevokeAllowance refusing another allowance, another cap or
+// cap version, the allowance read-only, an extra command, another sender and another gas payer.
+// Does NOT cover: whether Sui accepts these transactions (prove:pay and prove:end send real ones),
 // whether the allowance on chain belongs to this owner and purse (getAllowance in
 // chain.test.ts reads that), whether the coins named are the owner's own at their current
-// versions (listUsdcCoins reads that), or signing.
+// versions (listUsdcCoins reads that), whether the cap is the owner's (findAllowanceCap reads
+// that), or signing.
 import { randomInt } from 'node:crypto';
 import { bcs } from '@mysten/sui/bcs';
 import { Transaction } from '@mysten/sui/transactions';
@@ -24,9 +28,11 @@ import {
   type AllowanceTerms,
   AllowanceError,
   assertRefill,
+  assertRevokeAllowance,
   assertUsdcToAddress,
   buildIssueAllowance,
   buildRefill,
+  buildRevokeAllowance,
   buildUsdcToAddress,
   type ChainFacts,
   type CoinGasFacts,
@@ -34,6 +40,7 @@ import {
   type RefillFacts,
   refillDecision,
   type CoinRef,
+  type RevokeArgs,
   type UsdcMoveArgs,
 } from '../src/allowance.js';
 import type { CanonicalPayment } from '../src/challenge.js';
@@ -494,6 +501,90 @@ describe('assertUsdcToAddress', () => {
     expect((await refusalOf(assertUsdcToAddress(Uint8Array.from([1, 2, 3]), MOVE, FACTS))).message).toBe('the bytes do not decode as a Sui transaction');
     expect((await refusalOf(assertUsdcToAddress(await buildRefill(REFILL, REFILL_FACTS), MOVE, FACTS))).code).toBe('MISMATCH');
   });
+});
+
+const CAP = coinRef('ca', 5n);
+const REVOKE: RevokeArgs = { owner: OWNER, allowance: { objectId: ALLOWANCE_ID, initialSharedVersion: 1_050_464_896n }, cap: CAP };
+
+interface RevokeTamper {
+  sender?: string;
+  gasOwner?: string;
+  allowanceId?: string;
+  cap?: CoinRef;
+  mutable?: boolean;
+  drainGasCoin?: boolean;
+}
+
+/** The same revoke as Ellai's, by hand, with one thing changed: what a tampered client would hand back. */
+async function handBuiltRevoke(tamper: RevokeTamper = {}): Promise<Uint8Array> {
+  const cap = tamper.cap ?? CAP;
+  const tx = new Transaction();
+  tx.setSender(tamper.sender ?? OWNER);
+  const capRef = tx.objectRef({ objectId: cap.objectId, version: String(cap.version), digest: cap.digest });
+  const allowance = tx.sharedObjectRef({
+    objectId: tamper.allowanceId ?? ALLOWANCE_ID,
+    initialSharedVersion: String(REVOKE.allowance.initialSharedVersion),
+    mutable: tamper.mutable ?? true,
+  });
+  tx.moveCall({ target: '0x2::allowance::revoke', typeArguments: [normalizeStructTag(`0x2::balance::Balance<${USDC_TYPE_MAINNET}>`)], arguments: [capRef, allowance] });
+  if (tamper.drainGasCoin) {
+    const [stolen] = tx.splitCoins(tx.gas, [1_000_000]);
+    if (stolen === undefined) throw new Error('splitCoins returned nothing');
+    tx.transferObjects([stolen], ATTACKER);
+  }
+  tx.setGasOwner(tamper.gasOwner ?? OWNER);
+  tx.setGasPrice(FACTS.referenceGasPrice);
+  tx.setGasBudget(LIMITS.revokeGasBudgetMist);
+  tx.setGasPayment([]);
+  tx.setExpiration({
+    ValidDuring: { minEpoch: String(FACTS.epoch), maxEpoch: String(FACTS.epoch + 1n), minTimestamp: null, maxTimestamp: null, chain: MAINNET_CHAIN, nonce: FACTS.nonce },
+  });
+  return tx.build();
+}
+
+describe('buildRevokeAllowance and assertRevokeAllowance', () => {
+  it('holds exactly one revoke typed in the Balance of USDC, the cap as an owned ref and the allowance as a mutable shared ref, and passes its own check', async () => {
+    const built = await buildRevokeAllowance(REVOKE, FACTS);
+    const { v1, ptb } = decoded(built);
+    expect(v1.sender).toBe(OWNER);
+    expect(v1.gasData).toEqual({ payment: [], owner: OWNER, price: '100', budget: String(LIMITS.revokeGasBudgetMist) });
+    expect(v1.expiration).toEqual({
+      $kind: 'ValidDuring',
+      ValidDuring: { minEpoch: '1290', maxEpoch: '1291', minTimestamp: null, maxTimestamp: null, chain: MAINNET_CHAIN, nonce: FACTS.nonce },
+    });
+    expect(ptb.inputs).toEqual([
+      { $kind: 'Object', Object: { $kind: 'ImmOrOwnedObject', ImmOrOwnedObject: { objectId: CAP.objectId, version: '5', digest: CAP.digest } } },
+      { $kind: 'Object', Object: { $kind: 'SharedObject', SharedObject: { objectId: ALLOWANCE_ID, initialSharedVersion: '1050464896', mutable: true } } },
+    ]);
+    const [revoke, extra] = ptb.commands;
+    expect(extra).toBeUndefined();
+    if (revoke?.$kind !== 'MoveCall') throw new Error('expected one Move call');
+    expect([revoke.MoveCall.package, revoke.MoveCall.module, revoke.MoveCall.function]).toEqual([normalizeSuiAddress('0x2'), 'allowance', 'revoke']);
+    expect(revoke.MoveCall.typeArguments).toEqual([normalizeStructTag(`0x2::balance::Balance<${USDC_TYPE_MAINNET}>`)]);
+    expect(revoke.MoveCall.arguments).toMatchObject([{ $kind: 'Input', Input: 0 }, { $kind: 'Input', Input: 1 }]);
+
+    await expect(assertRevokeAllowance(built, REVOKE, FACTS)).resolves.toBeUndefined();
+    expect(await handBuiltRevoke()).toEqual(built);
+    const coinPaid = await buildRevokeAllowance(REVOKE, COIN_GAS);
+    expect(decoded(coinPaid).ptb).toEqual(ptb);
+    await expect(assertRevokeAllowance(coinPaid, REVOKE, COIN_GAS)).resolves.toBeUndefined();
+  });
+
+  const tamperings: Array<[string, RevokeTamper, string]> = [
+    ['another allowance', { allowanceId: normalizeSuiAddress(`0x${'5e'.repeat(32)}`) }, 'the allowance is not the one named'],
+    ['another cap', { cap: coinRef('cb', 5n) }, 'the cap is not the one named'],
+    ['the cap at another version', { cap: { ...CAP, version: 6n } }, 'the cap is not the one named'],
+    ['the allowance passed read-only', { mutable: false }, 'the allowance is not passed as mutable'],
+    ['an extra command that drains the gas coin', { drainGasCoin: true }, 'the transaction has 3 commands, a revoke has 1'],
+    ['another sender', { sender: ATTACKER }, 'the sender is not the owner'],
+    ['another gas owner', { gasOwner: ATTACKER }, 'the gas owner is not the owner'],
+  ];
+  for (const [what, tamper, reason] of tamperings) {
+    it(`refuses ${what}`, async () => {
+      const refusal = await refusalOf(assertRevokeAllowance(await handBuiltRevoke(tamper), REVOKE, FACTS));
+      expect([refusal.code, refusal.message]).toEqual(['MISMATCH', reason]);
+    });
+  }
 });
 
 const REFILL_SIZE = BigInt(LIMITS.purseRefillAtomic);

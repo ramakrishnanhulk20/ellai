@@ -12,27 +12,54 @@
 // balance when it covers the budget, otherwise with the fewest of the owner's SUI coins that do, and
 // NOT_ENOUGH_SUI when neither does. The USDC move builds from the coins Sui lists for the owner with
 // its exact summary, NOTHING_TO_MOVE coming before any gas read; ownerWallet reads the owner's own
-// address and splits USDC and SUI.
-// Does NOT cover: the live chain (proven read only by `npm run prove:onboarding`), core's own
-// registry and account reads (core's memory tests), or a real wallet signing the built bytes.
+// address and splits USDC and SUI. Ending the allowance, through the build, submit and confirm
+// routes: no allowance recorded is 409 not_ready and the body cannot name one; an allowance Sui no
+// longer has is forgotten and 409 already_done; no cap in the owner's wallet is 409 not_ready; the
+// build is one revoke of the recorded allowance with the listed cap, summarised from the row and
+// fixed text, at its pinned chain-call counts; signed bytes naming another allowance or cap are 400
+// bad_transaction with nothing sent; a landed revoke is 200 ended and forgets the allowance; a
+// refused one keeps it; confirm records the end only once Sui no longer has the allowance; and the
+// jobs tick stops visiting the owner once the revoke lands.
+// Does NOT cover: the live chain (proven read only by `npm run prove:onboarding`, and the revoke by
+// `npm run prove:end -w packages/proof`), core's own registry and account reads (core's memory
+// tests), or a real wallet signing the built bytes.
 import { randomBytes } from 'node:crypto';
-import type { AllowanceState, Chain, OwnedCoin, WalletBalances } from '@ellai/core/chain';
+import { buildRevokeAllowance } from '@ellai/core/allowance';
+import type { AllowanceCapRef, AllowanceState, Chain, OwnedCoin, WalletBalances } from '@ellai/core/chain';
 import { ChainError } from '@ellai/core/chain';
+import { canonicalSuiAddress } from '@ellai/core/keys';
 import { LIMITS } from '@ellai/core/limits';
 import { buildAddDelegateTx, buildCreateAccountTx, findMemoryAccount, MemoryError } from '@ellai/core/memory';
 import { USDC_TYPE_MAINNET } from '@ellai/core/usdc';
 import { GrpcTypes } from '@mysten/sui/grpc';
-import { Transaction } from '@mysten/sui/transactions';
-import { fromBase64, normalizeStructTag, toBase58, toHex } from '@mysten/sui/utils';
+import { Ed25519Keypair } from '@mysten/sui/keypairs/ed25519';
+import { Transaction, TransactionDataBuilder } from '@mysten/sui/transactions';
+import { fromBase64, normalizeStructTag, toBase58, toBase64, toHex } from '@mysten/sui/utils';
 import { eq } from 'drizzle-orm';
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
+import * as buildRoute from '../src/app/api/owner/onboarding/build/route.js';
+import * as confirmRoute from '../src/app/api/owner/onboarding/confirm/route.js';
+import * as submitRoute from '../src/app/api/owner/onboarding/submit/route.js';
+import { completeSignIn, issueSignIn } from '../src/server/auth/signin.js';
 import { type Database, createDb, migrate } from '../src/server/db/client.js';
 import { owners } from '../src/server/db/schema.js';
+import type { ServerEnv } from '../src/server/env.js';
+import { setServerContextFactory } from '../src/server/http/context.js';
+import { runJobsTick } from '../src/server/jobs/tick.js';
 import { ownerDelegate } from '../src/server/memory/delegate.js';
-import { buildOnboardingTx } from '../src/server/onboarding/build.js';
-import { confirmExistingStep, confirmOnboardingTx } from '../src/server/onboarding/confirm.js';
+import { BUILD_CHAIN_CALLS, buildOnboardingTx } from '../src/server/onboarding/build.js';
+import { CONFIRM_CHAIN_CALLS, confirmExistingStep, confirmOnboardingTx } from '../src/server/onboarding/confirm.js';
 import { fewestCovering, ownerWallet } from '../src/server/onboarding/funds.js';
-import { type BuildStep, type OnboardingStep, OnboardingError, onboardingState } from '../src/server/onboarding/state.js';
+import {
+  ALLOWANCE_ENDED_MESSAGE,
+  type BuildStep,
+  NO_ALLOWANCE_CAP_MESSAGE,
+  NO_ALLOWANCE_MESSAGE,
+  type OnboardingStep,
+  OnboardingError,
+  onboardingState,
+} from '../src/server/onboarding/state.js';
+import { SUBMIT_CHAIN_CALLS, submitOnboardingTx } from '../src/server/onboarding/submit.js';
 
 const DAY_MS = 86_400_000;
 
@@ -110,14 +137,23 @@ interface ChainSetup {
   wallet?: Partial<WalletBalances>;
   suiCoins?: OwnedCoin[];
   usdcCoins?: OwnedCoin[];
+  /** getAllowance answers NOT_FOUND, as it does once the allowance is revoked. */
+  allowanceGone?: boolean;
+  /** What findAllowanceCap answers; OWNER_CAP unless a test says otherwise. */
+  cap?: AllowanceCapRef | null;
+  /** How a relayed transaction ends on chain. */
+  execution?: 'success' | 'failure';
 }
+
+/** The owner's AllowanceCap as findAllowanceCap reads one. */
+const OWNER_CAP: AllowanceCapRef = { objectId: `0x${'ca'.repeat(32)}`, version: 7n, digest: toBase58(new Uint8Array(32).fill(7)) };
 
 /** A coin as listUsdcCoins and listSuiCoins give it, numbered so each is its own. */
 function ownedCoin(n: number, balance: bigint): OwnedCoin {
   return { objectId: `0x${n.toString(16).padStart(64, '0')}`, version: BigInt(n), digest: toBase58(new Uint8Array(32).fill(n)), balance };
 }
 
-/** A chain that answers only the reads confirm and build make. Anything else fails the test. */
+/** A chain that answers only the reads confirm and build make, and the send submit makes. Anything else fails the test. */
 function stubChain(owner: Owner, setup: ChainSetup = {}) {
   const created = setup.created ?? [{ objectId: `0x${'d2'.repeat(32)}`, type: ALLOWANCE_TYPE }];
   const getTransactionResult = vi.fn(async () => {
@@ -139,23 +175,36 @@ function stubChain(owner: Owner, setup: ChainSetup = {}) {
       },
     },
   }));
-  const getAllowance = vi.fn(async () => ({ ...goodAllowance(owner), ...setup.allowance }));
+  const getAllowance = vi.fn(async (_id: string) => {
+    if (setup.allowanceGone) throw new ChainError('NOT_FOUND', 'stand-in not found');
+    return { ...goodAllowance(owner), ...setup.allowance };
+  });
+  const findAllowanceCap = vi.fn(async (_owner: string, _allowanceId: string) => (setup.cap === undefined ? OWNER_CAP : setup.cap));
   // One SUI in the address balance unless a test says otherwise, so a fee is paid from it.
   const getWalletBalances = vi.fn(async () => ({ usdcAddressBalance: 0n, usdcCoinBalance: 0n, suiAddressBalance: 1_000_000_000n, suiCoinBalance: 0n, ...setup.wallet }));
   const listSuiCoins = vi.fn(async () => ({ coins: setup.suiCoins ?? [], more: false }));
   const listUsdcCoins = vi.fn(async () => ({ coins: setup.usdcCoins ?? [], more: false }));
+  const executeTransaction = vi.fn(async (bytes: Uint8Array, _signatures: string[]) => ({
+    digest: TransactionDataBuilder.getDigestFromBytes(bytes),
+    status: setup.execution ?? 'success',
+    errorCode: setup.execution === 'failure' ? 'MOVE_ABORT' : null,
+    balanceChanges: [],
+    createdObjects: [],
+  }));
   const chain = {
     usesApiKey: true,
     getTransactionResult,
     getAllowance,
+    findAllowanceCap,
     getWalletBalances,
     listSuiCoins,
     listUsdcCoins,
+    executeTransaction,
     getCurrentEpoch: async () => 900n,
     getReferenceGasPrice: async () => 100n,
     grpc: { ledgerService: { getTransaction } },
   } as unknown as Chain;
-  return { chain, getTransactionResult, getTransaction, getAllowance, getWalletBalances, listSuiCoins, listUsdcCoins };
+  return { chain, getTransactionResult, getTransaction, getAllowance, findAllowanceCap, getWalletBalances, listSuiCoins, listUsdcCoins, executeTransaction };
 }
 
 const untouchable = new Proxy({}, {
@@ -529,5 +578,191 @@ describe('ownerWallet', () => {
     });
     expect(stub.getWalletBalances.mock.calls).toEqual([[owner.suiAddress]]);
     expect((await refusal(ownerWallet({ db, ownerId: '00000000-0000-4000-8000-000000000000', chain: untouchable }))).code).toBe('NO_OWNER');
+  });
+});
+
+describe('ending the allowance, through the build, submit and confirm routes', () => {
+  const APP_ORIGIN = 'https://ellai.example';
+  const SESSION_SECRET = randomBytes(32).toString('hex');
+  const ENV: ServerEnv = {
+    DATABASE_URL: 'pglite:memory',
+    ELLAI_MASTER_SECRET: MASTER,
+    GAS_PRIVATE_KEY: Ed25519Keypair.generate().getSecretKey(),
+    SESSION_SECRET,
+    JOBS_SECRET: randomBytes(32).toString('hex'),
+    APP_ORIGIN,
+  };
+  // The routes read the chain from the context, so each test points it at its own stand-in.
+  let routeChain: Chain = untouchable;
+
+  beforeAll(() => setServerContextFactory(async () => ({ db, chain: routeChain, env: ENV, now: () => NOW })));
+  afterAll(() => setServerContextFactory(null));
+
+  interface SignedIn {
+    row: Owner;
+    cookie: string;
+    signer: Ed25519Keypair;
+  }
+
+  /** An owner signed in as the app signs one in, with an allowance recorded as confirm records one unless told otherwise. */
+  async function signedIn(allowanceId: string | null = address()): Promise<SignedIn> {
+    const signer = Ed25519Keypair.generate();
+    const { message } = await issueSignIn({ db, address: signer.toSuiAddress(), appOrigin: APP_ORIGIN, now: NOW });
+    const signature = (await signer.signPersonalMessage(new TextEncoder().encode(message))).signature;
+    const done = await completeSignIn({ db, message, signature, appOrigin: APP_ORIGIN, masterSecretHex: MASTER, sessionSecretHex: SESSION_SECRET, now: NOW });
+    if (allowanceId !== null) {
+      await db.update(owners).set({ allowanceId: canonicalSuiAddress(allowanceId), allowanceCheckedAt: NOW, refillNotBefore: new Date(NOW.getTime() + DAY_MS) }).where(eq(owners.id, done.ownerId));
+    }
+    const [row] = await db.select().from(owners).where(eq(owners.id, done.ownerId));
+    if (row === undefined) throw new Error('expected a row');
+    return { row, cookie: `__Host-ellai_session=${done.sessionToken}`, signer };
+  }
+
+  const post = (route: { POST: (request: Request) => Promise<Response> }, path: string, body: unknown, cookie: string) =>
+    route.POST(new Request(`${APP_ORIGIN}/api/owner/onboarding/${path}`, { method: 'POST', headers: { origin: APP_ORIGIN, cookie, 'content-type': 'application/json' }, body: JSON.stringify(body) }));
+  const build = (owner: SignedIn, body: unknown = { step: 'end_allowance' }) => post(buildRoute, 'build', body, owner.cookie);
+  const submit = (owner: SignedIn, body: unknown) => post(submitRoute, 'submit', body, owner.cookie);
+  const confirm = (owner: SignedIn, body: unknown = { step: 'end_allowance', digest: DIGEST }) => post(confirmRoute, 'confirm', body, owner.cookie);
+  const answer = async (response: Response) => [response.status, await response.json()];
+  const signed = async (owner: SignedIn, bytes: Uint8Array) => ({ step: 'end_allowance', txBytesBase64: toBase64(bytes), signature: (await owner.signer.signTransaction(bytes)).signature });
+  /** A revoke as core builds it, for this owner's recorded allowance and OWNER_CAP unless one of them is swapped. */
+  const revokeBytes = (owner: SignedIn, swap: { allowanceId?: string; cap?: AllowanceCapRef } = {}) =>
+    buildRevokeAllowance(
+      { owner: owner.row.suiAddress, allowance: { objectId: swap.allowanceId ?? owner.row.allowanceId ?? '', initialSharedVersion: 1n }, cap: swap.cap ?? OWNER_CAP },
+      { epoch: 900n, referenceGasPrice: 100n, nonce: 7 },
+    );
+
+  it('answers 409 not_ready when the owner row records no allowance, reading nothing, and takes no allowance id from the body (C7)', async () => {
+    const owner = await signedIn(null);
+    routeChain = untouchable;
+    expect(await answer(await build(owner))).toEqual([409, { error: 'not_ready', message: NO_ALLOWANCE_MESSAGE }]);
+    expect((await build(owner, { step: 'end_allowance', allowanceId: address() })).status).toBe(400);
+  });
+
+  it('forgets an allowance Sui no longer has and answers 409 already_done, never looking for a cap', async () => {
+    const owner = await signedIn();
+    const stub = stubChain(owner.row, { allowanceGone: true });
+    routeChain = stub.chain;
+    expect(await answer(await build(owner))).toEqual([409, { error: 'already_done', message: ALLOWANCE_ENDED_MESSAGE }]);
+    expect(stub.getAllowance.mock.calls).toEqual([[owner.row.allowanceId]]);
+    expect(stub.findAllowanceCap).not.toHaveBeenCalled();
+    expect(await reread(owner.row)).toMatchObject({ allowanceId: null, allowanceCheckedAt: null, refillNotBefore: null });
+  });
+
+  it("answers 409 not_ready when Sui shows no cap for the allowance in the owner's wallet, keeping the allowance", async () => {
+    const owner = await signedIn();
+    const stub = stubChain(owner.row, { cap: null });
+    routeChain = stub.chain;
+    expect(await answer(await build(owner))).toEqual([409, { error: 'not_ready', message: NO_ALLOWANCE_CAP_MESSAGE }]);
+    expect(stub.findAllowanceCap.mock.calls).toEqual([[owner.row.suiAddress, owner.row.allowanceId]]);
+    expect(stub.getWalletBalances).not.toHaveBeenCalled();
+    expect((await reread(owner.row)).allowanceId).toBe(owner.row.allowanceId);
+  });
+
+  it('builds one revoke of the recorded allowance with the cap Sui lists, summarised from the owner row and fixed text, counted at its real chain calls', async () => {
+    const owner = await signedIn();
+    const stub = stubChain(owner.row);
+    routeChain = stub.chain;
+    const built = (await (await build(owner)).json()) as { txBytesBase64: string; summary: unknown };
+    expect(built.summary).toEqual([
+      { label: 'Action', value: 'End the allowance your Ellai purse draws from' },
+      { label: 'Allowance', value: owner.row.allowanceId },
+      { label: 'Purse', value: owner.row.purseAddress },
+      { label: 'After this', value: 'Your purse can draw nothing more from your wallet.' },
+    ]);
+    const data = Transaction.from(fromBase64(built.txBytesBase64)).getData();
+    expect([data.sender, data.gasData.owner, data.gasData.budget]).toEqual([owner.row.suiAddress, owner.row.suiAddress, String(LIMITS.revokeGasBudgetMist)]);
+    expect(data.commands.map((command) => [command.MoveCall?.module, command.MoveCall?.function])).toEqual([['allowance', 'revoke']]);
+    expect(data.inputs.map((input) => input.Object)).toEqual([
+      { $kind: 'ImmOrOwnedObject', ImmOrOwnedObject: { objectId: OWNER_CAP.objectId, version: String(OWNER_CAP.version), digest: OWNER_CAP.digest } },
+      { $kind: 'SharedObject', SharedObject: { objectId: owner.row.allowanceId, initialSharedVersion: '1', mutable: true } },
+    ]);
+    expect(stub.getAllowance.mock.calls).toEqual([[owner.row.allowanceId]]);
+    expect(stub.findAllowanceCap.mock.calls).toEqual([[owner.row.suiAddress, owner.row.allowanceId]]);
+    // Build: one allowance read, two cap pages at most, three gas reads. Submit: the same two re-reads, a SUI coin re-read, the send. Confirm: one read.
+    expect([BUILD_CHAIN_CALLS.end_allowance, SUBMIT_CHAIN_CALLS.end_allowance, CONFIRM_CHAIN_CALLS.end_allowance]).toEqual([6, 5, 1]);
+  });
+
+  it('refuses signed bytes naming another allowance or another cap with 400 bad_transaction, sending nothing (C6, C7)', async () => {
+    const owner = await signedIn();
+    const stub = stubChain(owner.row);
+    routeChain = stub.chain;
+    for (const swap of [{ allowanceId: address() }, { cap: { ...OWNER_CAP, objectId: address() } }, { cap: { ...OWNER_CAP, version: OWNER_CAP.version - 1n } }]) {
+      const response = await submit(owner, await signed(owner, await revokeBytes(owner, swap)));
+      expect(await answer(response)).toEqual([400, { error: 'bad_transaction', message: 'it is not the transaction Ellai builds for this step' }]);
+    }
+    expect(stub.executeTransaction).not.toHaveBeenCalled();
+    expect((await reread(owner.row)).allowanceId).toBe(owner.row.allowanceId);
+  });
+
+  it('relays the revoke the build route made, answers 200 ended with its digest, and forgets the allowance', async () => {
+    const owner = await signedIn();
+    const stub = stubChain(owner.row);
+    routeChain = stub.chain;
+    const bytes = fromBase64(((await (await build(owner)).json()) as { txBytesBase64: string }).txBytesBase64);
+    const body = await signed(owner, bytes);
+    const digest = TransactionDataBuilder.getDigestFromBytes(bytes);
+    expect(await answer(await submit(owner, body))).toEqual([200, { ended: true, digest }]);
+    expect(stub.executeTransaction.mock.calls).toEqual([[bytes, [body.signature]]]);
+    expect(await reread(owner.row)).toMatchObject({ allowanceId: null, allowanceCheckedAt: null, refillNotBefore: null });
+    expect((await onboardingState({ db, ownerId: owner.row.id })).allowance).toBe('missing');
+  });
+
+  it('keeps the allowance when the network refuses the revoke, answering 422 chain_refused', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    try {
+      const owner = await signedIn();
+      const stub = stubChain(owner.row, { execution: 'failure' });
+      routeChain = stub.chain;
+      const response = await submit(owner, await signed(owner, await revokeBytes(owner)));
+      expect([response.status, ((await response.json()) as { error: string }).error]).toEqual([422, 'chain_refused']);
+      expect(stub.executeTransaction).toHaveBeenCalledTimes(1);
+      expect(await reread(owner.row)).toMatchObject({ allowanceId: owner.row.allowanceId, allowanceCheckedAt: NOW });
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("confirms an end from what Sui shows for the row's allowance: gone is recorded and forgotten, still there is 409 not_landed", async () => {
+    const owner = await signedIn();
+    routeChain = stubChain(owner.row).chain;
+    const pending = await confirm(owner);
+    expect([pending.status, ((await pending.json()) as { error: string }).error]).toEqual([409, 'not_landed']);
+    expect((await reread(owner.row)).allowanceId).toBe(owner.row.allowanceId);
+
+    const gone = stubChain(owner.row, { allowanceGone: true });
+    routeChain = gone.chain;
+    expect(await answer(await confirm(owner))).toEqual([200, { recorded: 'ended' }]);
+    expect(gone.getAllowance.mock.calls).toEqual([[owner.row.allowanceId]]);
+    expect((await reread(owner.row)).allowanceId).toBeNull();
+    // Already forgotten: nothing is read, and the answer is the same.
+    routeChain = untouchable;
+    expect(await answer(await confirm(owner))).toEqual([200, { recorded: 'ended' }]);
+  });
+
+  it('no longer has the refill tick visit the owner once the revoke lands', async () => {
+    const own = await createDb('pglite:memory');
+    try {
+      await migrate(own.db);
+      // A purse not derived from the master secret makes the refill step refuse before any chain read, so a visit shows only in the count.
+      const [row] = await own.db.insert(owners).values({ suiAddress: address(), purseAddress: address(), allowanceId: address(), allowanceCheckedAt: NOW }).returning();
+      if (row === undefined) throw new Error('expected a row');
+      const stub = stubChain(row);
+      const getBalances = vi.fn(async () => ({ usdcAddressBalance: 0n, usdcCoinBalance: 0n, suiTotal: 1_000_000_000n }));
+      const tickChain = { ...(stub.chain as object), getBalances } as unknown as Chain;
+      const tick = (at: Date) => runJobsTick({ db: own.db, chain: tickChain, masterSecretHex: MASTER, gasKeypair: Ed25519Keypair.generate(), now: () => at, sleep: async () => undefined });
+
+      expect((await tick(NOW)).owners).toBe(1);
+      const built = await buildOnboardingTx({ db: own.db, ownerId: row.id, step: 'end_allowance', chain: stub.chain, masterSecretHex: MASTER, now: NOW });
+      const ended = await submitOnboardingTx({ db: own.db, ownerId: row.id, step: 'end_allowance', txBytesBase64: built.txBytesBase64, signature: 'AA==', chain: stub.chain, masterSecretHex: MASTER, now: NOW });
+      expect(ended.status).toBe('ended');
+      const reads = stub.getAllowance.mock.calls.length;
+      const later = await tick(new Date(NOW.getTime() + DAY_MS));
+      expect(later.owners).toBe(0);
+      expect(later.errors.filter((error) => error.ownerId === row.id)).toEqual([]);
+      expect(stub.getAllowance.mock.calls.length).toBe(reads);
+    } finally {
+      await own.close();
+    }
   });
 });

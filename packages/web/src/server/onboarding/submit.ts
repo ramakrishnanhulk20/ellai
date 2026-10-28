@@ -1,5 +1,5 @@
 import { isDeepStrictEqual } from 'node:util';
-import { AllowanceError, type AllowanceTerms, buildIssueAllowance, type OwnerGasFacts } from '@ellai/core/allowance';
+import { AllowanceError, type AllowanceTerms, assertRevokeAllowance, buildIssueAllowance, type OwnerGasFacts } from '@ellai/core/allowance';
 import { type Chain, ChainError, type ExecutionResult } from '@ellai/core/chain';
 import { canonicalSuiAddress } from '@ellai/core/keys';
 import { LIMITS } from '@ellai/core/limits';
@@ -8,10 +8,21 @@ import { bcs } from '@mysten/sui/bcs';
 import { TransactionDataBuilder } from '@mysten/sui/transactions';
 import { fromBase64, toBase64 } from '@mysten/sui/utils';
 import type { Database } from '../db/client.js';
-import { buildAccountStep } from './build.js';
+import { buildAccountStep, readAllowanceToEnd } from './build.js';
 import { allowanceLimitsProblem, recordRelayedStep } from './confirm.js';
 import { checkUsdcMoveStep, requireOwnersGasCoins } from './funds.js';
-import { type AccountStep, type BuildStep, checkBuildStep, checkNow, loadOwner, OnboardingError, type OwnerRow, USDC_MOVE_STEP } from './state.js';
+import {
+  type AccountStep,
+  type BuildStep,
+  checkBuildStep,
+  checkNow,
+  END_ALLOWANCE_STEP,
+  forgetAllowance,
+  loadOwner,
+  OnboardingError,
+  type OwnerRow,
+  USDC_MOVE_STEP,
+} from './state.js';
 
 /**
  * The Tatum calls submitOnboardingTx's success path makes for each step, which the submit route
@@ -20,9 +31,17 @@ import { type AccountStep, type BuildStep, checkBuildStep, checkNow, loadOwner, 
  * findMemoryAccount's three reads to record the result; for an allowance, which is rebuilt
  * offline, the re-read of the owner's SUI coins when it pays its fee with them, the send and the
  * one read of the allowance it created; for the USDC move, the re-read of the owner's USDC coins,
- * that same SUI coin re-read, and the send.
+ * that same SUI coin re-read, and the send; for ending the allowance, the re-read of the allowance,
+ * its cap (at most LIMITS.allowanceCapMaxPages pages, counted at that most), that same SUI coin
+ * re-read, and the send.
  */
-export const SUBMIT_CHAIN_CALLS: Readonly<Record<BuildStep, number>> = { memory_account: 9, add_delegate: 11, allowance: 3, usdc_to_address: 3 };
+export const SUBMIT_CHAIN_CALLS: Readonly<Record<BuildStep, number>> = {
+  memory_account: 9,
+  add_delegate: 11,
+  allowance: 3,
+  usdc_to_address: 3,
+  end_allowance: 1 + LIMITS.allowanceCapMaxPages + 1 + 1,
+};
 
 /**
  * How a relayed transaction ended. `recorded`: it succeeded and the step is recorded. `sent`: it
@@ -30,11 +49,13 @@ export const SUBMIT_CHAIN_CALLS: Readonly<Record<BuildStep, number>> = { memory_
  * Sui does not show its result yet; the client confirms it later with the digest. `refused`: the
  * network refused it or it ran and failed, which is definite, and nothing is recorded. `moved`:
  * the USDC move succeeded, putting movedAtomic, what the coins held as read just before the send,
- * in the owner's address balance; nothing is recorded for it.
+ * in the owner's address balance; nothing is recorded for it. `ended`: the revoke of the owner's
+ * allowance succeeded, so Sui deleted it, and Ellai has forgotten it.
  */
 export type SubmitOutcome =
   | { status: 'recorded'; recorded: string; digest: string }
   | { status: 'moved'; movedAtomic: string; digest: string }
+  | { status: 'ended'; digest: string }
   | { status: 'sent'; digest: string }
   | { status: 'refused'; digest: string };
 
@@ -183,6 +204,26 @@ async function checkAllowanceStep(bytes: Uint8Array, decoded: Decoded, owner: Ow
   if ('gasCoins' in read.facts) await requireOwnersGasCoins(chain, canonicalSuiAddress(owner.suiAddress), read.facts.gasCoins);
 }
 
+/**
+ * Holds signed bytes to ending the owner's allowance: byte for byte a fresh buildRevokeAllowance
+ * (core assertRevokeAllowance) for the allowance on the owner row and the owner's cap for it, both
+ * re-read now (readAllowanceToEnd), with the gas source the bytes carry; then, when the bytes pay
+ * with SUI coins, those coins re-read as the owner's own. So another allowance, another cap, an
+ * extra command or a third party's gas coin is refused before anything is sent (C6, C7).
+ * Returns the row's allowance id as stored, for forgetAllowance once the revoke lands.
+ */
+async function checkEndAllowanceStep(db: Database, owner: OwnerRow, bytes: Uint8Array, facts: OwnerGasFacts, chain: Chain): Promise<string> {
+  const { args, recordedId } = await readAllowanceToEnd(db, owner, chain);
+  try {
+    await assertRevokeAllowance(bytes, args, facts);
+  } catch (error) {
+    if (error instanceof AllowanceError) badTransaction(NOT_THIS_STEP);
+    throw error;
+  }
+  if ('gasCoins' in facts) await requireOwnersGasCoins(chain, args.owner, facts.gasCoins);
+  return recordedId;
+}
+
 function unknownOutcome(digest: string, why: string): SubmitOutcome {
   console.warn(`[ellai onboarding] submit_not_recorded ${why}`);
   return { status: 'sent', digest };
@@ -203,16 +244,21 @@ function unknownOutcome(digest: string, why: string): SubmitOutcome {
  *   confirm records under.
  * - usdc_to_address: byte for byte a fresh buildUsdcToAddress for the owner with their USDC coins
  *   re-read now and the gas source the bytes carry (checkUsdcMoveStep).
- * - for both, gas coins the bytes pay with must be the owner's own SUI coins as Sui shows them now.
+ * - end_allowance: byte for byte a fresh buildRevokeAllowance for the allowance on the owner row and
+ *   the owner's cap for it, both re-read now, with the gas source the bytes carry
+ *   (checkEndAllowanceStep).
+ * - for all three, gas coins the bytes pay with must be the owner's own SUI coins as Sui shows them now.
  * Then the bytes go to chain.executeTransaction once, metered on this owner's Tatum budget (C22),
  * with the digest Ellai computed from them. A step's success is recorded as confirm records it,
  * from the result's own effects (recordRelayedStep), never from anything the caller sends (C7, C8);
- * the move records nothing and answers what the coins held as read before the send.
+ * the move records nothing and answers what the coins held as read before the send; a revoke that
+ * succeeded forgets the allowance it ended (forgetAllowance) and answers `ended`.
  * Returns SubmitOutcome. Throws OnboardingError: BAD_INPUT for a bad step, date or owner id;
  * NO_OWNER; BAD_TRANSACTION for bytes or a signature refused as above, nothing sent; NOT_READY and
- * ALREADY_DONE from the account build; NOTHING_TO_MOVE for the move when the owner holds no USDC
- * coins now. Throws ChainError BUDGET when Ellai's Tatum budget refused the send before it left,
- * and MemoryError or ChainError when the fresh build or a re-read cannot be made.
+ * ALREADY_DONE from the account build, and from end_allowance with no allowance recorded, no cap
+ * for it, or an allowance Sui no longer has (then forgotten); NOTHING_TO_MOVE for the move when the
+ * owner holds no USDC coins now. Throws ChainError BUDGET when Ellai's Tatum budget refused the send
+ * before it left, and MemoryError or ChainError when the fresh build or a re-read cannot be made.
  */
 export async function submitOnboardingTx(args: {
   db: Database;
@@ -233,10 +279,12 @@ export async function submitOnboardingTx(args: {
   if (!sameAddress(decoded.v1.sender, ownerAddress)) badTransaction('the transaction is not sent from your own address');
   if (!sameAddress(decoded.v1.gasData.owner, ownerAddress)) badTransaction('someone other than you would pay its gas');
   let moved: bigint | null = null;
-  if (step === USDC_MOVE_STEP) {
+  let ending: string | null = null;
+  if (step === USDC_MOVE_STEP || step === END_ALLOWANCE_STEP) {
     const facts = gasFactsOf(decoded.v1);
     if (facts === null) badTransaction(NOT_THIS_STEP);
-    moved = (await checkUsdcMoveStep(args.chain, ownerAddress, bytes, facts)).movedAtomic;
+    if (step === USDC_MOVE_STEP) moved = (await checkUsdcMoveStep(args.chain, ownerAddress, bytes, facts)).movedAtomic;
+    else ending = await checkEndAllowanceStep(args.db, owner, bytes, facts, args.chain);
   } else if (step === 'allowance') await checkAllowanceStep(bytes, decoded, owner, now, args.chain);
   else await checkAccountStep(decoded, step, owner, args.chain, args.masterSecretHex);
 
@@ -255,6 +303,12 @@ export async function submitOnboardingTx(args: {
     return { status: 'refused', digest };
   }
   if (step === USDC_MOVE_STEP) return { status: 'moved', movedAtomic: String(moved), digest };
+  if (step === END_ALLOWANCE_STEP) {
+    // A revoke that succeeded deleted exactly the allowance its byte check named, so the success is the proof it is gone.
+    if (ending === null) throw new Error('an ended allowance has no recorded id');
+    await forgetAllowance(args.db, owner.id, ending);
+    return { status: 'ended', digest };
+  }
   try {
     const { recorded } = await recordRelayedStep({ db: args.db, ownerId: owner.id, step, created: result.createdObjects, chain: args.chain, masterSecretHex: args.masterSecretHex, now });
     return { status: 'recorded', recorded, digest };

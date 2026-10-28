@@ -108,6 +108,20 @@ export const LIMITS = {
    * storage; a move of ownedCoinsMax coins has not been measured.
    */
   usdcMoveGasBudgetMist: 50_000_000,
+  /**
+   * AllowanceCap objects per GraphQL page when looking for the one that ends an owner's allowance.
+   * Each allowance an owner issues leaves one cap in their wallet, so an owner has a handful at most.
+   */
+  allowanceCapPageSize: 50,
+  /** Pages of caps read before giving up on finding the one for an allowance, so a wallet sent many objects cannot keep us looping. */
+  allowanceCapMaxPages: 2,
+  /**
+   * Gas budget the owner signs for when ending their allowance: 0.0003 SUI, about three times what
+   * one revoke was charged in a mainnet dry run (DECISIONS.md, 2026-10-28). Deleting the allowance
+   * and its cap returns more storage rebate than the revoke costs. The charge is a fixed 1,000 gas
+   * units, so this covers it only while the reference gas price is at most 300 MIST.
+   */
+  revokeGasBudgetMist: 300_000,
   /** Highest gas price Ellai builds with, in MIST per unit. Mainnet's reference price was 100 on 2026-10-20. */
   maxGasPriceMist: 1_000,
   /** Settlement reads for one payment before it is reported unsettled. */

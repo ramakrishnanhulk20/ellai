@@ -28,6 +28,8 @@ const API_KEY_HEADER = 'x-api-key';
 const SUI_TYPE = normalizeStructTag(SUI_TYPE_ARG);
 const USDC_COIN_TYPE = normalizeStructTag(`0x2::coin::Coin<${USDC_TYPE_MAINNET}>`);
 const SUI_COIN_TYPE = normalizeStructTag(`0x2::coin::Coin<${SUI_TYPE}>`);
+// Issued with the allowance and sent to its funder; revoke takes it by value, so whoever holds it can end the allowance.
+const ALLOWANCE_CAP_TYPE = normalizeStructTag(`0x2::allowance::AllowanceCap<0x2::balance::Balance<${USDC_TYPE_MAINNET}>>`);
 // Everything a transaction needs to name an owned coin, plus what the move summary shows.
 const COIN_PATHS = ['object_id', 'version', 'digest', 'object_type', 'owner', 'balance'];
 
@@ -271,6 +273,15 @@ export interface WalrusBlobScan {
   next: string | null;
 }
 
+/** The AllowanceCap that ends one allowance, named exactly as a transaction must name an owned object. */
+export interface AllowanceCapRef {
+  objectId: string;
+  /** Sui refuses a transaction that names any version but the cap's current one. */
+  version: bigint;
+  /** The cap's current object digest, base58. */
+  digest: string;
+}
+
 export interface Chain {
   /** True when an API key is sent with every request; false for the anonymous gateway. */
   readonly usesApiKey: boolean;
@@ -303,6 +314,12 @@ export interface Chain {
   getWalrusEpoch(): Promise<number>;
   executeTransaction(txBytes: Uint8Array, signatures: string[]): Promise<ExecutionResult>;
   getAllowance(objectId: string): Promise<AllowanceReading>;
+  /**
+   * The owner's Sui Mainnet USDC AllowanceCap whose allowance field is `allowanceId`, the one key
+   * that ends that allowance, or null when it is not among the first LIMITS.allowanceCapMaxPages
+   * pages of the owner's caps.
+   */
+  findAllowanceCap(owner: string, allowanceId: string): Promise<AllowanceCapRef | null>;
   /** Closes the gRPC channel so a script can exit. */
   close(): void;
 }
@@ -587,6 +604,47 @@ const blobScanPageSchema = z.object({
     }),
   }),
 });
+
+// Strict, as allowanceObjectSchema is: a cap holds exactly an id and the allowance it ends, and
+// only an address owner's fields are asked for, so any other owner kind arrives as a bare typename.
+const allowanceCapPageSchema = z.strictObject({
+  address: z.strictObject({
+    objects: z.strictObject({
+      pageInfo: z.strictObject({ hasNextPage: z.boolean(), endCursor: z.string().nullable() }),
+      nodes: z
+        .array(
+          z.strictObject({
+            address: z.string(),
+            version: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+            digest: z.string(),
+            owner: z.strictObject({ __typename: z.string(), address: z.strictObject({ address: z.string() }).nullable().optional() }),
+            contents: z.strictObject({
+              type: z.strictObject({ repr: z.string() }),
+              json: z.strictObject({ id: z.string(), allowance: z.string() }),
+            }),
+          }),
+        )
+        .max(LIMITS.allowanceCapPageSize),
+    }),
+  }),
+});
+
+const ALLOWANCE_CAPS_QUERY = `
+  query EllaiAllowanceCaps($owner: SuiAddress!, $type: String!, $first: Int!, $after: String) {
+    address(address: $owner) {
+      objects(first: $first, after: $after, filter: { type: $type }) {
+        pageInfo { hasNextPage endCursor }
+        nodes {
+          address
+          version
+          digest
+          owner { __typename ... on AddressOwner { address { address } } }
+          contents { type { repr } json }
+        }
+      }
+    }
+  }
+`;
 
 const BLOBS_QUERY = `
   query EllaiOwnedWalrusBlobs($owner: SuiAddress!, $type: String!, $first: Int!, $after: String) {
@@ -1427,6 +1485,67 @@ export function createChain(opts: { apiKey?: string; beforeRequest?: BeforeTatum
     };
   }
 
+  /**
+   * Looks through the owner's Sui Mainnet USDC AllowanceCap objects through Tatum GraphQL, at most
+   * LIMITS.allowanceCapMaxPages pages of LIMITS.allowanceCapPageSize, for the one whose allowance
+   * field is `allowanceId`, and returns it as an owned object reference, or null when it is not in
+   * that window. Each page has the usual timeout and retries. The page holding the cap is read to
+   * its end, and every cap read is held to what was asked for, the type filter being the
+   * gateway's: exactly that cap type, contents naming the object itself, owned outright by `owner`
+   * (not shared, wrapped or held by consensus), listed once, the only cap for its allowance, with a
+   * version and a digest in range. Ids on both sides of every comparison come out of the SDK
+   * normaliser.
+   * Throws ChainError: INVALID_INPUT for a malformed owner or allowance id; BAD_RESPONSE for a page
+   * of the wrong shape, anything above, or a next page promised without a usable cursor; UPSTREAM
+   * for GraphQL errors; or any transport code.
+   */
+  async function findAllowanceCap(owner: string, allowanceId: string): Promise<AllowanceCapRef | null> {
+    const ownerAddress = inputAddress(owner);
+    const wanted = inputAddress(allowanceId);
+    const seen = new Set<string>();
+    const capFor = new Set<string>();
+    let found: AllowanceCapRef | null = null;
+    let after: string | null = null;
+
+    for (let page = 0; page < LIMITS.allowanceCapMaxPages; page++) {
+      const variables: Record<string, unknown> = { owner: ownerAddress, type: ALLOWANCE_CAP_TYPE, first: LIMITS.allowanceCapPageSize, after };
+      const result = await bounded('findAllowanceCap', (signal) => graphql.query({ query: ALLOWANCE_CAPS_QUERY, variables, signal }));
+      if (result.errors?.length) {
+        throw new ChainError('UPSTREAM', `Tatum findAllowanceCap: GraphQL returned ${result.errors.length} error(s)`);
+      }
+      const parsed = allowanceCapPageSchema.safeParse(result.data);
+      if (!parsed.success) throw badResponse('the allowance cap page has an unknown shape');
+      const { nodes, pageInfo } = parsed.data.address.objects;
+
+      for (const node of nodes) {
+        const objectId = chainAddress(node.address, 'cap object id');
+        if (chainAddress(node.contents.json.id, 'cap id field') !== objectId) throw badResponse('the cap contents name another object');
+        if (chainStructTag(node.contents.type.repr, 'cap type') !== ALLOWANCE_CAP_TYPE) {
+          throw badResponse('an object that is not a USDC allowance cap passed the type filter');
+        }
+        const holder = node.owner.__typename === 'AddressOwner' ? node.owner.address?.address : undefined;
+        if (holder === undefined || chainAddress(holder, 'cap owner') !== ownerAddress) {
+          throw badResponse('a listed cap is not owned outright by the address asked about');
+        }
+        if (seen.has(objectId)) throw badResponse('a cap is listed twice');
+        seen.add(objectId);
+        const capAllowance = chainAddress(node.contents.json.allowance, 'cap allowance field');
+        // The module makes exactly one cap with each allowance and deletes both together.
+        if (capFor.has(capAllowance)) throw badResponse('two caps name the same allowance');
+        capFor.add(capAllowance);
+        // Object digests and transaction digests share one form: 32 bytes in base58.
+        if (!isValidTransactionDigest(node.digest)) throw badResponse('a cap digest is not 32 bytes of base58');
+        if (capAllowance === wanted) found = { objectId, version: BigInt(node.version), digest: node.digest };
+      }
+
+      if (found !== null || !pageInfo.hasNextPage) return found;
+      if (!pageInfo.endCursor) throw badResponse('next page promised without a cursor');
+      if (pageInfo.endCursor.length > LIMITS.graphqlCursorMaxChars) throw badResponse('the page cursor is longer than Ellai keeps');
+      after = pageInfo.endCursor;
+    }
+    return null;
+  }
+
   return {
     usesApiKey: apiKey !== undefined,
     grpc,
@@ -1445,6 +1564,7 @@ export function createChain(opts: { apiKey?: string; beforeRequest?: BeforeTatum
     getWalrusEpoch,
     executeTransaction,
     getAllowance,
+    findAllowanceCap,
     close: () => transport.close(),
   };
 }

@@ -12,8 +12,12 @@ import { ownerDelegate } from '../memory/delegate.js';
 import {
   ACCOUNT_STEPS,
   type AccountStep,
+  checkConfirmStep,
   checkNow,
   checkStep,
+  type ConfirmStep,
+  END_ALLOWANCE_STEP,
+  forgetAllowance,
   loadOwner,
   OnboardingError,
   type OnboardingStep,
@@ -24,9 +28,12 @@ import {
  * The Tatum calls confirmOnboardingTx's success path makes for each step, which the confirm route
  * counts against the day's budgets before any of them (C22): the transaction's result and its
  * facts, then findMemoryAccount's registry, registry entry and account, or the allowance itself
- * (one GraphQL call).
+ * (one GraphQL call). Ending the allowance reads only the allowance on the owner row: one call.
  */
-export const CONFIRM_CHAIN_CALLS: Readonly<Record<OnboardingStep, number>> = { memory_account: 5, add_delegate: 5, allowance: 3 };
+export const CONFIRM_CHAIN_CALLS: Readonly<Record<ConfirmStep, number>> = { memory_account: 5, add_delegate: 5, allowance: 3, end_allowance: 1 };
+
+/** What confirm answers for end_allowance: Sui no longer has the owner's allowance, and Ellai has forgotten it. */
+export const ENDED_RECORD = 'ended';
 
 /** The Tatum calls confirmExistingStep makes: findMemoryAccount's registry, registry entry and account. */
 export const CONFIRM_EXISTING_CHAIN_CALLS: Readonly<Record<AccountStep, number>> = { memory_account: 3, add_delegate: 3 };
@@ -209,6 +216,28 @@ async function confirmAllowance(
 }
 
 /**
+ * Records that the owner's allowance has ended, from what Sui shows for the allowance on the owner
+ * row, never an id the caller names (C7): when getAllowance answers NOT_FOUND it is forgotten
+ * (forgetAllowance). A row with no allowance has nothing left to forget.
+ * Throws OnboardingError NOT_LANDED while Sui still shows the allowance; ChainError from the read.
+ */
+async function confirmEnded(db: Database, owner: OwnerRow, chain: Chain): Promise<string> {
+  const recordedId = owner.allowanceId;
+  if (recordedId === null) return ENDED_RECORD;
+  const allowanceId = canonicalSuiAddress(recordedId);
+  try {
+    await chain.getAllowance(allowanceId);
+  } catch (error) {
+    if (error instanceof ChainError && error.code === 'NOT_FOUND') {
+      await forgetAllowance(db, owner.id, recordedId);
+      return ENDED_RECORD;
+    }
+    throw error;
+  }
+  throw new OnboardingError('NOT_LANDED', `Sui still shows allowance ${allowanceId}; ask again shortly`);
+}
+
+/**
  * Records one onboarding step for the owner, but only what Ellai itself reads from Sui
  * Mainnet through Tatum about the transaction `digest` (C7, C8). The transaction must have
  * succeeded and been sent from the owner's own address. Then:
@@ -223,31 +252,36 @@ async function confirmAllowance(
  *   maxima; allowance_id and allowance_checked_at are recorded and refill_not_before is
  *   cleared, so the jobs tick reads the new allowance at its next visit. The allowance id comes
  *   from the transaction's effects, never from the caller.
+ * - end_allowance: the digest is only checked for its form and is not read. What is recorded is
+ *   what Sui shows for the allowance on the owner row (confirmEnded): gone, and then forgotten, so
+ *   the tick stops visiting the owner for refills; still there is NOT_LANDED. One read.
  * Anything else refuses and records nothing. Idempotent: confirming the same step again
  * records the same values.
- * Returns what was recorded: the account id, the delegate public key as hex, or the allowance id.
+ * Returns what was recorded: the account id, the delegate public key as hex, the allowance id, or
+ * ENDED_RECORD for end_allowance.
  * Throws OnboardingError: BAD_INPUT for a bad step, digest, date or owner id; NO_OWNER;
  * NOT_READY for add_delegate before the account; NOT_LANDED while Sui does not show the
- * transaction or the allowance; REFUSED for anything the chain shows that the step does not
- * accept. Throws ChainError or MemoryError (fixed text) when Tatum cannot answer; nothing is
- * recorded then and the call can be made again.
+ * transaction or the allowance, or for end_allowance still shows the allowance; REFUSED for
+ * anything the chain shows that the step does not accept. Throws ChainError or MemoryError (fixed
+ * text) when Tatum cannot answer; nothing is recorded then and the call can be made again.
  */
 export async function confirmOnboardingTx(args: {
   db: Database;
   ownerId: string;
-  step: OnboardingStep;
+  step: ConfirmStep;
   digest: string;
   chain: Chain;
   masterSecretHex: string;
   now: Date;
 }): Promise<{ recorded: string }> {
-  const step = checkStep(args.step);
+  const step = checkConfirmStep(args.step);
   if (typeof args.digest !== 'string' || !isValidTransactionDigest(args.digest)) {
     throw new OnboardingError('BAD_INPUT', 'the digest is not a Sui transaction digest');
   }
   const { digest, db, chain } = args;
   const now = checkNow(args.now);
   const owner = await loadOwner(db, args.ownerId);
+  if (step === END_ALLOWANCE_STEP) return { recorded: await confirmEnded(db, owner, chain) };
   const ownerAddress = canonicalSuiAddress(owner.suiAddress);
   if (step === 'add_delegate' && owner.memwalAccountId === null) throw new OnboardingError('NOT_READY', 'confirm the Walrus Memory account first');
 

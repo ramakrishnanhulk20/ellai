@@ -1,5 +1,5 @@
-import { buildIssueAllowance } from '@ellai/core/allowance';
-import type { Chain } from '@ellai/core/chain';
+import { buildIssueAllowance, buildRevokeAllowance, type RevokeArgs } from '@ellai/core/allowance';
+import { type AllowanceReading, type Chain, ChainError } from '@ellai/core/chain';
 import { canonicalSuiAddress } from '@ellai/core/keys';
 import { LIMITS } from '@ellai/core/limits';
 import { buildAddDelegateTx, buildCreateAccountTx, findMemoryAccount } from '@ellai/core/memory';
@@ -9,12 +9,17 @@ import { formatUsdc } from '../decide/sentences.js';
 import { ownerDelegate } from '../memory/delegate.js';
 import { buildUsdcMoveStep, chooseOwnerGas } from './funds.js';
 import {
+  ALLOWANCE_ENDED_MESSAGE,
   ALREADY_DONE_MESSAGE,
   type AccountStep,
   type BuildStep,
   checkBuildStep,
   checkNow,
+  END_ALLOWANCE_STEP,
+  forgetAllowance,
   loadOwner,
+  NO_ALLOWANCE_CAP_MESSAGE,
+  NO_ALLOWANCE_MESSAGE,
   OnboardingError,
   type OwnerRow,
   USDC_MOVE_STEP,
@@ -31,9 +36,17 @@ export const DELEGATE_LABEL = 'Ellai';
  * for a delegate, and makes the one simulate call that resolves the transaction: 2 + 3 and 3 + 4.
  * An allowance chooses its gas source (chooseOwnerGas: the owner's balances, then the gas price and
  * either the epoch or the owner's SUI coins), three calls. The USDC move lists the owner's USDC
- * coins first, then chooses its gas source the same way: four.
+ * coins first, then chooses its gas source the same way: four. Ending the allowance reads it
+ * (getAllowance, one call), looks for its cap (findAllowanceCap, at most
+ * LIMITS.allowanceCapMaxPages pages, counted at that most), then chooses its gas source: six.
  */
-export const BUILD_CHAIN_CALLS: Readonly<Record<BuildStep, number>> = { memory_account: 5, add_delegate: 7, allowance: 3, usdc_to_address: 4 };
+export const BUILD_CHAIN_CALLS: Readonly<Record<BuildStep, number>> = {
+  memory_account: 5,
+  add_delegate: 7,
+  allowance: 3,
+  usdc_to_address: 4,
+  end_allowance: 1 + LIMITS.allowanceCapMaxPages + 3,
+};
 // A unit conversion: the owner sets how long the allowance runs as a count of days.
 const MS_PER_DAY = 86_400_000;
 const MAX_DAYS = Math.floor(LIMITS.onboardingAllowanceMaxMs / MS_PER_DAY);
@@ -145,9 +158,64 @@ export async function buildAccountStep(args: {
 }
 
 /**
+ * What ending the owner's allowance names, read now through Tatum for the allowance on the owner
+ * row, never one the caller names (C7): the allowance (getAllowance), whose funder must be the
+ * owner, and the owner's AllowanceCap for it (findAllowanceCap, bounded at
+ * LIMITS.allowanceCapMaxPages pages, C21). `recordedId` is the row's allowance id exactly as
+ * stored, for forgetAllowance. An allowance Sui no longer has is forgotten here, so the tick stops
+ * visiting the owner for refills.
+ * Throws OnboardingError: NOT_READY when the row records no allowance, or Sui shows no cap for it in
+ * the owner's wallet; ALREADY_DONE when Sui no longer has the allowance. Throws ChainError
+ * BAD_RESPONSE when the allowance draws from another address, and any ChainError from the reads.
+ */
+export async function readAllowanceToEnd(db: Database, owner: OwnerRow, chain: Chain): Promise<{ args: RevokeArgs; recordedId: string }> {
+  const recordedId = owner.allowanceId;
+  if (recordedId === null) throw new OnboardingError('NOT_READY', NO_ALLOWANCE_MESSAGE);
+  const ownerAddress = canonicalSuiAddress(owner.suiAddress);
+  const allowanceId = canonicalSuiAddress(recordedId);
+  let allowance: AllowanceReading;
+  try {
+    allowance = await chain.getAllowance(allowanceId);
+  } catch (error) {
+    if (error instanceof ChainError && error.code === 'NOT_FOUND') {
+      await forgetAllowance(db, owner.id, recordedId);
+      throw new OnboardingError('ALREADY_DONE', ALLOWANCE_ENDED_MESSAGE);
+    }
+    throw error;
+  }
+  // confirm recorded it only with the owner as funder; another funder means the read is not the allowance Ellai recorded.
+  if (canonicalSuiAddress(allowance.funder) !== ownerAddress) throw new ChainError('BAD_RESPONSE', 'unexpected response from Tatum: the allowance does not draw from the owner');
+  const cap = await chain.findAllowanceCap(ownerAddress, allowanceId);
+  if (cap === null) throw new OnboardingError('NOT_READY', NO_ALLOWANCE_CAP_MESSAGE);
+  return { args: { owner: ownerAddress, allowance: { objectId: allowanceId, initialSharedVersion: allowance.initialSharedVersion }, cap }, recordedId };
+}
+
+/**
+ * Builds the owner's own transaction that ends their recorded allowance (core buildRevokeAllowance),
+ * with the allowance and cap readAllowanceToEnd reads, the gas source chooseOwnerGas picks for
+ * LIMITS.revokeGasBudgetMist, and a plain summary whose values are the owner row's own ids or fixed
+ * text (C15).
+ */
+async function buildEndAllowanceStep(db: Database, owner: OwnerRow, chain: Chain): Promise<{ bytes: Uint8Array; summary: SummaryLine[] }> {
+  const { args } = await readAllowanceToEnd(db, owner, chain);
+  const facts = await chooseOwnerGas(chain, args.owner, LIMITS.revokeGasBudgetMist);
+  const bytes = await buildRevokeAllowance(args, facts);
+  return {
+    bytes,
+    summary: [
+      { label: 'Action', value: 'End the allowance your Ellai purse draws from' },
+      { label: 'Allowance', value: args.allowance.objectId },
+      { label: 'Purse', value: canonicalSuiAddress(owner.purseAddress) },
+      { label: 'After this', value: 'Your purse can draw nothing more from your wallet.' },
+    ],
+  };
+}
+
+/**
  * Builds the transaction the owner signs in their own wallet for one onboarding step or the USDC
  * move, and a plain list of what it does. Nothing is signed or sent, and nothing is recorded: a
- * step counts only once confirmOnboardingTx has read its result from chain.
+ * step counts only once confirmOnboardingTx has read its result from chain. The one write is
+ * end_allowance forgetting an allowance Sui no longer has.
  * - memory_account: create_account for the owner's own Walrus Memory account (core
  *   buildCreateAccountTx), refused with ALREADY_DONE when Sui already shows one (buildAccountStep).
  * - add_delegate: adds Ellai's derived delegate key for this owner, named "Ellai", to the
@@ -164,13 +232,17 @@ export async function buildAccountStep(args: {
  *   coins that do.
  * - usdc_to_address: moves the owner's USDC coins into their own address balance, gas chosen the
  *   same way (buildUsdcMoveStep). Not a recorded step.
- * Owner, purse and account come from the owner row, never from the caller, and every
+ * - end_allowance: ends the allowance on the owner row with the owner's cap for it, one revoke
+ *   call, gas chosen the same way at most LIMITS.revokeGasBudgetMist (buildEndAllowanceStep). An
+ *   allowance Sui no longer has is forgotten and answered ALREADY_DONE. Not a recorded step.
+ * Owner, purse, account and allowance come from the owner row, never from the caller, and every
  * summary value is one of those or a validated term (C7, C15).
  * Throws OnboardingError: BAD_INPUT for a bad step, date, owner id or allowance term;
- * NO_OWNER; NOT_READY for add_delegate before the account is recorded; ALREADY_DONE for an
- * account step Sui already shows done; NOTHING_TO_MOVE for the move when the owner holds no USDC
- * coins; NOT_ENOUGH_SUI when the owner's SUI cannot cover the gas budget. Throws MemoryError,
- * AllowanceError or ChainError from core when Sui refuses the build or Tatum cannot answer.
+ * NO_OWNER; NOT_READY for add_delegate before the account is recorded, and for end_allowance with
+ * no allowance recorded or no cap for it in the owner's wallet; ALREADY_DONE for an account step
+ * Sui already shows done or an allowance Sui no longer has; NOTHING_TO_MOVE for the move when the
+ * owner holds no USDC coins; NOT_ENOUGH_SUI when the owner's SUI cannot cover the gas budget. Throws
+ * MemoryError, AllowanceError or ChainError from core when Sui refuses the build or Tatum cannot answer.
  */
 export async function buildOnboardingTx(args: {
   db: Database;
@@ -190,6 +262,10 @@ export async function buildOnboardingTx(args: {
 
   if (step === USDC_MOVE_STEP) {
     const { bytes, summary } = await buildUsdcMoveStep(chain, ownerAddress);
+    return { txBytesBase64: toBase64(bytes), summary };
+  }
+  if (step === END_ALLOWANCE_STEP) {
+    const { bytes, summary } = await buildEndAllowanceStep(args.db, owner, chain);
     return { txBytesBase64: toBase64(bytes), summary };
   }
   if (step !== 'allowance') {

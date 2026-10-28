@@ -1607,8 +1607,8 @@ describe('the limits on routes that read Sui', () => {
     chainOwner = owner.address;
     vi.mocked(findMemoryAccount).mockResolvedValue({ accountId: address(), delegates: [] });
     vi.mocked(buildAddDelegateTx).mockResolvedValue(ACCOUNT_BYTES);
-    expect(BUILD_CHAIN_CALLS).toEqual({ memory_account: 5, add_delegate: 7, allowance: 3, usdc_to_address: 4 });
-    expect(CONFIRM_CHAIN_CALLS).toEqual({ memory_account: 5, add_delegate: 5, allowance: 3 });
+    expect(BUILD_CHAIN_CALLS).toEqual({ memory_account: 5, add_delegate: 7, allowance: 3, usdc_to_address: 4, end_allowance: 6 });
+    expect(CONFIRM_CHAIN_CALLS).toEqual({ memory_account: 5, add_delegate: 5, allowance: 3, end_allowance: 1 });
 
     // 26 confirms are 130 calls; 10 delegate builds a minute later bring the day to exactly 200.
     for (let i = 0; i < 26; i += 1) expect((await confirm({ step: 'memory_account', digest: DIGEST }, { cookie: owner.cookie })).status).toBe(200);
@@ -1624,7 +1624,7 @@ describe('the limits on routes that read Sui', () => {
     const owner = await signedInOwner();
     vi.mocked(findMemoryAccount).mockResolvedValue({ accountId: address(), delegates: [] });
     expect(CONFIRM_EXISTING_CHAIN_CALLS).toEqual({ memory_account: 3, add_delegate: 3 });
-    expect(SUBMIT_CHAIN_CALLS).toEqual({ memory_account: 9, add_delegate: 11, allowance: 3, usdc_to_address: 3 });
+    expect(SUBMIT_CHAIN_CALLS).toEqual({ memory_account: 9, add_delegate: 11, allowance: 3, usdc_to_address: 3, end_allowance: 5 });
     expect(WALLET_CHAIN_CALLS).toBe(1);
     const bytes = await allowanceBytes(owner);
     const sent = await signedBy(owner.signer, bytes);

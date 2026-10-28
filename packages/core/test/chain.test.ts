@@ -21,7 +21,12 @@
 // Offline too, against stand-in ListOwnedObjects pages: listUsdcCoins and listSuiCoins asking for exactly their
 // coin type, stopping at the coin cap or the page cap and saying more remain, and refusing any
 // listed object that is not the address's own coin of that type; getWalletBalances splitting SUI as USDC.
-// Does NOT cover: listUsdcCoins against the live gateway, an address holding more coins than one
+// Offline too, against stand-in GraphQL pages: findAllowanceCap asking for exactly the USDC cap type,
+// finding the cap that names the allowance, answering null past LIMITS.allowanceCapMaxPages pages with
+// one beforeRequest call a page, and refusing another type, another owner, a cap listed twice and a
+// cap out of form.
+// Does NOT cover: findAllowanceCap against the live gateway (prove:end reads a real cap),
+// listUsdcCoins against the live gateway, an address holding more coins than one
 // move takes on mainnet, the hook against the live gateway (no live test passes one), whether Tatum ever
 // answers a missing digest with an empty OK (the live made-up digest test fails if it does), a paid key's rate limits, the Walrus blob listing or scan against the live
 // gateway (the probe script and the scratch cross-check exercise the listing), an owner that
@@ -37,7 +42,7 @@ import { parseEnv } from 'node:util';
 import { GrpcTypes } from '@mysten/sui/grpc';
 import { Ed25519Keypair } from '@mysten/sui/keypairs/ed25519';
 import { Transaction, TransactionDataBuilder } from '@mysten/sui/transactions';
-import { normalizeSuiAddress, toBase58, toBase64 } from '@mysten/sui/utils';
+import { normalizeStructTag, normalizeSuiAddress, toBase58, toBase64 } from '@mysten/sui/utils';
 import { GrpcTransport } from '@protobuf-ts/grpc-transport';
 import { type MethodInfo, UnaryCall } from '@protobuf-ts/runtime-rpc';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
@@ -701,6 +706,129 @@ describe('getAllowance shape checks, against stand-in GraphQL bodies', () => {
     const missing = await withGraphql({ data: { object: null } }, () => failureOf(chain.getAllowance(STAND_IN_ALLOWANCE)));
     expect(missing.code).toBe('NOT_FOUND');
     expect((await failureOf(chain.getAllowance('0x'))).code).toBe('INVALID_INPUT');
+  });
+});
+
+const CAP_OWNER = normalizeSuiAddress(`0x${'3e'.repeat(32)}`);
+const CAP_TYPE = normalizeStructTag(`0x2::allowance::AllowanceCap<0x2::balance::Balance<${USDC_TYPE_MAINNET}>>`);
+const capAllowance = (n: number) => normalizeSuiAddress(`0x${(n + 1_000).toString(16)}`);
+
+// An AllowanceCap as Tatum GraphQL listed one for the test owner on 2026-10-28
+// (scratchpad/e1-cap-shape.mts), numbered so each cap and the allowance it ends are their own.
+function capNode(n: number, change: (node: any) => void = () => undefined) {
+  const id = normalizeSuiAddress(`0x${n.toString(16)}`);
+  const node = {
+    address: id,
+    version: n,
+    digest: toBase58(new Uint8Array(32).fill(n)),
+    owner: { __typename: 'AddressOwner', address: { address: CAP_OWNER } },
+    contents: { type: { repr: CAP_TYPE }, json: { id, allowance: capAllowance(n) } },
+  };
+  change(node);
+  return node;
+}
+
+const capPage = (nodes: unknown[], endCursor: string | null, hasNextPage = endCursor !== null) => ({
+  data: { address: { objects: { pageInfo: { hasNextPage, endCursor }, nodes } } },
+});
+
+/** Answers each GraphQL request with the next page in turn, and records the variables each one sent. */
+async function withCapPages<T>(pages: unknown[], run: (asked: Array<Record<string, unknown>>) => Promise<T>): Promise<T> {
+  const asked: Array<Record<string, unknown>> = [];
+  vi.stubGlobal('fetch', async (_url: unknown, init?: RequestInit) => {
+    asked.push((JSON.parse(String(init?.body)) as { variables: Record<string, unknown> }).variables);
+    return new Response(JSON.stringify(pages[asked.length - 1] ?? { data: null }), { status: 200, headers: { 'content-type': 'application/json' } });
+  });
+  try {
+    return await run(asked);
+  } finally {
+    vi.unstubAllGlobals();
+  }
+}
+
+describe('findAllowanceCap, against stand-in GraphQL pages', () => {
+  it('asks for exactly the USDC cap type and returns the cap naming the allowance, reading no page past the one holding it', async () => {
+    const found = await withCapPages([capPage([capNode(1), capNode(2), capNode(3)], 'cursor-1')], async (asked) => {
+      // The allowance id goes through the same normaliser as the cap's field, so a short form still matches.
+      const cap = await chain.findAllowanceCap(CAP_OWNER.toUpperCase().replace('0X', '0x'), `0x${(1_002).toString(16)}`);
+      expect(asked).toEqual([{ owner: CAP_OWNER, type: CAP_TYPE, first: LIMITS.allowanceCapPageSize, after: null }]);
+      return cap;
+    });
+    expect(found).toEqual({ objectId: normalizeSuiAddress('0x2'), version: 2n, digest: toBase58(new Uint8Array(32).fill(2)) });
+  });
+
+  it('returns null when the cap is not listed, or the owner holds none, and refuses a bad owner or id without asking', async () => {
+    expect(await withCapPages([capPage([capNode(1), capNode(3)], null)], () => chain.findAllowanceCap(CAP_OWNER, capAllowance(2)))).toBeNull();
+    expect(await withCapPages([capPage([], null)], () => chain.findAllowanceCap(CAP_OWNER, capAllowance(2)))).toBeNull();
+    const refused = await withCapPages([], async (asked) => {
+      const failures = [await failureOf(chain.findAllowanceCap('', capAllowance(2))), await failureOf(chain.findAllowanceCap(CAP_OWNER, 'not an id'))];
+      expect(asked).toEqual([]);
+      return failures;
+    });
+    for (const failure of refused) expect(failure.code).toBe('INVALID_INPUT');
+  });
+
+  it('refuses an object of another type that passed the filter, and a cap whose id, version, digest or cursor is out of form', async () => {
+    const refusals: Array<[string, unknown]> = [
+      ['an allowance cap over SUI', capPage([capNode(1, (node) => (node.contents.type.repr = '0x2::allowance::AllowanceCap<0x2::balance::Balance<0x2::sui::SUI>>'))], null)],
+      ['an allowance in place of its cap', capPage([capNode(1, (node) => (node.contents.type.repr = `0x2::allowance::Allowance<0x2::balance::Balance<${USDC_TYPE_MAINNET}>>`))], null)],
+      ['contents naming another object', capPage([capNode(1, (node) => (node.contents.json.id = normalizeSuiAddress('0x99')))], null)],
+      ['an unknown field', capPage([capNode(1, (node) => (node.contents.json.extra = '1'))], null)],
+      ['version zero', capPage([capNode(1, (node) => (node.version = 0))], null)],
+      ['a version as text', capPage([capNode(1, (node) => (node.version = '1'))], null)],
+      ['a digest that is not 32 bytes', capPage([capNode(1, (node) => (node.digest = toBase58(new Uint8Array(31))))], null)],
+      ['a next page with no cursor', capPage([capNode(1)], null, true)],
+      ['a cursor longer than Ellai keeps', capPage([capNode(1)], 'c'.repeat(LIMITS.graphqlCursorMaxChars + 1))],
+    ];
+    for (const [what, page] of refusals) {
+      const failure = await withCapPages([page, capPage([capNode(2)], null)], () => failureOf(chain.findAllowanceCap(CAP_OWNER, capAllowance(2))));
+      expect(failure.code, what).toBe('BAD_RESPONSE');
+    }
+  });
+
+  it('refuses a cap that is not owned outright by the address asked about', async () => {
+    const refusals: Array<[string, (node: any) => void]> = [
+      ['another address', (node) => (node.owner.address.address = normalizeSuiAddress('0x77'))],
+      ['an object owner', (node) => (node.owner = { __typename: 'ObjectOwner' })],
+      ['a shared object', (node) => (node.owner = { __typename: 'Shared' })],
+      ['consensus', (node) => (node.owner = { __typename: 'ConsensusAddressOwner' })],
+      ['an address owner with no address', (node) => (node.owner.address = null)],
+    ];
+    for (const [what, change] of refusals) {
+      const failure = await withCapPages([capPage([capNode(2, change)], null)], () => failureOf(chain.findAllowanceCap(CAP_OWNER, capAllowance(2))));
+      expect(failure.code, what).toBe('BAD_RESPONSE');
+    }
+  });
+
+  it('refuses a cap listed twice, on one page or across two, and two caps naming one allowance', async () => {
+    const listings: Array<[string, unknown[]]> = [
+      ['twice on one page', [capPage([capNode(1), capNode(1)], null)]],
+      ['once on each page', [capPage([capNode(1)], 'cursor-1'), capPage([capNode(1), capNode(2)], null)]],
+      ['two caps for one allowance', [capPage([capNode(1), capNode(3, (node) => (node.contents.json.allowance = capAllowance(1)))], null)]],
+    ];
+    for (const [what, pages] of listings) {
+      const failure = await withCapPages(pages, () => failureOf(chain.findAllowanceCap(CAP_OWNER, capAllowance(2))));
+      expect([what, failure.code, failure.message]).toEqual([what, 'BAD_RESPONSE', expect.stringMatching(/listed twice|two caps name the same allowance/)]);
+    }
+  });
+
+  it('reads at most LIMITS.allowanceCapMaxPages pages, each one Tatum request through beforeRequest, then answers null', async () => {
+    const pages = Array.from({ length: LIMITS.allowanceCapMaxPages + 1 }, (_, i) => capPage([capNode(i + 10)], `cursor-${i + 1}`));
+    // The cap asked for sits on the page past the cap, so finding it would mean reading too far.
+    const wanted = capAllowance(LIMITS.allowanceCapMaxPages + 10);
+    const { calls, beforeRequest } = hookRecorder();
+    const answer = await withCapPages(pages, async (asked) => {
+      const local = createChain({ beforeRequest });
+      try {
+        const read = await local.findAllowanceCap(CAP_OWNER, wanted);
+        expect(asked.map((variables) => variables.after)).toEqual([null, ...pages.slice(0, LIMITS.allowanceCapMaxPages - 1).map((_, i) => `cursor-${i + 1}`)]);
+        return read;
+      } finally {
+        local.close();
+      }
+    });
+    expect(answer).toBeNull();
+    expect(calls).toEqual(Array.from({ length: LIMITS.allowanceCapMaxPages }, () => ({ transport: 'graphql', method: 'EllaiAllowanceCaps' })));
   });
 });
 

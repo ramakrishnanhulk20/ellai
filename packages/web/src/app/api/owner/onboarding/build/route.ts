@@ -15,16 +15,20 @@ const body = z.strictObject({ step: z.enum(BUILD_STEPS), allowance: allowance.op
 
 /**
  * Builds the transaction the signed-in owner signs in their own wallet for one onboarding
- * step or the USDC move: { step, allowance? } in, step one of memory_account, add_delegate,
- * allowance or usdc_to_address, allowance being { dailyLimitAtomic, lifetimeCapAtomic, days }
- * with the amounts as decimal strings, and buildOnboardingTx's { txBytesBase64, summary } out
- * exactly as it gave them, so the summary the owner reads is the one made from the owner row
- * and the checked terms (C15). Nothing is recorded. The owner comes from the session alone
+ * step, the USDC move or ending the allowance: { step, allowance? } in, step one of
+ * memory_account, add_delegate, allowance, usdc_to_address or end_allowance, allowance being
+ * { dailyLimitAtomic, lifetimeCapAtomic, days } with the amounts as decimal strings, and
+ * buildOnboardingTx's { txBytesBase64, summary } out exactly as it gave them, so the summary the
+ * owner reads is the one made from the owner row and the checked terms (C15). The allowance
+ * end_allowance ends is the one on the owner row; the body cannot name one. Nothing is recorded,
+ * except that an allowance Sui no longer has is forgotten. The owner comes from the session alone
  * (C13), the request must come from the app (C14), and once its body is read each request counts
  * toward limitOwnerChainCalls's budgets at its step's BUILD_CHAIN_CALLS (C22): this owner's
  * requests a minute, and calls a day for this owner, for this client and for every owner. 403
  * cross_origin, 401 signed_out, 429 past this owner's or this client's caps, 400 for a bad body or terms, 409
- * not_ready for add_delegate before the account, 409 nothing_to_move when the owner holds no USDC
+ * not_ready for add_delegate before the account and for end_allowance with no allowance or no key
+ * to end it, 409 already_done for an account step Sui shows done or an allowance that has already
+ * ended, 409 nothing_to_move when the owner holds no USDC
  * coins, 409 not_enough_sui when the owner's SUI cannot pay the fee, 422 chain_refused when Sui refuses the step,
  * 503 chain_unavailable when Sui cannot be read, 503 chain_unavailable_today once every owner's
  * day is spent.
