@@ -7,7 +7,7 @@ This file is the backend design. The security rules every module must uphold are
 ## System overview
 
 ```mermaid
-flowchart LR
+flowchart TD
   subgraph Owner
     W[Owner wallet<br/>USDC in address balance]
     UI[Owner app]
