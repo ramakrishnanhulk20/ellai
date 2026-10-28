@@ -12,8 +12,6 @@ import { Button, CopyButton, ErrorLine, Skeleton } from './ui.js';
 import { DECLINED } from './wallet-messages.js';
 
 const WALLET_KEY = [APP_KEY, 'wallet'] as const;
-// A setup transaction pays its fee from the owner's own SUI. Below this the build refuses, so the page says so first.
-const FEE_FLOOR_MIST = 50_000_000n;
 const MOVED_MS = 3_000;
 const RECHECK_MS = 10_000;
 
@@ -212,7 +210,7 @@ export function WalletBlock() {
           <Row label="USDC READY FOR THE ALLOWANCE">{atomicToUsdc(funds.usdcAddressAtomic)} USDC</Row>
           <div className="flex flex-col gap-2">
             <Row label="SUI FOR FEES">{mistToSui(suiTotal)} SUI</Row>
-            {suiTotal < FEE_FLOOR_MIST ? (
+            {funds.feeSource === null ? (
               <p className="text-[14px] leading-[1.4] text-refused">Your wallet needs about 0.05 SUI to pay setup fees.</p>
             ) : null}
           </div>

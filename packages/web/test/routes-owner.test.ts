@@ -2,8 +2,9 @@
 // with a stub chain: a cookie from the real sign-in routes opening the overview; the session
 // requirement on every owner route; the overview's settings, onboarding, purse, counts and
 // question rate, with bigints as strings, a chain failure as purse null but the Tatum budget's
-// refusal as 503 chain_unavailable_today, and no chain read at all for an owner with no
-// allowance; whether the built-in agent has a key, never the key; the question list
+// refusal as 503 chain_unavailable_today, the purse still read and metered after the allowance is
+// forgotten while Ellai's ledger says it may hold USDC (C38), and no chain read at all for an owner
+// with neither; whether the built-in agent has a key, never the key; the question list
 // with Ellai's payment facts apart from agent text; answering, with its memory and grant; one
 // owner never seeing or answering another's question; same origin on the answer; and that an
 // unexpected failure, including a real database error carrying SQL, is a bare 500.
@@ -29,7 +30,7 @@ import { endSession } from '../src/server/auth/sessions.js';
 import { completeSignIn, issueSignIn } from '../src/server/auth/signin.js';
 import { SESSION_TOKEN_PREFIX, newBearerToken } from '../src/server/auth/tokens.js';
 import { type Database, createDb, migrate } from '../src/server/db/client.js';
-import { agents, decisionCitations, decisions, grants, memories, owners, payments, questions } from '../src/server/db/schema.js';
+import { agents, decisionCitations, decisions, grants, memories, owners, payments, questions, refills } from '../src/server/db/schema.js';
 import { decide } from '../src/server/decide/decide.js';
 import type { ServerEnv } from '../src/server/env.js';
 import { type ServerContextFactory, setServerContextFactory } from '../src/server/http/context.js';
@@ -332,6 +333,33 @@ describe('GET /api/owner/overview', () => {
     expect(Object.keys(body)).toEqual(['owner', 'onboarding', 'purse', 'counts', 'questionsPer20', 'builtinAgent']);
     expect(Object.keys(body.owner as object)).not.toContain('allowanceId');
     expect(getBalances.mock.calls).toEqual([[purseAddress]]);
+  });
+
+  it("still reads the purse once the allowance is forgotten while Ellai's ledger says it may hold USDC, metered as with an allowance, and reads nothing for an owner never refilled (C38)", async () => {
+    quiet();
+    const owner = await signedInOwner();
+    const purseAddress = canonicalSuiAddress(derivePurseKeypair(MASTER, owner.address).toSuiAddress());
+    // 0.10 USDC refilled and verified, 0.06 paid and not released, and the allowance it came from since forgotten.
+    await db.insert(refills).values({ ownerId: owner.ownerId, allowanceId: address(), amountAtomic: 100_000n, digest: hex(32), sentAt: ago(DAY_MS), status: 'verified', verifiedAt: ago(DAY_MS) });
+    const spent = await insertDecision(owner.ownerId, await agentFor(owner.ownerId), { status: 'paid', amountAtomic: 60_000n, createdAt: ago(60_000) });
+    await db.insert(payments).values({ decisionId: spent, ownerId: owner.ownerId, purseAddress, recipient: `0x${'11'.repeat(32)}`, amountAtomic: 60_000n, digest: hex(16), txBytesBase64: 'AA==', signedAt: ago(60_000), validUntilEpoch: 1n, settlement: 'verified' });
+    getBalances.mockResolvedValue({ usdcAddressBalance: 40_000n, usdcCoinBalance: 0n, suiTotal: 0n });
+
+    const body = (await (await overview(owner.cookie)).json()) as { purse: unknown; onboarding: { allowance: string } };
+    expect([body.purse, body.onboarding.allowance]).toEqual([{ usdcAtomic: '40000' }, 'missing']);
+    expect(getBalances.mock.calls).toEqual([[purseAddress]]);
+    // The same per-minute cap as an owner with an allowance: the 31st request is turned away before any read.
+    for (let i = 1; i < LIMITS.ownerChainReadsPerMinute; i += 1) expect((await overview(owner.cookie)).status).toBe(200);
+    expect((await overview(owner.cookie)).status).toBe(429);
+    expect(getBalances).toHaveBeenCalledTimes(LIMITS.ownerChainReadsPerMinute);
+
+    const neverRefilled = await signedInOwner();
+    getBalances.mockClear();
+    for (let i = 0; i <= LIMITS.ownerChainReadsPerMinute; i += 1) {
+      const response = await overview(neverRefilled.cookie);
+      expect([response.status, ((await response.json()) as { purse: unknown }).purse]).toEqual([200, null]);
+    }
+    expect(getBalances).not.toHaveBeenCalled();
   });
 
   it("shows whether /proof lists the owner, off until the owner opts in, and never another owner's setting", async () => {

@@ -6,7 +6,7 @@ import type { Ed25519Keypair } from '@mysten/sui/keypairs/ed25519';
 import { and, asc, eq, isNotNull, isNull, lte, notExists, or, sql } from 'drizzle-orm';
 import { unionAll } from 'drizzle-orm/pg-core';
 import type { Database } from '../db/client.js';
-import { memories, owners, payments } from '../db/schema.js';
+import { memories, owners, payments, refills } from '../db/schema.js';
 import { consumeShared } from '../http/ratelimit.js';
 import { withTatumScope } from '../http/tatum-meter.js';
 import { MemoryServiceError, ownerDelegate } from '../memory/delegate.js';
@@ -16,7 +16,7 @@ import { settlePayment } from '../pay/settle.js';
 import { awaitingChainCheck, chainExpiring, confirmBlobsOnChain, expireBlobsOnChain, lackingEndEpoch, walrusEpochForExpiry } from './blobs.js';
 import { expireDecisions } from './expire.js';
 import { pruneExpiredRows } from './prune.js';
-import { RefillError, refillIfNeeded } from './refill.js';
+import { RefillError, refillIfNeeded, resolvePendingRefill } from './refill.js';
 
 export interface JobsTickArgs {
   db: Database;
@@ -129,6 +129,7 @@ export function errorCode(error: unknown): string {
  * kept, which its scan fills in (lackingEndEpoch), pending payments, payments owed an outcome
  * memory (the memory the relayer is then sent), an allowance whose refill_not_before is unset or
  * past (refillMayStart), dated by when it was checked or, before that, when the owner joined,
+ * a refill still pending, with or without an allowance recorded (C38),
  * and, when the tick holds a Walrus epoch reading, memories found on chain whose Blob that epoch
  * has reached (chainExpiring). Open and asked decisions are not work: expireDecisions closes them
  * for every owner in one statement, so free sign-ins with a question each cannot push a paying
@@ -167,6 +168,11 @@ async function ownersWithWork(db: Database, now: Date, walrusEpoch: number | nul
     .select({ ownerId: owners.id, at: sql<Date>`coalesce(${owners.allowanceCheckedAt}, ${owners.createdAt})`.as('at') })
     .from(owners)
     .where(and(isNotNull(owners.allowanceId), refillMayStart(now)));
+  const refillWork = db
+    .select({ ownerId: refills.ownerId, at: sql<Date>`min(${refills.sentAt})`.as('at') })
+    .from(refills)
+    .where(eq(refills.status, 'pending'))
+    .groupBy(refills.ownerId);
   const expiryWork =
     walrusEpoch === null
       ? []
@@ -177,7 +183,7 @@ async function ownersWithWork(db: Database, now: Date, walrusEpoch: number | nul
             .where(chainExpiring(walrusEpoch))
             .groupBy(memories.ownerId),
         ];
-  const work = unionAll(memoryWork, blobWork, backfillWork, paymentWork, outcomeWork, allowanceWork, ...expiryWork).as('work');
+  const work = unionAll(memoryWork, blobWork, backfillWork, paymentWork, outcomeWork, allowanceWork, refillWork, ...expiryWork).as('work');
   const rows = await db
     .select({ ownerId: owners.id })
     .from(work)
@@ -230,7 +236,9 @@ async function ownersWithWork(db: Database, now: Date, walrusEpoch: number | nul
  *    and one whose outcome the paid call itself failed to record;
  * 3. refillIfNeeded (only with an allowance, and not before its refill_not_before), reading this
  *    tick's clock after its reads: C7 and C23 at refill time. A lost refill is failed only by a
- *    later tick, so no tick waits on one;
+ *    later tick, so no tick waits on one. Any other owner gets resolvePendingRefill instead, the
+ *    same digest and epoch reads in the same refills scope under the same deadline, so a refill
+ *    pending when the allowance was forgotten still reaches its final state (C38);
  * 4. memory (only with a Walrus Memory account): submitPendingMemories, then confirmMemoryJobs,
  *    which is skipped when the submit ended with core's DELEGATE refusal, so that code is
  *    recorded once per owner per tick; then, for every owner, confirmBlobsOnChain checks
@@ -373,6 +381,11 @@ export async function runJobsTick(args: JobsTickArgs): Promise<JobsTickSummary> 
               refillIfNeeded({ db, chain, ownerId, masterSecretHex, gasKeypair, now: now(), clock: now, canStart }),
             );
             if (outcome === 'refilled') summary.refills += 1;
+          });
+        } else {
+          // A refill sent before the allowance was forgotten, or waited out, still holds money the ledger cannot count until it is final (C38).
+          await step(ownerId, 'refill', async () => {
+            await withTatumScope({ kind: 'refills' }, () => resolvePendingRefill({ db, chain, ownerId, gasKeypair, clock: now, canStart }));
           });
         }
 

@@ -31,6 +31,8 @@ export type Example = {
   amount: string;
   host: string;
   digest: string | null;
+  /** The picked decision whole, because the card's badge is worked out from its rule and digest. */
+  decision: MapDecision;
   /** All memories the decision cited. */
   citationCount: number;
   /** Closest-match distances of the first three citations, in order. Null where recall gave none. */
@@ -39,17 +41,25 @@ export type Example = {
 
 const MAX_DOTS = 3;
 
+/** 3 is a payment verified on Sui on a learned rule, 0 is a decision the story cannot be told with. */
+function exampleRank(decision: MapDecision): number {
+  if (decision.outcome !== 'approved') return 0;
+  if (decision.rule === 'learned') return decision.digest ? 3 : 2;
+  return decision.rule === 'grant' && decision.digest ? 1 : 0;
+}
+
 /**
- * The newest approved decision that Ellai paid on a learned rule. If there is none, the newest
- * approved decision. If there is none of those either, the steps are told with no numbers.
+ * The newest approved learned decision with a verified payment. If there is none, the newest
+ * approved learned decision without one, then the newest approved grant with a verified payment.
+ * If there is none of those either, the steps are told with no numbers.
  */
 export function pickExample(decisions: readonly MapDecision[]): Example | null {
   let best: MapDecision | null = null;
-  let bestRank = -1;
+  let bestRank = 0;
   let bestTime = Number.NEGATIVE_INFINITY;
   for (const decision of decisions) {
-    if (decision.outcome !== 'approved') continue;
-    const rank = decision.rule === 'learned' ? 1 : 0;
+    const rank = exampleRank(decision);
+    if (rank === 0) continue;
     const time = Date.parse(decision.at);
     if (rank > bestRank || (rank === bestRank && time > bestTime)) {
       best = decision;
@@ -62,6 +72,7 @@ export function pickExample(decisions: readonly MapDecision[]): Example | null {
     amount: formatUsdc(best.amountUsdc),
     host: best.host,
     digest: best.digest,
+    decision: best,
     citationCount: best.citations.length,
     distances: best.citations.slice(0, MAX_DOTS).map((citation) => citation.distance),
   };
@@ -70,7 +81,14 @@ export function pickExample(decisions: readonly MapDecision[]): Example | null {
 /** Changes only when the picked example changes, so a refresh with the same data does not rebuild the pin. */
 export function exampleSignature(example: Example | null): string {
   if (!example) return 'none';
-  return [example.amount, example.host, example.digest ?? '', example.citationCount, example.distances.join(',')].join('|');
+  return [
+    example.amount,
+    example.host,
+    example.decision.rule,
+    example.digest ?? '',
+    example.citationCount,
+    example.distances.join(','),
+  ].join('|');
 }
 
 export function distanceLabel(distance: number | null): string | null {

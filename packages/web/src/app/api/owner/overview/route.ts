@@ -7,6 +7,7 @@ import { scoped } from '../../../../server/http/context.js';
 import { HttpError } from '../../../../server/http/errors.js';
 import { jsonResponse } from '../../../../server/http/json.js';
 import { limitOwnerChainCalls } from '../../../../server/http/owner-limits.js';
+import { ledgerBalanceAtomic } from '../../../../server/jobs/refill.js';
 import { onboardingState } from '../../../../server/onboarding/state.js';
 
 export const runtime = 'nodejs';
@@ -63,17 +64,19 @@ async function questionRate(db: Database, ownerId: string): Promise<{ asked: num
 /**
  * The signed-in owner's dashboard: their settings, including publicProof (whether /proof lists
  * their payments and memories, off until they opt in), onboarding progress, the purse's USDC read
- * from chain (purse is null when the owner has no allowance or the chain cannot be read), counts
+ * from chain (purse is null when the purse is not read, see below, or the chain cannot be read), counts
  * of asked, approved and refused decisions and verified payments over the last
  * LIMITS.overviewCountWindowMs (30 days), and questionsPer20: of the latest
  * LIMITS.overviewQuestionWindow (20) approved or asked decisions, how many were asked, with
  * `window` saying how many there were, and builtinAgent: 'ready' when the server holds an
  * Anthropic key and 'needs_key' when it does not, never the key itself. The owner comes from
  * the session alone (C13); 401 signed_out without one.
- * Only an owner with an allowance has a purse Ellai can fill, so only then is the purse read
- * through Tatum, and only then does the request count toward limitOwnerChainCalls's budgets at
- * one call (C22), answering with its 429 or 503 beyond them. An owner without one costs no chain
- * read. Because of that one call, screens load the overview on demand (page load, after an
+ * The purse is read through Tatum only for an owner with an allowance, whose purse Ellai fills, or
+ * one whose purse by Ellai's own ledger (ledgerBalanceAtomic: verified refills in, unreleased
+ * payments out) may still hold USDC after the allowance was forgotten (C38). Only then does the
+ * request count toward limitOwnerChainCalls's budgets at one call (C22), answering with its 429 or
+ * 503 beyond them. Any other owner costs no chain read; onboarding.allowance says whether an
+ * allowance is recorded. Because of that one call, screens load the overview on demand (page load, after an
  * action), never on a timer; GET /api/owner/settings reads the settings with no chain call.
  * The read is also counted by the Tatum meter, as this owner from this client; a refusal there
  * (ChainError BUDGET, nothing sent) is 503 chain_unavailable_today, not a blank purse, while any
@@ -100,7 +103,10 @@ export const GET = scoped('owner', async (request, ctx, { ownerId }): Promise<Re
   // if the session ended after the cookie was checked; that is treated as no session at all.
   if (row === undefined) throw new HttpError(401, 'signed_out');
   const { allowanceId, ...owner } = row;
-  if (allowanceId !== null) {
+  // C38: forgetting an allowance stops refills, not the money already in the purse, so the owner
+  // still sees it while Ellai's own ledger says some may be there.
+  const readsPurse = allowanceId !== null || (await ledgerBalanceAtomic(ctx.db, ownerId)) > 0n;
+  if (readsPurse) {
     const limited = await limitOwnerChainCalls(ctx, request, ownerId, PURSE_READ_CALLS);
     if (limited !== null) return limited;
   }
@@ -108,7 +114,7 @@ export const GET = scoped('owner', async (request, ctx, { ownerId }): Promise<Re
   const since = new Date(now.getTime() - LIMITS.overviewCountWindowMs);
   const [onboarding, purse, counts, questionsPer20] = await Promise.all([
     onboardingState({ db: ctx.db, ownerId }),
-    allowanceId === null ? null : purseBalance(ctx.chain, owner.purseAddress),
+    readsPurse ? purseBalance(ctx.chain, owner.purseAddress) : null,
     recentCounts(ctx.db, ownerId, since),
     questionRate(ctx.db, ownerId),
   ]);

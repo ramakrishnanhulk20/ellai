@@ -5,7 +5,8 @@
 // counters pruned; the public proof listing only verified payments and memories found on chain
 // and not since expired there,
 // only for owners who opted in and with totals over those owners only (a learned approval
-// counted once its payment is verified, a question only for an owner the page shows), a seller
+// counted once its payment is verified, a question only for an owner the page shows and only once
+// its own answer is on chain, C37), a seller
 // host only as the sentences write it, with no sentence,
 // purpose, label or owner address, at most 20 of each, read from the
 // database at most once per cache window however many requests come, and its last good copy
@@ -428,11 +429,13 @@ describe('GET /api/public/proof', () => {
     status: 'confirmed' | 'pending' | 'failed',
     confirmedAt: Date | null,
     chainConfirmedAt: Date | null = status === 'confirmed' ? confirmedAt : null,
+    decisionId: string | null = null,
   ): Promise<string | null> {
     const blobId = status === 'confirmed' ? randomBytes(32).toString('base64url') : null;
     await proofDb.db.insert(memories).values({
       ownerId: w.ownerId,
       kind,
+      decisionId,
       recipient: canonicalSuiAddress(`0x${'11'.repeat(32)}`),
       amountAtomic: 10_000n,
       verdict: 'approve',
@@ -473,7 +476,8 @@ describe('GET /api/public/proof', () => {
     const { response, text, body } = await proof();
     expect(response.status).toBe(200);
     expect(body).toEqual({
-      totals: { verifiedPayments: 2, verifiedUsdcAtomic: '35000', confirmedOwnerAnswers: 1, approvedByLearning: 2, askedDecisions: 2 },
+      // Neither question has an answer on chain, so neither is counted (C37).
+      totals: { verifiedPayments: 2, verifiedUsdcAtomic: '35000', confirmedOwnerAnswers: 1, approvedByLearning: 2, askedDecisions: 0 },
       payments: [
         { digest: newer, amountAtomic: '25000', sellerHost: 'hotels.example', signedAt: at(60_000).toISOString(), explorerUrl: `https://suiscan.xyz/mainnet/tx/${newer}` },
         { digest: older, amountAtomic: '10000', sellerHost: 'hotels.example', signedAt: at(120_000).toISOString(), explorerUrl: `https://suiscan.xyz/mainnet/tx/${older}` },
@@ -544,7 +548,7 @@ describe('GET /api/public/proof', () => {
     expect(ended.text).not.toContain(blobId);
   });
 
-  it('counts a learned approval only once its payment is verified and a question only for an owner the page shows, and writes a seller host as the sentences do (C17, C18)', async () => {
+  it('counts a learned approval only once its payment is verified and a question only for an owner the page shows once its answer is on chain, and writes a seller host as the sentences do (C17, C18, C37)', async () => {
     const w = await proofOwner();
     const odd = await proofPayment(w, 'verified', at(60_000), 10_000n, { sellerHost: 'evil"host.example' });
     const plain = await proofPayment(w, 'verified', at(50_000), 10_000n, { rule: 'grant' });
@@ -552,17 +556,19 @@ describe('GET /api/public/proof', () => {
     // Approved by learning, then refused at signing: no payment row at all.
     await proofDecision(w, { status: 'refused' });
     await proofDecision(w, { outcome: 'asked', rule: 'no_match', status: 'asked' });
+    const answered = await proofDecision(w, { outcome: 'asked', rule: 'no_match', status: 'answered' });
+    await proofMemory(w, 'owner_decision', 'confirmed', at(45_000), at(45_000), answered);
     // Opted in, but nothing of theirs is on the page: their questions are not counted.
     const idle = await proofOwner();
     for (let i = 0; i < 3; i += 1) await proofDecision(idle, { outcome: 'asked', rule: 'no_match', status: 'expired' });
     await proofPayment(idle, 'pending', at(30_000));
-    // On the page through an on-chain memory alone.
+    // On the page through an on-chain memory alone, but nothing on chain answers its question.
     const remembered = await proofOwner();
     await proofMemory(remembered, 'outcome', 'confirmed', at(20_000));
     await proofDecision(remembered, { outcome: 'asked', rule: 'recall_unavailable', status: 'asked' });
 
     const { text, body } = await proof();
-    expect(body.totals).toMatchObject({ verifiedPayments: 2, approvedByLearning: 1, askedDecisions: 2 });
+    expect(body.totals).toMatchObject({ verifiedPayments: 2, approvedByLearning: 1, askedDecisions: 1 });
     expect(body.payments.map((row) => [row.digest, row.sellerHost])).toEqual([
       [plain, 'hotels.example'],
       [odd, 'this seller'],
@@ -576,8 +582,8 @@ describe('GET /api/public/proof', () => {
     const shownDigest = await proofPayment(shown, 'verified', at(60_000), 10_000n);
     const hiddenDigest = await proofPayment(hidden, 'verified', at(30_000), 40_000n);
     const shownBlob = await proofMemory(shown, 'owner_decision', 'confirmed', at(90_000));
-    const hiddenBlob = (await proofMemory(hidden, 'owner_decision', 'confirmed', at(45_000))) ?? '';
-    await proofDecision(hidden, { outcome: 'asked', rule: 'no_match', status: 'asked' });
+    const hiddenAsked = await proofDecision(hidden, { outcome: 'asked', rule: 'no_match', status: 'answered' });
+    const hiddenBlob = (await proofMemory(hidden, 'owner_decision', 'confirmed', at(45_000), at(45_000), hiddenAsked)) ?? '';
 
     const { text, body } = await proof();
     expect(body.totals).toEqual({ verifiedPayments: 1, verifiedUsdcAtomic: '10000', confirmedOwnerAnswers: 1, approvedByLearning: 1, askedDecisions: 0 });
@@ -600,8 +606,8 @@ describe('GET /api/public/proof', () => {
     const first = await proof();
     expect(first.body.totals.verifiedPayments).toBe(1);
     const readsPerRefresh = selects.mock.calls.length;
-    // Six reads, the questions' one built with two exists subqueries.
-    expect(readsPerRefresh).toBe(8);
+    // Six reads, plus the five exists subqueries the shared rules are built from (two for the owner, three for the decision, C37).
+    expect(readsPerRefresh).toBe(11);
 
     await proofPayment(w, 'verified', at(30_000));
     nowMs += LIMITS.publicProofCacheMs - 1;

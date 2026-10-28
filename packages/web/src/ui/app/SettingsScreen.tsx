@@ -577,21 +577,22 @@ function AutomaticPaymentsCard({ settings }: { settings: Settings }) {
   );
 }
 
+const PUBLIC_PROOF_TEXT =
+  "Show my verified payments, my answers stored on Walrus, and the decisions behind them on Ellai's public proof page and the landing page's memory map. Amounts and seller names are shown. Your reasons and purposes never are.";
+
 function PublicProofCard({ settings }: { settings: Settings }) {
   const { save, busy, error, saved, dialog } = useSaveChange(settings, () => {});
   return (
     <Card className="max-w-[720px]">
       <CardTitle>Public proof</CardTitle>
       <div className="mt-3 flex items-center justify-between gap-4">
-        <p className="min-w-0 text-[15px] leading-[1.5] text-muted">
-          Show my verified payments and memories on Ellai&apos;s public proof page and memory map.
-        </p>
+        <p className="min-w-0 text-[15px] leading-[1.5] text-muted">{PUBLIC_PROOF_TEXT}</p>
         <div className="flex shrink-0 items-center gap-3">
           <Saved show={saved} />
           <Switch
             checked={settings.publicProof}
             disabled={busy}
-            label="Show my verified payments and memories on Ellai's public proof page and memory map."
+            label={PUBLIC_PROOF_TEXT}
             onChange={(next) => void save({ publicProof: next })}
           />
         </div>

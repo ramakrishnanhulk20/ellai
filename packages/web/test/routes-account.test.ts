@@ -14,7 +14,7 @@
 // another sender's and another kind of transaction before sending, recording a success, and
 // answering an unknown outcome 202 with the digest and a definite refusal 422; decisions saying
 // what the owner answered without the memory sentence; the wallet route reading the session owner's
-// own address, split into address balance and coins, counted at one chain call; the USDC move built
+// own address, split into address balance and coins, with the fee source, counted at one chain call; the USDC move built
 // and relayed only as Ellai builds it from the coins Sui lists for the owner, refusing another
 // recipient, another coin type and a third party's coins before sending and answering
 // nothing_to_move and not_enough_sui; a fee paid with the owner's SUI coins relayed only while Sui
@@ -22,7 +22,8 @@
 // settings held to their bounds at each edge, the auto pause cleared
 // only on request, the public proof opt-in starting off and switched for the signed-in owner
 // only; and the limits the routes that read Sui share: per owner a minute and a day, and for
-// every owner a day, with the overview counted only for an owner with an allowance.
+// every owner a day, with the overview counted only for an owner whose purse it reads (one with an
+// allowance here; routes-owner.test covers a forgotten allowance with money left, C38).
 // Does NOT cover: a real chain or wallet (the chain is stubbed and core's Walrus Memory builders
 // are stand-ins; onboarding.test and prove:onboarding cover those), a real wallet's signature
 // being accepted by Sui (submit's signatures are made with a test key and the send is a stand-in),
@@ -1087,7 +1088,7 @@ describe('GET /api/owner/onboarding/wallet', () => {
     const owner = await signedInOwner();
     getWalletBalances.mockResolvedValue({ usdcAddressBalance: 2_830_000n, usdcCoinBalance: 9_007_199_254_740_993n, suiAddressBalance: 0n, suiCoinBalance: 51_000_000n });
     const response = await walletRoute.GET(get(`/api/owner/onboarding/wallet?address=${address()}`, owner.cookie));
-    expect(await json(response)).toEqual({ usdcAddressAtomic: '2830000', usdcCoinAtomic: '9007199254740993', suiAddressMist: '0', suiCoinMist: '51000000' });
+    expect(await json(response)).toEqual({ usdcAddressAtomic: '2830000', usdcCoinAtomic: '9007199254740993', suiAddressMist: '0', suiCoinMist: '51000000', feeSource: 'coins' });
     expect(response.headers.get('cache-control')).toBe('no-store');
     expect(getWalletBalances.mock.calls).toEqual([[owner.address]]);
     expect(getBalances).not.toHaveBeenCalled();

@@ -8,10 +8,12 @@ export const dynamic = 'force-dynamic';
 
 /**
  * Where the signed-in owner's own USDC and SUI sit, read from Sui for the address on the owner row:
- * { usdcAddressAtomic, usdcCoinAtomic, suiAddressMist, suiCoinMist }, each a decimal string. An
- * allowance draws only from the address balance, so USDC held as coins has to be moved there first
- * (the usdc_to_address step); a setup fee is paid from the SUI address balance when it covers the
- * budget, otherwise with SUI coins. The owner comes from the session alone (C13), and each request counts
+ * { usdcAddressAtomic, usdcCoinAtomic, suiAddressMist, suiCoinMist }, each a decimal string, and
+ * feeSource. An allowance draws only from the address balance, so USDC held as coins has to be
+ * moved there first (the usdc_to_address step); a setup fee is paid from the SUI address balance
+ * when it covers the budget, otherwise with SUI coins. feeSource says which would pay the allowance
+ * step's fee, 'address_balance', 'coins', or null when neither covers it alone (Ellai never combines
+ * them), from the same read with no further call. The owner comes from the session alone (C13), and each request counts
  * toward limitOwnerChainCalls's budgets at WALLET_CHAIN_CALLS (C22), so screens read it on
  * demand, never on a timer. 401 signed_out, 404 no_owner, 429 past this owner's or this client's
  * caps, 503 chain_unavailable when Sui cannot be read, 503 chain_unavailable_today once the day's

@@ -1,6 +1,6 @@
 import type { MapDecision } from './memory-map.js';
 
-/** The four marks on the timeline. Approved decisions split by whether Ellai paid on a learned rule or on a grant. */
+/** The four marks on the timeline. Approved decisions split by whether Ellai approved on a learned rule or on a grant. */
 export type NodeKind = 'asked' | 'learned' | 'grant' | 'refused';
 
 export type TimelineNode = {
@@ -10,6 +10,8 @@ export type TimelineNode = {
   at: string;
   host: string;
   amountUsdc: string;
+  /** The decision behind the mark, kept whole because its badge reads the rule and the digest. */
+  decision: MapDecision;
   /** Where the mark sits along the line, from 0 (left end) to 1 (right end). */
   position: number;
 };
@@ -36,26 +38,32 @@ export function buildTimeline(decisions: readonly MapDecision[]): TimelineNode[]
     at: decision.at,
     host: decision.host,
     amountUsdc: decision.amountUsdc,
+    decision,
     position: (slot + 0.5) / oldestFirst.length,
   }));
 }
 
-/** Changes whenever the set of marks changes, and not when a refresh brings the same decisions back. */
+/**
+ * Changes whenever the set of marks changes, and not when a refresh brings the same decisions back.
+ * The digest is in it because a decision that gets paid later changes its badge.
+ */
 export function timelineSignature(decisions: readonly MapDecision[]): string {
-  return decisions.map((decision) => `${decision.id}:${decision.outcome}:${decision.rule}`).join('|');
+  return decisions
+    .map((decision) => `${decision.id}:${decision.outcome}:${decision.rule}:${decision.digest ?? ''}`)
+    .join('|');
 }
 
-export type Tally = { asked: number; paid: number };
+export type Tally = { asked: number; learned: number };
 
-/** How many questions and paid-on-its-own decisions sit among the first `shown` marks. */
+/** How many questions and approvals on its own (paid or not) sit among the first `shown` marks. Grants are not counted. */
 export function tallyThrough(nodes: readonly TimelineNode[], shown: number): Tally {
   let asked = 0;
-  let paid = 0;
+  let learned = 0;
   for (const node of nodes.slice(0, shown)) {
     if (node.kind === 'asked') asked += 1;
-    else if (node.kind === 'learned' || node.kind === 'grant') paid += 1;
+    else if (node.kind === 'learned') learned += 1;
   }
-  return { asked, paid };
+  return { asked, learned };
 }
 
 /** The date and time in the viewer's own locale, for example "28 Oct, 09:14". */

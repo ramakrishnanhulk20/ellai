@@ -49,11 +49,23 @@ function BigNumber({ children, unit }: { children: ReactNode; unit?: string }) {
   );
 }
 
-// An owner with no allowance has no purse to read, and a purse that comes back null with an
-// allowance means the read failed. A purse that did answer is shown whatever the allowance says.
+// A purse that did answer is always shown, because money left in it after an allowance ends is still
+// there. With no allowance a line says so. A purse that comes back null with no allowance is not set up,
+// and null with an allowance means the read failed.
 function PurseTile({ overview }: { overview: Overview }) {
   const { purse, onboarding } = overview;
-  if (purse !== null) return <BigNumber unit="USDC">{atomicToUsdc(purse.usdcAtomic)}</BigNumber>;
+  if (purse !== null) {
+    return (
+      <>
+        <BigNumber unit="USDC">{atomicToUsdc(purse.usdcAtomic)}</BigNumber>
+        {onboarding.allowance === 'missing' ? (
+          <p className="mt-2 text-[14px] leading-[1.4] text-faint">
+            No allowance. Ellai can still pay from this under your rules.
+          </p>
+        ) : null}
+      </>
+    );
+  }
   if (onboarding.allowance === 'missing') return <p className="text-[20px] leading-[1.2] text-muted">Not set up</p>;
   return (
     <>

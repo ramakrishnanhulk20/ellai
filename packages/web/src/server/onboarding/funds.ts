@@ -17,6 +17,12 @@ export const WALLET_CHAIN_CALLS = 1;
 // The nonce field of a ValidDuring expiration is a u32.
 const NONCE_RANGE = 2 ** 32;
 
+/**
+ * Where a setup transaction's fee comes from: the SUI address balance, the owner's SUI coins, or
+ * null when neither covers the budget on its own, since Ellai never combines the two.
+ */
+export type FeeSource = 'address_balance' | 'coins' | null;
+
 /** Atomic amounts as decimal strings, since JSON numbers lose precision past 2^53. */
 export interface OwnerWallet {
   /** USDC in the owner's address balance, the only part an allowance can draw from. */
@@ -27,6 +33,25 @@ export interface OwnerWallet {
   suiAddressMist: string;
   /** SUI the owner holds as Coin objects, in MIST, which pays the gas when the address balance falls short. */
   suiCoinMist: string;
+  /** How the allowance step's fee (LIMITS.issueGasBudgetMist) would be paid from these balances, by chooseOwnerGas's rule (feeSourceFor). */
+  feeSource: FeeSource;
+}
+
+// The one comparison every fee choice here makes, so the wallet route can never promise a fee
+// source the build would then refuse.
+function coversGas(heldMist: bigint, budgetMist: bigint): boolean {
+  return heldMist >= budgetMist;
+}
+
+/**
+ * The fee source chooseOwnerGas would pick for `budgetMist` from balances already read: the SUI
+ * address balance when it alone covers the budget, else the SUI coins when together they do, else
+ * null. Not covered: an owner with more than LIMITS.ownedCoinsMax SUI coins whose listed ones fall
+ * short while all of them would not, which chooseOwnerGas then refuses with NOT_ENOUGH_SUI.
+ */
+export function feeSourceFor(suiAddressMist: bigint, suiCoinMist: bigint, budgetMist: bigint): FeeSource {
+  if (coversGas(suiAddressMist, budgetMist)) return 'address_balance';
+  return coversGas(suiCoinMist, budgetMist) ? 'coins' : null;
 }
 
 function amountText(value: unknown): string {
@@ -38,20 +63,23 @@ function amountText(value: unknown): string {
 /**
  * Where the owner's own USDC and SUI sit, so the allowance step can show whether an allowance would
  * have anything to draw and whether the owner can pay the fee: one read of Sui Mainnet through Tatum
- * (getWalletBalances) for the address on the owner row, never one the caller names (C13). Nothing is
- * recorded.
+ * (getWalletBalances) for the address on the owner row, never one the caller names (C13). feeSource
+ * comes from that same read (feeSourceFor at LIMITS.issueGasBudgetMist), with no further call.
+ * Nothing is recorded.
  * Throws OnboardingError: BAD_INPUT for an owner id that is not a uuid, NO_OWNER. Throws ChainError
  * when Tatum cannot answer or Ellai's Tatum budget refuses the read (BUDGET, nothing sent).
  */
 export async function ownerWallet(args: { db: Database; ownerId: string; chain: Chain }): Promise<OwnerWallet> {
   const owner = await loadOwner(args.db, args.ownerId);
   const balances = await args.chain.getWalletBalances(canonicalSuiAddress(owner.suiAddress));
-  return {
+  const wallet = {
     usdcAddressAtomic: amountText(balances.usdcAddressBalance),
     usdcCoinAtomic: amountText(balances.usdcCoinBalance),
     suiAddressMist: amountText(balances.suiAddressBalance),
     suiCoinMist: amountText(balances.suiCoinBalance),
   };
+  // amountText has refused anything but a whole non-negative amount before the balances are compared.
+  return { ...wallet, feeSource: feeSourceFor(balances.suiAddressBalance, balances.suiCoinBalance, BigInt(LIMITS.issueGasBudgetMist)) };
 }
 
 const asRef = (coin: OwnedCoin): CoinRef => ({ objectId: coin.objectId, version: coin.version, digest: coin.digest });
@@ -67,7 +95,7 @@ export function fewestCovering(coins: readonly OwnedCoin[], budget: bigint): Coi
   for (const coin of largestFirst) {
     picked.push(asRef(coin));
     held += coin.balance;
-    if (held >= budget) return picked;
+    if (coversGas(held, budget)) return picked;
   }
   return null;
 }
@@ -86,7 +114,7 @@ export function fewestCovering(coins: readonly OwnedCoin[], budget: bigint): Coi
 export async function chooseOwnerGas(chain: Chain, ownerAddress: string, budgetMist: number): Promise<OwnerGasFacts> {
   const budget = BigInt(budgetMist);
   const { suiAddressBalance } = await chain.getWalletBalances(ownerAddress);
-  if (suiAddressBalance >= budget) {
+  if (coversGas(suiAddressBalance, budget)) {
     const referenceGasPrice = await chain.getReferenceGasPrice();
     return { epoch: await chain.getCurrentEpoch(), referenceGasPrice, nonce: randomInt(0, NONCE_RANGE) };
   }

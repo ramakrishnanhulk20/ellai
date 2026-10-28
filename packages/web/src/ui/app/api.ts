@@ -305,6 +305,8 @@ export type WalletFunds = {
   usdcCoinAtomic: string;
   suiAddressMist: string;
   suiCoinMist: string;
+  /** Where a setup fee can be paid from. Null means the wallet cannot pay one. */
+  feeSource: 'address_balance' | 'coins' | null;
 };
 
 export const fetchWalletFunds = () => ownerFetch<WalletFunds>('/api/owner/onboarding/wallet');

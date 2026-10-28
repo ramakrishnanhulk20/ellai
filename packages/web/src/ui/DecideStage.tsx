@@ -1,7 +1,7 @@
 'use client';
 
 import { motion } from 'motion/react';
-import { BADGES } from './DecisionCard.js';
+import { badgeFor } from './DecisionCard.js';
 import {
   BAR,
   CARD,
@@ -51,8 +51,17 @@ function Check() {
   );
 }
 
-export function CardBody({ example, paid, fluid = false }: { example: Example | null; paid: boolean; fluid?: boolean }) {
-  const badge = BADGES.approved;
+export function CardBody({
+  example,
+  showOutcome,
+  fluid = false,
+}: {
+  example: Example | null;
+  /** True from step 5, when the card gets its badge. The badge says what the picked decision really was. */
+  showOutcome: boolean;
+  fluid?: boolean;
+}) {
+  const badge = example ? badgeFor(example.decision) : null;
   return (
     <>
       <p className="label-mono text-muted">402 PAYMENT REQUIRED</p>
@@ -61,9 +70,9 @@ export function CardBody({ example, paid, fluid = false }: { example: Example | 
           {example.amount} USDC to {example.host}
         </p>
       ) : null}
-      {paid ? (
+      {showOutcome && badge ? (
         <>
-          <p className={`label-mono mt-3 inline-flex h-6 items-center rounded-button border px-2 ${badge.tone}`}>
+          <p className={`label-mono mt-3 inline-flex min-h-6 max-w-full items-center rounded-button border px-2 ${badge.tone}`}>
             {badge.label}
           </p>
           {example?.digest ? (
@@ -234,7 +243,7 @@ export function StageText({ step, example, live, still }: StageState) {
         animate={live ? { x: 0, opacity: cardOpacity(step) } : { x: '115%', opacity: 0 }}
         transition={still ? { duration: 0 } : { x: { duration: 0.5, ease: RISE_EASE }, opacity: fade }}
       >
-        <CardBody example={example} paid={step >= 4} fluid />
+        <CardBody example={example} showOutcome={step >= 4} fluid />
       </motion.div>
 
       {dots.map(({ label, point, below }, index) =>
@@ -324,7 +333,7 @@ export function MobileStage({ step, example, live, still }: StageState) {
       <div className="mt-4 max-w-[320px]">
         {step === 0 || step === 4 ? (
           <div className={CARD_SHELL}>
-            <CardBody example={example} paid={step === 4} />
+            <CardBody example={example} showOutcome={step === 4} />
           </div>
         ) : null}
         {step === 1 && labels.length > 0 ? (

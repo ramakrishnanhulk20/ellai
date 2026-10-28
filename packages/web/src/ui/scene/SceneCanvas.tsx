@@ -37,8 +37,9 @@ export function SceneCanvas({ memories, active, reducedMotion, paused, parallax,
       paid: readColor('--paid'),
       asked: readColor('--asked'),
       refused: readColor('--refused'),
+      approved: accent,
     }),
-    [],
+    [accent],
   );
 
   return (

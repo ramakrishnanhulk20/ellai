@@ -1,6 +1,8 @@
 // Covers: GET /api/public/memory-map called as Next would call it, on PGlite with a chain that
 // fails any touch: only owners who opted in, only their owner answers that Walrus Memory
-// confirmed, the tick found on chain and Walrus still stores, each decision's citations kept to
+// confirmed, the tick found on chain and Walrus still stores, only decisions Sui or Walrus backs
+// (a verified payment, a citation of such an answer, or the question's own answer being one, C37),
+// each decision's citations kept to
 // those answers with the distance decide stored (cut to what a real column holds) or none, a
 // digest only for a verified payment, the totals /proof shows, the exact key set at every level
 // with no sentence, purpose, reason, label, owner, agent, database id or address in the text,
@@ -17,6 +19,7 @@ import { LIMITS } from '@ellai/core/limits';
 import { USDC_TYPE_MAINNET } from '@ellai/core/usdc';
 import { Ed25519Keypair } from '@mysten/sui/keypairs/ed25519';
 import { toBase58 } from '@mysten/sui/utils';
+import { eq } from 'drizzle-orm';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import * as memoryMapRoute from '../src/app/api/public/memory-map/route.js';
 import * as proofRoute from '../src/app/api/public/proof/route.js';
@@ -236,12 +239,13 @@ describe('GET /api/public/memory-map', () => {
         { blobId: 'yes-hotel-2', verdict: 'approve', host: 'hotels.example', amountUsdc: usdc.twenty, at: at(240_000).toISOString() },
         { blobId: 'yes-hotel-1', verdict: 'approve', host: 'hotels.example', amountUsdc: usdc.twenty, at: at(300_000).toISOString() },
       ],
+      // The bare question and the bad-outcome question (it cites only an outcome memory) are not
+      // backed by an owner answer on chain, so neither is listed or counted (C37).
       decisions: [
         { id: '0', at: at(20_000).toISOString(), outcome: 'approved', rule: 'learned', host: 'hotels.example', amountUsdc: usdc.ten, digest: null, citations: [{ blobId: 'yes-hotel-1', distance: 0.1 }] },
-        { id: '1', at: at(30_000).toISOString(), outcome: 'asked', rule: 'bad_outcome', host: 'hotels.example', amountUsdc: usdc.ten, digest: null, citations: [] },
-        { id: '2', at: at(60_000).toISOString(), outcome: 'refused', rule: 'refused_recipient', host: 'this seller', amountUsdc: '0.030000', digest: null, citations: [{ blobId: 'no-odd-seller', distance: null }] },
+        { id: '1', at: at(60_000).toISOString(), outcome: 'refused', rule: 'refused_recipient', host: 'this seller', amountUsdc: '0.030000', digest: null, citations: [{ blobId: 'no-odd-seller', distance: null }] },
         {
-          id: '3',
+          id: '2',
           at: at(120_000).toISOString(),
           outcome: 'approved',
           rule: 'learned',
@@ -253,9 +257,8 @@ describe('GET /api/public/memory-map', () => {
             { blobId: 'yes-hotel-2', distance: 0.25 },
           ],
         },
-        { id: '4', at: at(180_000).toISOString(), outcome: 'asked', rule: 'no_match', host: 'hotels.example', amountUsdc: usdc.ten, digest: null, citations: [] },
       ],
-      totals: { memories: 3, learnedApprovals: 1, questionsAsked: 2 },
+      totals: { memories: 3, learnedApprovals: 1, questionsAsked: 0 },
     });
   });
 
@@ -277,14 +280,68 @@ describe('GET /api/public/memory-map', () => {
     for (const secret of secrets) expect(text).not.toContain(secret);
   });
 
-  it('leaves out the decisions of an opted-in owner with nothing on chain, as /proof does', async () => {
-    const empty = await party();
-    await decision(empty, { createdAt: at(5_000) });
-    expect((await map()).body.decisions).toEqual([]);
+  it('leaves out a question of an opted-in owner with nothing on chain, and still after another answer is on chain, until its own answer is (C37)', async () => {
+    const p = await party();
+    const asked = await decision(p, { status: 'answered', createdAt: at(5_000) });
+    const itsAnswer = await memory(p, 'its-answer', 'not_found_on_chain', { decisionId: asked });
+    const reload = async () => {
+      delete (globalThis as Record<string, unknown>).__ellaiMemoryMap;
+      return (await map()).body;
+    };
+    expect(await reload()).toMatchObject({ decisions: [], totals: { questionsAsked: 0 } });
 
-    await memory(empty, 'first-answer', 'on_chain');
-    delete (globalThis as Record<string, unknown>).__ellaiMemoryMap;
-    expect((await map()).body.decisions.map((row) => row.at)).toEqual([at(5_000).toISOString()]);
+    // The owner is on the page now, but nothing on chain answers this question.
+    await memory(p, 'another-answer', 'on_chain');
+    expect(await reload()).toMatchObject({ decisions: [], totals: { questionsAsked: 0 } });
+
+    await handle.db.update(memories).set({ chainConfirmedAt: at(1_000) }).where(eq(memories.id, itsAnswer));
+    const shown = await reload();
+    expect(shown.decisions.map((row) => [row.at, row.outcome])).toEqual([[at(5_000).toISOString(), 'asked']]);
+    expect(shown.totals.questionsAsked).toBe(1);
+  });
+
+  it('lists a decision only when Sui or Walrus backs it, and counts only such questions, on the map and /proof alike (C37)', async () => {
+    const p = await party();
+    const yes = await memory(p, 'yes-on-chain', 'on_chain');
+    const no = await memory(p, 'no-on-chain', 'on_chain', { verdict: 'refuse' });
+    const paidDigest = toBase58(new Uint8Array(32).fill(8));
+
+    // Left out: a limit refusal, an unanswered question, a grant whose payment is unverified, and
+    // a question whose answer Walrus Memory has not been found storing.
+    await decision(p, { outcome: 'refused', rule: 'over_payment_max', status: 'refused', createdAt: at(10_000) });
+    await decision(p, { createdAt: at(20_000) });
+    const unpaidGrant = await decision(p, { outcome: 'approved', rule: 'grant', status: 'paid', createdAt: at(30_000) });
+    await paid(p, unpaidGrant, 'pending');
+    const offChain = await decision(p, { status: 'answered', createdAt: at(35_000) });
+    await memory(p, 'answer-not-found', 'not_found_on_chain', { decisionId: offChain });
+
+    // Kept: a verified paid grant, learned approvals citing an answer on chain (paid or not), a
+    // refused_recipient citing a refusal on chain, and a question whose own answer is on chain.
+    const paidGrant = await decision(p, { outcome: 'approved', rule: 'grant', status: 'paid', createdAt: at(40_000) });
+    await paid(p, paidGrant, 'verified', DIGEST);
+    const learnedPaid = await decision(p, { outcome: 'approved', rule: 'learned', status: 'paid', createdAt: at(50_000) });
+    await paid(p, learnedPaid, 'verified', paidDigest);
+    await cite(p, learnedPaid, yes, 0.1);
+    const learnedUnpaid = await decision(p, { outcome: 'approved', rule: 'learned', status: 'paid', createdAt: at(60_000) });
+    await paid(p, learnedUnpaid, 'pending');
+    await cite(p, learnedUnpaid, yes, 0.2);
+    const refusedRecipient = await decision(p, { outcome: 'refused', rule: 'refused_recipient', status: 'refused', createdAt: at(70_000) });
+    await cite(p, refusedRecipient, no, null);
+    const answered = await decision(p, { status: 'answered', createdAt: at(80_000) });
+    await memory(p, 'its-answer', 'on_chain', { decisionId: answered });
+
+    const { body } = await map();
+    expect(body.decisions.map((row) => [row.at, row.outcome, row.rule, row.digest, row.citations.map((c) => c.blobId)])).toEqual([
+      [at(40_000).toISOString(), 'approved', 'grant', DIGEST, []],
+      [at(50_000).toISOString(), 'approved', 'learned', paidDigest, ['yes-on-chain']],
+      [at(60_000).toISOString(), 'approved', 'learned', null, ['yes-on-chain']],
+      [at(70_000).toISOString(), 'refused', 'refused_recipient', null, ['no-on-chain']],
+      [at(80_000).toISOString(), 'asked', 'no_match', null, []],
+    ]);
+    expect(body.totals).toEqual({ memories: 3, learnedApprovals: 1, questionsAsked: 1 });
+
+    const proof = (await (await proofRoute.GET()).json()) as { totals: { approvedByLearning: number; askedDecisions: number } };
+    expect([proof.totals.approvedByLearning, proof.totals.askedDecisions]).toEqual([body.totals.learnedApprovals, body.totals.questionsAsked]);
   });
 
   it('lists at most 200 answers and 50 decisions, newest first', async () => {
@@ -292,8 +349,14 @@ describe('GET /api/public/memory-map', () => {
     const answers = Array.from({ length: LIMITS.memoryMapMemories + 1 }, (_, i) =>
       memoryValues(p, `answer-${i}`, 'on_chain', { confirmedAt: at((LIMITS.memoryMapMemories + 1 - i) * 1_000), chainConfirmedAt: at(1_000) }),
     );
-    await handle.db.insert(memories).values(answers);
-    await handle.db.insert(decisions).values(Array.from({ length: LIMITS.memoryMapDecisions + 1 }, (_, i) => decisionValues(p, { createdAt: at((LIMITS.memoryMapDecisions + 1 - i) * 1_000) })));
+    const answerIds = await handle.db.insert(memories).values(answers).returning({ id: memories.id });
+    const listed = await handle.db
+      .insert(decisions)
+      .values(Array.from({ length: LIMITS.memoryMapDecisions + 1 }, (_, i) => decisionValues(p, { createdAt: at((LIMITS.memoryMapDecisions + 1 - i) * 1_000) })))
+      .returning({ id: decisions.id });
+    // Each cites an answer on chain, so every one of them may be listed (C37) and only the cap stops them.
+    const cited = answerIds[0]?.id ?? '';
+    await handle.db.insert(decisionCitations).values(listed.map((row) => ({ decisionId: row.id, memoryId: cited, ownerId: p.ownerId, distance: 0.1 })));
     expect([LIMITS.memoryMapMemories, LIMITS.memoryMapDecisions]).toEqual([200, 50]);
 
     const { body } = await map();

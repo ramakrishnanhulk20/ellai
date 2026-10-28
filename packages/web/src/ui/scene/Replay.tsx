@@ -76,6 +76,8 @@ const LINE_SLOTS = Array.from({ length: MAX_LINES }, (_, i) => i);
 export type ReplayColors = {
   fg: Color;
   paid: Color;
+  /** An approval with no verified payment settles to the accent, never to the paid colour (C37). */
+  approved: Color;
   asked: Color;
   refused: Color;
 };
@@ -84,6 +86,7 @@ type Plan = {
   /** Seconds on the page clock when this replay began. */
   startedAt: number;
   outcome: ActiveReplay['decision']['outcome'];
+  paid: boolean;
   start: Vector3;
   control: Vector3;
   /** Middle of the cited memories, in the field's own space. */
@@ -112,6 +115,7 @@ function buildPlan({ decision, step }: ActiveReplay, layout: MemoryLayout): Plan
   return {
     startedAt: performance.now() / 1000,
     outcome: decision.outcome,
+    paid: decision.digest !== null,
     start: new Vector3(START.x, START.y * side, 0),
     control: new Vector3(CONTROL.x, CONTROL.y * side, CONTROL.z),
     centroid,
@@ -245,7 +249,7 @@ export function Replay({ active, layout, scene, colors, markScale }: Props) {
     if (sinceOutcome >= 0) {
       if (current.outcome === 'approved') {
         const k = easeOutCubic(clamp01(sinceOutcome / SETTLE));
-        tint.current.lerp(colors.paid, k);
+        tint.current.lerp(current.paid ? colors.paid : colors.approved, k);
         radius = startRadius + (MEMORY_RADIUS * markScale - startRadius) * k;
       } else if (current.outcome === 'asked') {
         if (sinceOutcome < ASK_PULSE * ASK_PULSES) asking = (sinceOutcome % ASK_PULSE) / ASK_PULSE;

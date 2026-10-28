@@ -12,7 +12,8 @@
 // balance when it covers the budget, otherwise with the fewest of the owner's SUI coins that do, and
 // NOT_ENOUGH_SUI when neither does. The USDC move builds from the coins Sui lists for the owner with
 // its exact summary, NOTHING_TO_MOVE coming before any gas read; ownerWallet reads the owner's own
-// address and splits USDC and SUI. Ending the allowance, through the build, submit and confirm
+// address and splits USDC and SUI, and names the allowance fee's source by the build's own rule
+// from that one read, none when only the two together would cover it. Ending the allowance, through the build, submit and confirm
 // routes: no allowance recorded is 409 not_ready and the body cannot name one; an allowance both
 // getAllowance and objectExists say is gone is forgotten and 409 already_done at build and submit; one
 // only getAllowance misses is kept, with build, submit and confirm answering 503 chain_unavailable
@@ -20,15 +21,17 @@
 // build is one revoke of the recorded allowance with the listed cap, summarised from the row and
 // fixed text, at its pinned chain-call counts; signed bytes naming another allowance or cap are 400
 // bad_transaction with nothing sent; a landed revoke is 200 ended and forgets the allowance; a
-// refused one keeps it; confirm records the end only once Sui no longer has the allowance; and the
-// jobs tick stops visiting the owner once the revoke lands.
+// refused one keeps it; confirm records the end only once Sui no longer has the allowance; the
+// jobs tick stops visiting the owner once the revoke lands, except to bring a refill still pending
+// to its final state, after which the float it brought pays (C38).
 // Does NOT cover: the live chain (proven read only by `npm run prove:onboarding`, and the revoke by
 // `npm run prove:end -w packages/proof`), core's own registry and account reads (core's memory
 // tests), or a real wallet signing the built bytes.
 import { randomBytes } from 'node:crypto';
 import { buildRevokeAllowance } from '@ellai/core/allowance';
-import type { AllowanceCapRef, AllowanceState, Chain, OwnedCoin, WalletBalances } from '@ellai/core/chain';
+import type { AllowanceCapRef, AllowanceState, Chain, OwnedCoin, TransactionResult, WalletBalances } from '@ellai/core/chain';
 import { ChainError } from '@ellai/core/chain';
+import type { CanonicalPayment } from '@ellai/core/challenge';
 import { canonicalSuiAddress } from '@ellai/core/keys';
 import { LIMITS } from '@ellai/core/limits';
 import { buildAddDelegateTx, buildCreateAccountTx, findMemoryAccount, MemoryError } from '@ellai/core/memory';
@@ -44,7 +47,7 @@ import * as confirmRoute from '../src/app/api/owner/onboarding/confirm/route.js'
 import * as submitRoute from '../src/app/api/owner/onboarding/submit/route.js';
 import { completeSignIn, issueSignIn } from '../src/server/auth/signin.js';
 import { type Database, createDb, migrate } from '../src/server/db/client.js';
-import { owners } from '../src/server/db/schema.js';
+import { agents, decisions, owners, payments, refills } from '../src/server/db/schema.js';
 import type { ServerEnv } from '../src/server/env.js';
 import { setServerContextFactory } from '../src/server/http/context.js';
 import { runJobsTick } from '../src/server/jobs/tick.js';
@@ -63,6 +66,7 @@ import {
   onboardingState,
 } from '../src/server/onboarding/state.js';
 import { SUBMIT_CHAIN_CALLS, submitOnboardingTx } from '../src/server/onboarding/submit.js';
+import { signForDecision } from '../src/server/pay/sign.js';
 
 const DAY_MS = 86_400_000;
 
@@ -582,9 +586,31 @@ describe('ownerWallet', () => {
       usdcCoinAtomic: '9007199254740993',
       suiAddressMist: '0',
       suiCoinMist: '51000000',
+      feeSource: 'coins',
     });
     expect(stub.getWalletBalances.mock.calls).toEqual([[owner.suiAddress]]);
     expect((await refusal(ownerWallet({ db, ownerId: '00000000-0000-4000-8000-000000000000', chain: untouchable }))).code).toBe('NO_OWNER');
+  });
+
+  it("names the allowance fee's source by chooseOwnerGas's own rule from the one balance read, and none for 0.03 SUI each side of a larger budget, as the build refuses it", async () => {
+    const budget = BigInt(LIMITS.issueGasBudgetMist);
+    expect(budget).toBeGreaterThan(30_000_000n);
+    const feeSource = async (wallet: Partial<WalletBalances>, suiCoins: OwnedCoin[] = []) => {
+      const owner = await newOwner();
+      const stub = stubChain(owner, { wallet, suiCoins });
+      const shown = (await ownerWallet({ db, ownerId: owner.id, chain: stub.chain })).feeSource;
+      expect(stub.getWalletBalances).toHaveBeenCalledTimes(1);
+      expect(stub.listSuiCoins).not.toHaveBeenCalled();
+      return { owner, stub, shown };
+    };
+    expect((await feeSource({ suiAddressBalance: budget, suiCoinBalance: 0n })).shown).toBe('address_balance');
+    expect((await feeSource({ suiAddressBalance: budget - 1n, suiCoinBalance: budget })).shown).toBe('coins');
+
+    const split = await feeSource({ suiAddressBalance: 30_000_000n, suiCoinBalance: 30_000_000n }, [ownedCoin(1, 30_000_000n)]);
+    expect(split.shown).toBeNull();
+    const terms = { dailyLimitAtomic: 500_000n, lifetimeCapAtomic: 1_000_000n, days: 30 };
+    const refused = await refusal(buildOnboardingTx({ db, ownerId: split.owner.id, step: 'allowance', allowance: terms, chain: split.stub.chain, masterSecretHex: MASTER, now: NOW }));
+    expect(refused.code).toBe('NOT_ENOUGH_SUI');
   });
 });
 
@@ -612,15 +638,15 @@ describe('ending the allowance, through the build, submit and confirm routes', (
   }
 
   /** An owner signed in as the app signs one in, with an allowance recorded as confirm records one unless told otherwise. */
-  async function signedIn(allowanceId: string | null = address()): Promise<SignedIn> {
+  async function signedIn(allowanceId: string | null = address(), on: Database = db): Promise<SignedIn> {
     const signer = Ed25519Keypair.generate();
-    const { message } = await issueSignIn({ db, address: signer.toSuiAddress(), appOrigin: APP_ORIGIN, now: NOW });
+    const { message } = await issueSignIn({ db: on, address: signer.toSuiAddress(), appOrigin: APP_ORIGIN, now: NOW });
     const signature = (await signer.signPersonalMessage(new TextEncoder().encode(message))).signature;
-    const done = await completeSignIn({ db, message, signature, appOrigin: APP_ORIGIN, masterSecretHex: MASTER, sessionSecretHex: SESSION_SECRET, now: NOW });
+    const done = await completeSignIn({ db: on, message, signature, appOrigin: APP_ORIGIN, masterSecretHex: MASTER, sessionSecretHex: SESSION_SECRET, now: NOW });
     if (allowanceId !== null) {
-      await db.update(owners).set({ allowanceId: canonicalSuiAddress(allowanceId), allowanceCheckedAt: NOW, refillNotBefore: new Date(NOW.getTime() + DAY_MS) }).where(eq(owners.id, done.ownerId));
+      await on.update(owners).set({ allowanceId: canonicalSuiAddress(allowanceId), allowanceCheckedAt: NOW, refillNotBefore: new Date(NOW.getTime() + DAY_MS) }).where(eq(owners.id, done.ownerId));
     }
-    const [row] = await db.select().from(owners).where(eq(owners.id, done.ownerId));
+    const [row] = await on.select().from(owners).where(eq(owners.id, done.ownerId));
     if (row === undefined) throw new Error('expected a row');
     return { row, cookie: `__Host-ellai_session=${done.sessionToken}`, signer };
   }
@@ -807,6 +833,100 @@ describe('ending the allowance, through the build, submit and confirm routes', (
       expect(later.errors.filter((error) => error.ownerId === row.id)).toEqual([]);
       expect(stub.getAllowance.mock.calls.length).toBe(reads);
     } finally {
+      await own.close();
+    }
+  });
+
+  it('brings a refill still pending when the allowance ends to its final state on the next tick, so the float it brought can pay (C38)', async () => {
+    const own = await createDb('pglite:memory');
+    setServerContextFactory(async () => ({ db: own.db, chain: routeChain, env: ENV, now: () => NOW }));
+    try {
+      await migrate(own.db);
+      const owner = await signedIn(address(), own.db);
+      const ownerId = owner.row.id;
+      const allowanceId = owner.row.allowanceId ?? '';
+      const purse = owner.row.purseAddress;
+      const gas = Ed25519Keypair.generate();
+      const recipient = canonicalSuiAddress(`0x${'11'.repeat(32)}`);
+      const hoursAgo = (hours: number) => new Date(NOW.getTime() - hours * 3_600_000);
+      const [agent] = await own.db.insert(agents).values({ ownerId, label: 'Test agent', kind: 'external', tokenHash: randomBytes(32).toString('hex'), tokenPrefix: 'ellai_ab12' }).returning();
+      const decisionValues = (amountAtomic: bigint, status: 'paid' | 'open') => ({
+        ownerId,
+        agentId: agent?.id ?? '',
+        requestKey: randomBytes(16).toString('hex'),
+        sellerUrl: 'https://hotels.example/v1/rooms',
+        sellerMethod: 'POST' as const,
+        sellerHost: 'hotels.example',
+        bodyHash: randomBytes(32).toString('hex'),
+        purpose: 'search hotels',
+        recipient,
+        amountAtomic,
+        asset: USDC_TYPE_MAINNET,
+        network: 'sui:mainnet',
+        expiresAt: new Date(NOW.getTime() + 60_000),
+        outcome: 'approved' as const,
+        rule: 'grant' as const,
+        reason: 'You approved this payment when Ellai asked.',
+        status,
+      });
+
+      // One verified 0.10 refill, 0.06 of it paid and not released, and a second 0.10 refill that
+      // landed but that Ellai has not read back yet.
+      await own.db.insert(refills).values({ ownerId, allowanceId, amountAtomic: 100_000n, digest: toBase58(randomBytes(32)), sentAt: hoursAgo(3), validUntilEpoch: 901n, status: 'verified', verifiedAt: hoursAgo(3) });
+      const [spent] = await own.db.insert(decisions).values(decisionValues(60_000n, 'paid')).returning();
+      await own.db.insert(payments).values({ decisionId: spent?.id ?? '', ownerId, purseAddress: purse, recipient, amountAtomic: 60_000n, digest: toBase58(randomBytes(32)), txBytesBase64: 'AA==', signedAt: hoursAgo(2), validUntilEpoch: 901n, settlement: 'verified' });
+      const landedDigest = toBase58(randomBytes(32));
+      const [landing] = await own.db.insert(refills).values({ ownerId, allowanceId, amountAtomic: 100_000n, digest: landedDigest, sentAt: hoursAgo(1), validUntilEpoch: 901n, status: 'pending' }).returning();
+
+      const stub = stubChain(owner.row);
+      const landed: TransactionResult = {
+        status: 'success',
+        balanceChanges: [
+          { address: owner.row.suiAddress, coinType: USDC_TYPE_MAINNET, amount: -100_000n },
+          { address: purse, coinType: USDC_TYPE_MAINNET, amount: 100_000n },
+          { address: gas.toSuiAddress(), coinType: normalizeStructTag('0x2::sui::SUI'), amount: -2_000_000n },
+        ],
+      };
+      const tickChain = {
+        ...(stub.chain as object),
+        getTransactionResult: async (digest: string) => {
+          if (digest !== landedDigest) throw new ChainError('NOT_FOUND', 'stand-in not found');
+          return landed;
+        },
+        getBalances: async (at: string) => ({ usdcAddressBalance: at === purse ? 140_000n : 0n, usdcCoinBalance: 0n, suiTotal: 1_000_000_000n }),
+      } as unknown as Chain;
+
+      const payment: CanonicalPayment = {
+        dialect: 'x402-v1-t2000',
+        sellerUrl: 'https://hotels.example/v1/rooms',
+        sellerHost: 'hotels.example',
+        recipient,
+        amount: 50_000n,
+        asset: USDC_TYPE_MAINNET,
+        network: 'sui:mainnet',
+        expiresAtMs: NOW.getTime() + 60_000,
+        challengeId: 'challenge-1',
+        nonce: '7',
+        minEpoch: 900n,
+        maxEpoch: 901n,
+        resource: null,
+      };
+      const [open] = await own.db.insert(decisions).values(decisionValues(50_000n, 'open')).returning();
+      const pay = () => signForDecision({ db: own.db, ownerId, decisionId: open?.id ?? '', payment, masterSecretHex: MASTER, chain: tickChain, now: () => NOW });
+
+      routeChain = stub.chain;
+      const bytes = fromBase64(((await (await build(owner)).json()) as { txBytesBase64: string }).txBytesBase64);
+      expect(await answer(await submit(owner, await signed(owner, bytes)))).toEqual([200, { ended: true, digest: TransactionDataBuilder.getDigestFromBytes(bytes) }]);
+      // With the second refill still pending, Ellai's ledger holds 0.04 USDC: short of 0.05.
+      expect(await pay()).toEqual({ refusal: 'purse_short' });
+
+      const summary = await runJobsTick({ db: own.db, chain: tickChain, masterSecretHex: MASTER, gasKeypair: gas, now: () => NOW, sleep: async () => undefined });
+      expect([summary.owners, summary.errors]).toEqual([1, []]);
+      const [after] = await own.db.select().from(refills).where(eq(refills.id, landing?.id ?? ''));
+      expect(after).toMatchObject({ status: 'verified', verifiedAt: NOW });
+      expect(await pay()).toHaveProperty('signed');
+    } finally {
+      setServerContextFactory(async () => ({ db, chain: routeChain, env: ENV, now: () => NOW }));
       await own.close();
     }
   });

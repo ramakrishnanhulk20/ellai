@@ -17,7 +17,7 @@ function Counter({ value, label, tone }: { value: number; label: string; tone: s
       <p className={`font-display text-[clamp(4rem,min(9vw,14vh),8rem)] font-semibold leading-none tabular-nums ${tone}`}>
         {value}
       </p>
-      <p className="label-mono mt-3 text-muted">{label}</p>
+      <p className="label-mono mt-3 text-balance text-muted">{label}</p>
     </div>
   );
 }
@@ -53,7 +53,7 @@ function Counters({ tally }: { tally: Tally }) {
   return (
     <>
       <Counter value={tally.asked} label="QUESTIONS ASKED" tone="text-asked" />
-      <Counter value={tally.paid} label="PAID ON ITS OWN" tone="text-accent" />
+      <Counter value={tally.learned} label="APPROVED ON ITS OWN" tone="text-accent" />
     </>
   );
 }
@@ -137,7 +137,7 @@ export function WatchItLearn() {
                 <Counter value={tally.asked} label="QUESTIONS ASKED" tone="text-asked" />
               </div>
               <div className="mt-16">
-                <Counter value={tally.paid} label="PAID ON ITS OWN" tone="text-accent" />
+                <Counter value={tally.learned} label="APPROVED ON ITS OWN" tone="text-accent" />
               </div>
             </div>
             {count > 0 ? (

@@ -110,6 +110,22 @@ async function readOwner(db: DbHandle, ownerId: string, lock: boolean): Promise<
   return row;
 }
 
+function partiesOf(owner: OwnerFacts, gasKeypair: Ed25519Keypair): Parties {
+  return {
+    purse: canonicalSuiAddress(owner.purseAddress),
+    funder: canonicalSuiAddress(owner.suiAddress),
+    gasOwner: canonicalSuiAddress(gasKeypair.toSuiAddress()),
+  };
+}
+
+function checkedClock(read: () => Date): () => Date {
+  return () => {
+    const at = read();
+    if (!(at instanceof Date) || Number.isNaN(at.getTime())) throw new Error('the current time is not a date');
+    return at;
+  };
+}
+
 interface Ledger {
   pending: boolean;
   inWindow: number;
@@ -366,9 +382,42 @@ async function resolvePending(
   return failed.length > 0 ? 'clear' : 'blocked';
 }
 
+export interface PendingRefillArgs {
+  db: Database;
+  chain: Chain;
+  ownerId: string;
+  /** The gas wallet the refill was sent with, whose SUI debit is the only other change a landed refill may show. */
+  gasKeypair: Ed25519Keypair;
+  /** Read for every stamp, after the reads it follows (C26). */
+  clock: () => Date;
+  /** Asked before each chain read; false once the jobs tick's deadline has passed. Always true when left out. */
+  canStart?: () => boolean;
+}
+
+/**
+ * Takes this owner's oldest pending refill one step toward its final state, by exactly the reads
+ * and rules of refillIfNeeded's step 1, whether or not the owner still has an allowance recorded,
+ * so forgetting an allowance never strands a refill already sent (C38). It reads no balance and no
+ * allowance, and builds and sends nothing. 'verified' when the refill landed and moved exactly the
+ * refill; 'clear' when there was none (or no such owner), or it is now 'failed'; 'blocked' while
+ * the chain does not have it and cannot yet be shown never to; 'deferred' when `canStart` said no
+ * before a read.
+ * Throws for an owner id that is not a uuid or a clock reading that is not a date; ChainError from
+ * the reads; RefillError MISMATCH when the refill landed and moved anything but the refill.
+ */
+export async function resolvePendingRefill(args: PendingRefillArgs): Promise<'blocked' | 'verified' | 'clear' | 'deferred'> {
+  if (typeof args.ownerId !== 'string' || !UUID.test(args.ownerId)) throw new Error('the owner id is not a uuid');
+  const ownerId = args.ownerId.toLowerCase();
+  const owner = await readOwner(args.db, ownerId, false);
+  if (owner === undefined) return 'clear';
+  return resolvePending(args.db, args.chain, ownerId, partiesOf(owner, args.gasKeypair), checkedClock(args.clock), args.canStart ?? (() => true));
+}
+
 /**
  * Tops up one owner's purse from the owner's own allowance when the purse runs low, within
- * C23's bounds, with the gas wallet sponsoring the gas (C6, C7, C23, O6).
+ * C23's bounds, with the gas wallet sponsoring the gas (C6, C7, C23, O6). An owner with no
+ * allowance recorded is 'refused' with nothing read; the jobs tick brings such an owner's pending
+ * refill to its final state through resolvePendingRefill instead (C38).
  *
  * 1. A refill still pending from an earlier call is read by its stored digest first, before
  *    anything else is read or built: landed and exact is 'verified' and this call returns
@@ -444,23 +493,14 @@ export async function refillIfNeeded(args: RefillJobArgs): Promise<RefillOutcome
   if (typeof args.ownerId !== 'string' || !UUID.test(args.ownerId)) throw new Error('the owner id is not a uuid');
   if (!(args.now instanceof Date) || Number.isNaN(args.now.getTime())) throw new Error('the current time is not a date');
   const { db, chain, gasKeypair, now } = args;
-  const readClock = args.clock ?? (() => now);
-  const clock = (): Date => {
-    const at = readClock();
-    if (!(at instanceof Date) || Number.isNaN(at.getTime())) throw new Error('the current time is not a date');
-    return at;
-  };
+  const clock = checkedClock(args.clock ?? (() => now));
   const canStart = args.canStart ?? (() => true);
   const ownerId = args.ownerId.toLowerCase();
 
   const owner = await readOwner(db, ownerId, false);
   if (owner === undefined || owner.allowanceId === null) return 'refused';
   const allowanceId = owner.allowanceId;
-  const parties: Parties = {
-    purse: canonicalSuiAddress(owner.purseAddress),
-    funder: canonicalSuiAddress(owner.suiAddress),
-    gasOwner: canonicalSuiAddress(gasKeypair.toSuiAddress()),
-  };
+  const parties = partiesOf(owner, gasKeypair);
   const earlier = await resolvePending(db, chain, ownerId, parties, clock, canStart);
   if (earlier === 'deferred') return 'deferred';
   if (earlier === 'blocked') return 'skipped_pending';

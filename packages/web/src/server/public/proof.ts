@@ -20,8 +20,9 @@ export class ProofUnavailableError extends Error {
  * confirmed whose blob the jobs tick then found on chain and has not since seen Walrus stop
  * storing. The totals count those owners only. approvedByLearning counts decisions approved by
  * learned trust whose payment Ellai verified, and askedDecisions the questions asked of owners
- * the page shows, those with a verified payment or an on-chain memory, so neither grows from
- * requests that never paid.
+ * the page shows, those with a verified payment or an on-chain memory, and only questions Sui or
+ * Walrus backs: one that cites an owner answer on chain, or whose own answer is one (C37). So
+ * neither grows from requests that never paid or questions never answered on Walrus.
  * It holds no memory sentence, no purpose, no reason, no agent label and no owner or purse
  * address, so nothing an owner or an agent wrote is public. A seller host is shown only as the
  * sentences show it (hostLabel). Atomic amounts are decimal strings and times ISO strings; a
@@ -44,24 +45,41 @@ const EXPLORER_TX = 'https://suiscan.xyz/mainnet/tx/';
 // checked again on the way out because this page is where a stranger will read it.
 const BLOB_ID = /^[A-Za-z0-9_-]{1,128}$/;
 
-// Built in one place so /proof and the memory map can never disagree on which owners, payments
-// and memories a stranger may see.
+// Built in one place so /proof and the memory map can never disagree on which owners, payments,
+// memories and decisions a stranger may see.
 function publicRules(db: Database) {
   const shown = eq(owners.publicProof, true);
   const verified = eq(payments.settlement, 'verified');
   const onChain = and(eq(memories.status, 'confirmed'), isNotNull(memories.blobId), isNotNull(memories.chainConfirmedAt), isNull(memories.chainExpiredAt));
+  const ownerAnswer = and(eq(memories.kind, 'owner_decision'), onChain);
   const onPage = or(
     exists(db.select({ one: sql`1` }).from(payments).where(and(eq(payments.ownerId, owners.id), verified))),
     exists(db.select({ one: sql`1` }).from(memories).where(and(eq(memories.ownerId, owners.id), onChain))),
   );
-  return { shown, verified, onChain, onPage };
+  // C37: opting in must not let an owner put any host they like on the landing page. A decision is
+  // public only when Sui or Walrus backs it: a payment Ellai verified, a citation of an owner answer
+  // on chain, or the owner's own answer to its question on chain (the answer memory names its
+  // decision through memories.decision_id). Limit refusals, unanswered questions and unpaid grants
+  // match none of the three.
+  const backed = or(
+    exists(db.select({ one: sql`1` }).from(payments).where(and(eq(payments.decisionId, decisions.id), eq(payments.ownerId, decisions.ownerId), verified))),
+    exists(
+      db
+        .select({ one: sql`1` })
+        .from(decisionCitations)
+        .innerJoin(memories, and(eq(memories.id, decisionCitations.memoryId), eq(memories.ownerId, decisionCitations.ownerId)))
+        .where(and(eq(decisionCitations.decisionId, decisions.id), eq(decisionCitations.ownerId, decisions.ownerId), ownerAnswer)),
+    ),
+    exists(db.select({ one: sql`1` }).from(memories).where(and(eq(memories.decisionId, decisions.id), eq(memories.ownerId, decisions.ownerId), ownerAnswer))),
+  );
+  return { shown, verified, onChain, ownerAnswer, onPage, backed };
 }
 
 type PublicRules = ReturnType<typeof publicRules>;
 
 // The three totals both public reads show, from the same queries, so the landing page's numbers
 // always match /proof's.
-async function learningTotals(db: Database, { shown, verified, onChain, onPage }: PublicRules) {
+async function learningTotals(db: Database, { shown, verified, onChain, onPage, backed }: PublicRules) {
   const [answers, learned, asked] = await Promise.all([
     db
       .select({ n: count() })
@@ -78,7 +96,7 @@ async function learningTotals(db: Database, { shown, verified, onChain, onPage }
       .select({ n: count() })
       .from(decisions)
       .innerJoin(owners, eq(owners.id, decisions.ownerId))
-      .where(and(eq(decisions.outcome, 'asked'), shown, onPage)),
+      .where(and(eq(decisions.outcome, 'asked'), shown, onPage, backed)),
   ]);
   return { ownerAnswers: answers[0]?.n ?? 0, learnedApprovals: learned[0]?.n ?? 0, questionsAsked: asked[0]?.n ?? 0 };
 }
@@ -91,7 +109,8 @@ async function learningTotals(db: Database, { shown, verified, onChain, onPage }
  * (chain_confirmed_at set) and not expired there (chain_expired_at unset), newest first, by blob
  * id and kind only; and the totals, over the same owners, with an owner answer counted only while
  * it is so, a learned approval only once its payment is verified, and a question only for an owner
- * with a verified payment or an on-chain memory. A digest that is not a Sui transaction digest,
+ * with a verified payment or an on-chain memory, and only when it cites an owner answer on chain or
+ * its own answer is one (C37). A digest that is not a Sui transaction digest,
  * or a blob id that is not plain base64url, is left out rather than linked or shown.
  */
 export async function readPublicProof(db: Database): Promise<PublicProof> {
@@ -142,14 +161,17 @@ export async function readPublicProof(db: Database): Promise<PublicProof> {
 /**
  * What the landing page's memory map draws, from Ellai's own records and only for owners who
  * opted in (owners.public_proof): owner answers confirmed by Walrus Memory, found on chain and
- * not expired there, and recent decisions, each with the shown answers it cited and how close
- * recall found each one (null when the citation came from an exact lookup, or was written before
- * distances were kept). A decision's id is its place in this answer, never its database id, and
- * its digest is set only for a payment Ellai verified. The totals are /proof's: owner answers
- * on chain, learned approvals whose payment Ellai verified, and questions asked of owners the
- * page shows. It holds no memory sentence, purpose, reason, agent, owner id or address (C17,
- * C18, C19). Hosts are written as the sentences write them (hostLabel), amounts as decimal USDC
- * (formatUsdc), times as ISO strings; a memory's `at` is when Walrus Memory confirmed it.
+ * not expired there, and recent decisions Sui or Walrus backs (C37): those with a payment Ellai
+ * verified, those citing an owner answer on chain, and questions whose own answer is an owner
+ * answer on chain. Limit refusals, unanswered questions and unpaid grants are never listed. Each
+ * decision carries the shown answers it cited and how close recall found each one (null when the
+ * citation came from an exact lookup, or was written before distances were kept). A decision's id
+ * is its place in this answer, never its database id, and its digest is set only for a payment
+ * Ellai verified. The totals are /proof's: owner answers on chain, learned approvals whose payment
+ * Ellai verified, and questions asked of owners the page shows that pass the same decision rule.
+ * It holds no memory sentence, purpose, reason, agent, owner id or address (C17, C18, C19). Hosts
+ * are written as the sentences write them (hostLabel), amounts as decimal USDC (formatUsdc), times
+ * as ISO strings; a memory's `at` is when Walrus Memory confirmed it.
  */
 export interface MemoryMap {
   generatedAt: string;
@@ -178,8 +200,9 @@ function shownDistance(distance: number | null): number | null {
 /**
  * Reads the memory map from the database, at `now`: the totals' three reads, the latest
  * LIMITS.memoryMapMemories owner answers on chain (the /proof rule) by Walrus Memory's
- * confirmation time, the latest LIMITS.memoryMapDecisions decisions by creation time, both newest
- * first and kept to owners with public_proof true, then one read of those decisions' citations to
+ * confirmation time, the latest LIMITS.memoryMapDecisions decisions Sui or Walrus backs (C37) by
+ * creation time, both newest first and kept to owners with public_proof true, then one read of
+ * those decisions' citations to
  * owner answers on chain, closest first. No chain or relayer call (C22). A citation to any other
  * memory (an outcome, one not yet found on chain, one Walrus no longer stores) is left out, as is
  * a blob id that is not plain base64url or a memory whose amount is not a whole number of atomic
@@ -189,8 +212,7 @@ function shownDistance(distance: number | null): number | null {
 export async function readMemoryMap(db: Database, now: Date): Promise<MemoryMap> {
   if (!(now instanceof Date) || Number.isNaN(now.getTime())) throw new Error('The current time is not a date');
   const rules = publicRules(db);
-  const { shown, verified, onChain, onPage } = rules;
-  const ownerAnswer = and(eq(memories.kind, 'owner_decision'), onChain);
+  const { shown, verified, ownerAnswer, onPage, backed } = rules;
   const [learning, latestMemories, latestDecisions] = await Promise.all([
     learningTotals(db, rules),
     db
@@ -213,8 +235,8 @@ export async function readMemoryMap(db: Database, now: Date): Promise<MemoryMap>
       .from(decisions)
       .innerJoin(owners, eq(owners.id, decisions.ownerId))
       .leftJoin(payments, and(eq(payments.decisionId, decisions.id), eq(payments.ownerId, decisions.ownerId), verified))
-      // As on /proof: only owners with something on chain, so opting in alone cannot fill the map.
-      .where(and(shown, onPage))
+      // As on /proof: only owners with something on chain, and only decisions Sui or Walrus backs (C37).
+      .where(and(shown, onPage, backed))
       .orderBy(desc(decisions.createdAt), desc(decisions.id))
       .limit(LIMITS.memoryMapDecisions),
   ]);

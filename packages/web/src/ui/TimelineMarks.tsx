@@ -1,7 +1,7 @@
 'use client';
 
 import { motion } from 'motion/react';
-import { BADGES } from './DecisionCard.js';
+import { badgeFor } from './DecisionCard.js';
 import { formatUsdc } from './format-usdc.js';
 import { RISE_EASE } from './motion-tokens.js';
 import { formatWhen, type NodeKind, type TimelineNode } from './timeline-model.js';
@@ -29,7 +29,7 @@ function describe(node: TimelineNode): string {
 }
 
 function TipCard({ node }: { node: TimelineNode }) {
-  const badge = BADGES[node.outcome];
+  const badge = badgeFor(node.decision);
   return (
     <>
       <p className="font-mono text-[12px] leading-normal text-muted">{formatWhen(node.at)}</p>
@@ -62,7 +62,7 @@ export function WideTimeline({ nodes, shown }: { nodes: readonly TimelineNode[];
         >
           <button
             type="button"
-            aria-label={`${formatWhen(node.at)}. ${describe(node)}. ${BADGES[node.outcome].label.toLowerCase()}`}
+            aria-label={`${formatWhen(node.at)}. ${describe(node)}. ${badgeFor(node.decision).label.toLowerCase()}`}
             className="grid size-6 place-items-center rounded-full"
           >
             <span className="tl-mark">
@@ -124,7 +124,7 @@ export function NarrowTimeline({ nodes, shown, still, onReveal }: NarrowProps) {
             <span className="block text-[14px] leading-[1.35] text-muted">{formatWhen(node.at)}</span>
             <span className="block break-words text-[14px] leading-[1.35] text-fg">
               {describe(node)}
-              <span className="sr-only">. {BADGES[node.outcome].label.toLowerCase()}</span>
+              <span className="sr-only">. {badgeFor(node.decision).label.toLowerCase()}</span>
             </span>
           </li>
         ))}
