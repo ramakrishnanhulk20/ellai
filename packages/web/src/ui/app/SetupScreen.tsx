@@ -19,13 +19,12 @@ import { TextField } from './controls.js';
 import { CheckIcon } from './icons.js';
 import { ALLOWANCE_HINTS, checkAllowance, type AllowanceInput } from './limits.js';
 import { ConnectWalletButton, WrongWalletNote, useOwnerWallet } from './OwnerWallet.js';
-import { APP_KEY, usePatchOverview, useReloadOverview } from './session.js';
+import { ONBOARDING_KEY, usePatchOverview, useReloadOverview } from './session.js';
 import { Summary, Waiting } from './setup-parts.js';
 import { Button, Card, ErrorLine, PageShell, Ring, Skeleton } from './ui.js';
 import { DECLINED } from './wallet-messages.js';
 import { WalletBlock } from './WalletBlock.js';
 
-const ONBOARDING_KEY = [APP_KEY, 'onboarding'] as const;
 const POLL_MS = 5_000;
 const MAX_CHECKS = 6;
 
@@ -48,7 +47,7 @@ const STEPS: readonly StepInfo[] = [
     step: 'allowance',
     key: 'allowance',
     title: 'Set your spending allowance',
-    text: "Your USDC stays in your wallet. The allowance lets Ellai's purse draw up to your limits, and you can end it with one signature.",
+    text: "Your USDC stays in your wallet. The allowance lets Ellai's purse draw up to your limits, and you can end it with one signature in Settings.",
   },
 ];
 

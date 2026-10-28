@@ -30,8 +30,11 @@ export type OnboardingState = Overview['onboarding'];
 
 export type OnboardingStepName = 'memory_account' | 'add_delegate' | 'allowance';
 
-/** The three steps plus the optional move of USDC coins into the address balance, which records nothing and has no confirm. */
-export type BuildStepName = OnboardingStepName | 'usdc_to_address';
+/**
+ * The three steps plus two that record nothing new: the optional move of USDC coins into the address
+ * balance, which has no confirm, and ending the allowance, which is confirmed by Sui no longer showing it.
+ */
+export type BuildStepName = OnboardingStepName | 'usdc_to_address' | 'end_allowance';
 
 /** Allowance terms as the server takes them: amounts as atomic USDC text, the length in whole days. */
 export type AllowanceTerms = { dailyLimitAtomic: string; lifetimeCapAtomic: string; days: number };
@@ -250,16 +253,19 @@ export const buildOnboardingStep = (step: BuildStepName, allowance?: AllowanceTe
   });
 
 /**
- * 200 answers with `recorded` too (for the USDC move, { movedAtomic }); 202 answers with the digest
- * alone, meaning Sui has not shown the result yet.
+ * 200 answers with `recorded` too (for the USDC move, { movedAtomic }), or with `ended` when the
+ * allowance is gone; 202 answers with the digest alone, meaning Sui has not shown the result yet.
  */
 export const submitOnboardingStep = (step: BuildStepName, txBytesBase64: string, signature: string) =>
-  ownerFetch<{ recorded?: string | { movedAtomic: string }; digest: string }>('/api/owner/onboarding/submit', {
-    method: 'POST',
-    body: { step, txBytesBase64, signature },
-  });
+  ownerFetch<{ recorded?: string | { movedAtomic: string }; ended?: true; digest: string }>(
+    '/api/owner/onboarding/submit',
+    {
+      method: 'POST',
+      body: { step, txBytesBase64, signature },
+    },
+  );
 
-export const confirmOnboardingDigest = (step: OnboardingStepName, digest: string) =>
+export const confirmOnboardingDigest = (step: OnboardingStepName | 'end_allowance', digest: string) =>
   ownerFetch<{ recorded: string }>('/api/owner/onboarding/confirm', { method: 'POST', body: { step, digest } });
 
 export const confirmExistingStep = (step: 'memory_account' | 'add_delegate') =>

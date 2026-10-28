@@ -19,6 +19,7 @@ export type Verdict = 'approve' | 'refuse';
 export const APP_KEY = 'ellai';
 export const OVERVIEW_KEY = [APP_KEY, 'overview'] as const;
 export const QUESTIONS_KEY = [APP_KEY, 'questions'] as const;
+export const ONBOARDING_KEY = [APP_KEY, 'onboarding'] as const;
 
 const QUESTIONS_REFRESH_MS = 30_000;
 
