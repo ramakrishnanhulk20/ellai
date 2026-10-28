@@ -18,7 +18,7 @@ Ellai signs payments when an agent asks, on terms written by a seller it does no
 | Daily budget | Up to 5.00 USDC, default 0.50, never below the per-payment maximum | Ellai's code |
 | Smallest payment | 0.01 USDC, the minimum for a gasless send | Ellai's code |
 
-Sui holds the first three, so even a bug in Ellai cannot make the purse draw more than the allowance says. You can end the allowance. Ending it is a Sui transaction that you sign yourself, using the allowance's own revoke call. The app has no revoke button for it yet. The money already in the purse when you end the allowance stays spendable by whoever can sign for the purse, which is Ellai.
+Sui holds the first three, so even a bug in Ellai cannot make the purse draw more than the allowance says. You can end the allowance at any time from the Allowance card in Settings. Ellai builds one transaction that calls the allowance's own revoke, checks it byte for byte, and your wallet signs it. Sui deletes the allowance and refunds its storage deposit, which is more than the network fee. The money already in the purse when you end the allowance stays spendable by whoever can sign for the purse, which is Ellai.
 
 Ellai holds the rest. A plain send from the purse has no cap of its own on chain, so the 0.20 USDC float is the real ceiling on any single payment. The per-payment maximum can be set higher than the float, but a payment above what the purse holds fails with a message that the purse does not hold enough.
 
