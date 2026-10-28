@@ -1,0 +1,173 @@
+/* Styles for the /app screens that Tailwind classes cannot express. The colour tokens come from globals.css. */
+
+/* Page change: the new page fades in and rises 8px. */
+@keyframes app-enter {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.app-enter {
+  animation: app-enter 240ms cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+/* Cards enter one after another: each sets --i to its place in the list. */
+@keyframes app-rise {
+  from {
+    opacity: 0;
+    transform: translateY(16px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.app-rise {
+  animation: app-rise 480ms cubic-bezier(0.22, 1, 0.36, 1) both;
+  animation-delay: calc(var(--i, 0) * 60ms);
+}
+
+@keyframes ring-turn {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.ring-turn {
+  animation: ring-turn 60s linear infinite;
+}
+
+.ring-spin {
+  animation: ring-turn 1s linear infinite;
+}
+
+@keyframes mark-pop {
+  from {
+    transform: scale(0);
+  }
+  to {
+    transform: scale(1);
+  }
+}
+
+.mark-pop {
+  animation: mark-pop 200ms cubic-bezier(0.22, 1, 0.36, 1) both;
+  animation-delay: calc(var(--i, 0) * 30ms);
+}
+
+@keyframes save-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.3;
+  }
+}
+
+.save-pulse {
+  animation: save-pulse 1.4s ease-in-out infinite;
+}
+
+/* A thin line draws left to right under a text link on hover or focus. */
+.app-underline {
+  background-image: linear-gradient(currentColor, currentColor);
+  background-repeat: no-repeat;
+  background-position: 0 100%;
+  background-size: 0% 1px;
+  transition: background-size 200ms ease-out;
+}
+
+.app-underline:hover,
+.app-underline:focus-visible {
+  background-size: 100% 1px;
+}
+
+/* A row opens by growing from zero height. While closed, its content also leaves the tab order. */
+.app-expand {
+  display: grid;
+  grid-template-rows: 0fr;
+  transition: grid-template-rows 240ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.app-expand[data-open] {
+  grid-template-rows: 1fr;
+}
+
+.app-expand > div {
+  min-height: 0;
+  overflow: hidden;
+  visibility: hidden;
+  transition: visibility 0s linear 240ms;
+}
+
+.app-expand[data-open] > div {
+  visibility: visible;
+  transition-delay: 0s;
+}
+
+/* The More sheet on small screens slides up over a dimmed page. */
+@keyframes sheet-fade {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@keyframes sheet-up {
+  from {
+    transform: translateY(100%);
+  }
+  to {
+    transform: translateY(0);
+  }
+}
+
+.sheet-backdrop {
+  animation: sheet-fade 200ms ease-out both;
+}
+
+.sheet-panel {
+  animation: sheet-up 280ms cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+/* Bar and tab backgrounds used on small screens. */
+.app-glass {
+  background-color: rgba(8, 9, 10, 0.92);
+  -webkit-backdrop-filter: blur(12px);
+  backdrop-filter: blur(12px);
+}
+
+.app-skeleton {
+  background-color: rgba(242, 242, 238, 0.06);
+  border-radius: 8px;
+  animation: save-pulse 1.4s ease-in-out infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .app-enter,
+  .app-rise,
+  .ring-turn,
+  .ring-spin,
+  .mark-pop,
+  .save-pulse,
+  .app-skeleton,
+  .sheet-backdrop,
+  .sheet-panel {
+    animation: none;
+  }
+
+  .app-expand,
+  .app-expand > div,
+  .app-underline {
+    transition: none;
+  }
+}
