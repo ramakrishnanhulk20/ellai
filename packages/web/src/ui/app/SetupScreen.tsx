@@ -20,8 +20,10 @@ import { CheckIcon } from './icons.js';
 import { ALLOWANCE_HINTS, checkAllowance, type AllowanceInput } from './limits.js';
 import { ConnectWalletButton, WrongWalletNote, useOwnerWallet } from './OwnerWallet.js';
 import { APP_KEY, usePatchOverview, useReloadOverview } from './session.js';
+import { Summary, Waiting } from './setup-parts.js';
 import { Button, Card, ErrorLine, PageShell, Ring, Skeleton } from './ui.js';
 import { DECLINED } from './wallet-messages.js';
+import { WalletBlock } from './WalletBlock.js';
 
 const ONBOARDING_KEY = [APP_KEY, 'onboarding'] as const;
 const POLL_MS = 5_000;
@@ -75,36 +77,6 @@ function sleep(ms: number): Promise<void> {
 // digest is in hand they leave the step waiting rather than sending the owner back to build again.
 function isTransient(caught: unknown): boolean {
   return isApiError(caught) && (caught.status === 429 || caught.status === 503 || caught.code === 'network');
-}
-
-function Summary({ rows }: { rows: BuiltStep['summary'] }) {
-  return (
-    <div>
-      <p className="label-mono text-muted">WHAT YOU WILL SIGN</p>
-      <dl className="mt-2 rounded-button border border-line bg-bg px-4">
-        {rows.map((row, index) => (
-          <div
-            key={`${row.label}-${index}`}
-            className="flex flex-col gap-1 border-b border-line py-3 last:border-b-0 sm:flex-row sm:gap-4"
-          >
-            <dt className="shrink-0 text-[14px] leading-[1.5] text-muted sm:w-[160px]">{row.label}</dt>
-            <dd className="min-w-0 font-mono text-[14px] leading-[1.5] text-fg [overflow-wrap:anywhere]">{row.value}</dd>
-          </div>
-        ))}
-      </dl>
-    </div>
-  );
-}
-
-function Waiting({ children }: { children: string }) {
-  return (
-    <p role="status" className="flex items-center gap-3 text-[15px] leading-[1.5] text-fg">
-      <span className="h-4 w-4 shrink-0 text-accent">
-        <Ring stroke={2} className="ring-spin" />
-      </span>
-      {children}
-    </p>
-  );
 }
 
 function AllowanceForm({
@@ -407,7 +379,8 @@ function StepCard({
           {done ? null : (
             <>
               <p className="mt-1 text-[15px] leading-[1.5] text-muted">{info.text}</p>
-              <div className="mt-5">
+              <div className="mt-5 flex flex-col gap-5">
+                {info.step === 'allowance' && !locked ? <WalletBlock /> : null}
                 <StepFlow step={info.step} locked={locked} onFinished={onFinished} />
               </div>
             </>

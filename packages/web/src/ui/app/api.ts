@@ -30,6 +30,9 @@ export type OnboardingState = Overview['onboarding'];
 
 export type OnboardingStepName = 'memory_account' | 'add_delegate' | 'allowance';
 
+/** The three steps plus the optional move of USDC coins into the address balance, which records nothing and has no confirm. */
+export type BuildStepName = OnboardingStepName | 'usdc_to_address';
+
 /** Allowance terms as the server takes them: amounts as atomic USDC text, the length in whole days. */
 export type AllowanceTerms = { dailyLimitAtomic: string; lifetimeCapAtomic: string; days: number };
 
@@ -240,15 +243,18 @@ export const logout = () => ownerFetch<{ signedOut: true }>('/api/auth/logout', 
 
 export const fetchOnboarding = () => ownerFetch<OnboardingState>('/api/owner/onboarding');
 
-export const buildOnboardingStep = (step: OnboardingStepName, allowance?: AllowanceTerms) =>
+export const buildOnboardingStep = (step: BuildStepName, allowance?: AllowanceTerms) =>
   ownerFetch<BuiltStep>('/api/owner/onboarding/build', {
     method: 'POST',
     body: allowance === undefined ? { step } : { step, allowance },
   });
 
-/** 200 answers with `recorded` too; 202 answers with the digest alone, meaning Sui has not shown the result yet. */
-export const submitOnboardingStep = (step: OnboardingStepName, txBytesBase64: string, signature: string) =>
-  ownerFetch<{ recorded?: string; digest: string }>('/api/owner/onboarding/submit', {
+/**
+ * 200 answers with `recorded` too (for the USDC move, { movedAtomic }); 202 answers with the digest
+ * alone, meaning Sui has not shown the result yet.
+ */
+export const submitOnboardingStep = (step: BuildStepName, txBytesBase64: string, signature: string) =>
+  ownerFetch<{ recorded?: string | { movedAtomic: string }; digest: string }>('/api/owner/onboarding/submit', {
     method: 'POST',
     body: { step, txBytesBase64, signature },
   });
@@ -286,3 +292,13 @@ export const endEverySession = () =>
 
 export const runBuiltinAgent = (task: string, signal?: AbortSignal) =>
   ownerFetch<RunResult>('/api/owner/agent/run', { method: 'POST', body: { task }, signal });
+
+/** Where the owner's own USDC and SUI sit. Reading it costs a Sui call, so it is read on demand only. */
+export type WalletFunds = {
+  usdcAddressAtomic: string;
+  usdcCoinAtomic: string;
+  suiAddressMist: string;
+  suiCoinMist: string;
+};
+
+export const fetchWalletFunds = () => ownerFetch<WalletFunds>('/api/owner/onboarding/wallet');

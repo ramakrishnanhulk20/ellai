@@ -77,3 +77,10 @@ export function useNow(): number {
 export function walruscanUrl(blobId: string): string {
   return `https://walruscan.com/mainnet/blob/${encodeURIComponent(blobId)}`;
 }
+
+/** Mist (9 decimals) as SUI with three decimals, cut rather than rounded, so a total under a threshold never reads as the threshold. */
+export function mistToSui(mist: bigint): string {
+  const whole = mist / 1_000_000_000n;
+  const thousandths = (mist % 1_000_000_000n) / 1_000_000n;
+  return `${whole}.${thousandths.toString().padStart(3, '0')}`;
+}
