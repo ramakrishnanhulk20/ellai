@@ -24,8 +24,39 @@ export function Mark({ kind }: { kind: NodeKind }) {
   return <span aria-hidden="true" className={`block size-3 rounded-full ${tone}`} />;
 }
 
+const LEGEND: ReadonlyArray<{ kind: NodeKind; words: string }> = [
+  { kind: 'asked', words: 'ASKED YOU' },
+  { kind: 'learned', words: 'APPROVED ON ITS OWN' },
+  { kind: 'grant', words: 'APPROVED WITH YOUR YES' },
+  { kind: 'refused', words: 'REFUSED' },
+];
+
+/** What each mark means, one item per kind. The caller sets the layout, so wide and narrow screens share it. */
+export function MarkLegend({ className = '' }: { className?: string }) {
+  return (
+    <ul className={className}>
+      {LEGEND.map(({ kind, words }) => (
+        <li key={kind} className="label-mono inline-flex items-center gap-2 text-faint">
+          <Mark kind={kind} />
+          {words}
+        </li>
+      ))}
+    </ul>
+  );
+}
+
 function describe(node: TimelineNode): string {
   return `${formatUsdc(node.amountUsdc)} USDC to ${node.host}`;
+}
+
+/** The text colour class out of a badge tone, which also carries the border class. */
+function textToneOf(tone: string): string {
+  return tone.split(' ').find((name) => name.startsWith('text-')) ?? 'text-muted';
+}
+
+function OutcomeLine({ node }: { node: TimelineNode }) {
+  const badge = badgeFor(node.decision);
+  return <span className={`label-mono mt-1 block ${textToneOf(badge.tone)}`}>{badge.label}</span>;
 }
 
 function TipCard({ node }: { node: TimelineNode }) {
@@ -33,7 +64,9 @@ function TipCard({ node }: { node: TimelineNode }) {
   return (
     <>
       <p className="font-mono text-[12px] leading-normal text-muted">{formatWhen(node.at)}</p>
-      <p className="mt-1 break-words text-[16px] leading-[1.25] text-fg">{describe(node)}</p>
+      <p title={describe(node)} className="mt-1 truncate text-[16px] leading-[1.25] text-fg">
+        {describe(node)}
+      </p>
       <p className={`label-mono mt-3 inline-flex h-6 items-center rounded-button border px-2 ${badge.tone}`}>
         {badge.label}
       </p>
@@ -96,7 +129,7 @@ type NarrowProps = {
   onReveal: (index: number) => void;
 };
 
-/** The vertical timeline for small screens: a line, then each decision stacked 40px apart. */
+/** The vertical timeline for small screens: a line, then each decision stacked as a row with its outcome in words. */
 export function NarrowTimeline({ nodes, shown, still, onReveal }: NarrowProps) {
   return (
     <div className="relative">
@@ -122,10 +155,10 @@ export function NarrowTimeline({ nodes, shown, still, onReveal }: NarrowProps) {
               )}
             </span>
             <span className="block text-[14px] leading-[1.35] text-muted">{formatWhen(node.at)}</span>
-            <span className="block break-words text-[14px] leading-[1.35] text-fg">
+            <span title={describe(node)} className="block truncate text-[14px] leading-[1.35] text-fg">
               {describe(node)}
-              <span className="sr-only">. {badgeFor(node.decision).label.toLowerCase()}</span>
             </span>
+            <OutcomeLine node={node} />
           </li>
         ))}
       </ol>

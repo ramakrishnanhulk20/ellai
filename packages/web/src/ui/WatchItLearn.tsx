@@ -3,13 +3,14 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from 'react';
 import type { MapDecision } from './memory-map.js';
 import { gsap, refreshScrollTriggers } from './scroll-trigger.js';
-import { NarrowTimeline, WideTimeline } from './TimelineMarks.js';
+import { MarkLegend, NarrowTimeline, WideTimeline } from './TimelineMarks.js';
 import { buildTimeline, tallyThrough, timelineSignature, type Tally } from './timeline-model.js';
 import { useMediaQuery, usePrefersReducedMotion } from './useMediaQuery.js';
 import { useMemoryMap } from './useMemoryMap.js';
 
 const NO_DECISIONS: MapDecision[] = [];
 const PIN_DISTANCE = '+=220%';
+const markNote = (oldest: string) => `EVERY MARK IS A REAL PUBLIC DECISION, OLDEST ${oldest}, THE LEARNING TEST INCLUDED`;
 
 function Counter({ value, label, tone }: { value: number; label: string; tone: string }) {
   return (
@@ -31,7 +32,7 @@ function Headline({ className = '' }: { className?: string }) {
       <span className="block">
         It asks you <span className="text-accent">less</span>
       </span>
-      <span className="block">every week.</span>
+      <span className="block">as it learns.</span>
     </h2>
   );
 }
@@ -143,9 +144,10 @@ export function WatchItLearn() {
             {count > 0 ? (
               <>
                 <WideTimeline nodes={nodes} shown={shown} />
-                <p className="label-mono absolute inset-x-8 top-[calc(72%+56px)] text-center text-faint">
-                  EVERY MARK IS A REAL DECISION, OLDEST ON THE LEFT
-                </p>
+                <div className="absolute inset-x-8 top-[calc(72%+48px)] flex flex-col items-center gap-3">
+                  <MarkLegend className="flex items-center gap-6" />
+                  <p className="label-mono text-center text-faint">{markNote('ON THE LEFT')}</p>
+                </div>
               </>
             ) : (
               <div className="absolute inset-x-8 top-[72%]">{empty ? <EmptyNote /> : null}</div>
@@ -156,6 +158,8 @@ export function WatchItLearn() {
             <p className="label-mono text-muted">05 / WATCH IT LEARN</p>
             <Headline className="mt-6" />
             <Pitch className="mt-6" />
+            <MarkLegend className="mt-8 flex flex-wrap gap-x-4 gap-y-2" />
+            <p className="label-mono mt-3 text-faint">{markNote('AT THE TOP')}</p>
             <div className="relative mt-10">
               <div className="sticky top-[60px] z-10 -mx-4 grid grid-cols-2 gap-4 bg-[rgba(8,9,10,0.72)] px-4 py-3 backdrop-blur-[12px]">
                 <Counters tally={tally} />

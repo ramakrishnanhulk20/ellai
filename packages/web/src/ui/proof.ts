@@ -9,6 +9,10 @@ export type ProofPayment = {
 export type ProofMemory = {
   blobId: string;
   kind: 'owner_decision' | 'outcome';
+  /** The owner's answer on an owner_decision memory. Null on an outcome, or when the server did not say. */
+  verdict: 'approve' | 'refuse' | null;
+  /** The seller the memory is about. Null when the server did not say. */
+  host: string | null;
   confirmedAt: string;
 };
 
@@ -47,11 +51,18 @@ function parsePayment(value: unknown): ProofPayment | null {
 
 function parseMemory(value: unknown): ProofMemory | null {
   if (!isRecord(value)) return null;
-  const { blobId, kind, confirmedAt } = value;
+  const { blobId, kind, verdict, host, confirmedAt } = value;
   if (typeof blobId !== 'string' || blobId === '') return null;
   if (kind !== 'owner_decision' && kind !== 'outcome') return null;
   if (!isTime(confirmedAt)) return null;
-  return { blobId, kind, confirmedAt };
+  // A missing or odd verdict or host is not a reason to drop the row: the row is still a real memory.
+  return {
+    blobId,
+    kind,
+    verdict: verdict === 'approve' || verdict === 'refuse' ? verdict : null,
+    host: typeof host === 'string' && host !== '' ? host : null,
+    confirmedAt,
+  };
 }
 
 function parseAll<T>(entries: unknown[], parseOne: (entry: unknown) => T | null): T[] | null {

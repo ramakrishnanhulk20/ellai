@@ -7,7 +7,8 @@
 // only for owners who opted in and with totals over those owners only (a learned approval
 // counted once its payment is verified, a question only for an owner the page shows and only once
 // its own answer is on chain, C37), a seller
-// host only as the sentences write it, with no sentence,
+// host only as the sentences write it, each memory's verdict (owner answers only) and host from
+// its own columns, with no sentence,
 // purpose, label or owner address, at most 20 of each, read from the
 // database at most once per cache window however many requests come, and its last good copy
 // or a 503 when a refresh fails; and the fixed status, code and wording toErrorResponse gives
@@ -313,7 +314,7 @@ describe('POST /api/jobs/tick', () => {
 interface Proof {
   totals: Record<string, number | string>;
   payments: Array<{ digest: string; amountAtomic: string; sellerHost: string; signedAt: string; explorerUrl: string }>;
-  memories: Array<{ blobId: string; kind: string; confirmedAt: string }>;
+  memories: Array<{ blobId: string; kind: string; verdict: string | null; host: string | null; confirmedAt: string }>;
 }
 
 describe('GET /api/public/proof', () => {
@@ -482,9 +483,10 @@ describe('GET /api/public/proof', () => {
         { digest: newer, amountAtomic: '25000', sellerHost: 'hotels.example', signedAt: at(60_000).toISOString(), explorerUrl: `https://suiscan.xyz/mainnet/tx/${newer}` },
         { digest: older, amountAtomic: '10000', sellerHost: 'hotels.example', signedAt: at(120_000).toISOString(), explorerUrl: `https://suiscan.xyz/mainnet/tx/${older}` },
       ],
+      // proofMemory stores a verdict on the outcome too; only an owner answer may show one.
       memories: [
-        { blobId: outcomeBlob, kind: 'outcome', confirmedAt: at(90_000).toISOString() },
-        { blobId: answerBlob, kind: 'owner_decision', confirmedAt: at(180_000).toISOString() },
+        { blobId: outcomeBlob, kind: 'outcome', verdict: null, host: 'hotels.example', confirmedAt: at(90_000).toISOString() },
+        { blobId: answerBlob, kind: 'owner_decision', verdict: 'approve', host: 'hotels.example', confirmedAt: at(180_000).toISOString() },
       ],
     });
     for (const secret of [MARKER, w.suiAddress, w.purseAddress, w.suiAddress.slice(2), w.purseAddress.slice(2), 'The owner said', 'Book the room']) {
@@ -518,7 +520,7 @@ describe('GET /api/public/proof', () => {
     expect(await confirmBlobsOnChain({ db: proofDb.db, chain: listing([blobId]), ownerId: w.ownerId, now: new Date(nowMs) })).toEqual({ checked: 1, confirmed: 1 });
     nowMs += LIMITS.publicProofCacheMs;
     const after = await proof();
-    expect(after.body.memories).toEqual([{ blobId, kind: 'owner_decision', confirmedAt: confirmedAt.toISOString() }]);
+    expect(after.body.memories).toEqual([{ blobId, kind: 'owner_decision', verdict: 'approve', host: 'hotels.example', confirmedAt: confirmedAt.toISOString() }]);
     expect(after.body.totals.confirmedOwnerAnswers).toBe(1);
   });
 
@@ -538,7 +540,7 @@ describe('GET /api/public/proof', () => {
     expect(await confirmBlobsOnChain({ db: proofDb.db, chain: listing(45), ownerId: w.ownerId, now: new Date(nowMs) })).toEqual({ checked: 1, confirmed: 1 });
     nowMs += LIMITS.publicProofCacheMs;
     const stored = await proof();
-    expect([stored.body.memories, stored.body.totals.confirmedOwnerAnswers]).toEqual([[{ blobId, kind: 'owner_decision', confirmedAt: confirmedAt.toISOString() }], 1]);
+    expect([stored.body.memories, stored.body.totals.confirmedOwnerAnswers]).toEqual([[{ blobId, kind: 'owner_decision', verdict: 'approve', host: 'hotels.example', confirmedAt: confirmedAt.toISOString() }], 1]);
 
     expect(await expireBlobsOnChain({ db: proofDb.db, chain: listing(53), ownerId: w.ownerId, now: new Date(nowMs) })).toEqual({ expired: 0 });
     expect(await expireBlobsOnChain({ db: proofDb.db, chain: listing(54), ownerId: w.ownerId, now: new Date(nowMs) })).toEqual({ expired: 1 });

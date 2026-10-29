@@ -10,9 +10,10 @@ export type ActiveReplay = {
 };
 
 /**
- * Walks the real decisions, newest first and looping, one every `seconds`. The decision is
- * picked when its turn starts, so a refresh that adds new decisions cannot swap the one
- * already on screen.
+ * Walks the real decisions, looping, one every `seconds`. Decisions with a verified payment
+ * come first, newest first, then the rest, newest first, so the first card after load is a
+ * real payment. The decision is picked when its turn starts, so a refresh that adds new
+ * decisions cannot swap the one already on screen.
  */
 export function useDecisionCycle(
   decisions: MapDecision[],
@@ -20,13 +21,13 @@ export function useDecisionCycle(
   enabled: boolean,
 ): ActiveReplay | null {
   const [active, setActive] = useState<ActiveReplay | null>(null);
-  const newestFirst = useMemo(
-    () => [...decisions].sort((a, b) => Date.parse(b.at) - Date.parse(a.at)),
-    [decisions],
-  );
-  const latest = useRef(newestFirst);
-  latest.current = newestFirst;
-  const hasDecisions = enabled && newestFirst.length > 0;
+  const ordered = useMemo(() => {
+    const newestFirst = [...decisions].sort((a, b) => Date.parse(b.at) - Date.parse(a.at));
+    return [...newestFirst.filter((decision) => decision.digest), ...newestFirst.filter((decision) => !decision.digest)];
+  }, [decisions]);
+  const latest = useRef(ordered);
+  latest.current = ordered;
+  const hasDecisions = enabled && ordered.length > 0;
 
   useEffect(() => {
     if (!hasDecisions) {

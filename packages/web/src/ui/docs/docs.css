@@ -153,6 +153,12 @@ body:has(.ellai-docs)::after {
   border-color: var(--line);
 }
 
+/* A link made of inline code keeps the link's colour and underline. */
+.ellai-docs .prose a > code {
+  color: inherit;
+  text-decoration: inherit;
+}
+
 /* Code blocks */
 .ellai-docs figure.shiki {
   margin: 24px 0;

@@ -102,7 +102,7 @@ sequenceDiagram
   E->>M: outcome memory (only ever makes later decisions stricter)
 ```
 
-The labels like C1 and C11 point to numbered rules in the [threat model](https://github.com/ramakrishnanhulk20/ellai/blob/main/docs/security/threat-model.md). The [Security](/docs/security) page explains the ones that matter most.
+The labels in brackets in the diagram, such as (C8), point to numbered rules in the [threat model](https://github.com/ramakrishnanhulk20/ellai/blob/main/docs/security/threat-model.md). The [Security](/docs/security) page explains the ones that matter most.
 
 ## The decision rules, in order
 
@@ -141,7 +141,7 @@ Only your own answers count as approval. A memory counts only when Ellai's recor
 ## The money flow
 
 1. You issue an allowance. In one transaction you let your Ellai purse draw USDC from your own address balance: a total cap, a daily limit and an end date. Your USDC does not move yet.
-2. The purse is refilled in small steps. A background job runs every 10 minutes. When the purse holds less than 0.05 USDC, and fewer than 3 refills happened in the last 24 hours, Ellai pulls exactly 0.10 USDC through your allowance. The purse never holds more than 0.20 USDC right after a refill. Ellai first rehearses the refill with a dry run and sends it only if it moves exactly that amount. Ellai's own gas wallet pays the network fee, at most 0.02 SUI per refill.
+2. The purse is refilled in small steps. Ellai checks it right after your own actions and your agent's payments, and a scheduled job checks again later. When the purse holds less than 0.05 USDC, and fewer than 3 refills happened in the last 24 hours, Ellai pulls exactly 0.10 USDC through your allowance. The purse never holds more than 0.20 USDC right after a refill. Ellai first rehearses the refill with a dry run and sends it only if it moves exactly that amount. Ellai's own gas wallet pays the network fee, at most 0.02 SUI per refill.
 3. A payment is a plain gasless USDC send from the purse to the seller. The purse needs no SUI. The smallest payment is 0.01 USDC. Before signing, Ellai decodes the transaction and checks that it is that plain send and nothing more: no extra commands, no other recipient, no other coin.
 4. Tatum reads it back. Ellai computes the transaction digest from the bytes it signed, then reads that digest through Tatum. The payment is "verified" only when the effects show success, a debit of the agreed amount from your purse, and a credit of the agreed amount to the agreed recipient in USDC. If the numbers do not match, or Ellai cannot confirm in time, automatic payments pause for you until you review.
 
@@ -155,7 +155,7 @@ A payment record shows one of four settlement states: pending (not yet seen on c
 
 Two kinds of memory exist.
 
-1. Your answers. The moment you answer a question, Ellai records it. A refusal binds at once, even before the memory reaches Walrus. A background job then writes the sentence to your Walrus Memory account. That job runs every 10 minutes. After Walrus Memory confirms the write and the search index has caught up, the answer can count toward learned approval. Later the job finds the memory's blob on chain, and only then can it appear on the public proof page, if you turned that on.
+1. Your answers. The moment you answer a question, Ellai records it. A refusal binds at once, even before the memory reaches Walrus. Right after you answer, Ellai writes the sentence to your Walrus Memory account, usually within a minute. A scheduled job retries anything that did not go through. After Walrus Memory confirms the write and the search index has caught up, the answer can count toward learned approval. Later the job finds the memory's blob on chain, and only then can it appear on the public proof page, if you turned that on.
 2. Outcomes, only when something goes wrong. If a payment is verified on chain but the seller returned nothing, Ellai writes an outcome memory. A normal delivered payment writes no memory, since it is already on chain and in Ellai's records. This keeps outcomes from crowding your own answers out of the search.
 
 A memory sentence has this shape. The quoted purpose and reason are cleaned of quote marks and control characters, and the purpose is cut to 200 characters.

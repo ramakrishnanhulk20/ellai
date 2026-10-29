@@ -7,7 +7,7 @@ Ellai's claim is that it learns from your yes and no answers and then asks you l
 
 ## The method
 
-Before the test ran, 24 requests were written down, each with an approve or refuse label, and Ram, who built Ellai, read and accepted every label. The labels are in `LABELS.md` at the repo root. The requests come in two phases of 12.
+Before the test ran, 24 requests were written down, each with an approve or refuse label, and Ram, who built Ellai, read and accepted every label. The labels are in [LABELS.md](https://github.com/ramakrishnanhulk20/ellai/blob/main/LABELS.md) at the repo root. The requests come in two phases of 12.
 
 1. The Learn phase. Ellai sees 12 requests one by one. When it asks, the label is submitted as the owner's answer through the same answer code the app uses. Eight of the 12 were asked and answered. Those 8 answers were written to the test owner's Walrus Memory account with Ellai's delegate key, and all 8 were confirmed after 46 seconds of waiting, plus 90 seconds for the search index. The other 4 were hotel requests. Ellai approved them on its own, because two earlier real approvals for that seller already sat in the account.
 2. The Test phase. Ellai decides the other 12 requests alone, with no questions. The phase began at least 11 minutes after the last answer, when every one-time grant had expired, so a grant could not approve anything. Any approval had to come from learned trust.
@@ -70,7 +70,7 @@ The owner for these is Ellai's test owner [0xaa4a4767...0e9](https://suiscan.xyz
 
 ## The honest notes
 
-Rows 18, 22 and 24 had a written prediction in `LABELS.md`. Two came true and one did not.
+Rows 18, 22 and 24 had a written prediction in [LABELS.md](https://github.com/ramakrishnanhulk20/ellai/blob/main/LABELS.md). Two came true and one did not.
 
 - Row 18 was predicted to be refused on the per-payment limit alone, since 0.25 USDC is over the 0.05 USDC default. It was: "This payment of 0.250000 USDC is over your limit of 0.050000 USDC per payment."
 - Row 24 was predicted to be refused without asking, because the refusal in row 10 wins. It was: "You refused payments to piptradedex.xyz before."

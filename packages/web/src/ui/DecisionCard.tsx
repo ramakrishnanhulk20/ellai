@@ -34,7 +34,7 @@ export function reasonFor(decision: MapDecision): string | null {
         citation.distance === null ? [] : [citation.distance],
       );
       const base = `Matched ${matched} of your past answers`;
-      return distances.length > 0 ? `${base}, closest ${Math.min(...distances).toFixed(2)}` : base;
+      return distances.length > 0 ? `${base}. Closest: ${Math.min(...distances).toFixed(2)} (0 is an exact match)` : base;
     }
     case 'grant':
       return decision.digest ? 'Paid with the yes you gave' : 'Approved with the yes you gave';
@@ -65,8 +65,11 @@ function CardBody({ decision }: { decision: MapDecision }) {
   return (
     <>
       <p className="label-mono text-muted">AGENT WANTS TO PAY</p>
-      <p className="mt-2 break-words text-[20px] leading-[1.25] text-fg">
-        {formatUsdc(decision.amountUsdc)} USDC to {decision.host}
+      <p className="mt-2 text-[20px] leading-[1.25] text-fg">
+        {formatUsdc(decision.amountUsdc)} USDC to
+        <span title={decision.host} className="block truncate text-[20px] leading-[1.25] text-fg">
+          {decision.host}
+        </span>
       </p>
       <p
         className={`label-mono mt-3 inline-flex h-6 items-center rounded-button border px-2 ${badge.tone}`}
@@ -90,15 +93,19 @@ function CardBody({ decision }: { decision: MapDecision }) {
   );
 }
 
-/** Shows the decision the scene is replaying. Content cross-fades when the decision changes. */
+/**
+ * Shows the decision the scene is replaying. Content cross-fades when the decision changes. The
+ * box is as tall as the tallest card (a paid one with a two-line reason and the Sui link), so it
+ * never changes height between decisions.
+ */
 export function DecisionCard({ decision, className = '' }: { decision: MapDecision | null; className?: string }) {
   const reduced = usePrefersReducedMotion();
   if (!decision) return null;
   return (
     <div
-      className={`relative rounded-card border border-line bg-[rgba(8,9,10,0.72)] p-4 backdrop-blur-[12px] ${className}`}
+      className={`relative min-h-[236px] rounded-card border border-line bg-[rgba(8,9,10,0.72)] p-4 backdrop-blur-[12px] ${className}`}
     >
-      <AnimatePresence mode="popLayout">
+      <AnimatePresence mode="wait">
         <motion.div
           key={decision.id}
           initial={{ opacity: 0, y: reduced ? 0 : 8 }}

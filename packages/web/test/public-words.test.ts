@@ -1,10 +1,20 @@
 // Covers: the words and colours a public decision wears. "Paid" only with a digest, the cause
 // only from the rule, a reason line for every rule the server writes, the landing page's second
-// counter counting only learned approvals, and the hero picking its example only from approvals
-// with a verified payment, a learned one before any other rule.
+// counter counting only learned approvals, the hero picking its example only from approvals
+// with a verified payment, a learned one before any other rule, and the seller host /proof and
+// the memory map both write, on PGlite: the learning test's stand-in host by name, any host
+// outside plain DNS as "this seller", and no host for a memory that names none.
 // Does NOT cover: how the components lay these words out, or what the server writes into a
-// decision (memory-map.test.ts and decide.test.ts).
-import { describe, expect, it } from 'vitest';
+// decision (memory-map.test.ts and decide.test.ts), or which rows the public reads list
+// (routes-public.test.ts and memory-map.test.ts).
+import { randomBytes } from 'node:crypto';
+import { canonicalSuiAddress } from '@ellai/core/keys';
+import { USDC_TYPE_MAINNET } from '@ellai/core/usdc';
+import { toBase58 } from '@mysten/sui/utils';
+import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { createDb, migrate } from '../src/server/db/client.js';
+import { agents, decisions, memories, owners, payments } from '../src/server/db/schema.js';
+import { readMemoryMap, readPublicProof } from '../src/server/public/proof.js';
 import { badgeFor, reasonFor } from '../src/ui/DecisionCard.js';
 import { exampleSignature, pickExample } from '../src/ui/decide-model.js';
 import type { MapDecision } from '../src/ui/memory-map.js';
@@ -64,7 +74,7 @@ describe('reasonFor', () => {
       { blobId: 'b', distance: 0.118 },
       { blobId: 'c', distance: null },
     ];
-    expect(reasonFor(decision({ citations }))).toBe('Matched 3 of your past answers, closest 0.12');
+    expect(reasonFor(decision({ citations }))).toBe('Matched 3 of your past answers. Closest: 0.12 (0 is an exact match)');
     expect(reasonFor(decision({ citations: [{ blobId: 'a', distance: null }] }))).toBe('Matched 1 of your past answers');
     expect(reasonFor(decision())).toBe('Matched your past answers');
   });
@@ -193,5 +203,111 @@ describe('pickExample', () => {
     expect(exampleSignature(pickExample([decision({ digest: 'another' })]))).not.toBe(base);
     expect(exampleSignature(pickExample([decision({ rule: 'grant', digest: DIGEST })]))).not.toBe(base);
     expect(exampleSignature(pickExample([decision()]))).toBe('none');
+  });
+});
+
+describe('the seller host on both public reads', () => {
+  const STAND_IN = 'Ellai wallet check (learning test)';
+  const RECIPIENT = canonicalSuiAddress(`0x${'11'.repeat(32)}`);
+  const hex = (bytes: number) => randomBytes(bytes).toString('hex');
+  const now = new Date('2031-01-01T10:00:00.000Z');
+  const at = (msAgo: number) => new Date(now.getTime() - msAgo);
+  let handle: Awaited<ReturnType<typeof createDb>>;
+
+  beforeAll(async () => {
+    handle = await createDb('pglite:memory');
+    await migrate(handle.db);
+  });
+
+  afterAll(async () => {
+    await handle.close();
+  });
+
+  it('names the learning test stand-in on /proof and the map, writes a host outside plain DNS as this seller, and none for a memory that names none', async () => {
+    const purseAddress = canonicalSuiAddress(`0x${hex(32)}`);
+    const [owner] = await handle.db
+      .insert(owners)
+      .values({ suiAddress: canonicalSuiAddress(`0x${hex(32)}`), purseAddress, publicProof: true })
+      .returning({ id: owners.id });
+    const ownerId = owner?.id ?? '';
+    const [agent] = await handle.db
+      .insert(agents)
+      .values({ ownerId, label: 'Learning test agent', kind: 'external', tokenHash: hex(32), tokenPrefix: 'ellai_agent_' })
+      .returning({ id: agents.id });
+
+    const stored = (blobId: string, kind: 'owner_decision' | 'outcome', sellerHost: string | null, msAgo: number) =>
+      handle.db.insert(memories).values({
+        ownerId,
+        kind,
+        recipient: RECIPIENT,
+        amountAtomic: 10_000n,
+        verdict: kind === 'owner_decision' ? 'approve' : null,
+        sellerHost,
+        sentence: 'The owner said yes.',
+        namespace: 'ellai-v1',
+        writerPublicKey: hex(32),
+        blobId,
+        status: 'confirmed',
+        confirmedAt: at(msAgo),
+        chainConfirmedAt: at(msAgo),
+      });
+    const paid = async (sellerHost: string, msAgo: number) => {
+      const [row] = await handle.db
+        .insert(decisions)
+        .values({
+          ownerId,
+          agentId: agent?.id ?? '',
+          requestKey: hex(16),
+          sellerUrl: `https://${sellerHost}/api/sell/wallet-check`,
+          sellerMethod: 'POST',
+          sellerHost,
+          bodyHash: hex(32),
+          purpose: 'Check a wallet',
+          recipient: RECIPIENT,
+          amountAtomic: 10_000n,
+          asset: USDC_TYPE_MAINNET,
+          network: 'sui:mainnet',
+          expiresAt: at(-60_000),
+          outcome: 'approved',
+          rule: 'grant',
+          reason: 'You said yes.',
+          status: 'paid',
+          createdAt: at(msAgo),
+        })
+        .returning({ id: decisions.id });
+      await handle.db.insert(payments).values({
+        decisionId: row?.id ?? '',
+        ownerId,
+        purseAddress,
+        recipient: RECIPIENT,
+        amountAtomic: 10_000n,
+        digest: toBase58(randomBytes(32)),
+        txBytesBase64: 'AA==',
+        signedAt: at(msAgo),
+        validUntilEpoch: 1n,
+        settlement: 'verified',
+      });
+    };
+
+    await stored('stand-in-answer', 'owner_decision', 'ellai.invalid', 300_000);
+    await stored('odd-host-answer', 'owner_decision', 'evil"host.example', 200_000);
+    await stored('no-host-outcome', 'outcome', null, 100_000);
+    await paid('ellai.invalid', 60_000);
+    await paid('evil"host.example', 30_000);
+
+    const proof = await readPublicProof(handle.db);
+    expect(proof.memories.map((row) => [row.blobId, row.host])).toEqual([
+      ['no-host-outcome', null],
+      ['odd-host-answer', 'this seller'],
+      ['stand-in-answer', STAND_IN],
+    ]);
+    expect(proof.payments.map((row) => row.sellerHost)).toEqual(['this seller', STAND_IN]);
+
+    const map = await readMemoryMap(handle.db, now);
+    expect(map.memories.map((row) => [row.blobId, row.host])).toEqual([
+      ['odd-host-answer', 'this seller'],
+      ['stand-in-answer', STAND_IN],
+    ]);
+    expect(map.decisions.map((row) => row.host)).toEqual(['this seller', STAND_IN]);
   });
 });

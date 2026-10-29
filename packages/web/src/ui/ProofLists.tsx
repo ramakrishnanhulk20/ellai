@@ -35,7 +35,9 @@ function Row({
   return (
     <li className="proof-row relative -mx-3 flex min-h-14 items-center justify-between gap-4 border-b border-line px-3 py-2 last:border-b-0">
       <div className="min-w-0">
-        <p className="break-words text-[15px] leading-[1.3] text-fg">{title}</p>
+        <p title={title} className="truncate text-[15px] leading-[1.3] text-fg">
+          {title}
+        </p>
         <p className="text-[13px] leading-[1.3] text-muted">{when}</p>
       </div>
       <a
@@ -65,8 +67,18 @@ function PaymentRow({ payment, now }: { payment: ProofPayment; now: number }) {
   );
 }
 
+/** The words for a memory row: the answer and the seller when the server says them, the plain kind otherwise. */
+function memoryTitle(memory: ProofMemory): string {
+  if (memory.kind === 'owner_decision') {
+    if (memory.host && memory.verdict === 'approve') return `Yes to ${memory.host}`;
+    if (memory.host && memory.verdict === 'refuse') return `No to ${memory.host}`;
+    return 'Owner answer';
+  }
+  return memory.host ? `Outcome for ${memory.host}` : 'Outcome';
+}
+
 function MemoryRow({ memory, now }: { memory: ProofMemory; now: number }) {
-  const kind = memory.kind === 'owner_decision' ? 'Owner answer' : 'Outcome';
+  const kind = memoryTitle(memory);
   return (
     <Row
       title={kind}
@@ -91,7 +103,7 @@ function Card({
   children: ReactNode;
 }) {
   return (
-    <section aria-label={title} className="rounded-[16px] border border-line bg-panel p-6">
+    <section aria-label={title} className="min-w-0 rounded-[16px] border border-line bg-panel p-6">
       <div className="flex items-baseline justify-between gap-4">
         <h3 className="text-[16px] font-medium text-fg">{title}</h3>
         <p className="label-mono text-muted">{count}</p>

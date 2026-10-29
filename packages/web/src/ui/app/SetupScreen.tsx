@@ -399,7 +399,7 @@ function ReadyCard() {
       </div>
       <h2 className="mt-5 font-display text-[28px] font-medium leading-[1.2] text-fg">Ellai is ready.</h2>
       <p className="mt-2 max-w-[520px] text-[15px] leading-[1.5] text-muted">
-        Your purse is topped up within about ten minutes. Then give your agent a key, or try the built-in agent.
+        Ellai tops up your purse right after, usually within a minute or two. Then give your agent a key, or try the built-in agent.
       </p>
       <div className="mt-6 flex flex-wrap gap-3">
         <ButtonLink href="/app/agents" variant="primary" size="lg">

@@ -14,7 +14,7 @@ export function TopBar() {
       <nav className="flex items-center gap-2">
         <a
           href="/docs"
-          className="label-mono hidden h-10 items-center rounded-button border border-line px-4 text-fg transition-[border-color,background-color] duration-[160ms] ease-out hover:border-fg hover:bg-[rgba(242,242,238,0.06)] md:inline-flex"
+          className="label-mono inline-flex h-10 items-center rounded-button border border-line px-3 text-fg transition-[border-color,background-color] duration-[160ms] ease-out hover:border-fg hover:bg-[rgba(242,242,238,0.06)] md:px-4"
         >
           Docs
         </a>

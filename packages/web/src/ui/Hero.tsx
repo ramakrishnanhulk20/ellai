@@ -33,7 +33,11 @@ function useSceneComponent(): ComponentType<SceneProps> | null {
   return Scene;
 }
 
-/** The first screen: the scene panel, the marker row, and on small screens the pitch and the card. */
+/**
+ * The first screen: the scene panel, the marker row, and on small screens the card and the pitch.
+ * The order is set with CSS so the server render already has it: below 768px the card sits right
+ * under the panel and the marker row comes last.
+ */
 export function Hero() {
   const state = useMemoryMap();
   const reduced = usePrefersReducedMotion();
@@ -53,10 +57,10 @@ export function Hero() {
   const card = active?.decision ?? null;
 
   return (
-    <div className="pt-[72px] md:pt-[120px]">
+    <div className="flex flex-col pt-[72px] md:pt-[120px]">
       <div
         ref={panel}
-        className="enter-reveal relative mx-4 h-[max(68svh,420px)] overflow-hidden rounded-panel border border-line bg-panel md:mx-8 md:h-[calc(100svh-120px-56px)]"
+        className="enter-reveal relative order-1 mx-4 h-[max(52svh,340px)] overflow-hidden rounded-panel border border-line bg-panel md:mx-8 md:h-[calc(100svh-120px-56px)]"
       >
         <div aria-hidden="true" className="panel-light pointer-events-none absolute inset-0" />
         <ParallaxLayer disabled={reduced}>
@@ -84,13 +88,16 @@ export function Hero() {
         </div>
       </div>
 
-      <MarkerRow />
+      <div className="order-2 px-4 pt-4 md:hidden">
+        <DecisionCard decision={card} />
+      </div>
 
-      <div className="px-4 md:px-8 lg:hidden">
+      <div className="order-3 px-4 md:px-8 lg:hidden">
         <Statement className="pt-6 text-[20px] leading-[1.25] text-fg" />
       </div>
-      <div className="px-4 pt-8 md:hidden">
-        <DecisionCard decision={card} />
+
+      <div className="order-4 md:order-2">
+        <MarkerRow />
       </div>
     </div>
   );

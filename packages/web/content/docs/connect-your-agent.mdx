@@ -12,10 +12,10 @@ Create the key in the app on the Agents page. See [Getting started](/docs/gettin
 
 ## Claude Code
 
-In the command, replace `<origin>` with the address of this site, and `YOUR_AGENT_KEY` with the key you copied.
+In the command, replace `YOUR_AGENT_KEY` with the key you copied.
 
 ```bash
-claude mcp add --transport http ellai <origin>/api/mcp --header "Authorization: Bearer YOUR_AGENT_KEY"
+claude mcp add --transport http ellai https://ellai-pay.vercel.app/api/mcp --header "Authorization: Bearer YOUR_AGENT_KEY"
 ```
 
 The key dialog in the app builds this command for you, with your site address and your key already in place.
@@ -29,7 +29,7 @@ Use a client that supports remote HTTP servers and custom headers.
   "mcpServers": {
     "ellai": {
       "type": "http",
-      "url": "<origin>/api/mcp",
+      "url": "https://ellai-pay.vercel.app/api/mcp",
       "headers": { "Authorization": "Bearer YOUR_AGENT_KEY" }
     }
   }
@@ -122,7 +122,7 @@ When the owner approves, Ellai writes a one-time grant. It allows one payment fo
 The same as `paid_fetch`. Send `Content-Type: application/json` and a body with the same five fields: `url`, `method`, `body`, `contentType`, `purpose`. A refusal or a question for the owner is still a 200, because `outcome` says what Ellai did. The response has the fields shown for `paid_fetch`.
 
 ```bash
-curl -X POST <origin>/api/agent/fetch \
+curl -X POST https://ellai-pay.vercel.app/api/agent/fetch \
   -H "Authorization: Bearer YOUR_AGENT_KEY" \
   -H "Content-Type: application/json" \
   -d '{"url":"https://seller.example/api","method":"GET","purpose":"Find a hotel in Lisbon under 120 euros"}'

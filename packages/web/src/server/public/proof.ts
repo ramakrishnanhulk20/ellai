@@ -26,8 +26,8 @@ export class ProofUnavailableError extends Error {
  * about that host on Walrus.
  * It holds no memory sentence, no purpose, no reason, no agent label and no owner or purse
  * address, so nothing an owner or an agent wrote is public. A seller host is shown only as the
- * sentences show it (hostLabel). Atomic amounts are decimal strings and times ISO strings; a
- * memory's confirmedAt is when Walrus Memory confirmed it.
+ * sentences show it, or as the learning test's stand-in by name (publicHost). Atomic amounts are
+ * decimal strings and times ISO strings; a memory's confirmedAt is when Walrus Memory confirmed it.
  */
 export interface PublicProof {
   totals: {
@@ -38,13 +38,19 @@ export interface PublicProof {
     askedDecisions: number;
   };
   payments: Array<{ digest: string; amountAtomic: string; sellerHost: string; signedAt: string; explorerUrl: string }>;
-  memories: Array<{ blobId: string; kind: (typeof MEMORY_KINDS)[number]; confirmedAt: string }>;
+  memories: Array<{ blobId: string; kind: (typeof MEMORY_KINDS)[number]; verdict: (typeof VERDICTS)[number] | null; host: string | null; confirmedAt: string }>;
 }
 
 const EXPLORER_TX = 'https://suiscan.xyz/mainnet/tx/';
 // The shape core's memory client already demands of every blob id it accepts from the relayer,
 // checked again on the way out because this page is where a stranger will read it.
 const BLOB_ID = /^[A-Za-z0-9_-]{1,128}$/;
+const PUBLIC_STAND_IN_LABEL = 'Ellai wallet check (learning test)';
+
+// The learning test reached Ellai's own wallet-check seller under ellai.invalid (docs/learning-results), and .invalid is a reserved name no real seller can use.
+function publicHost(host: string): string {
+  return host === 'ellai.invalid' ? PUBLIC_STAND_IN_LABEL : hostLabel(host);
+}
 
 // Built in one place so /proof and the memory map can never disagree on which owners, payments,
 // memories and decisions a stranger may see.
@@ -109,14 +115,17 @@ async function learningTotals(db: Database, { shown, verified, onChain, onPage, 
 /**
  * Reads the public proof from the database: six reads, no chain call, each joined to its
  * owner and kept to owners with public_proof true. The latest LIMITS.publicProofLatest verified
- * payments, newest first, each with its explorer link and its seller host through hostLabel; the
+ * payments, newest first, each with its explorer link and its seller host through publicHost; the
  * latest LIMITS.publicProofLatest memories confirmed by Walrus Memory, found on chain
  * (chain_confirmed_at set) and not expired there (chain_expired_at unset), newest first, by blob
- * id and kind only; and the totals, over the same owners, with an owner answer counted only while
- * it is so, a learned approval only once its payment is verified, and a question only for an owner
- * with a verified payment or an on-chain memory, and only when it cites an owner answer on chain
- * given about its own host or its own answer is one (C37). A digest that is not a Sui transaction
- * digest, or a blob id that is not plain base64url, is left out rather than linked or shown.
+ * id, kind, verdict and host; and the totals, over the same owners, with an owner answer counted
+ * only while it is so, a learned approval only once its payment is verified, and a question only
+ * for an owner with a verified payment or an on-chain memory, and only when it cites an owner
+ * answer on chain given about its own host or its own answer is one (C37). A memory's verdict and host come from
+ * its own columns alone (C37): the verdict only for an owner answer and only when it is exactly
+ * approve or refuse, else null, and the host through publicHost, or null when it names none. A
+ * digest that is not a Sui transaction digest, or a blob id that is not plain base64url, is left
+ * out rather than linked or shown.
  */
 export async function readPublicProof(db: Database): Promise<PublicProof> {
   const rules = publicRules(db);
@@ -137,7 +146,7 @@ export async function readPublicProof(db: Database): Promise<PublicProof> {
       .orderBy(desc(payments.signedAt), desc(payments.id))
       .limit(LIMITS.publicProofLatest),
     db
-      .select({ blobId: memories.blobId, kind: memories.kind, confirmedAt: memories.confirmedAt })
+      .select({ blobId: memories.blobId, kind: memories.kind, verdict: memories.verdict, sellerHost: memories.sellerHost, confirmedAt: memories.confirmedAt })
       .from(memories)
       .innerJoin(owners, eq(owners.id, memories.ownerId))
       .where(and(onChain, isNotNull(memories.confirmedAt), shown))
@@ -154,11 +163,21 @@ export async function readPublicProof(db: Database): Promise<PublicProof> {
     },
     payments: latestPayments.flatMap((row) =>
       isValidTransactionDigest(row.digest)
-        ? [{ digest: row.digest, amountAtomic: row.amountAtomic.toString(10), sellerHost: hostLabel(row.sellerHost), signedAt: row.signedAt.toISOString(), explorerUrl: `${EXPLORER_TX}${row.digest}` }]
+        ? [{ digest: row.digest, amountAtomic: row.amountAtomic.toString(10), sellerHost: publicHost(row.sellerHost), signedAt: row.signedAt.toISOString(), explorerUrl: `${EXPLORER_TX}${row.digest}` }]
         : [],
     ),
     memories: latestMemories.flatMap((row) =>
-      row.blobId !== null && BLOB_ID.test(row.blobId) && row.confirmedAt !== null ? [{ blobId: row.blobId, kind: row.kind, confirmedAt: row.confirmedAt.toISOString() }] : [],
+      row.blobId !== null && BLOB_ID.test(row.blobId) && row.confirmedAt !== null
+        ? [
+            {
+              blobId: row.blobId,
+              kind: row.kind,
+              verdict: row.kind === 'owner_decision' && (row.verdict === 'approve' || row.verdict === 'refuse') ? row.verdict : null,
+              host: typeof row.sellerHost === 'string' && row.sellerHost !== '' ? publicHost(row.sellerHost) : null,
+              confirmedAt: row.confirmedAt.toISOString(),
+            },
+          ]
+        : [],
     ),
   };
 }
@@ -176,7 +195,7 @@ export async function readPublicProof(db: Database): Promise<PublicProof> {
  * Ellai verified. The totals are /proof's: owner answers on chain, learned approvals whose payment
  * Ellai verified, and questions asked of owners the page shows that pass the same decision rule.
  * It holds no memory sentence, purpose, reason, agent, owner id or address (C17, C18, C19). Hosts
- * are written as the sentences write them (hostLabel), amounts as decimal USDC (formatUsdc), times
+ * are written as /proof writes them (publicHost), amounts as decimal USDC (formatUsdc), times
  * as ISO strings; a memory's `at` is when Walrus Memory confirmed it.
  */
 export interface MemoryMap {
@@ -272,7 +291,7 @@ export async function readMemoryMap(db: Database, now: Date): Promise<MemoryMap>
     generatedAt: now.toISOString(),
     memories: latestMemories.flatMap((row) =>
       row.blobId !== null && BLOB_ID.test(row.blobId) && row.verdict !== null && row.amountAtomic !== null && row.amountAtomic >= 0n && row.confirmedAt !== null
-        ? [{ blobId: row.blobId, verdict: row.verdict, host: hostLabel(row.sellerHost ?? ''), amountUsdc: formatUsdc(row.amountAtomic), at: row.confirmedAt.toISOString() }]
+        ? [{ blobId: row.blobId, verdict: row.verdict, host: publicHost(row.sellerHost ?? ''), amountUsdc: formatUsdc(row.amountAtomic), at: row.confirmedAt.toISOString() }]
         : [],
     ),
     decisions: latestDecisions.map((row, index) => ({
@@ -280,7 +299,7 @@ export async function readMemoryMap(db: Database, now: Date): Promise<MemoryMap>
       at: row.createdAt.toISOString(),
       outcome: row.outcome,
       rule: row.rule,
-      host: hostLabel(row.sellerHost),
+      host: publicHost(row.sellerHost),
       amountUsdc: formatUsdc(row.amountAtomic),
       digest: row.digest !== null && isValidTransactionDigest(row.digest) ? row.digest : null,
       citations: citations.get(row.id) ?? [],

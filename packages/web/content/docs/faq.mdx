@@ -43,10 +43,10 @@ When a payment is verified on chain but the seller returned nothing, Ellai write
 Yes. Create an agent key in the app, then run:
 
 ```bash
-claude mcp add --transport http ellai <origin>/api/mcp --header "Authorization: Bearer YOUR_AGENT_KEY"
+claude mcp add --transport http ellai https://ellai-pay.vercel.app/api/mcp --header "Authorization: Bearer YOUR_AGENT_KEY"
 ```
 
-Replace `<origin>` with this site's address and `YOUR_AGENT_KEY` with your key. Claude Code then has two tools, `paid_fetch` and `check_decision`. You can also read your own memories from Claude Code through the Walrus Memory MCP. Both are covered in [Connect your agent](/docs/connect-your-agent).
+Replace `YOUR_AGENT_KEY` with your key. Claude Code then has two tools, `paid_fetch` and `check_decision`. You can also read your own memories from Claude Code through the Walrus Memory MCP. Both are covered in [Connect your agent](/docs/connect-your-agent).
 
 ## How is Ellai different from Sui Agent Pass?
 

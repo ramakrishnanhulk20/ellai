@@ -27,7 +27,9 @@ const proofSchema: z.ZodType<PublicProof> = z.strictObject({
   payments: z.array(
     z.strictObject({ digest: z.string().min(1), amountAtomic: atomicString, sellerHost: z.string(), signedAt: isoTime, explorerUrl: z.url({ protocol: /^https$/ }) }),
   ),
-  memories: z.array(z.strictObject({ blobId: z.string().min(1), kind: z.enum(MEMORY_KINDS), confirmedAt: isoTime })),
+  memories: z.array(
+    z.strictObject({ blobId: z.string().min(1), kind: z.enum(MEMORY_KINDS), verdict: z.enum(VERDICTS).nullable(), host: z.string().nullable(), confirmedAt: isoTime }),
+  ),
 });
 
 const memoryMapSchema: z.ZodType<MemoryMap> = z.strictObject({
