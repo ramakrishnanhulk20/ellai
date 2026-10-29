@@ -686,6 +686,11 @@ describe('server contexts', () => {
       await first.close();
       await second.close();
       first.chain.close();
+      // A server keeps this database for its whole life, so close() above leaves it open. A test
+      // is not a server: it closes the database itself and empties the slot it was kept in.
+      await (first.db as unknown as { $client: { close(): Promise<void> } }).$client.close();
+      const shared = (globalThis as unknown as { __ellaiServerShared?: { localDb?: unknown } }).__ellaiServerShared;
+      if (shared !== undefined) shared.localDb = undefined;
     }
   });
 

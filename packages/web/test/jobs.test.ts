@@ -69,7 +69,7 @@ import { TransactionDataBuilder } from '@mysten/sui/transactions';
 import { SUI_TYPE_ARG, normalizeStructTag } from '@mysten/sui/utils';
 import { verifyTransactionSignature } from '@mysten/sui/verify';
 import { and, count, eq, isNull, like, sql } from 'drizzle-orm';
-import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { type Database, createDb, migrate } from '../src/server/db/client.js';
 import {
   agents,
@@ -123,7 +123,13 @@ beforeAll(async () => {
 
 afterAll(async () => {
   await handle.close();
-  for (const extra of opened) await extra.close();
+  for (const extra of opened.splice(0)) await extra.close();
+});
+
+// Each PGlite holds at least 128 MB of WebAssembly memory. Kept until the file ended, one per
+// test, they ran this file's worker past 7 GB and out of memory on a 16 GB machine.
+afterEach(async () => {
+  for (const extra of opened.splice(0)) await extra.close();
 });
 
 beforeEach(() => {
