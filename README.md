@@ -265,10 +265,12 @@ Run these from the repository root. Live proofs read a `.env` file at the repo r
 | `npm run prove:loop -w packages/web` | The learning loop. Two owner approvals are written as Walrus Memory blobs and come back confirmed. A third similar request is approved on its own citing both. The same request to another recipient is still asked. | None |
 | `npm run prove:flow -w packages/web` | The pay flow. An agent asks for a hotel search. Ellai fetches the seller's price itself, approves it from the two earlier approvals, pays 0.01 USDC from the purse with a gasless send, hands back the seller's answer and verifies the payment on chain by its own digest. Run `prove:loop` first. | At most 0.02 USDC |
 | `npm run prove:seller -w packages/web` | Ellai's own seller. It answers a request with a 402, a buyer reads and pays it, and the seller checks the bytes and signature, sends the payment through Tatum, verifies the settlement from the chain's effects and answers with the wallet check. | Exactly 0.01 USDC on the first run. A rerun pays nothing. |
-| `npm run prove:visit -w packages/web` | The background work an answer starts. It records one owner answer, runs that owner's visit against the real Walrus Memory relayer and Sui through Tatum, and prints the seconds from the answer to confirmed. It measured 21.3 seconds on 29 October 2026. | None |
+| `npm run prove:visit -w packages/web` | The background work an answer starts. It records one owner answer, runs that owner's visit against the real Walrus Memory relayer and Sui through Tatum, and prints the seconds from the answer to confirmed. Two runs on 29 October 2026 measured 21.3 and 21.6 seconds. | None |
 | `npm run prove:pay -w packages/proof` | The money path. The owner issues an allowance to the purse, the purse pulls one 0.10 USDC refill with the gas wallet paying the fee, and the purse pays at most one live seller 0.01 USDC. Each payment is verified from its own digest. | Capped. At most 0.20 USDC may leave the owner, and at most 0.02 USDC is newly signed to sellers. |
 
-The outputs below are copied from the saved runs of 24 October 2026. Some lines were left out to keep this page short, and none were edited. The `prove:pay` run ends with a STOPPED line because the seller's answer timed out after the payment had already settled and been verified; the payment is what that proof is about.
+The outputs below are the first runs, saved on 24 October 2026, when the money moved. Some lines were left out to keep this page short, and none were edited. The `prove:pay` first run ends with a STOPPED line because the seller's answer timed out after the payment had already settled and been verified; the payment is what that proof is about.
+
+On 29 October 2026 every script ran again against Sui Mainnet. `prove:memory`, `prove:loop` and `prove:flow` ended PROVEN again, reading their earlier writes and payment back through Tatum and sending nothing new. `prove:pay` found its allowance and its payment JD999NqS on chain and sent nothing. `prove:seller` stopped on purpose, because its purse had already paid that seller once. `prove:visit` is new and ran in full; its output is below.
 
 
 ### prove:memory
@@ -334,6 +336,26 @@ PROVEN: Ellai fetched the price itself, approved it from the owner's own past an
 [...]
 
 PROVEN: Ellai's seller issued a 402 that core's own buyer code reads and pays, took exactly 0.01 USDC once, checked the bytes and the signature before sending them through Tatum, verified the settlement on chain and answered with the wallet check.
+```
+
+### prove:visit
+
+```text
+2. A new request, 10000 atomic USDC (0.01) to JMPR 0x9549bff7412d028e936f3b4525c986c3165273cf363db0a72337da54e001391c: "search hotels in Lisbon for one night, asked at 2026-10-29T07:22:48.100Z"
+  decide: asked (no_match). Reason: "You have not approved a payment like this to suimpp.jmpr.world yet."
+3. The owner approves, as the answer route records it
+  Approval recorded as memory daf5e74d-2e5e-4eb5-a87b-efea80d4d113, status pending
+4. The visit the answer route schedules: trigger 'answer', the real chain and relayer, a real sleep
+  pass 1 done, the memory is still waiting; next pass in 10 s
+  pass 2 done, the memory is still waiting; next pass in 10 s
+  started true, passes 3, submitted 1, confirmed 1, errors none
+  The visit took 22.3 s
+5. The approval memory
+  status confirmed, job ed970032-d8bb-4aa5-902a-226f0f808ecd
+  Answer to confirmed: 21.6 s (answered_at to confirmed_at, both written by Ellai)
+  Blob gZpEn1seVUsIRCadoGXX_iaMe3vNeAuMUPIMZ-AJiFM
+  https://walruscan.com/mainnet/blob/gZpEn1seVUsIRCadoGXX_iaMe3vNeAuMUPIMZ-AJiFM
+PROVEN: the owner's approval was written to Walrus Memory and confirmed by the visit its own answer starts, with no jobs tick.
 ```
 
 ### prove:pay

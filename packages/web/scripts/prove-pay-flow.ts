@@ -313,7 +313,7 @@ async function main(): Promise<void> {
     const all = await db.select().from(payments).where(eq(payments.ownerId, ownerId));
     const landedTotal = all.filter((row) => row.settlement === 'verified').reduce((sum, row) => sum + row.amountAtomic, 0n);
     const left = before >= after ? usdc(before - after) : `minus ${usdc(after - before)}`;
-    console.log(`  Purse USDC before ${usdc(before)}, after ${usdc(after)}: ${left} left as read from chain`);
+    console.log(`  Purse USDC before ${usdc(before)}, after ${usdc(after)}, read from chain: ${left} left the purse in this run`);
     console.log(`  Realised: ${usdc(landedTotal)} in payments verified on chain; ${all.length} payments signed for this owner in total`);
     if (before - after > ORDER_CAP_ATOMIC || landedTotal > ORDER_CAP_ATOMIC) problems.push('more than 0.02 USDC left the purse');
   } finally {
