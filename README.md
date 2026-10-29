@@ -255,13 +255,13 @@ With a Sui wallet and a little USDC: click "Open Ellai" (or go to [https://ellai
 
 ## Prove it
 
-Run these from the repository root. Live proofs read a `.env` file at the repo root and use your own test wallets on Sui Mainnet, so fund those first. Each live proof is capped, and the last column gives the cap.
+Run these from the repository root. Live proofs read a `.env` file at the repo root and use your own test wallets on Sui Mainnet, so fund those first. The outputs further down come from Ellai's own test wallets, so your runs show your own addresses and ids. Each live proof is capped, and the last column gives the cap.
 
 | Command | What it shows | USDC moved |
 |---|---|---|
-| `npm test` | Everything offline, plus the live core reads through Tatum. Run it alone, with a Tatum key in `.env`. It takes about 2.5 minutes. | None |
+| `npm test` | Everything offline, plus the live core reads through Tatum. Run it alone: core takes about 2.5 minutes, and the web suite needs about 4 GB of free memory. | None |
 | `npm run typecheck` | The types of every package. | None |
-| `npm run prove:memory -w packages/proof` | The Walrus Memory slice. It makes sure the owner has an account with Ellai's derived key on it, writes 10 true sentences once, recalls one by meaning, and reads the owner's Walrus Blob objects back from chain through Tatum. | None |
+| `npm run prove:memory -w packages/proof` | The Walrus Memory slice. It makes sure the owner has an account with Ellai's derived key on it, writes 10 true sentences once, recalls one by meaning, and reads the owner's Walrus Blob objects back from chain through Tatum. | None. The first run spends a little SUI creating the Walrus Memory account. |
 | `npm run prove:loop -w packages/web` | The learning loop. Two owner approvals are written as Walrus Memory blobs and come back confirmed. A third similar request is approved on its own citing both. The same request to another recipient is still asked. | None |
 | `npm run prove:flow -w packages/web` | The pay flow. An agent asks for a hotel search. Ellai fetches the seller's price itself, approves it from the two earlier approvals, pays 0.01 USDC from the purse with a gasless send, hands back the seller's answer and verifies the payment on chain by its own digest. Run `prove:loop` first. | At most 0.02 USDC |
 | `npm run prove:seller -w packages/web` | Ellai's own seller. It answers a request with a 402, a buyer reads and pays it, and the seller checks the bytes and signature, sends the payment through Tatum, verifies the settlement from the chain's effects and answers with the wallet check. | Exactly 0.01 USDC on the first run. A rerun pays nothing. |
@@ -372,21 +372,24 @@ STOPPED: Payment JD999NqSNbgJVLHF5ikv1wSirNm1v9gbhm4Xva1JAmv4 settled and verifi
 
 ## Quick start
 
-You need Node 22.19 or newer, a free Tatum account with a Mainnet API key ([dashboard.tatum.io](https://dashboard.tatum.io/)), and nothing else for local work. A hosted copy also needs a Postgres database (a free [Neon](https://neon.tech) project works); `npm run db:migrate -w packages/web` applies the migrations to the database `DATABASE_URL` names.
+You need Node 22.19 or newer and about 4 GB of free memory for the web tests. A free Tatum Mainnet API key ([dashboard.tatum.io](https://dashboard.tatum.io/)) is recommended: without one, Ellai's Sui reads go out anonymously at 5 requests a minute, so the app and the tests still work, only slower. A hosted copy also needs a Postgres database (a free [Neon](https://neon.tech) project works); `npm run db:migrate -w packages/web` applies the migrations to the database `DATABASE_URL` names.
 
 ```bash
 git clone https://github.com/ramakrishnanhulk20/ellai.git
 cd ellai
 npm ci
+npm run build
 cp .env.example .env
 npm run setup -w packages/proof
 ```
 
-`npm run setup -w packages/proof` fills in the wallet keys and the master secret that every purse derives from, and prints the test owner, gas wallet and purse addresses. It never overwrites a value that is already set. Back up the `.env` file: losing the master secret strands any money in the purses.
+`npm run build` compiles the shared `core` package, which the setup script and the app import.
+
+`npm run setup -w packages/proof` adds the wallet keys and the master secret that every purse derives from at the bottom of `.env`, and prints the test owner, gas wallet and purse addresses. It never changes a line that is already there, so the blank lines with the same names copied from `.env.example` stay; they do nothing, because the last value of a name wins. Back up the `.env` file: losing the master secret strands any money in the purses.
 
 Then fill in the rest of `.env`:
 
-- `TATUM_API_KEY`: your Tatum Mainnet key.
+- `TATUM_API_KEY`: your Tatum Mainnet key, or leave it blank to read anonymously and slowly.
 - `SESSION_SECRET` and `JOBS_SECRET`: 64 hex characters each. Generate each with `node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"`.
 - `APP_ORIGIN`: `http://localhost:3001` for local work.
 - `DATABASE_URL`: `pglite:./local-db` for local work. It is a file database that the app creates and migrates inside `packages/web` on first start, so no Postgres is needed.
@@ -398,7 +401,7 @@ Start the app:
 node packages/web/scripts/dev.mjs
 ```
 
-It serves on port 3001 (set `PORT` to change it) and reads the root `.env`. To run the live proofs, fund the addresses the setup script printed: a few dollars of USDC and about 0.5 SUI to the test owner, and about 0.5 SUI to the gas wallet. That was enough for every proof in this repo.
+It serves on port 3001 (set `PORT` to change it) and reads the root `.env`. To run the live proofs, fund the addresses the setup script printed: a few dollars of USDC and about 0.5 SUI to the test owner, and about 0.5 SUI to the gas wallet. That was enough for every proof in this repo. No SUI or USDC yet? Buy them on an exchange that supports withdrawals on the Sui network and send them to the printed addresses.
 
 ## Connect an agent
 
