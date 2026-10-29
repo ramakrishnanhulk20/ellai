@@ -30,11 +30,9 @@ export function reasonFor(decision: MapDecision): string | null {
     case 'learned': {
       const matched = decision.citations.length;
       if (matched === 0) return 'Matched your past answers';
-      const distances = decision.citations.flatMap((citation) =>
-        citation.distance === null ? [] : [citation.distance],
-      );
-      const base = `Matched ${matched} of your past answers`;
-      return distances.length > 0 ? `${base}. Closest: ${Math.min(...distances).toFixed(2)} (0 is an exact match)` : base;
+      // A distance means the match came from Walrus Memory's search by meaning, not an exact lookup.
+      const byMeaning = decision.citations.some((citation) => citation.distance !== null);
+      return `Matched ${matched} of your past answers${byMeaning ? ' by meaning' : ''}`;
     }
     case 'grant':
       return decision.digest ? 'Paid with the yes you gave' : 'Approved with the yes you gave';

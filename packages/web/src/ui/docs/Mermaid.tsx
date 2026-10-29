@@ -23,7 +23,7 @@ async function draw(chart: string, id: string): Promise<string> {
     mermaid.initialize({
       startOnLoad: false,
       securityLevel: 'strict',
-      // Diagrams keep their real size and scroll inside their own box. Shrunk to the column, the wide ones are too small to read.
+      // On wide screens diagrams keep their real size and scroll inside their own box, because shrunk to the column the wide ones are too small to read. On phones the stylesheet fits them to the width instead.
       flowchart: { useMaxWidth: false },
       sequence: { useMaxWidth: false },
       theme: 'base',
@@ -114,10 +114,13 @@ export function Mermaid({ chart }: { chart: string }) {
     <figure
       className="ellai-mermaid"
       aria-busy={drawn.status === 'drawing'}
-      {...(drawn.status === 'done' ? { tabIndex: 0, role: 'region', 'aria-label': 'Diagram, scrolls sideways' } : {})}
+      {...(drawn.status === 'done' ? { tabIndex: 0, role: 'region', 'aria-label': 'Diagram' } : {})}
     >
       {drawn.status === 'done' ? (
-        <div className="ellai-mermaid-svg" dangerouslySetInnerHTML={{ __html: drawn.svg }} />
+        <>
+          <div className="ellai-mermaid-svg" dangerouslySetInnerHTML={{ __html: drawn.svg }} />
+          <figcaption className="ellai-mermaid-hint">Pinch to zoom</figcaption>
+        </>
       ) : (
         <noscript>
           <pre className="ellai-mermaid-source">{chart}</pre>

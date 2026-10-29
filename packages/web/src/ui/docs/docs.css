@@ -151,6 +151,7 @@ body:has(.ellai-docs)::after {
   border-radius: 6px;
   background: var(--panel);
   border-color: var(--line);
+  overflow-wrap: anywhere;
 }
 
 /* A link made of inline code keeps the link's colour and underline. */
@@ -219,6 +220,30 @@ body:has(.ellai-docs)::after {
   display: block;
   max-width: none;
   margin-inline: auto;
+}
+
+.ellai-mermaid-hint {
+  display: none;
+}
+
+/* On phones the whole diagram fits the width, and the reader pinches in to read it. */
+@media (max-width: 767px) {
+  .ellai-mermaid-svg svg {
+    max-width: 100%;
+    height: auto;
+  }
+
+  .ellai-mermaid-hint {
+    display: block;
+    margin-top: 12px;
+    text-align: center;
+    font-family: var(--font-geist-mono), ui-monospace, monospace;
+    font-size: 12px;
+    line-height: 1.5;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--muted);
+  }
 }
 
 .ellai-mermaid-source {

@@ -74,7 +74,7 @@ describe('reasonFor', () => {
       { blobId: 'b', distance: 0.118 },
       { blobId: 'c', distance: null },
     ];
-    expect(reasonFor(decision({ citations }))).toBe('Matched 3 of your past answers. Closest: 0.12 (0 is an exact match)');
+    expect(reasonFor(decision({ citations }))).toBe('Matched 3 of your past answers by meaning');
     expect(reasonFor(decision({ citations: [{ blobId: 'a', distance: null }] }))).toBe('Matched 1 of your past answers');
     expect(reasonFor(decision())).toBe('Matched your past answers');
   });

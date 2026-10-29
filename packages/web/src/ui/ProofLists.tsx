@@ -1,6 +1,6 @@
 'use client';
 
-import type { ReactNode } from 'react';
+import { Fragment, type ReactNode } from 'react';
 import { atomicToUsdc, formatAgo, shortId } from './proof-format.js';
 import type { ProofMemory, ProofPayment } from './proof.js';
 import { useProof } from './useProof.js';
@@ -12,6 +12,20 @@ function Arrow() {
     <svg width="12" height="12" viewBox="0 0 12 12" fill="none" aria-hidden="true" className="shrink-0">
       <path d="M3 9 9 3M4.5 3H9v4.5" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" strokeLinejoin="round" />
     </svg>
+  );
+}
+
+/** Lets a long host wrap after any dot or hyphen, so it breaks at a natural place and is not cut mid-word. */
+function breakable(text: string): ReactNode[] {
+  return text.split(/([.-])/).map((part, index) =>
+    index % 2 === 1 ? (
+      <Fragment key={index}>
+        {part}
+        <wbr />
+      </Fragment>
+    ) : (
+      part
+    ),
   );
 }
 
@@ -35,8 +49,8 @@ function Row({
   return (
     <li className="proof-row relative -mx-3 flex min-h-14 items-center justify-between gap-4 border-b border-line px-3 py-2 last:border-b-0">
       <div className="min-w-0">
-        <p title={title} className="truncate text-[15px] leading-[1.3] text-fg">
-          {title}
+        <p title={title} className="line-clamp-3 text-[15px] leading-[1.3] text-fg">
+          {breakable(title)}
         </p>
         <p className="text-[13px] leading-[1.3] text-muted">{when}</p>
       </div>
