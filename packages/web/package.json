@@ -17,7 +17,8 @@
     "prove:loop": "tsx --env-file-if-exists=../../.env scripts/prove-memory-loop.ts",
     "prove:onboarding": "tsx --env-file-if-exists=../../.env scripts/prove-onboarding.ts",
     "prove:flow": "tsx --env-file-if-exists=../../.env scripts/prove-pay-flow.ts",
-    "prove:seller": "tsx --env-file-if-exists=../../.env scripts/prove-seller.ts"
+    "prove:seller": "tsx --env-file-if-exists=../../.env scripts/prove-seller.ts",
+    "prove:visit": "tsx --env-file-if-exists=../../.env scripts/prove-visit.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "1.3.0",

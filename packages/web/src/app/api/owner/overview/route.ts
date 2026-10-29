@@ -7,10 +7,16 @@ import { scoped } from '../../../../server/http/context.js';
 import { HttpError } from '../../../../server/http/errors.js';
 import { jsonResponse } from '../../../../server/http/json.js';
 import { limitOwnerChainCalls } from '../../../../server/http/owner-limits.js';
+import { scheduleOwnerVisit } from '../../../../server/jobs/visit.js';
 import { onboardingState } from '../../../../server/onboarding/state.js';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
+// Seconds this route may run, so the ceiling is Ellai's choice and not the platform's default.
+// Next.js reads this export without running the module, so it is written as the literal value of
+// LIMITS.slowRouteMaxDurationS, and a test holds the two equal. The owner's visit this route
+// starts runs after the answer is sent, inside this ceiling (C40).
+export const maxDuration = 300;
 
 // One ListBalances page on the success path. A purse sent more than LIMITS.balancePageSize coin
 // types reads more pages; scratchpad/tatum-budget.md counts that as the worst case.
@@ -93,8 +99,12 @@ async function questionRate(db: Database, ownerId: string): Promise<{ asked: num
  * The read is also counted by the Tatum meter, as this owner from this client; a refusal there
  * (ChainError BUDGET, nothing sent) is 503 chain_unavailable_today, not a blank purse, while any
  * other failed read blanks the purse. Atomic amounts are decimal strings.
+ * Every 200 schedules a visit for this owner after the response (scheduleOwnerVisit, C40), which
+ * starts nothing when the owner has no work or was visited within LIMITS.ownerVisitMinGapMs; it
+ * never changes the response.
  */
 export const GET = scoped('owner', async (request, ctx, { ownerId }): Promise<Response> => {
+  const requestStartedMs = Date.now();
   const now = ctx.now();
   const [row] = await ctx.db
     .select({
@@ -132,5 +142,6 @@ export const GET = scoped('owner', async (request, ctx, { ownerId }): Promise<Re
   if (purse === BUDGET_SPENT) throw new HttpError(503, 'chain_unavailable_today');
   // The same test the run route makes before it builds a client, so the two can never disagree.
   const builtinAgent = ctx.env.ANTHROPIC_API_KEY === undefined ? 'needs_key' : 'ready';
+  scheduleOwnerVisit(ownerId, 'overview', requestStartedMs);
   return jsonResponse({ owner, onboarding, purse, purseRead: readsPurse, counts, questionsPer20, builtinAgent });
 });

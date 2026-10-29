@@ -1,6 +1,7 @@
 import { LIMITS } from '@ellai/core/limits';
 import { scoped } from '../../../../server/http/context.js';
 import { jsonResponse, readJson } from '../../../../server/http/json.js';
+import { scheduleOwnerVisit } from '../../../../server/jobs/visit.js';
 import { agentPaidFetch, paidFetchInput } from '../../../../server/mcp/server.js';
 
 export const runtime = 'nodejs';
@@ -22,8 +23,14 @@ export const maxDuration = 300;
  * LIMITS.agentCallsPerMinute for this agent or LIMITS.ownerPayRequestsPerMinute for all of its
  * owner's agents together. A refusal or a question for the owner is still
  * 200: `outcome` says what Ellai did. No CORS headers: agents call from servers, not pages.
+ * Every 200, whatever its outcome, schedules a visit for the agent's owner after the response,
+ * so a payment or its outcome memory does not wait for the scheduled tick (scheduleOwnerVisit,
+ * C40); it never changes the response.
  */
 export const POST = scoped('agent', async (request, ctx, agent): Promise<Response> => {
+  const requestStartedMs = Date.now();
   const input = await readJson(request, paidFetchInput, LIMITS.agentBodyMaxBytes);
-  return jsonResponse(await agentPaidFetch(ctx, agent, input));
+  const answer = await agentPaidFetch(ctx, agent, input);
+  scheduleOwnerVisit(agent.ownerId, 'agent', requestStartedMs);
+  return jsonResponse(answer);
 });

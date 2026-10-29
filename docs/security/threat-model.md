@@ -341,6 +341,7 @@ Each invariant names the risk it closes. Every backend work order carries the in
 - **C39 (A6, A9, G3). Ellai relays owner-signed transactions only as it built them.**
   - Ellai sends a transaction the owner signed in the app only when the bytes equal a fresh build for that owner and step, from the owner row, with the owner as sender and gas owner, metered under C22.
   - Fields the relay does not check, by design: on the Walrus Memory account steps, the gas coins, gas price and expiry the owner's wallet chose. The owner signed them and pays for them; a stolen session cannot produce the signature.
+- **C40 (A4, A6, A11, A12, G5). Work an owner's own request starts.** A request from an owner, or from that owner's agent, may start background work for that owner only, after its answer is sent, and that work never changes the answer. At most one visit per owner runs at a time, the scheduled tick's included, held by a lease in the database that ends by itself. A visit does only the work the jobs tick does for that owner, in the same order, charged to the same per-owner jobs share and refill pool (C22, C28), and starts no external call that could end past the route's time limit (C21). It runs in a context of its own, never the request's closed one, and records fixed codes only (C19). Non-goal: work created while no visit can start waits for the scheduled tick, which GitHub runs only every few hours.
 
 **1. Primitives over lists**
 - **Addresses and coin types:** one normaliser from the Sui SDK on every side (`normalizeSuiAddress`, `normalizeStructTag`).

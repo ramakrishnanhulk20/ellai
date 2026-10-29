@@ -1,6 +1,7 @@
 import { scoped } from '../../../server/http/context.js';
 import { API_RESPONSE_HEADERS } from '../../../server/http/errors.js';
-import { handleMcpRequest } from '../../../server/mcp/server.js';
+import { scheduleOwnerVisit } from '../../../server/jobs/visit.js';
+import { type AgentFetchAnswer, handleMcpRequest } from '../../../server/mcp/server.js';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -16,11 +17,46 @@ export const maxDuration = 300;
  * as POST /api/agent/fetch and GET /api/agent/decisions/[id]. The bearer agent token is
  * checked before anything is read (C13); 401 agent_unauthorized without a valid one. A tool
  * failure is a tool result with isError and the same fixed JSON the HTTP routes send, the
- * per-minute limits' too_many_requests included.
+ * per-minute limits' too_many_requests included. A request in which paid_fetch answered,
+ * whatever its outcome, schedules one visit for the agent's owner after the response, as POST
+ * /api/agent/fetch does (scheduleOwnerVisit, C40); it never changes the response.
  */
 export const POST = scoped('agent', async (request, ctx, agent): Promise<Response> => {
-  return handleMcpRequest(request, ctx, agent);
+  const requestStartedMs = Date.now();
+  const answered = await handleMcpRequest(request, ctx, agent);
+  if (await paidFetchAnswered(answered)) scheduleOwnerVisit(agent.ownerId, 'agent', requestStartedMs);
+  return answered;
 });
+
+const PAID_FETCH_MARK: keyof AgentFetchAnswer = 'sellerBodyIsUntrusted';
+
+// The route sees only the JSON-RPC answer. A tool's result is its answer as JSON text, and of the
+// two tools only paid_fetch's answer carries sellerBodyIsUntrusted: true (C17), at its top level,
+// where a seller's text cannot reach, and only when the pay flow returned; its failures are
+// results with isError. That is the same test POST /api/agent/fetch makes. Anything that does not
+// parse is no answer.
+async function paidFetchAnswered(answered: Response): Promise<boolean> {
+  if (answered.status !== 200) return false;
+  let body: unknown;
+  try {
+    body = await answered.clone().json();
+  } catch {
+    return false;
+  }
+  return (Array.isArray(body) ? body : [body]).some((message: unknown) => {
+    const result = (message as { result?: { isError?: unknown; content?: unknown } } | null)?.result;
+    if (result === undefined || result.isError === true || !Array.isArray(result.content)) return false;
+    return result.content.some((part: unknown) => {
+      const { type, text } = (part ?? {}) as { type?: unknown; text?: unknown };
+      if (type !== 'text' || typeof text !== 'string') return false;
+      try {
+        return (JSON.parse(text) as Record<string, unknown> | null)?.[PAID_FETCH_MARK] === true;
+      } catch {
+        return false;
+      }
+    });
+  });
+}
 
 // A stateless server keeps no session to stream to or to end, so GET's event stream and
 // DELETE's session end do not exist here. The body is the JSON-RPC error the SDK itself sends.

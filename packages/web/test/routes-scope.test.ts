@@ -6,17 +6,24 @@
 // and Ellai's seller as that anonymous client; the overview purse, both onboarding steps and the
 // built-in agent's paid calls as the signed-in owner from that client; an agent's paid fetch, over
 // HTTP and over MCP, as the agent's owner from that client; and the jobs tick as jobs, only once
-// its secret is right.
+// its secret is right. And the owner visit each of the five routes an owner or an agent uses to
+// act (an answer, an onboarding confirm, the overview, a paid fetch over HTTP and over MCP) hands
+// to the visit scheduler: exactly one task when the route succeeds and none when it fails; the
+// task opens a context of its own, a second call of the context factory, and visits the agent's
+// own owner; and neither a task whose context cannot open nor a scheduler that refuses the task
+// changes the route's answer (C40).
 // Does NOT cover: how the meter counts (tatum-meter.test.ts) or core's hook (core chain.test.ts).
 // The onboarding builds, the paid-call flow and the model run are stand-ins that make one chain
 // call each, so these tests show the scope each route opened, not every call those modules make
 // (their own tests cover them). Routes that never reach the chain are covered only by being made
-// by scoped().
+// by scoped(). What a scheduled visit does is visit.test.ts's; here it runs only far enough to
+// show whose context it opens.
 import { readdirSync } from 'node:fs';
 import { basename } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { Chain } from '@ellai/core/chain';
 import { canonicalSuiAddress } from '@ellai/core/keys';
+import { USDC_TYPE_MAINNET } from '@ellai/core/usdc';
 import { Ed25519Keypair } from '@mysten/sui/keypairs/ed25519';
 import { computeZkLoginAddressFromSeed, getZkLoginSignature } from '@mysten/sui/zklogin';
 import { eq } from 'drizzle-orm';
@@ -30,13 +37,15 @@ import * as agentRunRoute from '../src/app/api/owner/agent/run/route.js';
 import * as buildRoute from '../src/app/api/owner/onboarding/build/route.js';
 import * as confirmRoute from '../src/app/api/owner/onboarding/confirm/route.js';
 import * as overviewRoute from '../src/app/api/owner/overview/route.js';
+import * as answerRoute from '../src/app/api/owner/questions/[id]/answer/route.js';
 import * as sellRoute from '../src/app/api/sell/wallet-check/route.js';
 import { createAgentToken } from '../src/server/auth/agents.js';
 import { type Database, createDb, migrate } from '../src/server/db/client.js';
-import { owners } from '../src/server/db/schema.js';
+import { decisions, owners, questions } from '../src/server/db/schema.js';
 import type { ServerEnv } from '../src/server/env.js';
 import { isScoped, setServerContextFactory } from '../src/server/http/context.js';
 import { type TatumScope, currentTatumScope } from '../src/server/http/tatum-meter.js';
+import { setVisitScheduler } from '../src/server/jobs/visit.js';
 
 // One chain call each in place of the work these modules do, so a test sees the scope it ran in.
 vi.mock('../src/server/onboarding/build.js', async (importOriginal) => {
@@ -95,6 +104,8 @@ interface Seen {
   scope: TatumScope | undefined;
 }
 let seen: Seen[] = [];
+/** The owner visits the routes handed to the scheduler, in order. */
+let tasks: Array<() => Promise<void>> = [];
 
 const ANSWERS: Readonly<Record<string, () => unknown>> = {
   getCurrentEpoch: () => 1_100n,
@@ -149,12 +160,18 @@ beforeEach(() => {
   minutesUsed += 1;
   clock = new Date(FIRST_MINUTE + minutesUsed * 60_000 + 1_000);
   seen = [];
+  tasks = [];
   setServerContextFactory(async () => ({ db, chain, env: ENV, now: () => clock }));
+  // Next's own scheduler works only inside a request Next is serving, so the tasks are collected.
+  setVisitScheduler((task) => {
+    tasks.push(task);
+  });
   // clientKey trusts X-Forwarded-For only on Vercel, which is where a client key means anything.
   vi.stubEnv('VERCEL', '1');
 });
 
 afterEach(() => {
+  setVisitScheduler(null);
   vi.unstubAllEnvs();
   vi.restoreAllMocks();
 });
@@ -295,5 +312,160 @@ describe('the Tatum scope each route that can reach the chain runs in', () => {
       { method: 'getCurrentEpoch', scope: asOwner(ownerId) },
       { method: 'getCurrentEpoch', scope: asOwner(ownerId) },
     ]);
+  });
+});
+
+describe('the owner visit each route an owner or an agent acts through schedules (C40)', () => {
+  interface Acting {
+    ownerId: string;
+    cookie: string;
+    authorization: string;
+  }
+  type Call = [trigger: string, run: () => Promise<Response>, answerKey: string];
+
+  async function acting(): Promise<Acting> {
+    const { ownerId, cookie } = await signedIn();
+    const { token } = await createAgentToken({ db, ownerId, label: 'Visit agent', kind: 'external', sessionSecretHex: SECRET, now: clock });
+    return { ownerId, cookie, authorization: `Bearer ${token}` };
+  }
+
+  async function askedQuestion(ownerId: string): Promise<string> {
+    const { agentId } = await createAgentToken({ db, ownerId, label: 'Asking agent', kind: 'external', sessionSecretHex: SECRET, now: clock });
+    const [row] = await db
+      .insert(decisions)
+      .values({
+        ownerId,
+        agentId,
+        requestKey: hex(16),
+        sellerUrl: 'https://seller.example/rooms',
+        sellerMethod: 'POST',
+        sellerHost: 'seller.example',
+        bodyHash: hex(32),
+        purpose: 'Find a room',
+        recipient: canonicalSuiAddress(`0x${'11'.repeat(32)}`),
+        amountAtomic: 10_000n,
+        asset: USDC_TYPE_MAINNET,
+        network: 'sui:mainnet',
+        expiresAt: new Date(clock.getTime() + 60_000),
+        outcome: 'asked',
+        rule: 'no_match',
+        reason: 'stand-in',
+        status: 'asked',
+        createdAt: clock,
+      })
+      .returning({ id: decisions.id });
+    if (row === undefined) throw new Error('the decision insert returned no row');
+    await db.insert(questions).values({ decisionId: row.id, ownerId, createdAt: clock });
+    return row.id;
+  }
+
+  const purchase = { url: 'https://seller.example/rooms', method: 'GET', purpose: 'Find a room' };
+  const answer = (id: string, cookie: string) =>
+    answerRoute.POST(request('POST', `/api/owner/questions/${id}/answer`, { body: { answer: 'approve' }, headers: { cookie } }), { params: Promise.resolve({ id }) });
+  const confirm = (body: unknown, cookie: string) => confirmRoute.POST(request('POST', '/api/owner/onboarding/confirm', { body, headers: { cookie } }));
+  const overview = (headers: Record<string, string>) => overviewRoute.GET(request('GET', '/api/owner/overview', { headers }));
+  const agentFetch = (body: unknown, authorization: string) => agentFetchRoute.POST(request('POST', '/api/agent/fetch', { body, headers: { authorization } }));
+  const mcp = (message: unknown, authorization: string) =>
+    mcpRoute.POST(request('POST', '/api/mcp', { body: message, headers: { authorization, accept: 'application/json, text/event-stream' } }));
+  const mcpFetch = (args: unknown, authorization: string) => mcp({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'paid_fetch', arguments: args } }, authorization);
+
+  /** One successful request to each of the five routes, with the trigger its visit names and a key its answer carries. */
+  const succeeding = (who: Acting): Call[] => [
+    ['answer', async () => answer(await askedQuestion(who.ownerId), who.cookie), 'memoryId'],
+    ['onboarding', () => confirm({ step: 'memory_account', digest: 'stand-in' }, who.cookie), 'recorded'],
+    ['overview', () => overview({ cookie: who.cookie }), 'owner'],
+    ['agent', () => agentFetch(purchase, who.authorization), 'outcome'],
+    ['agent', () => mcpFetch(purchase, who.authorization), 'result'],
+  ];
+
+  it('hands exactly one task to the scheduler when each of the five routes succeeds, and none when it fails', async () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    const who = await acting();
+    for (const [trigger, run] of succeeding(who)) {
+      tasks = [];
+      const response = await run();
+      expect([trigger, response.status, tasks.length]).toEqual([trigger, 200, 1]);
+    }
+    const failing: Array<[string, () => Promise<Response>]> = [
+      ['answer', () => answer(globalThis.crypto.randomUUID(), who.cookie)],
+      ['onboarding', () => confirm({ step: 'memory_account' }, who.cookie)],
+      ['overview', () => overview({})],
+      ['agent', () => agentFetch({ ...purchase, purpose: ' ' }, who.authorization)],
+      ['mcp', () => mcpFetch(purchase, `Bearer ${hex(32)}`)],
+    ];
+    for (const [trigger, run] of failing) {
+      tasks = [];
+      const response = await run();
+      expect([trigger, response.status === 200, tasks.length]).toEqual([trigger, false, 0]);
+    }
+    // MCP answers 200 to a refused tool call and to a call of no tool: paid_fetch never answered, so nothing is scheduled.
+    tasks = [];
+    const refused = await mcpFetch({ ...purchase, purpose: ' ' }, who.authorization);
+    expect([refused.status, JSON.stringify(await refused.json()).includes('"isError":true')]).toEqual([200, true]);
+    expect((await mcp({ jsonrpc: '2.0', id: 2, method: 'tools/list' }, who.authorization)).status).toBe(200);
+    expect(tasks).toHaveLength(0);
+  });
+
+  it("runs each task in a context of its own, a second call of the context factory, for the acting owner's own work", async () => {
+    const log = vi.spyOn(console, 'log').mockImplementation(() => undefined);
+    const [who, payer, bystander] = [await acting(), await acting(), await acting()];
+    let opened = 0;
+    setServerContextFactory(async () => {
+      opened += 1;
+      return { db, chain, env: ENV, now: () => clock };
+    });
+    for (const [trigger, run] of succeeding(who)) {
+      [opened, tasks] = [0, []];
+      expect((await run()).status).toBe(200);
+      expect(opened).toBe(1);
+      await tasks[0]?.();
+      expect([trigger, opened]).toEqual([trigger, 2]);
+      expect(log.mock.calls.at(-1)?.join(' ')).toBe(`[ellai visit] trigger=${trigger} started=false passes=0 submitted=0 confirmed=0 refills=0 codes=none`);
+    }
+
+    // An allowance is work for the visit, which reads the purse; only the agent's own owner is visited.
+    // A visit's deadline counts from the request's real start (Date.now()), so this request runs on
+    // real time rather than this file's clock, which runs a minute ahead per test.
+    clock = new Date();
+    for (const { ownerId } of [payer, bystander]) await db.update(owners).set({ allowanceId: `0x${hex(32)}`, allowanceCheckedAt: clock }).where(eq(owners.id, ownerId));
+    [seen, tasks] = [[], []];
+    expect((await agentFetch(purchase, payer.authorization)).status).toBe(200);
+    await tasks[0]?.();
+    expect(log.mock.calls.at(-1)?.join(' ')).toBe('[ellai visit] trigger=agent started=true passes=1 submitted=0 confirmed=0 refills=0 codes=none');
+    const visited = async (ownerId: string) => (await db.select({ at: owners.lastTickedAt }).from(owners).where(eq(owners.id, ownerId)))[0]?.at ?? null;
+    expect([await visited(payer.ownerId), await visited(bystander.ownerId)]).toEqual([clock, null]);
+    // The request's own read ran as the owner; the visit's purse read is charged to the refills pool, never to the person (C28).
+    expect(seen).toEqual([
+      { method: 'getCurrentEpoch', scope: asOwner(payer.ownerId) },
+      { method: 'getBalances', scope: { kind: 'refills' } },
+    ]);
+  });
+
+  it("leaves each route's answer as it was when the task's context cannot open, and when the scheduler refuses the task", async () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    const error = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    const who = await acting();
+    for (const [trigger, run, answerKey] of succeeding(who)) {
+      tasks = [];
+      const response = await run();
+      setServerContextFactory(async () => {
+        throw new Error('the database cannot be reached');
+      });
+      await expect(tasks[0]?.()).resolves.toBeUndefined();
+      setServerContextFactory(async () => ({ db, chain, env: ENV, now: () => clock }));
+      expect(error.mock.calls.at(-1)?.join(' ')).toBe(`[ellai visit] trigger=${trigger} started=false passes=0 submitted=0 confirmed=0 refills=0 codes=UNEXPECTED`);
+      expect(response.status).toBe(200);
+      expect(Object.keys((await response.json()) as object)).toContain(answerKey);
+    }
+
+    setVisitScheduler(() => {
+      throw new Error('refused');
+    });
+    for (const [trigger, run, answerKey] of succeeding(who)) {
+      const response = await run();
+      expect(error.mock.calls.at(-1)?.join(' ')).toBe(`[ellai visit] trigger=${trigger} schedule_failed`);
+      expect(response.status).toBe(200);
+      expect(Object.keys((await response.json()) as object)).toContain(answerKey);
+    }
   });
 });

@@ -6,11 +6,17 @@ import { answerQuestion } from '../../../../../../server/decide/answer.js';
 import { scoped } from '../../../../../../server/http/context.js';
 import { HttpError } from '../../../../../../server/http/errors.js';
 import { jsonResponse, readJson } from '../../../../../../server/http/json.js';
+import { scheduleOwnerVisit } from '../../../../../../server/jobs/visit.js';
 import { ownerDelegate } from '../../../../../../server/memory/delegate.js';
 import { MEMORY_NAMESPACE } from '../../../../../../server/memory/namespace.js';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
+// Seconds this route may run, so the ceiling is Ellai's choice and not the platform's default.
+// Next.js reads this export without running the module, so it is written as the literal value of
+// LIMITS.slowRouteMaxDurationS, and a test holds the two equal. The owner's visit this route
+// starts runs after the answer is sent, inside this ceiling (C40).
+export const maxDuration = 300;
 
 // answerQuestion trims the reason and enforces its length in code points, the way the column
 // counts it; the body cap bounds everything before that.
@@ -23,9 +29,12 @@ const body = z.strictObject({ answer: z.enum(VERDICTS), reason: z.string().optio
  * the payment that was asked about. The owner comes from the session alone (C13) and the
  * request must come from the app (C14). Another owner's question and a missing one are the
  * same 404 not_found, so a response never shows that an id exists. 403 cross_origin, 401
- * signed_out, 400 for a bad body or id, 409 when already answered or no longer asked.
+ * signed_out, 400 for a bad body or id, 409 when already answered or no longer asked. Once the
+ * answer is recorded, a visit for this owner is scheduled to send its memory after the response
+ * (scheduleOwnerVisit, C40); it never changes the response.
  */
 export const POST = scoped('owner', async (request, ctx, { ownerId }, { params }: { params: Promise<{ id: string }> }): Promise<Response> => {
+  const requestStartedMs = Date.now();
   const { id } = await params;
   const { answer, reason } = await readJson(request, body, LIMITS.answerBodyMaxBytes);
   const [owner] = await ctx.db.select({ suiAddress: owners.suiAddress }).from(owners).where(eq(owners.id, ownerId));
@@ -41,5 +50,6 @@ export const POST = scoped('owner', async (request, ctx, { ownerId }, { params }
     namespace: MEMORY_NAMESPACE,
     now: ctx.now(),
   });
+  scheduleOwnerVisit(ownerId, 'answer', requestStartedMs);
   return jsonResponse(answered);
 });

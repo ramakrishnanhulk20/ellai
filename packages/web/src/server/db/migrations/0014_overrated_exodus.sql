@@ -1,0 +1,1 @@
+ALTER TABLE "owners" ADD COLUMN "visit_lease_until" timestamp with time zone;

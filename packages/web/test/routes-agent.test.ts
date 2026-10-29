@@ -29,6 +29,9 @@ import * as decisionRoute from '../src/app/api/agent/decisions/[id]/route.js';
 import * as fetchRoute from '../src/app/api/agent/fetch/route.js';
 import * as jobsRoute from '../src/app/api/jobs/tick/route.js';
 import * as mcpRoute from '../src/app/api/mcp/route.js';
+import * as confirmRoute from '../src/app/api/owner/onboarding/confirm/route.js';
+import * as overviewRoute from '../src/app/api/owner/overview/route.js';
+import * as answerRoute from '../src/app/api/owner/questions/[id]/answer/route.js';
 import { createAgentToken, revokeAgent } from '../src/server/auth/agents.js';
 import { completeSignIn, issueSignIn } from '../src/server/auth/signin.js';
 import { type Database, createDb, migrate } from '../src/server/db/client.js';
@@ -258,9 +261,10 @@ describe('route files', () => {
     expect(route.dynamic).toBe('force-dynamic');
   });
 
-  it('gives the routes that can wait on a paid call or a tick the ceiling in LIMITS.slowRouteMaxDurationS, past the paid call deadline', () => {
+  it('gives the routes that can wait on a paid call, a tick or an owner visit the ceiling in LIMITS.slowRouteMaxDurationS, past the paid call deadline', () => {
     const ceiling = LIMITS.slowRouteMaxDurationS;
-    expect([fetchRoute.maxDuration, mcpRoute.maxDuration, jobsRoute.maxDuration]).toEqual([ceiling, ceiling, ceiling]);
+    const routes = [fetchRoute, mcpRoute, jobsRoute, answerRoute, confirmRoute, overviewRoute];
+    expect(routes.map((route) => route.maxDuration)).toEqual(Array(routes.length).fill(ceiling));
     expect(LIMITS.paidFetchDeadlineMs).toBeLessThan(ceiling * 1_000);
   });
 });

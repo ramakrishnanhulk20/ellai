@@ -624,4 +624,16 @@ export const LIMITS = {
    * limit turned away goes again at the next tick.
    */
   memoryWriteLeaseMs: 360_000,
+  /**
+   * How long one visit holds an owner, the scheduled tick's included: slowRouteMaxDurationS, the
+   * ceiling of every route a visit runs under, so a lease outlives any run that holds it and frees
+   * itself if the function is killed. A test holds the two equal.
+   */
+  ownerVisitLeaseMs: 300_000,
+  /** Wait between two passes of one owner's visit while a relayer write is awaiting confirmation. */
+  ownerVisitPassGapMs: 10_000,
+  /** Passes in one owner's visit: the seven waits between eight passes fit inside the visit's time budget, tickTimeBudgetMs. */
+  ownerVisitMaxPasses: 8,
+  /** The overview starts a visit only when the owner's last visit is older than this, since screens load it after every action. */
+  ownerVisitMinGapMs: 60_000,
 } as const;

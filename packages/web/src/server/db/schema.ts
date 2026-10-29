@@ -137,6 +137,9 @@ export const owners = pgTable(
     publicProof: boolean('public_proof').notNull().default(false),
     // The jobs tick visits owners least recently visited first, so no owner waits behind the earliest ones.
     lastTickedAt: at('last_ticked_at'),
+    // A visit to this owner holds it until then, so the tick and the owner's own requests never work
+    // on one owner at once, and a visit whose function was killed frees it by itself.
+    visitLeaseUntil: at('visit_lease_until'),
     // Where the chain check of this owner's Walrus Blob objects stopped, since one tick reads a
     // bounded number of pages and anyone can send Blob objects to an address.
     blobScanCursor: text('blob_scan_cursor'),

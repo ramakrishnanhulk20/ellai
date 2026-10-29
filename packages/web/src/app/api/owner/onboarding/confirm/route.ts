@@ -4,11 +4,17 @@ import { TEXT_CAPS } from '../../../../../server/db/schema.js';
 import { scoped } from '../../../../../server/http/context.js';
 import { jsonResponse, readJson } from '../../../../../server/http/json.js';
 import { limitOwnerChainCalls, onboardingChainFailure } from '../../../../../server/http/owner-limits.js';
+import { scheduleOwnerVisit } from '../../../../../server/jobs/visit.js';
 import { CONFIRM_CHAIN_CALLS, CONFIRM_EXISTING_CHAIN_CALLS, confirmExistingStep, confirmOnboardingTx } from '../../../../../server/onboarding/confirm.js';
 import { ACCOUNT_STEPS, CONFIRM_STEPS } from '../../../../../server/onboarding/state.js';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
+// Seconds this route may run, so the ceiling is Ellai's choice and not the platform's default.
+// Next.js reads this export without running the module, so it is written as the literal value of
+// LIMITS.slowRouteMaxDurationS, and a test holds the two equal. The owner's visit this route
+// starts runs after the answer is sent, inside this ceiling (C40).
+export const maxDuration = 300;
 
 // confirmOnboardingTx decides whether the digest is a Sui digest; this only bounds its length.
 const byDigest = z.strictObject({ step: z.enum(CONFIRM_STEPS), digest: z.string().max(TEXT_CAPS.digest) });
@@ -33,9 +39,12 @@ const body = z.union([byDigest, existing]);
  * cross_origin, 401 signed_out, 429 past this owner's or this client's caps, 400 for a bad body or
  * digest, 409 not_ready or not_landed (ask again shortly), 422 refused when the chain shows
  * something the step does not accept, 503 chain_unavailable when Sui cannot be read, 503
- * chain_unavailable_today once every owner's day is spent.
+ * chain_unavailable_today once every owner's day is spent. Once a step is recorded, a visit for
+ * this owner is scheduled after the response, so a new allowance's first refill does not wait for
+ * the scheduled tick (scheduleOwnerVisit, C40); it never changes the response.
  */
 export const POST = scoped('owner', async (request, ctx, { ownerId }): Promise<Response> => {
+  const requestStartedMs = Date.now();
   // Read first, so the calls counted are the ones this step makes; the body is capped at 1 KiB.
   const sent = await readJson(request, body, LIMITS.onboardingConfirmBodyMaxBytes);
   const calls = 'existing' in sent ? CONFIRM_EXISTING_CHAIN_CALLS[sent.step] : CONFIRM_CHAIN_CALLS[sent.step];
@@ -44,6 +53,7 @@ export const POST = scoped('owner', async (request, ctx, { ownerId }): Promise<R
   const common = { db: ctx.db, ownerId, chain: ctx.chain, masterSecretHex: ctx.env.ELLAI_MASTER_SECRET, now: ctx.now() };
   try {
     const { recorded } = 'existing' in sent ? await confirmExistingStep({ ...common, step: sent.step }) : await confirmOnboardingTx({ ...common, step: sent.step, digest: sent.digest });
+    scheduleOwnerVisit(ownerId, 'onboarding', requestStartedMs);
     return jsonResponse({ recorded });
   } catch (error) {
     const answer = onboardingChainFailure(error);
