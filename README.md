@@ -259,7 +259,7 @@ Run these from the repository root. Live proofs read a `.env` file at the repo r
 
 | Command | What it shows | USDC moved |
 |---|---|---|
-| `npm test` | Everything offline, plus the live core reads through Tatum. Run it alone: core takes about 2.5 minutes, and the web suite needs about 4 GB of free memory. | None |
+| `npm test` | Everything offline, plus the live core reads through Tatum. Run it alone: core takes about 2.5 minutes, and the web suite peaks at about 3 GB of memory. | None |
 | `npm run typecheck` | The types of every package. | None |
 | `npm run prove:memory -w packages/proof` | The Walrus Memory slice. It makes sure the owner has an account with Ellai's derived key on it, writes 10 true sentences once, recalls one by meaning, and reads the owner's Walrus Blob objects back from chain through Tatum. | None. The first run spends a little SUI creating the Walrus Memory account. |
 | `npm run prove:loop -w packages/web` | The learning loop. Two owner approvals are written as Walrus Memory blobs and come back confirmed. A third similar request is approved on its own citing both. The same request to another recipient is still asked. | None |
@@ -372,7 +372,7 @@ STOPPED: Payment JD999NqSNbgJVLHF5ikv1wSirNm1v9gbhm4Xva1JAmv4 settled and verifi
 
 ## Quick start
 
-You need Node 22.19 or newer and about 4 GB of free memory for the web tests. A free Tatum Mainnet API key ([dashboard.tatum.io](https://dashboard.tatum.io/)) is recommended: without one, Ellai's Sui reads go out anonymously at 5 requests a minute, so the app and the tests still work, only slower. A hosted copy also needs a Postgres database (a free [Neon](https://neon.tech) project works); `npm run db:migrate -w packages/web` applies the migrations to the database `DATABASE_URL` names.
+You need Node 22.19 or newer. The web tests peak at about 3 GB of memory. A free Tatum Mainnet API key is recommended (sign up at [dashboard.tatum.io](https://dashboard.tatum.io/) and create an API key for Mainnet): without one, Ellai's Sui reads go out anonymously at 5 requests a minute, so the app and the tests still work, only slower. A hosted copy also needs a Postgres database (a free [Neon](https://neon.tech) project works); `npm run db:migrate -w packages/web` applies the migrations to the database `DATABASE_URL` names.
 
 ```bash
 git clone https://github.com/ramakrishnanhulk20/ellai.git
@@ -391,8 +391,8 @@ Then fill in the rest of `.env`:
 
 - `TATUM_API_KEY`: your Tatum Mainnet key, or leave it blank to read anonymously and slowly.
 - `SESSION_SECRET` and `JOBS_SECRET`: 64 hex characters each. Generate each with `node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"`.
-- `APP_ORIGIN`: `http://localhost:3001` for local work.
-- `DATABASE_URL`: `pglite:./local-db` for local work. It is a file database that the app creates and migrates inside `packages/web` on first start, so no Postgres is needed.
+- `APP_ORIGIN`: `http://localhost:3001` for local work. If you set `PORT`, use the same port here, because wallet sign-in checks the address.
+- `DATABASE_URL`: `pglite:./local-db` for local work. It is a file database that the app creates and migrates inside `packages/web` the first time a page reads data, so no Postgres is needed.
 - `ANTHROPIC_API_KEY`: optional. Only the built-in agent needs it.
 
 Start the app:
@@ -401,7 +401,7 @@ Start the app:
 node packages/web/scripts/dev.mjs
 ```
 
-It serves on port 3001 (set `PORT` to change it) and reads the root `.env`. To run the live proofs, fund the addresses the setup script printed: a few dollars of USDC and about 0.5 SUI to the test owner, and about 0.5 SUI to the gas wallet. That was enough for every proof in this repo. No SUI or USDC yet? Buy them on an exchange that supports withdrawals on the Sui network and send them to the printed addresses.
+It serves on port 3001 (set `PORT` to change it) and reads the root `.env`. A fresh local copy starts empty: the numbers on the live site come from the live site's own records. To run the live proofs, fund the addresses the setup script printed: a few dollars of USDC and about 0.5 SUI to the test owner, and about 0.5 SUI to the gas wallet. That was enough for every proof in this repo. No SUI or USDC yet? Buy them on an exchange that supports withdrawals on the Sui network and send them to the printed addresses.
 
 ## Connect an agent
 
@@ -560,6 +560,7 @@ The written standard is the [threat model](docs/security/threat-model.md). It li
 - Every outside call has a time limit and a size limit. When something cannot be checked, the answer is no.
 - Purposes, seller hosts, reasons, memory sentences and seller answers are shown as plain text. They are never rendered as HTML.
 - On the pay flow, 18 of 18 deliberate guard removals were caught by the tests.
+- `npm audit --omit=dev` finds nothing. The full `npm audit` reports 4 moderate findings, all in an old esbuild inside drizzle-kit, the developer tool that writes database migrations. It never ships with the app and never runs a server.
 
 How it was checked. Three review rounds and then four independent read-only audit passes, run with Claude Opus. The audit found 7 important issues, and the re-check found 2 more. All were fixed and re-checked. There has not been an outside human audit yet.
 
