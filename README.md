@@ -493,11 +493,11 @@ What the test does not show: the 4 hotel requests in the first 12 were already l
 
 | Suite | Test files | Tests | Run on |
 |---|---|---|---|
-| core (includes live Tatum reads on Sui Mainnet) | 9 | 293 passed | 29 October 2026 |
-| proof | 1 | 8 passed | 29 October 2026 |
-| web | 25 | 785 passed | 29 October 2026 |
+| core (includes live Tatum reads on Sui Mainnet) | 9 | 298 passed | 2 November 2026 |
+| proof | 1 | 8 passed | 2 November 2026 |
+| web | 25 | 800 passed | 2 November 2026 |
 
-All three come from `npm test` in each package on 29 October 2026, with no failures, the root typecheck clean and the production web build clean. Core's live reads need a Tatum key in `.env`.
+All three come from `npm test` in each package on 2 November 2026, with no failures, the root typecheck clean and the production web build clean. Core's live reads need a Tatum key in `.env`.
 
 ## What it costs
 
