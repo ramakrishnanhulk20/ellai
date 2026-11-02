@@ -477,9 +477,15 @@ export const LIMITS = {
    */
   tatumCallsRefillsPerDay: 500,
   /**
-   * The least time between two tick reads of one pending payment whose window is still open: an
-   * hour. The paid call read it already, and a payment the seller is holding back costs a read
-   * per tick otherwise (C22).
+   * Requests to Tatum the refill step may make for one owner in a day, counted before
+   * tatumCallsRefillsPerDay, so one owner's visits cannot spend the pool every other owner's purse
+   * needs (C23, C28). Three refills a day with their dry runs, sends and paced reads need well under this.
+   */
+  tatumCallsRefillsPerOwnerPerDay: 100,
+  /**
+   * The least time between two tick or visit reads of one pending payment, or one pending refill
+   * past freshRefillWindowMs, while no read has seen its window closed: an hour. The paid call read
+   * it already, and a payment the seller is holding back costs a read per tick otherwise (C22, C40).
    */
   pendingPaymentReadIntervalMs: 3_600_000,
   /** How long the refill step waits after a failed dry run before trying again: an hour, since the owner may top up their wallet at any time and failed rows already count toward purseMaxRefillsPerDay. */
@@ -636,4 +642,50 @@ export const LIMITS = {
   ownerVisitMaxPasses: 8,
   /** The overview starts a visit only when the owner's last visit is older than this, since screens load it after every action. */
   ownerVisitMinGapMs: 60_000,
+  /**
+   * The least time between two reads of a pending refill past freshRefillWindowMs once a read has
+   * seen its window closed (missing_since set): the jobs tick's 10-minute cadence, so its two-pass
+   * release keeps its timing however often visits come. While its window is open it is read at
+   * most every pendingPaymentReadIntervalMs instead (C22, C40).
+   */
+  pendingRefillReadIntervalMs: 600_000,
+  /**
+   * How long after it was sent a pending refill is read on every pass of a visit
+   * (ownerVisitPassGapMs apart) and keeps the visit passing: a refill that lands lands within
+   * seconds, and one visit's whole budget (tickTimeBudgetMs) fits inside this, so past it the reads
+   * are paced by the hour or by pendingRefillReadIntervalMs and a stuck refill stays inside one
+   * owner's tatumCallsRefillsPerOwnerPerDay (C22, C40).
+   */
+  freshRefillWindowMs: 120_000,
+  /**
+   * How long the refill step asks the chain nothing after one of its reads failed or the allowance
+   * index lagged: the tick's 10-minute cadence, so an outage costs a visit at request rate no more
+   * reads than it costs the tick (C22, C40).
+   */
+  refillErrorWaitMs: 600_000,
+  /**
+   * The least time between two reads of a pending payment whose window has closed, on the tick's
+   * and visits' paced passes: the tick's 10-minute cadence, so the settlementUnverifiableReads
+   * failed reads that make a payment unverifiable take at least 50 minutes however often visits
+   * run (C8, C21, C40).
+   */
+  closedWindowReadSpacingMs: 600_000,
+  /**
+   * The least time between two scans of one owner's Walrus Blob objects for memories still
+   * waiting: half an hour, so a memory waiting all day costs 48 scans rather than one a visit;
+   * a memory confirmed since the last scan is looked for at once (C18, C22, C40).
+   */
+  blobScanSpacingMs: 1_800_000,
+  /**
+   * How long the refill step waits after Tatum's GraphQL index missed an allowance gRPC still holds:
+   * a minute, since the index usually catches up within one and the first refill after setup
+   * should not wait refillErrorWaitMs (C7, C22).
+   */
+  allowanceLagWaitMs: 60_000,
+  /**
+   * How long one Sui epoch reading is reused across runs in a process, whatever scope read it:
+   * epochs only go up, so an older reading can only hold a read back, and visits at request rate
+   * then cost one epoch read per this span (C22, C40).
+   */
+  epochReadingReuseMs: 600_000,
 } as const;

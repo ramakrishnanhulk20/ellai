@@ -434,10 +434,10 @@ describe('the owner visit each route an owner or an agent acts through schedules
     expect(log.mock.calls.at(-1)?.join(' ')).toBe('[ellai visit] trigger=agent started=true passes=1 submitted=0 confirmed=0 refills=0 codes=none');
     const visited = async (ownerId: string) => (await db.select({ at: owners.lastTickedAt }).from(owners).where(eq(owners.id, ownerId)))[0]?.at ?? null;
     expect([await visited(payer.ownerId), await visited(bystander.ownerId)]).toEqual([clock, null]);
-    // The request's own read ran as the owner; the visit's purse read is charged to the refills pool, never to the person (C28).
+    // The request's own read ran as the owner; the visit's purse read is charged to that owner's refills share and then the refills pool, never to the person (C28, C40).
     expect(seen).toEqual([
       { method: 'getCurrentEpoch', scope: asOwner(payer.ownerId) },
-      { method: 'getBalances', scope: { kind: 'refills' } },
+      { method: 'getBalances', scope: { kind: 'refills', ownerId: payer.ownerId } },
     ]);
   });
 

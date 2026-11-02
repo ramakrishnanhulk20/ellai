@@ -34,9 +34,10 @@ export interface SettleArgs {
    */
   inline?: boolean;
   /**
-   * True for the jobs tick's passes: a payment whose window is still open, and which a paced pass
-   * read less than LIMITS.pendingPaymentReadIntervalMs ago, is not read again, and every digest
-   * read such a pass sends stamps payments.last_read_at (C22). Ignored for an inline pass.
+   * True for the jobs tick's and visits' passes: a payment a paced pass read less than
+   * LIMITS.pendingPaymentReadIntervalMs ago, or less than LIMITS.closedWindowReadSpacingMs ago once
+   * a pass has seen its window closed, is not read again, the epoch included, and every digest read
+   * such a pass sends stamps payments.last_read_at (C22, C40). Ignored for an inline pass.
    */
   paced?: boolean;
 }
@@ -133,15 +134,19 @@ async function stored(db: Database, ownerId: string, paymentId: string): Promise
  * owner's auto_paused_at to that same time, in the same update, and neither replaces a
  * PURSE_KEY_MISMATCH pause already in place (A-F4).
  *
- * A `paced` pass, the jobs tick's, first looks at payments.last_read_at: when a paced pass read
- * this digest less than LIMITS.pendingPaymentReadIntervalMs ago, it reads the epoch through
- * `readEpoch` before any digest read, and while the window is still open, or the epoch cannot be
- * read, it answers 'pending' with nothing read, so a seller holding a payment back costs one read
- * an hour rather than one a tick (C22). A window that has closed is read on every pass, so the
- * release above keeps its timing; an older epoch reading can only hold a read back, since epochs
- * only go up. Every digest read a paced pass sends that does not find the transaction stamps
- * last_read_at with the time after it; a read the budget refused was never sent and stamps
- * nothing. The epoch is read at most once a pass.
+ * A `paced` pass, the jobs tick's or a visit's, first looks at payments.last_read_at and answers
+ * 'pending' with nothing read, the epoch included, while the last paced read is younger than its
+ * spacing (C22, C40). Once a pass has seen the window closed (missing_since stamped, or a failed
+ * read counted) the spacing is LIMITS.closedWindowReadSpacingMs, the tick's own cadence, so the
+ * release above keeps its timing and a visit's passes at request rate count failed reads no faster
+ * than the tick: the LIMITS.settlementUnverifiableReads that make a payment unverifiable take at
+ * least 50 minutes (C8, C21). Before that it is LIMITS.pendingPaymentReadIntervalMs, so a seller
+ * holding a payment back costs one digest read and one epoch reading an hour however often visits
+ * come. A window that closed between two reads is then seen up to that hour late, which only
+ * delays a release or the count toward a verdict; it never brings either sooner. An older epoch
+ * reading can likewise only hold a read back, since epochs only go up. Every digest read a paced
+ * pass sends that does not find the transaction stamps last_read_at with the time after it; a read
+ * the budget refused was never sent and stamps nothing. The epoch is read at most once a pass.
  *
  * A payment already past 'pending' is returned as it is. Writes only from 'pending', so two
  * passes never overwrite each other. Throws for an unknown payment or tries out of range.
@@ -267,15 +272,10 @@ export async function settlePayment(args: SettleArgs): Promise<Settlement> {
   let epochReading: Promise<bigint> | null = null;
   const epochNow = (): Promise<bigint> => (epochReading ??= readEpoch());
 
-  if (paced && lastReadAt !== null && stamp().getTime() - lastReadAt.getTime() < LIMITS.pendingPaymentReadIntervalMs) {
-    let early: bigint;
-    try {
-      early = await epochNow();
-    } catch {
-      return 'pending';
-    }
-    if (early <= validUntilEpoch) return 'pending';
-  }
+  // Only a pass whose epoch reading showed the window closed stamps missing_since or counts a failed read.
+  const seenClosed = missingSince !== null || row.payment.settlementFailedReads > 0;
+  const sinceReadMs = paced && lastReadAt !== null ? stamp().getTime() - lastReadAt.getTime() : null;
+  if (sinceReadMs !== null && sinceReadMs < (seenClosed ? LIMITS.closedWindowReadSpacingMs : LIMITS.pendingPaymentReadIntervalMs)) return 'pending';
 
   let failed = false;
   let refused = false;

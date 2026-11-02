@@ -1,6 +1,6 @@
 import { type Chain, ChainError, type ChainErrorCode } from '@ellai/core/chain';
 import { LIMITS } from '@ellai/core/limits';
-import { type SQL, and, asc, count, eq, gte, inArray, isNotNull, isNull, lte, sql } from 'drizzle-orm';
+import { type SQL, and, asc, count, eq, gt, gte, inArray, isNotNull, isNull, lt, lte, or, sql } from 'drizzle-orm';
 import type { Database } from '../db/client.js';
 import { memories, owners } from '../db/schema.js';
 
@@ -100,6 +100,32 @@ export function awaitingChainCheck(now: Date): SQL | undefined {
 }
 
 /**
+ * An owner, joined from memories or read alone, whose blob reads may run again at `now`: never
+ * read, or last read at least LIMITS.blobScanSpacingMs before it (owners.blobs_checked_at), so
+ * visits at request rate scan no more often than that (C22, C40). The jobs tick reads the same
+ * condition to decide whether an owner has blob work.
+ */
+export function blobScanDue(now: Date): SQL | undefined {
+  return or(isNull(owners.blobsCheckedAt), lte(owners.blobsCheckedAt, new Date(now.getTime() - LIMITS.blobScanSpacingMs)));
+}
+
+/**
+ * A waiting memory, joined with its owner, that became old enough to be looked for
+ * (confirmed_at + LIMITS.blobChainCheckMinAgeMs, as awaitingChainCheck counts) after the owner's
+ * last blob read, so no read has looked for it yet, even one run for other memories just after it
+ * was confirmed: it is looked for at once, whatever the spacing, so /proof shows a new memory
+ * promptly. Confirmations come only from owner answers and from verified payments delivered false.
+ * An owner answer needs only the session, so each answer can force one extra scan, spent from that
+ * owner's own jobs share (C28); a delivered-false outcome costs a real payment.
+ */
+export const confirmedSinceScan = lt(owners.blobsCheckedAt, sql`${memories.confirmedAt} + (${LIMITS.blobChainCheckMinAgeMs}::integer * interval '1 millisecond')`);
+
+/** Records that this owner's blob reads ran at `now`, whatever they returned (blobScanDue). */
+async function stampBlobsChecked(db: Database, ownerId: string, now: Date): Promise<void> {
+  await db.update(owners).set({ blobsCheckedAt: now }).where(eq(owners.id, ownerId));
+}
+
+/**
  * C18: sets chain_confirmed_at on this owner's memories that Walrus Memory reported confirmed,
  * once their blob id is on a Walrus Blob object at the owner's address that is certified and
  * whose end epoch is past the current Walrus epoch, so /proof never vouches for a write on the
@@ -115,7 +141,10 @@ export function awaitingChainCheck(now: Date): SQL | undefined {
  * listing, from the top to its end with no failure, a memory still lacking an end epoch is on no
  * certified Blob object the owner holds, so Walrus stores nothing for the owner under that id:
  * chain_expired_at is set to `now` (C18). A listing read across calls proves no absence. With
- * nothing waiting and nothing to fill in, nothing is read from Tatum (C21).
+ * nothing waiting and nothing to fill in, nothing is read from Tatum (C21). Nor is anything read
+ * unless the owner's blob reads are due (blobScanDue) or a waiting memory became old enough to be
+ * looked for after the last of them (confirmedSinceScan); a call that reads stamps owners.blobs_checked_at with `now`
+ * first, whatever the reads then return (C22, C40).
  *
  * Anyone can send Blob objects to an address, so the owner's objects are read in stretches: from
  * owners.blob_scan_cursor, one page of chain.scanOwnedWalrusBlobs at a time, at most
@@ -143,7 +172,10 @@ export async function confirmBlobsOnChain(args: BlobConfirmArgs): Promise<{ chec
   const canStart = args.canStart ?? (() => true);
   const ownerId = args.ownerId.toLowerCase();
 
-  const [owner] = await db.select({ suiAddress: owners.suiAddress, cursor: owners.blobScanCursor }).from(owners).where(eq(owners.id, ownerId));
+  const [owner] = await db
+    .select({ suiAddress: owners.suiAddress, cursor: owners.blobScanCursor, checkedAt: owners.blobsCheckedAt })
+    .from(owners)
+    .where(eq(owners.id, ownerId));
   if (owner === undefined) return { checked: 0, confirmed: 0 };
   const waitingHere = and(eq(memories.ownerId, ownerId), awaitingChainCheck(now));
   const lackingHere = and(eq(memories.ownerId, ownerId), lackingEndEpoch);
@@ -151,6 +183,13 @@ export async function confirmBlobsOnChain(args: BlobConfirmArgs): Promise<{ chec
   const waiting = counted?.n ?? 0;
   const [lacking] = await db.select({ id: memories.id }).from(memories).where(lackingHere).limit(1);
   if ((waiting === 0 && lacking === undefined) || !canStart()) return { checked: 0, confirmed: 0 };
+  const { checkedAt } = owner;
+  if (checkedAt !== null && now.getTime() - checkedAt.getTime() < LIMITS.blobScanSpacingMs) {
+    const eligibleSince = new Date(checkedAt.getTime() - LIMITS.blobChainCheckMinAgeMs);
+    const [newer] = await db.select({ id: memories.id }).from(memories).where(and(waitingHere, gt(memories.confirmedAt, eligibleSince))).limit(1);
+    if (newer === undefined) return { checked: 0, confirmed: 0 };
+  }
+  await stampBlobsChecked(db, ownerId, now);
 
   const epoch = await currentWalrusEpoch(chain, now);
   // Blob id to the latest end epoch among the certified Blob objects that carry it, and among
@@ -213,9 +252,10 @@ export async function confirmBlobsOnChain(args: BlobConfirmArgs): Promise<{ chec
  * epoch is the one confirmBlobsOnChain saw; a Blob extended since then is counted expired early,
  * which can only hide a memory, never show one. Nothing is read unless the owner has a memory
  * stored on chain, and then only the Walrus epoch, through the hourly reading the jobs tick and
- * confirmBlobsOnChain share; with that reading stale, `canStart` is asked first. Returns how many
- * it marked. Throws for an owner id that is not a uuid or a time that is not a date, and
- * ChainError from the read.
+ * confirmBlobsOnChain share; with that reading stale, `canStart` is asked first, the read waits
+ * until the owner's blob reads are due (blobScanDue), and owners.blobs_checked_at is stamped with
+ * `now` before it (C22, C40). Returns how many it marked. Throws for an owner id that is not a
+ * uuid or a time that is not a date, and ChainError from the read.
  */
 export async function expireBlobsOnChain(args: BlobConfirmArgs): Promise<{ expired: number }> {
   if (typeof args.ownerId !== 'string' || !UUID.test(args.ownerId)) throw new Error('the owner id is not a uuid');
@@ -230,8 +270,14 @@ export async function expireBlobsOnChain(args: BlobConfirmArgs): Promise<{ expir
     .where(and(eq(memories.ownerId, ownerId), storedOnChain))
     .limit(1);
   if (stored === undefined) return { expired: 0 };
-  const epoch = cachedWalrusEpoch(chain, now) ?? (canStart() ? await currentWalrusEpoch(chain, now) : null);
-  if (epoch === null) return { expired: 0 };
+  let epoch = cachedWalrusEpoch(chain, now);
+  if (epoch === null) {
+    if (!canStart()) return { expired: 0 };
+    const [due] = await db.select({ id: owners.id }).from(owners).where(and(eq(owners.id, ownerId), blobScanDue(now)));
+    if (due === undefined) return { expired: 0 };
+    await stampBlobsChecked(db, ownerId, now);
+    epoch = await currentWalrusEpoch(chain, now);
+  }
   const expiringHere = and(eq(memories.ownerId, ownerId), chainExpiring(epoch));
   const due = db.select({ id: memories.id }).from(memories).where(expiringHere).orderBy(asc(memories.blobEndEpoch), asc(memories.id)).limit(LIMITS.blobConfirmBatch);
   const marked = await db

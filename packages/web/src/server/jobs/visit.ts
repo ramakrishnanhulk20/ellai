@@ -7,6 +7,7 @@ import type { Database } from '../db/client.js';
 import { memories, owners, refills } from '../db/schema.js';
 import { withServerContext } from '../http/context.js';
 import { withTatumScope } from '../http/tatum-meter.js';
+import { writeFree } from '../memory/writer.js';
 import { type JobsTickArgs, type JobsTickSummary, emptySummary, errorCode, hasVisitWork, oneEpochReading, recordingStep, visitOwner } from './tick.js';
 
 /** The owner's own request a visit follows. */
@@ -47,8 +48,13 @@ export async function releaseVisitLease(db: Database, ownerId: string, until: Da
     .where(and(eq(owners.id, ownerId), eq(owners.visitLeaseUntil, until)));
 }
 
-/** A relayer write still to be confirmed (only for an owner with a Walrus Memory account, the only kind a pass can send) or a refill still pending. */
-async function stillWaiting(db: Database, ownerId: string): Promise<boolean> {
+/**
+ * A relayer write still to be confirmed (only for an owner with a Walrus Memory account, the only
+ * kind a pass can send) or a refill still pending that was sent within LIMITS.freshRefillWindowMs
+ * of `now`. A refill that lands does so within seconds; one older than that is read no faster than
+ * the tick would read it (refills.last_read_at), so further passes would only wait (C22, C40).
+ */
+async function stillWaiting(db: Database, ownerId: string, now: Date): Promise<boolean> {
   const memory = db
     .select({ id: memories.id })
     .from(memories)
@@ -56,7 +62,7 @@ async function stillWaiting(db: Database, ownerId: string): Promise<boolean> {
   const refill = db
     .select({ id: refills.id })
     .from(refills)
-    .where(and(eq(refills.ownerId, ownerId), eq(refills.status, 'pending')));
+    .where(and(eq(refills.ownerId, ownerId), eq(refills.status, 'pending'), gt(refills.sentAt, new Date(now.getTime() - LIMITS.freshRefillWindowMs))));
   const [row] = await db
     .select({ id: owners.id })
     .from(owners)
@@ -64,7 +70,7 @@ async function stillWaiting(db: Database, ownerId: string): Promise<boolean> {
   return row !== undefined;
 }
 
-/** A pending memory no pass holds, of an owner with a Walrus Memory account: never sent, and never handed to the relayer, or handed to it longer ago than submitPendingMemories's own lease. */
+/** A pending memory no pass holds, of an owner with a Walrus Memory account: never sent, and free by submitPendingMemories's own rule (writeFree). */
 async function unsentMemory(db: Database, ownerId: string, now: Date): Promise<boolean> {
   const [row] = await db
     .select({ id: memories.id })
@@ -77,7 +83,7 @@ async function unsentMemory(db: Database, ownerId: string, now: Date): Promise<b
         isNotNull(owners.memwalAccountId),
         eq(memories.status, 'pending'),
         isNull(memories.jobId),
-        or(isNull(memories.submittedAt), lte(memories.submittedAt, new Date(now.getTime() - LIMITS.memoryWriteLeaseMs))),
+        writeFree(now),
       ),
     )
     .limit(1);
@@ -105,18 +111,23 @@ async function visitedSince(db: Database, ownerId: string, since: Date): Promise
  * have run, it takes the owner's lease (acquireVisitLease; null, another visit holds the owner,
  * ends the visit) and makes passes under it: each stamps last_ticked_at and runs visitOwner once.
  * The passes stop when a pass recorded an error, when nothing is waiting (no pending memory for
- * an owner with a Walrus Memory account and no pending refill), at the pass ceiling, or at the
+ * an owner with a Walrus Memory account and no pending refill sent within
+ * LIMITS.freshRefillWindowMs, stillWaiting), at the pass ceiling, or at the
  * deadline; otherwise it sleeps LIMITS.ownerVisitPassGapMs and passes again, asking the deadline
  * once more after the sleep, so no pass starts at or past `deadlineMs` (C21). The lease is
  * released however the passes end. A memory a request recorded while this visit held the lease
  * found the lease taken, so its own visit did nothing: once released, a pending memory no pass
- * holds (no job id, and submitted_at null or at least LIMITS.memoryWriteLeaseMs old), of an owner
+ * holds (no job id, and free by the writer's own rule, writeFree), of an owner
  * with a Walrus Memory account, takes the lease again and continues the passes, inside the same
  * ceilings. Passes that ended on a pass's recorded error never take the lease again, since the
  * failure would only repeat at once: the scheduled tick or the owner's next request retries it.
  *
- * Every pass shares one epoch reading (oneEpochReading). Each Tatum request is charged as the
- * tick's are: to this owner's jobs share, and the refill step's to the refills pool (C22, C28).
+ * Every pass shares one epoch reading (oneEpochReading), which names this owner. Each Tatum
+ * request is charged to this owner's own share before a shared one: to this owner's jobs share,
+ * that epoch reading included, and the refill step's to this owner's refills share and then the
+ * refills pool (C22, C28). Every external read a pass makes is paced by a time stored on its row
+ * (payments.last_read_at, refills.last_read_at, owners.refill_not_before), so passes at request
+ * rate repeat no read faster than the tick would (C40).
  * A failed step, a failed lease read or release ('lease') and a failed read of what is still
  * waiting ('waiting') are recorded with a fixed code (C19). Never throws for a step's failure;
  * throws only when the first check for work cannot be read, or when `sleep` throws, after
@@ -133,7 +144,7 @@ export async function runOwnerVisit(args: JobsTickArgs & { ownerId: string; trig
   if (trigger === 'overview' && (await visitedSince(db, ownerId, new Date(gateAt.getTime() - LIMITS.ownerVisitMinGapMs)))) return result;
   if (!(await hasVisitWork(db, ownerId, gateAt))) return result;
 
-  const visit = { db, chain, masterSecretHex, gasKeypair, now, sleep, ownerId, canStart, readEpoch: oneEpochReading(chain), summary, step };
+  const visit = { db, chain, masterSecretHex, gasKeypair, now, sleep, ownerId, canStart, readEpoch: oneEpochReading(chain, now, ownerId), summary, step };
   const recorded = (name: string) => (error: unknown) => {
     summary.errors.push({ ownerId, step: name, code: errorCode(error) });
     return null;
@@ -153,7 +164,7 @@ export async function runOwnerVisit(args: JobsTickArgs & { ownerId: string; trig
       result.started = true;
       summary.owners = 1;
       if (summary.errors.length > errorsBefore) return true;
-      if ((await stillWaiting(db, ownerId).catch(recorded('waiting'))) !== true) return false;
+      if ((await stillWaiting(db, ownerId, now()).catch(recorded('waiting'))) !== true) return false;
       if (result.passes >= LIMITS.ownerVisitMaxPasses || !canStart()) return false;
     }
   };
@@ -188,11 +199,11 @@ export function setVisitScheduler(next: VisitScheduler | null): void {
 
 const realSleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
-// A visit may start no unit that could still be running at the route's limit: the slowest unit
-// the tick may start just before its deadline is held to tickEndByMs - tickTimeBudgetMs
-// (jobs.test.ts works it out), so that much is kept clear of the limit (C21).
-function visitDeadline(taskStartMs: number, requestStartedMs: number): number {
-  return Math.min(taskStartMs + LIMITS.tickTimeBudgetMs, requestStartedMs + LIMITS.slowRouteMaxDurationS * 1_000 - (LIMITS.tickEndByMs - LIMITS.tickTimeBudgetMs));
+// The tick's own deadline, counted from the request's start as the route's limit is: the slowest
+// unit begun just before it still ends inside tickEndByMs, the tick's 20 s margin under that limit
+// (jobs.test.ts works it out), never at the limit itself (C21).
+function visitDeadline(requestStartedMs: number): number {
+  return requestStartedMs + LIMITS.tickTimeBudgetMs;
 }
 
 // Counts and fixed codes only: never an id, an address, a message or a value (C19).
@@ -211,9 +222,10 @@ function logVisit(trigger: VisitTrigger, result: OwnerVisitResult | null, codes:
  * the route has answered (C40). The task opens a context of its own (withServerContext: a fresh
  * database handle and Tatum meter, never the request's, whose pool is closed by then), runs in the
  * jobs scope as the jobs route does, and calls runOwnerVisit with the jobs route's arguments and a
- * deadline of the visit's time budget (LIMITS.tickTimeBudgetMs) from when the task starts, cut
- * short so the slowest unit it may start still ends inside the route's own limit, counted from
- * `requestStartedMs` (C21). The task never throws: it writes exactly one console line,
+ * deadline of the visit's time budget (LIMITS.tickTimeBudgetMs) from `requestStartedMs`, so the
+ * slowest unit it may start ends inside LIMITS.tickEndByMs of the request's start, as a tick's
+ * does inside the jobs route, with the tick's margin under the route's own limit (C21). The task
+ * never throws: it writes exactly one console line,
  * `[ellai visit] trigger=... started=... passes=... submitted=... confirmed=... refills=... codes=...`,
  * with counts and fixed codes only (C19). A scheduler that refuses the task is logged as a fixed
  * code and never reaches the route's answer.
@@ -233,7 +245,7 @@ export function scheduleOwnerVisit(ownerId: string, trigger: VisitTrigger, reque
             sleep: realSleep,
             ownerId,
             trigger,
-            deadlineMs: visitDeadline(ctx.now().getTime(), requestStartedMs),
+            deadlineMs: visitDeadline(requestStartedMs),
           }),
         ),
       );

@@ -143,6 +143,9 @@ export const owners = pgTable(
     // Where the chain check of this owner's Walrus Blob objects stopped, since one tick reads a
     // bounded number of pages and anyone can send Blob objects to an address.
     blobScanCursor: text('blob_scan_cursor'),
+    // When this owner's Blob objects or the Walrus epoch were last read for it, failed reads included,
+    // so visits at request rate scan no more often than LIMITS.blobScanSpacingMs (C22, C40).
+    blobsCheckedAt: at('blobs_checked_at'),
     // An allowance whose rate window has no room for a refill cannot change before the window
     // ends, so the tick does not ask the chain again until then (C22).
     refillNotBefore: at('refill_not_before'),
@@ -483,8 +486,9 @@ export const payments = pgTable(
     // The first tick pass that saw the window closed and the digest missing. A release needs a
     // second such pass well after it, so one lagging read can never free the budget (C4, C27).
     missingSince: at('missing_since'),
-    // When the tick last read this payment's digest, so a payment held back by its seller is read
-    // at most hourly while its window is open (C22).
+    // When the tick or a visit last read this payment's digest, so a payment held back by its
+    // seller is read at most hourly while its window is open, and at the tick's cadence once it
+    // has closed (C22, C40).
     lastReadAt: at('last_read_at'),
   },
   (t) => [
@@ -517,6 +521,9 @@ export const refills = pgTable(
     // The first pass that saw the refill's window closed and its digest missing; it is failed only
     // after a second such pass well after it, as payments are (C27).
     missingSince: at('missing_since'),
+    // When this refill's digest was last asked for, failed reads included, so visits at request
+    // rate read a refill that is not landing no more often than the tick would (C22, C40).
+    lastReadAt: at('last_read_at'),
   },
   (t) => [
     index('refills_owner_idx').on(t.ownerId),

@@ -1,0 +1,1 @@
+ALTER TABLE "owners" ADD COLUMN "blobs_checked_at" timestamp with time zone;

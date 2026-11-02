@@ -6,18 +6,20 @@ import { consumeShared, consumeWindow } from './ratelimit.js';
 
 /**
  * Who a request to Tatum is charged to. 'jobs' is the scheduled tick and the operator's scripts,
- * with the owner whose visit the tick is on when it is on one. 'refills' is the tick's refill step,
- * whichever owner it is for. 'person' is anything a caller started: an anonymous caller by its
- * client key alone, a signed-in owner or an agent with that owner's id as well.
+ * with the owner whose visit the tick is on when it is on one. 'refills' is the refill step of a
+ * tick or a visit, with the owner it is for when it names one. 'person' is anything a caller
+ * started: an anonymous caller by its client key alone, a signed-in owner or an agent with that
+ * owner's id as well.
  */
 export type TatumScope =
   | { readonly kind: 'jobs'; readonly ownerId?: string }
-  | { readonly kind: 'refills' }
+  | { readonly kind: 'refills'; readonly ownerId?: string }
   | { readonly kind: 'person'; readonly clientKey: string; readonly ownerId?: string };
 
 const CLIENT_DAY_KEY_PREFIX = 'tatum-client-day:';
 const OWNER_DAY_KEY_PREFIX = 'tatum-owner-day:';
 const JOBS_OWNER_DAY_KEY_PREFIX = 'tatum-jobs-owner-day:';
+const REFILLS_OWNER_DAY_KEY_PREFIX = 'tatum-refills-owner-day:';
 const PERSON_QUOTA = 'tatum-calls:day';
 const ANONYMOUS_QUOTA = 'tatum-anonymous-calls:day';
 const JOBS_QUOTA = 'tatum-jobs-calls:day';
@@ -37,14 +39,13 @@ function scopes(): AsyncLocalStorage<TatumScope> {
  * Runs `run` with `scope` as the one every Tatum request it starts is charged to, requests from
  * promises it leaves running included. A scope entered inside another replaces it for that inner
  * run. Returns what `run` returns. Throws Error for a person scope with an empty client key, or an
- * empty owner id in a jobs or person scope, which is a server bug.
+ * empty owner id in any scope, which is a server bug.
  */
 export function withTatumScope<T>(scope: TatumScope, run: () => T): T {
-  if (scope.kind === 'refills') return scopes().run(Object.freeze({ kind: 'refills' as const }), run);
   if (scope.ownerId !== undefined && (typeof scope.ownerId !== 'string' || scope.ownerId === '')) throw new Error('an owner id in a scope cannot be empty');
   let fixed: TatumScope;
-  if (scope.kind === 'jobs') {
-    fixed = scope.ownerId === undefined ? { kind: 'jobs' } : { kind: 'jobs', ownerId: scope.ownerId };
+  if (scope.kind === 'jobs' || scope.kind === 'refills') {
+    fixed = scope.ownerId === undefined ? { kind: scope.kind } : { kind: scope.kind, ownerId: scope.ownerId };
   } else {
     if (typeof scope.clientKey !== 'string' || scope.clientKey === '') throw new Error('a person scope needs a client key');
     fixed = scope.ownerId === undefined ? { kind: 'person', clientKey: scope.clientKey } : { kind: 'person', clientKey: scope.clientKey, ownerId: scope.ownerId };
@@ -84,19 +85,22 @@ async function ownTurn(db: Database, key: string, limit: number, now: Date, who:
  *   other owner's settlement and refills need (C28). Then every 'jobs' request counts one of
  *   LIMITS.tatumCallsJobsPerDay, a budget of its own, so strangers spending the persons' day cannot
  *   stop settlement, and the tick spends none of theirs.
- * - 'refills' counts one of LIMITS.tatumCallsRefillsPerDay, shared by every owner's refill and
- *   apart from the jobs day and every owner's jobs share, so owners whose payments spend those
- *   cannot stop other owners' purses being refilled (C23, C28). Strangers cannot reach it either.
+ * - 'refills' with an owner counts one of LIMITS.tatumCallsRefillsPerOwnerPerDay for that owner
+ *   first, so one owner's visits at request rate cannot spend the pool every other owner's purse
+ *   needs (C23, C28, C40). Then every 'refills' request counts one of LIMITS.tatumCallsRefillsPerDay,
+ *   shared by every owner's refill and apart from the jobs day and every owner's jobs share, so
+ *   owners whose payments spend those cannot stop other owners' purses being refilled (C23, C28).
+ *   Strangers cannot reach it either.
  * - 'person' counts one each, in this order, of LIMITS.tatumCallsPerClientPerDay for its client
  *   key; LIMITS.tatumCallsPerOwnerPerDay for its owner when it names one, or, when it names none,
  *   LIMITS.tatumCallsAnonymousPerDay shared by every caller with no owner, so strangers can never
  *   take the share owners need to sign; and LIMITS.tatumCallsPerDayGlobal shared by every person.
  * Each request stops at the first limit passed, so a caller past its own limit spends nothing after
  * it. A request over a limit still counts toward that limit. A refusal throws Error with fixed text,
- * which createChain turns into ChainError BUDGET with nothing sent. A client, owner or jobs owner
- * refusal logs a fixed code each time; a shared budget (the anonymous, the persons', the jobs' or
- * the refills') logs its name once, at its first refusal in a day. A database failure throws as well, so no
- * request is sent uncounted.
+ * which createChain turns into ChainError BUDGET with nothing sent. A client, owner, jobs owner or
+ * refills owner refusal logs a fixed code each time; a shared budget (the anonymous, the persons',
+ * the jobs' or the refills') logs its name once, at its first refusal in a day. A database failure
+ * throws as well, so no request is sent uncounted.
  */
 export function tatumMeter(db: Database, now: () => Date): BeforeTatumRequest {
   return async () => {
@@ -106,10 +110,13 @@ export function tatumMeter(db: Database, now: () => Date): BeforeTatumRequest {
       throw refusal();
     }
     const at = now();
-    if (scope.kind === 'refills') return sharedTurn(db, REFILLS_QUOTA, LIMITS.tatumCallsRefillsPerDay, at);
     // Owner ids come out of the database in one case already; lower-casing keeps any other
     // spelling from opening a second count.
     const ownerKey = scope.ownerId?.toLowerCase();
+    if (scope.kind === 'refills') {
+      if (ownerKey !== undefined) await ownTurn(db, `${REFILLS_OWNER_DAY_KEY_PREFIX}${ownerKey}`, LIMITS.tatumCallsRefillsPerOwnerPerDay, at, 'refills_owner');
+      return sharedTurn(db, REFILLS_QUOTA, LIMITS.tatumCallsRefillsPerDay, at);
+    }
     if (scope.kind === 'jobs') {
       if (ownerKey !== undefined) await ownTurn(db, `${JOBS_OWNER_DAY_KEY_PREFIX}${ownerKey}`, LIMITS.tatumCallsJobsPerOwnerPerDay, at, 'jobs_owner');
       return sharedTurn(db, JOBS_QUOTA, LIMITS.tatumCallsJobsPerDay, at);

@@ -1,13 +1,14 @@
 // Covers: tatumMeter as a real core chain's beforeRequest hook, on PGlite, with stand-in GraphQL
-// answers counting what is actually sent and the seven day budgets cut small (LIMITS is mocked,
+// answers counting what is actually sent and the eight day budgets cut small (LIMITS is mocked,
 // each to its own size) so each is reached in a few requests: a request outside any scope refused
 // with nothing sent; one client's day, one owner's day, the day every caller with no owner shares
 // and the day every person shares each refusing at exactly its own limit with no request sent past
 // it and nothing counted after the first refusal, so strangers spending theirs leave owners able to
 // sign; the jobs budget kept apart, whole after persons spend the shared day and spending none of
 // it, and one owner's jobs share spent leaving the jobs day for every other owner; the refills pool
-// kept apart from the jobs day and every owner's jobs share, both ways; each shared budget logged
-// once a day; and a new UTC day starting over.
+// kept apart from the jobs day and every owner's jobs share, both ways, and one owner's refills
+// share spent leaving the pool for every other; each shared budget logged once a day; and a new
+// UTC day starting over.
 // Does NOT cover: real Tatum or gRPC (core's chain.test.ts runs the hook on a stand-in gRPC
 // transport), several server instances counting at once (they share the one database, and PGlite
 // serves one connection), or which route enters which scope (routes-scope.test.ts).
@@ -20,7 +21,7 @@ import { type TatumScope, tatumMeter, withTatumScope } from '../src/server/http/
 // The shared day is larger than one client's and one owner's days together, so a test can show
 // that a request refused by one of those never reached the counts after it. The anonymous day sits
 // inside the persons' day, and one owner's jobs share inside the jobs day, as in LIMITS.
-const { CLIENT_DAY, OWNER_DAY, ANONYMOUS_DAY, PERSONS_DAY, JOBS_DAY, JOBS_OWNER_DAY, REFILLS_DAY } = vi.hoisted(() => ({
+const { CLIENT_DAY, OWNER_DAY, ANONYMOUS_DAY, PERSONS_DAY, JOBS_DAY, JOBS_OWNER_DAY, REFILLS_DAY, REFILLS_OWNER_DAY } = vi.hoisted(() => ({
   CLIENT_DAY: 4,
   OWNER_DAY: 3,
   ANONYMOUS_DAY: 5,
@@ -28,6 +29,7 @@ const { CLIENT_DAY, OWNER_DAY, ANONYMOUS_DAY, PERSONS_DAY, JOBS_DAY, JOBS_OWNER_
   JOBS_DAY: 5,
   JOBS_OWNER_DAY: 2,
   REFILLS_DAY: 3,
+  REFILLS_OWNER_DAY: 2,
 }));
 
 vi.mock('@ellai/core/limits', async (importOriginal) => {
@@ -42,6 +44,7 @@ vi.mock('@ellai/core/limits', async (importOriginal) => {
       tatumCallsJobsPerDay: JOBS_DAY,
       tatumCallsJobsPerOwnerPerDay: JOBS_OWNER_DAY,
       tatumCallsRefillsPerDay: REFILLS_DAY,
+      tatumCallsRefillsPerOwnerPerDay: REFILLS_OWNER_DAY,
     },
   };
 });
@@ -106,6 +109,7 @@ const person = (clientKey: string, ownerId?: string): TatumScope => (ownerId ===
 const JOBS: TatumScope = { kind: 'jobs' };
 const jobsFor = (ownerId: string): TatumScope => ({ kind: 'jobs', ownerId });
 const REFILLS: TatumScope = { kind: 'refills' };
+const refillsFor = (ownerId: string): TatumScope => ({ kind: 'refills', ownerId });
 const repeat = <T>(n: number, value: T): T[] => Array<T>(n).fill(value);
 const fresh = (label: string) => `${label}-${randomUUID()}`;
 /** A signed-in owner on a client of its own, so only the persons' day is shared with anyone. */
@@ -218,5 +222,19 @@ describe('tatumMeter', () => {
     expect(await requests(repeat(REFILLS_DAY, REFILLS))).toEqual(repeat(REFILLS_DAY, 'sent'));
     expect(await requests([...repeat(JOBS_OWNER_DAY, jobsFor(owners[0] ?? '')), ...repeat(JOBS_DAY - JOBS_OWNER_DAY, JOBS)])).toEqual(repeat(JOBS_DAY, 'sent'));
     expect(sent).toBe(REFILLS_DAY + JOBS_DAY);
+  });
+
+  it("holds one owner's refills to that owner's refills share before the pool, so one owner past it leaves the pool for every other (C23, C28)", async () => {
+    expect(REFILLS_OWNER_DAY).toBeLessThan(REFILLS_DAY);
+    const greedy = randomUUID();
+    expect(await requests(repeat(REFILLS_OWNER_DAY + 2, refillsFor(greedy)))).toEqual([...repeat(REFILLS_OWNER_DAY, 'sent'), 'BUDGET', 'BUDGET']);
+    expect(logs).toEqual(repeat(2, '[ellai tatum] refills_owner rate_limited_today'));
+    // The same owner spelled in capitals is the same share.
+    expect(await request(refillsFor(greedy.toUpperCase()))).toBe('BUDGET');
+    // None of the refusals reached the pool: another owner still gets exactly what is left of it.
+    const other = randomUUID();
+    expect(await requests(repeat(REFILLS_DAY - REFILLS_OWNER_DAY + 1, refillsFor(other)))).toEqual([...repeat(REFILLS_DAY - REFILLS_OWNER_DAY, 'sent'), 'BUDGET']);
+    expect(sent).toBe(REFILLS_DAY);
+    expect(logs.at(-1)).toBe('[ellai tatum] quota_spent tatum-refills-calls:day');
   });
 });

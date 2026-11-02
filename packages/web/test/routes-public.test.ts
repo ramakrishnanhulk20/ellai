@@ -517,6 +517,8 @@ describe('GET /api/public/proof', () => {
     nowMs += LIMITS.publicProofCacheMs;
     expect((await proof()).body.memories).toEqual([]);
 
+    // The owner's next blob read is due LIMITS.blobScanSpacingMs after the last.
+    nowMs += LIMITS.blobScanSpacingMs;
     expect(await confirmBlobsOnChain({ db: proofDb.db, chain: listing([blobId]), ownerId: w.ownerId, now: new Date(nowMs) })).toEqual({ checked: 1, confirmed: 1 });
     nowMs += LIMITS.publicProofCacheMs;
     const after = await proof();
@@ -542,7 +544,10 @@ describe('GET /api/public/proof', () => {
     const stored = await proof();
     expect([stored.body.memories, stored.body.totals.confirmedOwnerAnswers]).toEqual([[{ blobId, kind: 'owner_decision', verdict: 'approve', host: 'hotels.example', confirmedAt: confirmedAt.toISOString() }], 1]);
 
+    // Each listing is a new chain client with no Walrus epoch kept, so each expiry call reads it, once the owner's blob reads are due again.
+    nowMs += LIMITS.blobScanSpacingMs;
     expect(await expireBlobsOnChain({ db: proofDb.db, chain: listing(53), ownerId: w.ownerId, now: new Date(nowMs) })).toEqual({ expired: 0 });
+    nowMs += LIMITS.blobScanSpacingMs;
     expect(await expireBlobsOnChain({ db: proofDb.db, chain: listing(54), ownerId: w.ownerId, now: new Date(nowMs) })).toEqual({ expired: 1 });
     nowMs += LIMITS.publicProofCacheMs;
     const ended = await proof();

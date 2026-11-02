@@ -39,7 +39,8 @@
 // settles pending payments with one digest read a pass and remembers a paid seller stored as
 // delivering nothing exactly once (never one whose delivery is unknown) with one epoch reading for
 // every settlement pass in a tick, reads a payment whose window is open at most once per
-// LIMITS.pendingPaymentReadIntervalMs and one whose window has closed every tick, releases a lost
+// LIMITS.pendingPaymentReadIntervalMs and one whose window has closed at most once per
+// LIMITS.closedWindowReadSpacingMs, every tick at the tick's cadence, releases a lost
 // payment only on a second pass
 // LIMITS.paymentReleaseGapMs after the first, records an outcome a paid call failed to record,
 // expires decisions for every owner without visiting one whose only work they are, fails aged
@@ -768,20 +769,24 @@ describe('refillIfNeeded', () => {
     expect(calls).toEqual([readLost, 'getCurrentEpoch']);
     expect(await lostRow()).toMatchObject({ status: 'pending', missingSince: null });
 
-    // The first call that sees the window closed and the digest missing only marks it.
+    // The first call that sees the window closed and the digest missing only marks it. The refill is
+    // fresh, so it may be read again a pass gap after the last read (refills.last_read_at).
+    const marked = new Date(NOW.getTime() + LIMITS.ownerVisitPassGapMs);
+    const after = (ms: number) => new Date(marked.getTime() + ms);
     state.epoch = 102n;
     calls.length = 0;
-    expect(await refill(w, chain)).toBe('skipped_pending');
+    expect(await refill(w, chain, marked)).toBe('skipped_pending');
     expect(calls).toEqual([readLost, 'getCurrentEpoch']);
-    expect(await lostRow()).toMatchObject({ status: 'pending', missingSince: NOW });
+    expect(await lostRow()).toMatchObject({ status: 'pending', missingSince: marked });
 
     // A miss sooner than LIMITS.paymentReleaseGapMs after that changes nothing.
-    expect(await refill(w, chain, new Date(NOW.getTime() + LIMITS.paymentReleaseGapMs - 1))).toBe('skipped_pending');
-    expect(await lostRow()).toMatchObject({ status: 'pending', missingSince: NOW });
+    expect(await refill(w, chain, after(LIMITS.paymentReleaseGapMs - 1))).toBe('skipped_pending');
+    expect(await lostRow()).toMatchObject({ status: 'pending', missingSince: marked });
     expect(executions).toHaveLength(1);
 
+    // The next read, LIMITS.pendingRefillReadIntervalMs after that one, misses it past the gap.
     calls.length = 0;
-    expect(await refill(w, chain, new Date(NOW.getTime() + LIMITS.paymentReleaseGapMs))).toBe('refilled');
+    expect(await refill(w, chain, after(LIMITS.paymentReleaseGapMs - 1 + LIMITS.pendingRefillReadIntervalMs))).toBe('refilled');
     expect(calls.slice(0, 2)).toEqual([readLost, 'getCurrentEpoch']);
     expect(calls.filter((call) => call === readLost)).toHaveLength(1);
     const rows = await refillRows(w.ownerId);
@@ -1400,6 +1405,8 @@ async function confirmedMemory(w: World, blobId: string, confirmedAt: Date, on: 
 }
 
 const chainConfirmedAt = async (id: string, on: Database) => one(await on.select({ at: memories.chainConfirmedAt }).from(memories).where(eq(memories.id, id))).at;
+/** Lets the owner's next blob read run at once, as LIMITS.blobScanSpacingMs later would, for tests about what a read does rather than when it may run. */
+const rescan = (w: World, on: Database) => on.update(owners).set({ blobsCheckedAt: null }).where(eq(owners.id, w.ownerId));
 const blobEndEpochOf = async (id: string, on: Database) => one(await on.select({ end: memories.blobEndEpoch }).from(memories).where(eq(memories.id, id))).end;
 const chainExpiredAt = async (id: string, on: Database) => one(await on.select({ at: memories.chainExpiredAt }).from(memories).where(eq(memories.id, id))).at;
 
@@ -1462,6 +1469,7 @@ describe('confirmBlobsOnChain', () => {
 
     // A millisecond on, the too-new memory is old enough, and the too-old one stays unchecked for good.
     const later = new Date(NOW.getTime() + 1);
+    await rescan(w, on);
     expect(await confirmBlobsOnChain({ db: on, chain, ownerId: w.ownerId, now: later })).toEqual({ checked: 1, confirmed: 1 });
     expect(await at()).toEqual([later, NOW, NOW, null]);
     expect(LIMITS.blobChainCheckMaxAgeMs).toBe(3 * 86_400_000);
@@ -1512,7 +1520,10 @@ describe('confirmBlobsOnChain', () => {
     const gone = await legacyMemory(w, 'blob-old-gone', on);
     const { chain, state } = stubChain(on);
     state.blobs.set(w.suiAddress, Array.from({ length: 2 * LIMITS.graphqlPageSize }, (_, i) => blob(`blob-${i}`)));
-    const scanOnce = () => confirmBlobsOnChain({ db: on, chain, ownerId: w.ownerId, now: NOW });
+    const scanOnce = async () => {
+      await rescan(w, on);
+      return confirmBlobsOnChain({ db: on, chain, ownerId: w.ownerId, now: NOW });
+    };
     await withLimit('blobScanPagesPerTick', 1, async () => {
       // The top and the end of the listing, each in a call of its own.
       await scanOnce();
@@ -1541,7 +1552,8 @@ describe('confirmBlobsOnChain', () => {
     expect(await cursorOf(w, on)).toBe(`page-${LIMITS.blobScanPagesPerTick}`);
 
     calls.length = 0;
-    const second = new Date(NOW.getTime() + 600_000);
+    // The owner's next blob read is due LIMITS.blobScanSpacingMs after the first.
+    const second = new Date(NOW.getTime() + LIMITS.blobScanSpacingMs);
     expect(await confirmBlobsOnChain({ db: on, chain, ownerId: w.ownerId, now: second })).toEqual({ checked: 1, confirmed: 1 });
     expect(scans(calls)).toEqual([20, 21, 22, 23, 24].map((page) => `scanOwnedWalrusBlobs:${w.suiAddress}:page-${page}`));
     expect(await chainConfirmedAt(memory, on)).toEqual(second);
@@ -1567,6 +1579,7 @@ describe('confirmBlobsOnChain', () => {
     late.state.blobs.set(atFiftyFour.suiAddress, [blob('blob-ended')]);
     expect(await confirmBlobsOnChain({ db: on, chain: late.chain, ownerId: atFiftyFour.ownerId, now: NOW })).toEqual({ checked: 1, confirmed: 0 });
     expect(await chainConfirmedAt(ended, on)).toBeNull();
+    await rescan(atFortyFive, on);
     expect(await confirmBlobsOnChain({ db: on, chain: early.chain, ownerId: atFortyFive.ownerId, now: NOW })).toEqual({ checked: 1, confirmed: 0 });
   });
 
@@ -1576,7 +1589,10 @@ describe('confirmBlobsOnChain', () => {
     const w = await world(on);
     await confirmedMemory(w, 'blob-not-there', ago(120_000), on);
     const { chain, calls } = stubChain(on);
-    const at = (ms: number) => confirmBlobsOnChain({ db: on, chain, ownerId: w.ownerId, now: new Date(NOW.getTime() + ms) });
+    const at = async (ms: number) => {
+      await rescan(w, on);
+      return confirmBlobsOnChain({ db: on, chain, ownerId: w.ownerId, now: new Date(NOW.getTime() + ms) });
+    };
     await at(0);
     await at(LIMITS.walrusEpochCacheMs - 1);
     expect(calls.filter((call) => call === 'getWalrusEpoch')).toHaveLength(1);
@@ -1610,8 +1626,10 @@ describe('confirmBlobsOnChain', () => {
           return chain.scanOwnedWalrusBlobs(address, opts);
         },
       }) as Chain;
+    await rescan(w, on);
     await expect(confirmBlobsOnChain({ db: on, chain: failing(true), ownerId: w.ownerId, now: NOW })).rejects.toMatchObject({ code: 'UPSTREAM' });
     expect(await cursorOf(w, on)).toBe('page-2');
+    await rescan(w, on);
     await expect(confirmBlobsOnChain({ db: on, chain: failing(false), ownerId: w.ownerId, now: NOW })).rejects.toMatchObject({ code: 'BAD_RESPONSE' });
     expect(await cursorOf(w, on)).toBeNull();
   });
@@ -1629,7 +1647,7 @@ describe('confirmBlobsOnChain', () => {
         },
       }) as Chain;
     const scanFrom = async (cursor: string, failure: ChainError) => {
-      await on.update(owners).set({ blobScanCursor: cursor }).where(eq(owners.id, w.ownerId));
+      await on.update(owners).set({ blobScanCursor: cursor, blobsCheckedAt: null }).where(eq(owners.id, w.ownerId));
       await expect(confirmBlobsOnChain({ db: on, chain: failingWith(failure), ownerId: w.ownerId, now: NOW })).rejects.toBe(failure);
       return cursorOf(w, on);
     };
@@ -1663,6 +1681,10 @@ describe('expireBlobsOnChain', () => {
 
     const at54 = stubChain(on);
     at54.state.walrusEpoch = 54;
+    // That read was a moment ago, so a chain client with no Walrus epoch kept reads nothing until the owner's blob reads are due again (C22).
+    expect(await expireBlobsOnChain({ db: on, chain: at54.chain, ownerId: w.ownerId, now: NOW })).toEqual({ expired: 0 });
+    expect(at54.calls).toEqual([]);
+    await rescan(w, on);
     expect(await expireBlobsOnChain({ db: on, chain: at54.chain, ownerId: w.ownerId, now: NOW })).toEqual({ expired: 1 });
     expect([await chainExpiredAt(ending, on), await chainExpiredAt(lasting, on)]).toEqual([NOW, null]);
     expect(await expireBlobsOnChain({ db: on, chain: at54.chain, ownerId: w.ownerId, now: NOW })).toEqual({ expired: 0 });
@@ -1798,7 +1820,7 @@ describe('runJobsTick', () => {
     expect(released.map((row) => row.settlement)).toEqual(Array<string>(5).fill('not_landed'));
   });
 
-  it('reads 10 payments a seller holds back for a day at most 10 x 24 times, then reads them every tick once their window closes and releases them on the two-pass rule (C4, C22)', { timeout: 120_000 }, async () => {
+  it('reads 10 payments a seller holds back for a day at most 10 x 24 times with an epoch reading only on those ticks, sees their window closed at the next hourly read, then reads them every tick and releases them on the two-pass rule (C4, C22)', { timeout: 120_000 }, async () => {
     expect(LIMITS.pendingPaymentReadIntervalMs).toBe(3_600_000);
     const on = await freshDb();
     const w = await world(on);
@@ -1817,29 +1839,31 @@ describe('runJobsTick', () => {
     expect((await rows()).map((row) => row.lastReadAt)).toEqual(Array<Date | null>(10).fill(null));
     calls.length = 0;
 
-    // A day of ticks ten minutes apart, every window still open: a read an hour each, and the tick's one epoch reading.
+    // A day of ticks ten minutes apart, every window still open: a read an hour each, and an epoch reading only on the ticks that read.
     for (let n = 0; n < 144; n++) expect(await tickAt(n)).toMatchObject({ owners: 1, paymentsVerified: 0, paymentsNotLanded: 0, errors: [] });
     expect(reads()).toBe(10 * 24);
-    expect(calls.filter((call) => call === 'getCurrentEpoch')).toHaveLength(144);
+    expect(calls.filter((call) => call === 'getCurrentEpoch')).toHaveLength(24);
     expect((await rows()).map((row) => row.lastReadAt)).toEqual(Array<Date>(10).fill(at(138)));
 
     expect(await tickAt(144)).toMatchObject({ owners: 1, paymentsNotLanded: 0, errors: [] });
     expect(reads()).toBe(10 * 25);
-    // The window closes ten minutes after that read: from then on every tick reads every payment.
+    // The window closes ten minutes after that read, and no read sees it until the next hourly one.
     state.epoch = 102n;
-    expect(await tickAt(145)).toMatchObject({ owners: 1, paymentsNotLanded: 0, errors: [] });
+    for (let n = 145; n < 150; n++) expect(await tickAt(n)).toMatchObject({ owners: 1, paymentsNotLanded: 0, errors: [] });
+    expect(reads()).toBe(10 * 25);
+    expect(await tickAt(150)).toMatchObject({ owners: 1, paymentsNotLanded: 0, errors: [] });
     expect(reads()).toBe(10 * 26);
-    expect((await rows()).map((row) => [row.settlement, row.missingSince])).toEqual(Array(10).fill(['pending', at(145)]));
-    // Released only by a pass LIMITS.paymentReleaseGapMs after the one that stamped missing_since.
+    expect((await rows()).map((row) => [row.settlement, row.missingSince])).toEqual(Array(10).fill(['pending', at(150)]));
+    // From then on every tick reads every payment, and a pass LIMITS.paymentReleaseGapMs after the one that stamped missing_since releases them.
     expect(LIMITS.paymentReleaseGapMs).toBe(3 * tickMs);
-    for (const n of [146, 147]) expect(await tickAt(n)).toMatchObject({ owners: 1, paymentsNotLanded: 0, errors: [] });
+    for (const n of [151, 152]) expect(await tickAt(n)).toMatchObject({ owners: 1, paymentsNotLanded: 0, errors: [] });
     expect(reads()).toBe(10 * 28);
-    expect(await tickAt(148)).toMatchObject({ owners: 1, paymentsNotLanded: 10, errors: [] });
+    expect(await tickAt(153)).toMatchObject({ owners: 1, paymentsNotLanded: 10, errors: [] });
     expect(reads()).toBe(10 * 29);
     expect((await rows()).map((row) => row.settlement)).toEqual(Array<string>(10).fill('not_landed'));
   });
 
-  it("counts a payment's failed settlement reads on the payment row itself, one per tick", async () => {
+  it("counts a payment's failed settlement reads on the payment row itself, one per tick LIMITS.closedWindowReadSpacingMs apart, none in a tick sooner (C8, C40)", async () => {
     const on = await freshDb();
     const w = await world(on);
     const unreadable = await payment(w, await decision(w, 'paid', ago(120_000), on), { validUntilEpoch: 99n }, on);
@@ -1855,6 +1879,9 @@ describe('runJobsTick', () => {
 
     expect(await tick(on, chain)).toMatchObject({ owners: 1, paymentsMismatched: 0, errors: [] });
     expect(await tick(on, chain)).toMatchObject({ owners: 1, errors: [] });
+    expect(await failedReads()).toBe(1);
+    const spaced = await runJobsTick({ db: on, chain, masterSecretHex: MASTER, gasKeypair: GAS, now: () => new Date(NOW.getTime() + LIMITS.closedWindowReadSpacingMs), sleep: noSleep });
+    expect(spaced).toMatchObject({ owners: 1, errors: [] });
     expect(await failedReads()).toBe(2);
   });
 
@@ -1965,11 +1992,14 @@ describe('runJobsTick', () => {
     expect(await minutesOn(1)).toMatchObject({ owners: 1, memoriesSubmitted: 0, memoriesConfirmed: 1, memoriesChainConfirmed: 0, errors: [] });
     // Confirmed this tick, too new to be listed yet, so the chain is not asked.
     expect(listings()).toBe(0);
-    // Confirmed by the relayer a minute ago but not yet seen on chain, so the owner still has work.
+    // Confirmed by the relayer a minute ago but not yet seen on chain, so the owner still has work, looked for at once.
     expect(await minutesOn(2)).toMatchObject({ owners: 1, memoriesChainConfirmed: 0, errors: [] });
     state.blobs.set(w.suiAddress, [blob('blob-job-0')]);
-    expect(await minutesOn(3)).toMatchObject({ owners: 1, memoriesChainConfirmed: 1, errors: [] });
-    expect(await minutesOn(4)).toMatchObject({ owners: 0 });
+    // Still waiting, it is looked for again once LIMITS.blobScanSpacingMs has passed, and is no work before then.
+    const spacingMinutes = LIMITS.blobScanSpacingMs / 60_000;
+    expect(await minutesOn(1 + spacingMinutes)).toMatchObject({ owners: 0 });
+    expect(await minutesOn(2 + spacingMinutes)).toMatchObject({ owners: 1, memoriesChainConfirmed: 1, errors: [] });
+    expect(await minutesOn(3 + spacingMinutes)).toMatchObject({ owners: 0 });
     expect(listings()).toBe(2);
     expect(client.rememberBulk).toHaveBeenCalledTimes(1);
   });

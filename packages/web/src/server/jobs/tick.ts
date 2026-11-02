@@ -13,7 +13,7 @@ import { MemoryServiceError, ownerDelegate } from '../memory/delegate.js';
 import { recordOutcome } from '../memory/outcome.js';
 import { confirmMemoryJobs, failAgedMemories, isKeyRefused, submitPendingMemories } from '../memory/writer.js';
 import { settlePayment } from '../pay/settle.js';
-import { awaitingChainCheck, chainExpiring, confirmBlobsOnChain, expireBlobsOnChain, lackingEndEpoch, walrusEpochForExpiry } from './blobs.js';
+import { awaitingChainCheck, blobScanDue, chainExpiring, confirmBlobsOnChain, confirmedSinceScan, expireBlobsOnChain, lackingEndEpoch, walrusEpochForExpiry } from './blobs.js';
 import { expireDecisions } from './expire.js';
 import { pruneExpiredRows } from './prune.js';
 import { RefillError, refillIfNeeded, resolvePendingRefill } from './refill.js';
@@ -104,17 +104,36 @@ function refillMayStart(now: Date) {
   return or(isNull(owners.refillNotBefore), lte(owners.refillNotBefore, now));
 }
 
+// Per chain client, and the server keeps one per process (context.ts), so every run in a process shares it.
+const epochReadings = new WeakMap<Chain, { epoch: bigint; readAtMs: number }>();
+
 /**
- * One reading of the chain's epoch for a whole tick, taken the first time a settlement pass asks,
+ * One reading of the chain's epoch for a whole run, taken the first time a settlement pass asks,
  * so a backlog of payments past their window costs one epoch read rather than one each (C22). A
- * failed reading is kept as well, and those passes leave their payments pending for the next tick.
- * It is charged to the jobs day with no owner, since every owner's pass shares it: charged to the
- * owner whose pass asked first, that owner's spent share would fail it for everyone (C28).
+ * failed reading is kept for the run as well, and those passes leave their payments pending for a
+ * later run. A reading another run in this process took, whatever its scope, is reused while it is
+ * younger than LIMITS.epochReadingReuseMs on `now`, so visits at request rate cost one epoch read
+ * per that span (C22, C40). Reuse is safe because epochs only go up: an older reading can only say
+ * a window is still open, which holds a read or a release back and never brings one sooner, as
+ * settlePayment already relies on. Only a new read is charged: the tick's, with no `ownerId`, to
+ * the jobs day with no owner, since every owner's pass shares it (charged to the owner whose pass
+ * asked first, that owner's spent share would fail it for everyone, C28); a visit's, which serves
+ * one owner only, to that owner's jobs share first, like every other request the visit makes
+ * (C22, C28, C40).
  */
-export function oneEpochReading(chain: Chain): () => Promise<bigint> {
+export function oneEpochReading(chain: Chain, now: () => Date, ownerId?: string): () => Promise<bigint> {
   let reading: Promise<bigint> | null = null;
   return () => {
-    reading ??= withTatumScope({ kind: 'jobs' }, () => chain.getCurrentEpoch());
+    reading ??= (async () => {
+      const askedMs = now().getTime();
+      const kept = epochReadings.get(chain);
+      if (kept !== undefined && askedMs >= kept.readAtMs && askedMs - kept.readAtMs < LIMITS.epochReadingReuseMs) return kept.epoch;
+      const epoch = await withTatumScope(ownerId === undefined ? { kind: 'jobs' } : { kind: 'jobs', ownerId }, () => chain.getCurrentEpoch());
+      // Aged from when it was asked for, so it is never reused past the span it may be.
+      const latest = epochReadings.get(chain);
+      if (latest === undefined || latest.readAtMs <= askedMs) epochReadings.set(chain, { epoch, readAtMs: askedMs });
+      return epoch;
+    })();
     return reading;
   };
 }
@@ -174,8 +193,10 @@ export function recordingStep(summary: JobsTickSummary): JobsStep {
  * oldest visit, and among equals the oldest work. Work is only what needs the chain or the relayer
  * for this owner: pending memories (only for an owner with a Walrus Memory account, the only kind
  * the memory step can send), confirmed memories not yet found on chain that confirmBlobsOnChain
- * would check at `now` (awaitingChainCheck), memories found on chain before blob_end_epoch was
- * kept, which its scan fills in (lackingEndEpoch), pending payments, payments owed an outcome
+ * would check at `now` (awaitingChainCheck, while the owner's blob reads are due or the memory became
+ * old enough to be looked for since the last of them: blobScanDue, confirmedSinceScan), memories found on chain
+ * before blob_end_epoch was kept, which its scan fills in (lackingEndEpoch, while blobScanDue),
+ * pending payments, payments owed an outcome
  * memory (the memory the relayer is then sent), an allowance whose refill_not_before is unset or
  * past (refillMayStart), dated by when it was checked or, before that, when the owner joined,
  * a refill still pending, with or without an allowance recorded, but never one that ended
@@ -194,15 +215,18 @@ async function ownersWithWork(db: Database, now: Date, walrusEpoch: number | nul
     .innerJoin(owners, eq(owners.id, memories.ownerId))
     .where(and(eq(memories.status, 'pending'), isNotNull(owners.memwalAccountId)))
     .groupBy(memories.ownerId);
+  // Only when confirmBlobsOnChain would read now, so no owner is visited for blob work it would skip (C40).
   const blobWork = db
     .select({ ownerId: memories.ownerId, at: sql<Date>`min(coalesce(${memories.confirmedAt}, ${memories.createdAt}))`.as('at') })
     .from(memories)
-    .where(awaitingChainCheck(now))
+    .innerJoin(owners, eq(owners.id, memories.ownerId))
+    .where(and(awaitingChainCheck(now), or(blobScanDue(now), confirmedSinceScan)))
     .groupBy(memories.ownerId);
   const backfillWork = db
     .select({ ownerId: memories.ownerId, at: sql<Date>`min(${memories.chainConfirmedAt})`.as('at') })
     .from(memories)
-    .where(lackingEndEpoch)
+    .innerJoin(owners, eq(owners.id, memories.ownerId))
+    .where(and(lackingEndEpoch, blobScanDue(now)))
     .groupBy(memories.ownerId);
   const paymentWork = db
     .select({ ownerId: payments.ownerId, at: sql<Date>`min(${payments.signedAt})`.as('at') })
@@ -259,9 +283,9 @@ export async function hasVisitWork(db: Database, ownerId: string, now: Date): Pr
  * One visit's work for one owner: the payments, outcomes, refill and memory steps, in the order
  * and with the rules runJobsTick lists, each handed `canStart` and recorded through `step`, with
  * counts added to `summary`. Every Tatum request of the visit is charged to this owner's jobs
- * share, except the refill step's, which runs in the refills scope (C22, C28). Neither stamps
- * last_ticked_at nor takes the owner's lease; its caller does both. Never throws for a step's
- * failure.
+ * share, except the refill step's, which runs in the refills scope with this owner, charged to the
+ * owner's refills share and then the refills pool (C22, C28). Neither stamps last_ticked_at nor
+ * takes the owner's lease; its caller does both. Never throws for a step's failure.
  */
 export async function visitOwner(v: OwnerVisitArgs): Promise<void> {
   const { db, chain, masterSecretHex, gasKeypair, now, sleep, ownerId, canStart, readEpoch, summary, step } = v;
@@ -312,8 +336,9 @@ export async function visitOwner(v: OwnerVisitArgs): Promise<void> {
 
       if (owner.allowanceId !== null && (owner.refillNotBefore === null || owner.refillNotBefore.getTime() <= now().getTime())) {
         await step(ownerId, 'refill', async () => {
-          // A pool of its own, so this owner's payments, or every owner's, spending the jobs day cannot stop the refill (C23, C28).
-          const outcome = await withTatumScope({ kind: 'refills' }, () =>
+          // A pool of its own, so this owner's payments, or every owner's, spending the jobs day cannot
+          // stop the refill; this owner's share of it first, so this owner cannot spend it for all (C23, C28).
+          const outcome = await withTatumScope({ kind: 'refills', ownerId }, () =>
             // The tick's own clock, so the day's refill count and sent_at are read under the lock, after the reads before them (C26).
             refillIfNeeded({ db, chain, ownerId, masterSecretHex, gasKeypair, now: now(), clock: now, canStart }),
           );
@@ -322,7 +347,7 @@ export async function visitOwner(v: OwnerVisitArgs): Promise<void> {
       } else {
         // A refill sent before the allowance was forgotten, or waited out, still holds money the ledger cannot count until it is final (C38).
         await step(ownerId, 'refill', async () => {
-          await withTatumScope({ kind: 'refills' }, () => resolvePendingRefill({ db, chain, ownerId, gasKeypair, clock: now, canStart }));
+          await withTatumScope({ kind: 'refills', ownerId }, () => resolvePendingRefill({ db, chain, ownerId, gasKeypair, clock: now, canStart }));
         });
       }
 
@@ -383,27 +408,33 @@ export async function visitOwner(v: OwnerVisitArgs): Promise<void> {
  * starts, so an owner whose visit fails or is cut off goes to the back of the line like any
  * other. The visit runs in the Tatum scope { kind: 'jobs', ownerId }, so every request it makes is
  * charged to that owner's jobs share before the shared jobs day (C22, C28), except the refill
- * step's, which runs in { kind: 'refills' } and is charged to LIMITS.tatumCallsRefillsPerDay alone,
- * so payments spending the jobs day and every owner's share leave refills able to run (C23, C28).
+ * step's, which runs in { kind: 'refills', ownerId } and is charged to that owner's
+ * LIMITS.tatumCallsRefillsPerOwnerPerDay and then LIMITS.tatumCallsRefillsPerDay, so payments
+ * spending the jobs day and every owner's share leave refills able to run (C23, C28).
  * Then, in order, each
  * step handed the deadline as `canStart`, the money steps first, so a slow relayer or a hung SEAL
  * read in the memory steps can never use up the time this owner's payments and refill need (C28):
  * 1. payments: every payment still 'pending', oldest first, until the deadline, is read once by settlePayment
  *    (tries 1; later ticks are the patience), which checks it against Ellai's own digest (C8)
  *    and counts a failed read past the payment's window in payments.settlement_failed_reads;
- *    every pass in the tick, for every owner, shares one epoch reading (oneEpochReading). The
- *    passes are paced: a payment whose window is still open is read at most once per
- *    LIMITS.pendingPaymentReadIntervalMs, by payments.last_read_at, and one whose window has
- *    closed on every visit, so the two-pass release keeps its timing (C22, C4);
+ *    every pass in the tick, for every owner, shares one epoch reading (oneEpochReading), itself
+ *    reused across runs for LIMITS.epochReadingReuseMs. The passes are paced by
+ *    payments.last_read_at: a payment is read at most once per LIMITS.pendingPaymentReadIntervalMs
+ *    until a pass has seen its window closed, then at most once per
+ *    LIMITS.closedWindowReadSpacingMs, the tick's own cadence, so the two-pass release keeps its
+ *    timing and a visit at request rate counts failed reads no faster than the tick (C22, C4, C8, C40);
  * 2. outcomes: every 'verified' payment stored as delivered false (never null) whose decision has
  *    no outcome memory yet, oldest first, becomes a delivered=false outcome memory through
  *    recordOutcome, idempotent per decision. That takes in a payment step 1 has just verified
  *    and one whose outcome the paid call itself failed to record;
  * 3. refillIfNeeded (only with an allowance, and not before its refill_not_before), reading this
  *    tick's clock after its reads: C7 and C23 at refill time. A lost refill is failed only by a
- *    later tick, so no tick waits on one. Any other owner gets resolvePendingRefill instead, the
- *    same digest and epoch reads in the same refills scope under the same deadline, so a refill
- *    pending when the allowance was forgotten still reaches its final state (C38). A refill that
+ *    later tick, so no tick waits on one, and a pending refill is read no more often than
+ *    refills.last_read_at allows; a failed read in the step holds it off for
+ *    LIMITS.refillErrorWaitMs by refill_not_before (C22, C40). Any other owner gets
+ *    resolvePendingRefill instead, the same paced digest and epoch reads in the same refills scope
+ *    under the same deadline, so a refill pending when the allowance was forgotten still reaches
+ *    its final state (C38). A refill that
  *    landed as anything but the refill ends 'mismatch' and pauses the owner, with the step's
  *    error REFILL_MISMATCH once; after that neither job reads it again, and it holds back every
  *    later refill for that owner before any chain read;
@@ -424,7 +455,7 @@ export async function runJobsTick(args: JobsTickArgs): Promise<JobsTickSummary> 
   const startedMs = now().getTime();
   const deadlineMs = startedMs + LIMITS.tickTimeBudgetMs;
   const canStart = () => now().getTime() < deadlineMs;
-  const readEpoch = oneEpochReading(chain);
+  const readEpoch = oneEpochReading(chain, now);
 
   await step('', 'prune', async () => {
     const pruned = await pruneExpiredRows({ db, now: now(), clock: now });

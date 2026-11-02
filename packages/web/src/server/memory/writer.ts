@@ -1,6 +1,6 @@
 import { LIMITS } from '@ellai/core/limits';
 import { MemoryError, type RelayerPacing, checkJobs, submitSentences } from '@ellai/core/memory';
-import { type SQL, and, asc, eq, inArray, isNotNull, isNull, lte, or, sql } from 'drizzle-orm';
+import { type SQL, and, asc, eq, gt, inArray, isNotNull, isNull, lte, or, sql } from 'drizzle-orm';
 import type { Database } from '../db/client.js';
 import { memories, owners } from '../db/schema.js';
 import { MemoryServiceError, ownerMemoryClient } from './delegate.js';
@@ -215,17 +215,34 @@ function firstOfEachSentence<T extends { sentence: string }>(rows: T[]): T[] {
 type Claimed = { id: string; sentence: string; submitAttempts: number; submittedAt: Date | null };
 
 /**
+ * A memory no pass holds at `now`: never handed to the relayer; never refused and handed to it at
+ * least LIMITS.memoryWriteLeaseMs ago; or refused before (submit_attempts above 0) and handed to it
+ * at least LIMITS.closedWindowReadSpacingMs ago. A refused attempt keeps its claim's submitted_at,
+ * so the attempts that spend LIMITS.memoryWriteMaxAttempts are the tick's cadence apart however
+ * often visits come, and five take at least 40 minutes before a memory fails (C33, C40).
+ */
+export function writeFree(now: Date): SQL | undefined {
+  const before = (ms: number) => new Date(now.getTime() - ms);
+  return or(
+    isNull(memories.submittedAt),
+    and(eq(memories.submitAttempts, 0), lte(memories.submittedAt, before(LIMITS.memoryWriteLeaseMs))),
+    and(gt(memories.submitAttempts, 0), lte(memories.submittedAt, before(LIMITS.closedWindowReadSpacingMs))),
+  );
+}
+
+/**
  * The rows of this pass's next write, claimed in one short transaction that commits before the
  * relayer is called, so no lock is ever held across a relayer call. Fails, unsent, every row past
  * LIMITS.memoryWriteMaxAgeMs since created_at and every candidate already at the attempt ceiling;
  * then takes the oldest free row tried before, alone, or else every free untried row up to
- * LIMITS.pendingMemoryWriteBatch, one copy of each sentence. A row is free when no pass handed it
- * to the relayer within LIMITS.memoryWriteLeaseMs before `now`, and taking it sets its
- * submitted_at to `now`: that is the lease, and it is what keeps a concurrent pass off it.
+ * LIMITS.pendingMemoryWriteBatch, one copy of each sentence. A row is free when no pass holds it
+ * (writeFree: LIMITS.memoryWriteLeaseMs, or LIMITS.closedWindowReadSpacingMs once refused), and
+ * taking it sets its submitted_at to `now`: that is the lease, and it is what keeps a concurrent
+ * pass off it.
  */
 async function claimWrite(db: Database, ours: SQL | undefined, now: Date): Promise<{ rows: Claimed[]; bulk: boolean }> {
   return db.transaction(async (tx) => {
-    const free = and(ours, or(isNull(memories.submittedAt), lte(memories.submittedAt, new Date(now.getTime() - LIMITS.memoryWriteLeaseMs))));
+    const free = and(ours, writeFree(now));
     await tx
       .update(memories)
       .set({ status: 'failed' })
@@ -329,7 +346,8 @@ async function releaseLease(tx: Pick<Database, 'update'>, rows: Claimed[], now: 
  * - Accepted: the job ids are stored.
  * - Refused as written (core's WRITE, from its own checks or for the relayer's 4xx): the rows stay
  *   pending with no job id, each spends one of LIMITS.memoryWriteMaxAttempts, a row that reaches
- *   it is 'failed', and the pass goes on to its next write.
+ *   it is 'failed', and the pass goes on to its next write. A refused row is sent again only
+ *   LIMITS.closedWindowReadSpacingMs after that attempt (writeFree).
  * - A rate limit, an outage or a timeout (core's RATE_LIMITED, UPSTREAM or TIMEOUT: a 429, any
  *   5xx, no answer, or the key's points spent), or a setup step that failed before the request went
  *   out, whatever status it carries (watchBulkWrites): nothing is spent, the rows stay pending under

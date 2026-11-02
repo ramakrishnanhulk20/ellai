@@ -7,8 +7,10 @@
 // still holds that allowance, and a dry run with no verdict does not (D-1, C22); an allowance expiring within
 // LIMITS.allowanceExpiryMarginMs of the clock read after it, or of the end of a full rate window,
 // is forgotten and nothing is built (A-F6, C30); an allowance getAllowance cannot find is forgotten
-// only when objectExists agrees it is gone, and is otherwise left as it is with one warning line,
-// a failed check or a passed deadline forgetting nothing (WO-E1b, C7, C22).
+// only when objectExists agrees it is gone, and is otherwise kept with one warning line, a failed
+// check or a passed deadline forgetting nothing, and a lag or a failed check holding the refill
+// off for LIMITS.refillErrorWaitMs (WO-E1b, C7, C22); a pending refill is read only when
+// refills.last_read_at allows, a failed read stamping it too (C22, C40).
 // Does NOT cover: the jobs tick that calls refillIfNeeded (jobs.test.ts), the real Sui chain or
 // Tatum, or two connections racing on the owner lock (PGlite serves one).
 import { randomBytes } from 'node:crypto';
@@ -198,6 +200,8 @@ const refill = (w: Funded, chain: Chain, extra: { clock?: () => Date; canStart?:
 
 describe('refillIfNeeded, the money-path audit fixes', () => {
   const GAP = LIMITS.paymentReleaseGapMs;
+  const PACE = LIMITS.pendingRefillReadIntervalMs;
+  const HOUR = LIMITS.pendingPaymentReadIntervalMs;
 
   /** An owner whose only refill was sent an hour ago for epochs up to 99 and never seen; the chain is at 102. */
   async function lostRefill() {
@@ -218,10 +222,19 @@ describe('refillIfNeeded, the money-path audit fixes', () => {
     expect(reads).toEqual([lost.digest, lost.digest]);
     expect(executions).toEqual([]);
 
-    expect(await refill(w, chain, { clock: () => at(GAP) })).toBe('refilled');
+    // Read a moment ago, so a call at the gap itself waits for the next read LIMITS.pendingRefillReadIntervalMs on.
+    expect(await refill(w, chain, { clock: () => at(GAP) })).toBe('skipped_pending');
+    expect(reads).toHaveLength(2);
+    expect(await refill(w, chain, { clock: () => at(GAP - 1 + PACE) })).toBe('refilled');
     expect(await rowOf(lost.id)).toMatchObject({ status: 'failed', missingSince: NOW });
     expect(reads.filter((digest) => digest === lost.digest)).toHaveLength(3);
     expect(executions).toHaveLength(1);
+
+    // When the next read comes exactly the gap after the call that marked it, that read releases it.
+    const exact = await lostRefill();
+    expect(await refill(exact.w, exact.chain, { clock: () => NOW })).toBe('skipped_pending');
+    expect(await refill(exact.w, exact.chain, { clock: () => at(GAP) })).toBe('refilled');
+    expect(await rowOf(exact.lost.id)).toMatchObject({ status: 'failed', missingSince: NOW });
   });
 
   it('records a lost refill that a later call finds as landed, whatever an earlier call missed, and marks nothing while its window is open', async () => {
@@ -230,13 +243,56 @@ describe('refillIfNeeded, the money-path audit fixes', () => {
     expect(await refill(w, chain)).toBe('skipped_pending');
     expect(await rowOf(lost.id)).toMatchObject({ status: 'pending', missingSince: null });
 
+    // That read saw the window open, so the next is LIMITS.pendingPaymentReadIntervalMs after it.
     state.epoch = 102n;
-    expect(await refill(w, chain, { clock: () => at(60_000) })).toBe('skipped_pending');
-    expect((await rowOf(lost.id)).missingSince).toEqual(at(60_000));
+    expect(await refill(w, chain, { clock: () => at(HOUR - 1) })).toBe('skipped_pending');
+    expect((await rowOf(lost.id)).missingSince).toBeNull();
+    expect(await refill(w, chain, { clock: () => at(HOUR) })).toBe('skipped_pending');
+    expect((await rowOf(lost.id)).missingSince).toEqual(at(HOUR));
     state.landed.add(lost.digest);
-    expect(await refill(w, chain, { clock: () => at(60_000 + GAP) })).toBe('resolved_pending');
-    expect(await rowOf(lost.id)).toMatchObject({ status: 'verified', verifiedAt: at(60_000 + GAP) });
+    expect(await refill(w, chain, { clock: () => at(HOUR + GAP) })).toBe('resolved_pending');
+    expect(await rowOf(lost.id)).toMatchObject({ status: 'verified', verifiedAt: at(HOUR + GAP) });
     expect(executions).toEqual([]);
+  });
+
+  it('reads a pending refill no more often than last_read_at allows: every LIMITS.ownerVisitPassGapMs while fresh, hourly while its window is open, every LIMITS.pendingRefillReadIntervalMs once a read saw it closed, a failed read stamping it too (C22, C40)', async () => {
+    const PASS = LIMITS.ownerVisitPassGapMs;
+    const FRESH = LIMITS.freshRefillWindowMs;
+    const w = await funded();
+    // Sent at NOW with its window open past epoch 100, so every read is the digest and the epoch.
+    const pending = await refillRow(w, NOW, 'pending', 200n);
+    const { chain, state, reads } = stubChain(w);
+    let failing = false;
+    const flaky = {
+      ...chain,
+      getTransactionResult: async (digest: string) => {
+        if (!failing) return chain.getTransactionResult(digest);
+        reads.push(digest);
+        throw new ChainError('UPSTREAM', 'Tatum getTransactionResult: gateway error', true);
+      },
+    } as Chain;
+    const callAt = (ms: number) => refill(w, flaky, { clock: () => at(ms) });
+    const lastReadAt = async () => (await rowOf(pending.id)).lastReadAt;
+
+    for (const ms of [0, PASS - 1, PASS]) expect(await callAt(ms)).toBe('skipped_pending');
+    expect([reads.length, await lastReadAt()]).toEqual([2, at(PASS)]);
+    // Past the fresh window, with no read yet seeing it closed, the next read waits an hour from the last one.
+    for (const ms of [FRESH, PASS + HOUR - 1]) expect(await callAt(ms)).toBe('skipped_pending');
+    expect(reads).toHaveLength(2);
+    failing = true;
+    await expect(callAt(PASS + HOUR)).rejects.toMatchObject({ name: 'ChainError', code: 'UPSTREAM' });
+    expect([reads.length, await lastReadAt()]).toEqual([3, at(PASS + HOUR)]);
+    failing = false;
+    expect(await callAt(PASS + 2 * HOUR - 1)).toBe('skipped_pending');
+    expect(reads).toHaveLength(3);
+    // This read sees the window closed and stamps missing_since; from then on reads are the tick's ten minutes apart.
+    state.epoch = 201n;
+    expect(await callAt(PASS + 2 * HOUR)).toBe('skipped_pending');
+    expect([reads.length, (await rowOf(pending.id)).missingSince]).toEqual([4, at(PASS + 2 * HOUR)]);
+    expect(await callAt(PASS + 2 * HOUR + PACE - 1)).toBe('skipped_pending');
+    expect(reads).toHaveLength(4);
+    expect(await callAt(PASS + 2 * HOUR + PACE)).toBe('skipped_pending');
+    expect(reads).toHaveLength(5);
   });
 
   /** Three refills that fill the day at NOW, the oldest leaving the window 5 s later; the newest is lost and is released by this call. */
@@ -370,16 +426,17 @@ describe('refillIfNeeded, the money-path audit fixes', () => {
 
     const lag = await visit(true);
     expect(lag).toMatchObject({ outcome: 'refused', lines: ['[ellai refill] allowance_index_lag'], objectReads: [lag.w.allowanceId] });
-    expect(lag.recorded).toEqual({ allowanceId: lag.w.allowanceId, allowanceCheckedAt: NOW, refillNotBefore: null });
+    // Held off for LIMITS.allowanceLagWaitMs, a minute: the index usually catches up within one, and the first refill after setup should not wait ten (C40).
+    expect(lag.recorded).toEqual({ allowanceId: lag.w.allowanceId, allowanceCheckedAt: NOW, refillNotBefore: at(LIMITS.allowanceLagWaitMs) });
 
     const gone = await visit(false);
     expect(gone).toMatchObject({ outcome: 'refused', lines: [], objectReads: [gone.w.allowanceId] });
     expect(gone.recorded).toEqual({ allowanceId: null, allowanceCheckedAt: null, refillNotBefore: null });
 
-    // A check that cannot answer forgets nothing; the tick records the failure and the next visit reads again.
+    // A check that cannot answer forgets nothing; the tick records the failure and a visit reads again once the hold-off ends.
     const unanswered = await visit(new ChainError('TIMEOUT', 'Tatum objectExists: timed out', true));
     expect(unanswered.outcome).toMatchObject({ name: 'ChainError', code: 'TIMEOUT' });
-    expect(unanswered.recorded.allowanceId).toBe(unanswered.w.allowanceId);
+    expect(unanswered.recorded).toMatchObject({ allowanceId: unanswered.w.allowanceId, refillNotBefore: at(LIMITS.refillErrorWaitMs) });
 
     // The check is a chain read like any other, so a deadline that passed during the allowance read stops it.
     let open = true;
@@ -387,6 +444,27 @@ describe('refillIfNeeded, the money-path audit fixes', () => {
       open = false;
     });
     expect(late).toMatchObject({ outcome: 'deferred', objectReads: [] });
-    expect(late.recorded.allowanceId).toBe(late.w.allowanceId);
+    expect(late.recorded).toMatchObject({ allowanceId: late.w.allowanceId, refillNotBefore: null });
+  });
+
+  it('waits LIMITS.allowanceLagWaitMs after the first index lag for an allowance and LIMITS.refillErrorWaitMs after each lag that outlasts it (C7, C22, C40)', async () => {
+    const w = await funded();
+    const stub = stubChain(w);
+    stub.state.allowance = new ChainError('NOT_FOUND', 'Allowance was not found on Sui mainnet');
+    let clockMs = NOW.getTime();
+    const waits: number[] = [];
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    try {
+      // Each call comes as the wait the one before it set ends, as the next visit would.
+      for (let lag = 0; lag < 3; lag++) {
+        expect(await refill(w, stub.chain, { clock: () => new Date(clockMs) })).toBe('refused');
+        const notBefore = (await ownerRow(w.ownerId)).refillNotBefore?.getTime() ?? clockMs;
+        waits.push(notBefore - clockMs);
+        clockMs = notBefore;
+      }
+    } finally {
+      warn.mockRestore();
+    }
+    expect(waits).toEqual([60_000, 600_000, 600_000]);
   });
 });

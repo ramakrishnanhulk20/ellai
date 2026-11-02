@@ -8,11 +8,25 @@
 // held the lease is still sent, after that visit releases it, but the lease is never taken again
 // for a memory of an owner with no Walrus Memory account, nor after a pass that recorded an error,
 // so neither repeats passes at once; ten visits read a purse above the
-// refill threshold once (C28); the tick skips an owner whose lease is held; and 'overview' starts
+// refill threshold once (C28); every request of a visit, its epoch reading included, is charged
+// to the owner's own share; a refill pending since long before a visit costs it one pass and one
+// read, and 32 visits across 40 minutes read it once; a failed refill read holds the refill step
+// off for LIMITS.refillErrorWaitMs; a closed-window payment Tatum cannot read counts one failed
+// read across a visit's passes and still becomes unverifiable after six reads 10 minutes apart;
+// ten visits in ten minutes make one epoch read for a held-back payment; visits every minute scan
+// a waiting memory's Blob objects once per LIMITS.blobScanSpacingMs, and at once for a memory
+// confirmed since; a refill stuck all day costs at most 72 refills-scope requests; refused writes
+// take at least 40 minutes to fail a memory; a memory confirmed just before a scan for others is
+// looked for once old enough; and a day of visits, at an agent's cap for its first ten minutes and
+// a minute apart after, stays inside the
+// N and M of C34 for one held-back payment, one stuck refill and one memory awaiting its blob, on
+// one process and with every visit on a fresh instance, the payment still settling (C40); the tick skips an owner whose lease is held; and 'overview' starts
 // nothing within LIMITS.ownerVisitMinGapMs of the last visit or for an owner with no work.
 // Does NOT cover: the real Sui chain, Tatum or the relayer (npm run prove:visit sends a memory
-// live), two database connections racing on the lease (PGlite serves one connection, so the
-// single UPDATE that takes it is not raced here), or what Next does with the scheduled task
+// live), Tatum failing during the day of visits (each retry is then a request of its own, which
+// the 200 and 100 shares cap), an owner whose Blob objects take more than one page, two database
+// connections racing on the lease (PGlite serves one connection, so the single UPDATE that takes
+// it is not raced here), or what Next does with the scheduled task
 // (the route tests hand it to a collector).
 import { randomBytes, randomUUID } from 'node:crypto';
 import { type Chain, ChainError } from '@ellai/core/chain';
@@ -24,9 +38,9 @@ import { Ed25519Keypair } from '@mysten/sui/keypairs/ed25519';
 import { and, eq } from 'drizzle-orm';
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { type Database, createDb, migrate } from '../src/server/db/client.js';
-import { agents, decisions, memories, owners, payments, questions } from '../src/server/db/schema.js';
+import { agents, decisions, memories, owners, payments, questions, refills } from '../src/server/db/schema.js';
 import { answerQuestion } from '../src/server/decide/answer.js';
-import { type TatumScope, currentTatumScope } from '../src/server/http/tatum-meter.js';
+import { type TatumScope, currentTatumScope, tatumMeter } from '../src/server/http/tatum-meter.js';
 import { emptySummary, runJobsTick } from '../src/server/jobs/tick.js';
 import { type VisitTrigger, runOwnerVisit } from '../src/server/jobs/visit.js';
 import { ownerDelegate } from '../src/server/memory/delegate.js';
@@ -157,6 +171,53 @@ async function pendingMemory(w: World, sentence: string, on: Database = db): Pro
       .returning({ id: memories.id }),
   );
   return row.id;
+}
+
+/** A refill the chain has not seen, its window open until epoch 1_200. */
+async function pendingRefill(w: World, sentAt: Date) {
+  return one(
+    await db
+      .insert(refills)
+      .values({ ownerId: w.ownerId, allowanceId: randomAddress(), amountAtomic: BigInt(LIMITS.purseRefillAtomic), digest: hex(32), sentAt, validUntilEpoch: 1_200n, status: 'pending' })
+      .returning(),
+  );
+}
+
+/** A memory Walrus Memory reported done with this blob id, not yet found on chain. */
+async function confirmedMemory(w: World, blobId: string, confirmedAt: Date): Promise<string> {
+  const row = one(
+    await db
+      .insert(memories)
+      .values({
+        ownerId: w.ownerId,
+        kind: 'owner_decision',
+        recipient: RECIPIENT,
+        amountAtomic: PRICE,
+        verdict: 'approve',
+        sellerHost: 'hotels.example',
+        sentence: `On 2026-10-29 the owner approved a hotel search ${blobId}.`,
+        namespace: MEMORY_NAMESPACE,
+        writerPublicKey: ownerDelegate(MASTER, w.suiAddress).publicKeyHex,
+        blobId,
+        status: 'confirmed',
+        confirmedAt,
+        createdAt: confirmedAt,
+      })
+      .returning({ id: memories.id }),
+  );
+  return row.id;
+}
+
+/** A clock that only `sleep` and the test move. */
+function fakeClock(startMs: number) {
+  const clock = {
+    ms: startMs,
+    now: () => new Date(clock.ms),
+    sleep: async (ms: number) => {
+      clock.ms += ms;
+    },
+  };
+  return clock;
 }
 
 const memoryOf = async (id: string, on: Database = db) => one(await on.select({ status: memories.status, jobId: memories.jobId, blobId: memories.blobId }).from(memories).where(eq(memories.id, id)));
@@ -444,6 +505,262 @@ describe('runOwnerVisit', () => {
     expect(stub.calls.filter((call) => call === `getBalances:${w.purse}`)).toHaveLength(1);
     expect(stub.scopes.filter((scope) => scope?.kind === 'refills')).toHaveLength(1);
     expect((await ownerRow(w)).refillNotBefore).toEqual(later(LIMITS.pendingPaymentReadIntervalMs));
+  });
+
+  it("charges every request of a visit to the owner's own share, its epoch reading included, so none lands on the shared jobs day alone (C22, C28, C40)", async () => {
+    const w = await world();
+    // A payment the seller is holding back, visited an hour apart: every visit reads it and a new epoch reading.
+    await payment(w);
+    const stub = stubChain();
+
+    for (let i = 0; i < 10; i++) {
+      expect(await visit(db, stub.chain, w, { trigger: 'agent', now: () => later(i * LIMITS.pendingPaymentReadIntervalMs) })).toMatchObject({ started: true, passes: 1, summary: { errors: [] } });
+    }
+    expect(stub.scopes.filter((scope) => scope?.kind === 'jobs' && scope.ownerId === undefined)).toHaveLength(0);
+    expect(stub.scopes.filter((_, i) => stub.calls[i] === 'getCurrentEpoch')).toEqual(Array(10).fill({ kind: 'jobs', ownerId: w.ownerId }));
+  });
+
+  it('makes one pass and one digest read for a refill pending since long before the visit, and 32 visits across 40 minutes read it once, 2 refills-scope requests (C22, C23, C40)', async () => {
+    const w = await world(db, { allowanceId: randomAddress() });
+    const stuck = await pendingRefill(w, ago(3_600_000));
+    const stub = stubChain({ getCurrentEpoch: () => 1_100n });
+    const digestReads = () => stub.calls.filter((call) => call === `getTransactionResult:${stuck.digest}`).length;
+    const refillsRequests = () => stub.scopes.filter((scope) => scope?.kind === 'refills').length;
+    const clock = fakeClock(NOW.getTime());
+
+    expect(await visit(db, stub.chain, w, { now: clock.now, sleep: clock.sleep })).toMatchObject({ started: true, passes: 1, summary: { errors: [] } });
+    expect(digestReads()).toBe(1);
+
+    // 75 s apart, so the 32 visits fill 40 minutes; that read saw its window open, so the next waits an hour.
+    for (let i = 1; i < 32; i++) {
+      clock.ms = NOW.getTime() + i * 75_000;
+      expect(await visit(db, stub.chain, w, { trigger: 'agent', now: clock.now, sleep: clock.sleep })).toMatchObject({ started: true, passes: 1, summary: { errors: [] } });
+    }
+    expect([digestReads(), refillsRequests()]).toEqual([1, 2]);
+  });
+
+  it('holds the refill step off for LIMITS.refillErrorWaitMs after a chain read in it failed, so a visit within that wait asks the refills pool nothing (C22, C40)', async () => {
+    const w = await world(db, { allowanceId: randomAddress() });
+    // A payment the seller is holding back keeps the owner's work going while the refill is held off.
+    await payment(w);
+    const stub = stubChain({
+      getBalances: () => {
+        throw new ChainError('UPSTREAM', 'Tatum getBalances: gateway error', true);
+      },
+    });
+    const refillsRequests = () => stub.scopes.filter((scope) => scope?.kind === 'refills').length;
+
+    expect(await visit(db, stub.chain, w, { trigger: 'agent' })).toMatchObject({ started: true, passes: 1, summary: { errors: [{ ownerId: w.ownerId, step: 'refill', code: 'CHAIN_UPSTREAM' }] } });
+    expect(await visit(db, stub.chain, w, { trigger: 'agent', now: () => later(300_000) })).toMatchObject({ started: true, passes: 1, summary: { errors: [] } });
+    expect(refillsRequests()).toBe(1);
+    expect((await ownerRow(w)).refillNotBefore).toEqual(later(LIMITS.refillErrorWaitMs));
+  });
+
+  it("keeps a closed-window payment pending through one visit's passes while Tatum fails, counting one failed read, and six reads 10 minutes apart still make it unverifiable (C8, C21, C22, C40)", async () => {
+    const w = await world(db, { memwalAccountId: randomAddress() });
+    // A relayer job that stays running keeps the visit passing for as long as it may.
+    await pendingMemory(w, 'On 2026-10-29 the owner approved a hotel search in Lagos.');
+    relayer({ rememberBulk: accepted, getRememberBulkStatus: jobsAre('running') });
+    const closed = await payment(w, { validUntilEpoch: 99n });
+    const stub = stubChain({
+      getTransactionResult: () => {
+        throw new ChainError('UPSTREAM', 'Tatum getTransactionResult: gateway error', true);
+      },
+    });
+    const settlement = async () =>
+      one(await db.select({ settlement: payments.settlement, failedReads: payments.settlementFailedReads, reason: payments.mismatchReason }).from(payments).where(eq(payments.id, closed.id)));
+    const clock = fakeClock(NOW.getTime());
+
+    expect(await visit(db, stub.chain, w, { now: clock.now, sleep: clock.sleep })).toMatchObject({ started: true, passes: LIMITS.ownerVisitMaxPasses, summary: { paymentsMismatched: 0 } });
+    expect(await settlement()).toEqual({ settlement: 'pending', failedReads: 1, reason: null });
+
+    for (let i = 1; i <= 5; i++) {
+      clock.ms = NOW.getTime() + i * 600_000;
+      await visit(db, stub.chain, w, { trigger: 'agent', now: clock.now, sleep: clock.sleep });
+      if (i < 5) expect(await settlement()).toEqual({ settlement: 'pending', failedReads: i + 1, reason: null });
+    }
+    expect(await settlement()).toEqual({ settlement: 'mismatch', failedReads: 6, reason: 'unverifiable' });
+    expect(one(await db.select({ reason: owners.autoPausedReason }).from(owners).where(eq(owners.id, w.ownerId))).reason).toBe('settlement_unverifiable');
+  });
+
+  it('makes one epoch read across 10 visits within 10 minutes for an owner whose seller holds a payment back (C22, C40)', async () => {
+    const w = await world();
+    await payment(w);
+    const stub = stubChain();
+
+    for (let i = 0; i < 10; i++) {
+      expect(await visit(db, stub.chain, w, { trigger: 'agent', now: () => later(i * 60_000) })).toMatchObject({ started: true, passes: 1, summary: { errors: [] } });
+    }
+    expect(stub.calls.filter((call) => call === 'getCurrentEpoch')).toHaveLength(1);
+  });
+
+  it("scans the owner's Blob objects once across visits every minute for 30 minutes, and once more at once for a memory confirmed since that scan (C18, C22, C40)", async () => {
+    const w = await world();
+    await confirmedMemory(w, 'blob-waiting', ago(120_000));
+    const stub = stubChain();
+    const scans = () => stub.calls.filter((call) => call.startsWith('scanOwnedWalrusBlobs')).length;
+    const scannedAt: number[] = [];
+
+    for (let minute = 0; minute < 30; minute++) {
+      if (minute === 10) await confirmedMemory(w, 'blob-newer', later(10 * 60_000));
+      const before = scans();
+      await visit(db, stub.chain, w, { trigger: 'agent', now: () => later(minute * 60_000) });
+      if (scans() > before) scannedAt.push(minute);
+    }
+    // The newer memory waits LIMITS.blobChainCheckMinAgeMs before it is looked for.
+    expect(scannedAt).toEqual([0, 11]);
+  });
+
+  it('looks for a memory confirmed just before a scan that ran for other memories as soon as it is old enough to be looked for, not a spacing later (C18, C40)', async () => {
+    const w = await world();
+    await confirmedMemory(w, 'blob-older', ago(10 * 60_000));
+    await confirmedMemory(w, 'blob-just-confirmed', NOW);
+    const stub = stubChain();
+    const scans = () => stub.calls.filter((call) => call.startsWith('scanOwnedWalrusBlobs')).length;
+
+    // Thirty seconds on, the newer memory is too new to be looked for, so this scan is for the older one alone.
+    expect(await visit(db, stub.chain, w, { trigger: 'agent', now: () => later(30_000) })).toMatchObject({ started: true, passes: 1 });
+    expect(scans()).toBe(1);
+    expect(await visit(db, stub.chain, w, { trigger: 'agent', now: () => later(LIMITS.blobChainCheckMinAgeMs) })).toMatchObject({ started: true, passes: 1 });
+    expect(scans()).toBe(2);
+  });
+
+  it('reads a refill stuck pending all day with its window open 2 x (12 fresh + 24 hourly) = 72 refills-scope requests at most, under the owner\'s refills share (C22, C23, C40)', { timeout: 120_000 }, async () => {
+    // Reads while fresh are ownerVisitPassGapMs apart, then pendingPaymentReadIntervalMs apart while the window is open; each is the digest and the epoch.
+    const bound = 2 * (Math.ceil(LIMITS.freshRefillWindowMs / LIMITS.ownerVisitPassGapMs) + Math.ceil(LIMITS.rateWindowDayMs / LIMITS.pendingPaymentReadIntervalMs));
+    const w = await world(db, { allowanceId: randomAddress() });
+    await pendingRefill(w, NOW);
+    const stub = stubChain({ getCurrentEpoch: () => 1_100n });
+    const clock = fakeClock(NOW.getTime());
+
+    // Visits back to back while the refill is fresh, then one a minute: past the fresh window every
+    // read waits at least ten minutes, so more visits than one a minute cannot add a read.
+    while (clock.ms < NOW.getTime() + LIMITS.rateWindowDayMs) {
+      await visit(db, stub.chain, w, { trigger: 'agent', now: clock.now, sleep: clock.sleep });
+      clock.ms += clock.ms - NOW.getTime() < 2 * LIMITS.freshRefillWindowMs ? 2_000 : 60_000;
+    }
+    const refillsRequests = stub.scopes.filter((scope) => scope?.kind === 'refills').length;
+    expect(refillsRequests).toBeLessThanOrEqual(bound);
+    expect([bound, bound < LIMITS.tatumCallsRefillsPerOwnerPerDay]).toEqual([72, true]);
+  });
+
+  const DAY = LIMITS.rateWindowDayMs;
+  const HOURLY = Math.ceil(DAY / LIMITS.pendingPaymentReadIntervalMs);
+  // core's getWalrusEpoch reads the System object and then its version's dynamic field.
+  const WALRUS_EPOCH_REQUESTS = 2;
+  // A scan per spacing, and one more at once for the memory's confirmation; one page of Blob objects each.
+  const SCANS = Math.ceil(DAY / LIMITS.blobScanSpacingMs) + 1;
+  // The payment: a digest read and an epoch reading an hour. The memory: its scans and the Walrus
+  // epoch, hourly when one process keeps the reading, or before every scan on fresh instances.
+  const N_ONE_PROCESS = 2 * HOURLY + SCANS + WALRUS_EPOCH_REQUESTS * Math.ceil(DAY / LIMITS.walrusEpochCacheMs);
+  const N_FRESH_INSTANCES = 2 * HOURLY + SCANS + WALRUS_EPOCH_REQUESTS * SCANS;
+  // The refill: its send (balance, allowance, epoch, gas price, dry run, send, read back), reads
+  // every pass gap while fresh, then hourly, each read the digest and the epoch. No cache is involved.
+  const M = 7 + 2 * Math.ceil(LIMITS.freshRefillWindowMs / LIMITS.ownerVisitPassGapMs) + 2 * HOURLY;
+
+  it('derives N, M and K for C34 from LIMITS, with the many-instance N under the jobs share', () => {
+    const K = (n: number, pool: number) => Math.ceil(pool / n);
+    expect({
+      nOneProcess: N_ONE_PROCESS,
+      kOneProcess: K(N_ONE_PROCESS, LIMITS.tatumCallsJobsPerDay),
+      nFreshInstances: N_FRESH_INSTANCES,
+      kFreshInstances: K(N_FRESH_INSTANCES, LIMITS.tatumCallsJobsPerDay),
+      m: M,
+      kRefills: K(M, LIMITS.tatumCallsRefillsPerDay),
+    }).toEqual({ nOneProcess: 145, kOneProcess: 11, nFreshInstances: 195, kFreshInstances: 8, m: 79, kRefills: 7 });
+    expect([N_FRESH_INSTANCES < LIMITS.tatumCallsJobsPerOwnerPerDay, M < LIMITS.tatumCallsRefillsPerOwnerPerDay]).toEqual([true, true]);
+  });
+
+  /**
+   * A day of one owner's visits for one held-back payment, one stuck refill and one memory awaiting
+   * its blob, through the real Tatum meter, with getWalrusEpoch charged its two requests. With
+   * `freshProcess` every visit gets a chain client of its own, as a cold server instance would, so
+   * neither the Walrus epoch reading nor the Sui epoch reading is kept between visits. Returns what
+   * the meter charged the owner's jobs and refills shares, the error codes, and the payment's end.
+   */
+  async function dayOfVisits(startIso: string, freshProcess: boolean) {
+    // One UTC day, so the meter's daily counts cover exactly this run.
+    const start = new Date(startIso).getTime();
+    const w = await world(db, { allowanceId: randomAddress() });
+    const held = await payment(w);
+    await pendingRefill(w, new Date(start));
+    await confirmedMemory(w, `blob-awaiting-all-day-${hex(4)}`, new Date(start - 120_000));
+    let landed = false;
+    const stub = stubChain({
+      getTransactionResult: (digest: string) => {
+        if (landed && digest === held.digest) {
+          return { status: 'success', balanceChanges: [{ address: w.purse, coinType: USDC_TYPE_MAINNET, amount: -PRICE }, { address: RECIPIENT, coinType: USDC_TYPE_MAINNET, amount: PRICE }] };
+        }
+        throw new ChainError('NOT_FOUND', 'not found (gRPC NOT_FOUND)');
+      },
+    });
+    const clock = fakeClock(start);
+    const admit = tatumMeter(db, clock.now);
+    const charged: Array<TatumScope | undefined> = [];
+    const meteredClient = () =>
+      new Proxy(stub.chain, {
+        get(target, property, receiver) {
+          const value: unknown = Reflect.get(target, property, receiver);
+          if (typeof value !== 'function') return value;
+          return async (...args: unknown[]) => {
+            const requests = property === 'getWalrusEpoch' ? WALRUS_EPOCH_REQUESTS : 1;
+            for (let request = 0; request < requests; request++) {
+              charged.push(currentTatumScope());
+              try {
+                await admit({ transport: 'graphql', method: String(property) });
+              } catch {
+                throw new ChainError('BUDGET', `${String(property)} refused by the request budget, nothing was sent`);
+              }
+            }
+            return (value as (...given: unknown[]) => unknown)(...args);
+          };
+        },
+      });
+    const shared = meteredClient();
+
+    const codes = new Set<string>();
+    // LIMITS.agentCallsPerMinute paid calls a minute, each starting a visit, for the first ten
+    // minutes, which hold the fresh refill's reads; after that every read waits at least ten
+    // minutes on a stored time, so one visit a minute meets each as the cap would.
+    const atCapMs = 60_000 / LIMITS.agentCallsPerMinute;
+    while (clock.ms < start + DAY) {
+      if (!landed && clock.ms >= start + DAY - 90 * 60_000) landed = true;
+      const result = await visit(db, freshProcess ? meteredClient() : shared, w, { trigger: 'agent', now: clock.now, sleep: clock.sleep });
+      for (const error of result.summary.errors) codes.add(error.code);
+      clock.ms += clock.ms - start < 10 * 60_000 ? atCapMs : 60_000;
+    }
+    const share = (kind: TatumScope['kind']) => charged.filter((scope) => scope?.kind === kind && scope.ownerId === w.ownerId).length;
+    const settled = one(await db.select({ settlement: payments.settlement }).from(payments).where(eq(payments.id, held.id))).settlement;
+    return { jobs: share('jobs'), refills: share('refills'), codes: [...codes], settled };
+  }
+
+  it("keeps one owner's visits on one process for a day, at its agent's cap for the first ten minutes, inside N and M for one held-back payment, one stuck refill and one memory awaiting its blob, and the payment still settles (C22, C28, C34, C40)", async () => {
+    const day = await dayOfVisits('2026-10-31T00:00:00Z', false);
+    expect(day).toEqual({ jobs: 143, refills: 70, codes: [], settled: 'verified' });
+    expect([day.jobs <= N_ONE_PROCESS, day.refills <= M]).toEqual([true, true]);
+  });
+
+  it('keeps the same day inside the many-instance N when every visit lands on a fresh server instance, which keeps no epoch reading, and under the jobs share (C22, C28, C34, C40)', async () => {
+    const day = await dayOfVisits('2026-11-01T00:00:00Z', true);
+    expect(day).toEqual({ jobs: 191, refills: 70, codes: [], settled: 'verified' });
+    expect([day.jobs <= N_FRESH_INSTANCES, day.jobs < LIMITS.tatumCallsJobsPerOwnerPerDay, day.refills <= M]).toEqual([true, true, true]);
+  });
+
+  it('spaces the refused write attempts that fail a memory at LIMITS.closedWindowReadSpacingMs, so five take at least 40 minutes at request rate (C33, C40)', async () => {
+    const w = await world(db, { memwalAccountId: randomAddress() });
+    const memoryId = await pendingMemory(w, 'On 2026-10-29 the owner approved a hotel search in Tavira.');
+    // A 400: the relayer refused what was sent, which spends one of LIMITS.memoryWriteMaxAttempts.
+    const client = relayer({ rememberBulk: () => Promise.reject(Object.assign(new Error('bad request'), { status: 400 })) });
+    const clock = fakeClock(NOW.getTime());
+
+    let failedAtMs: number | null = null;
+    while (failedAtMs === null && clock.ms < NOW.getTime() + 60 * 60_000) {
+      await visit(db, stubChain().chain, w, { trigger: 'agent', now: clock.now, sleep: clock.sleep });
+      if ((await memoryOf(memoryId)).status === 'failed') failedAtMs = clock.ms - NOW.getTime();
+      clock.ms += 2_000;
+    }
+    expect(client.rememberBulk).toHaveBeenCalledTimes(LIMITS.memoryWriteMaxAttempts);
+    expect(failedAtMs).toBeGreaterThanOrEqual(40 * 60_000);
   });
 
   it("starts nothing for 'overview' when the owner's last visit is newer than LIMITS.ownerVisitMinGapMs or the owner has no work", async () => {
