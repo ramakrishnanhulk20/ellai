@@ -66,12 +66,14 @@ export function tallyThrough(nodes: readonly TimelineNode[], shown: number): Tal
   return { asked, learned };
 }
 
-/** The date and time in the viewer's own locale, for example "28 Oct, 09:14". */
+/** The date and time in UTC, for example "27 Oct, 10:52 UTC". */
 export function formatWhen(isoTime: string): string {
-  return new Intl.DateTimeFormat(undefined, {
+  const text = new Intl.DateTimeFormat('en-GB', {
     day: 'numeric',
     month: 'short',
     hour: '2-digit',
     minute: '2-digit',
+    timeZone: 'UTC',
   }).format(new Date(isoTime));
+  return `${text} UTC`;
 }

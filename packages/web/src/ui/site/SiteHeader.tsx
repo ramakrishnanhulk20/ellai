@@ -50,10 +50,11 @@ export function SiteHeader({ overPoster }: { overPoster: boolean }) {
           <span className="font-grotesk text-[17px] font-bold tracking-[0.08em]">ELLAI</span>
         </Link>
 
-        <div className="flex items-center gap-6">
-          <nav aria-label="Main" className="hidden items-center gap-8 font-grotesk text-[15px] font-medium md:flex">
-            {/* The journey lives on the landing, so other pages link back to it there. */}
-            <a href={overPoster ? '#journey' : '/#journey'} className="nav-sweep">
+        <div className="flex items-center gap-4 md:gap-6">
+          <nav aria-label="Main" className="flex items-center gap-4 font-grotesk text-[14px] font-medium md:gap-8 md:text-[15px]">
+            {/* The journey lives on the landing, so other pages link back to it there. The important marks
+                are needed because .nav-sweep sets its own display, which would otherwise beat the hiding. */}
+            <a href={overPoster ? '#journey' : '/#journey'} className="nav-sweep hidden! md:inline!">
               How it works
             </a>
             <Link href="/proof" className="nav-sweep">

@@ -301,7 +301,7 @@ function ConnectCard({ still }: { still: boolean }) {
         className="relative overflow-hidden bg-bone"
         style={{ height: sized ? panelHeight : 'auto' }}
       >
-        {/* On phones the code stops short of the copy button, so a long first line never runs under it. */}
+        {/* At every width the code stops short of the copy button, so a long first line never runs under it. */}
         <motion.pre
           key={snippet.id}
           ref={code}
@@ -311,7 +311,7 @@ function ConnectCard({ still }: { still: boolean }) {
           initial={swaps === 0 || still ? false : { opacity: 0 }}
           animate={{ opacity: 1 }}
           transition={{ duration: still ? 0 : 0.2 }}
-          className="mr-14 overflow-x-auto px-5 pb-6 pt-5 font-plex text-[13px] leading-[1.7] whitespace-pre text-ink [scrollbar-color:#A7AAAA_transparent] [scrollbar-width:thin] focus-visible:outline-offset-[-2px] md:mr-0"
+          className="mr-14 overflow-x-auto px-5 pb-6 pt-5 font-plex text-[13px] leading-[1.7] whitespace-pre text-ink [scrollbar-color:#A7AAAA_transparent] [scrollbar-width:thin] focus-visible:outline-offset-[-2px]"
         >
           <code>{highlight(text)}</code>
         </motion.pre>

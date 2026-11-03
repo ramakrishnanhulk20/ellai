@@ -325,7 +325,7 @@ function Column({ title, count, children }: { title: string; count: number | nul
     <div className="min-w-0" aria-busy={count === null}>
       <h3 className={SMALL_CAPS}>
         {title}
-        {count === null ? null : <span className="ml-2 text-ink">{count}</span>}
+        {count === null ? null : <span className="ml-2 text-ink"><span className="sr-only">, </span>{count} shown</span>}
       </h3>
       {children}
     </div>
