@@ -65,7 +65,7 @@ Two things do not change as Ellai learns. It always asks about a seller address 
 
 - History lists every decision with the rule that made it, Ellai's reason, the memories it cited, and a Suiscan link for each payment.
 - Memories lists every sentence Ellai wrote for you with its state: pending, confirmed or failed. A new answer is sent to your Walrus Memory account right after you give it; the live proof measured 21 seconds from the answer to confirmed.
-- A public [proof page](https://ellai-pay.vercel.app/proof) and a live memory map on the landing page, built from the chain and from owners who chose to show their data. They never show a memory sentence, a purpose, a reason or an address.
+- A public [proof page](https://ellai-pay.vercel.app/proof) and the landing page's journey and learning sections, built from the chain and from owners who chose to show their data. They never show a memory sentence, a purpose, a reason or an address.
 
 ### Plugs into your agent
 
@@ -81,7 +81,7 @@ Two things do not change as Ellai learns. It always asks about a seller address 
 
 - Ellai pays one x402 form today: version 1, as t2000 sellers send it. x402 version 2 is read but refused. MPP is not supported.
 - The app has no way to take back a refusal.
-- Walrus Memory SDK 0.1.12, which Ellai pins, does not yet put a time limit on the Sui read behind its Seal session (issue #1367, fix in review), so Ellai keeps its own 120-second limit on every relayer call.
+- Walrus Memory SDK 0.1.12, which Ellai pins, does not yet put a time limit on the Sui read behind its Seal session ([issue #1367](https://github.com/MystenLabs/walrus-memory/issues/1367), fix in review as [#1368](https://github.com/MystenLabs/walrus-memory/pull/1368)), so Ellai keeps its own 120-second limit on every relayer call, and a 15-second limit on the search it runs while deciding a payment. See [Found while building](#found-while-building).
 
 ## Architecture
 
@@ -231,13 +231,14 @@ flowchart TD
 
 ## The two-minute judge path
 
-No wallet and no sign-in needed for steps 1 to 5. Everything on these screens is read from the chain and from owners who chose to show their data.
+No wallet and no sign-in needed for steps 1 to 6. Everything on these screens is read from the chain and from owners who chose to show their data.
 
-1. Open [https://ellai-pay.vercel.app](https://ellai-pay.vercel.app). The first screen is the live memory map. Each light is a real memory on Walrus. The decision card (in the corner, or under the map on a phone) opens on a real payment Ellai verified on Sui, with a "See it on Sui" link to the transaction on Suiscan, then replays the other public decisions: "Agent wants to pay", a badge (Paid on its own, Approved on its own, Asked you or Refused) and the reason from the rule that decided it. "Paid" appears only for a payment Ellai verified on Sui. "Approved on its own" marks a learned approval that moved no money, such as the learning test's.
-2. Scroll down to "05 / Watch it learn": "It asks you less as it learns." The section holds the screen while a playhead walks along real decisions, oldest on the left. Questions asked climbs early. Approved on its own climbs later.
-3. Keep scrolling to "07 / Proof": "Don't trust us. Check." Click "See all proof" to open [https://ellai-pay.vercel.app/proof](https://ellai-pay.vercel.app/proof).
-4. On the proof page, click any row under "Latest payments" to open the transaction on Suiscan. Click any row under "Latest memories" to open the Walrus blob on Walruscan.
-5. Click "Docs" in the top bar, then "The learning test" in the sidebar, or go straight to [https://ellai-pay.vercel.app/docs/learning-results](https://ellai-pay.vercel.app/docs/learning-results). It has the 24 requests, the two scores and the honest notes, with every cited memory linked to Suiscan.
+1. Open [https://ellai-pay.vercel.app](https://ellai-pay.vercel.app). The first screen says what Ellai does: "Your agent pays. Ellai learns when to ask you." The strip along the bottom counts, live, the payments settled on Sui and the owner answers stored on Walrus.
+2. Scroll into "A payment's journey". The section holds the screen while one real payment Ellai verified on Sui travels from the agent to the seller, through Ellai's rules, past the Walrus memories it matched, to Sui. Each stop opens a card with real data: the seller's 402, the checks, the cited memories (each linked to Walruscan), and the payment with its Suiscan link. The last stop shows a real question Ellai asked and the answer for that seller, stored on Walrus.
+3. Keep scrolling to "It asks you less as it learns." Two numbers compare the questions in the earliest 10 of the public decisions shown with the latest 10, and each decision is a mark on one strip, oldest on the left. Hover a mark to see what it was.
+4. Keep scrolling to "Don't trust us. Check." for the live totals, the latest payments and memories, and the "Found while building" card about the Walrus Memory bug we reported. Click "See all proof" to open [https://ellai-pay.vercel.app/proof](https://ellai-pay.vercel.app/proof).
+5. On the proof page, click any row under "Latest payments" to open the transaction on Suiscan. Click any row under "Latest memories" to open the Walrus blob on Walruscan.
+6. Click "Docs" in the top bar, then "The learning test" in the sidebar, or go straight to [https://ellai-pay.vercel.app/docs/learning-results](https://ellai-pay.vercel.app/docs/learning-results). It has the 24 requests, the two scores and the honest notes, with every cited memory linked to Suiscan.
 
 With a Sui wallet and a little USDC: click "Open Ellai" (or go to [https://ellai-pay.vercel.app/app](https://ellai-pay.vercel.app/app)), sign in, and sign the three setup steps. Then give an agent a key under Agents, or press Run and give the built-in agent a task. When Ellai meets a seller it has no answers for, a card appears under Questions. Approve it with a short reason, and watch the sentence appear under Memories as pending, then confirmed.
 
@@ -489,13 +490,19 @@ The learning test. Ram labelled 24 requests approve or refuse in advance, in [LA
 
 What the test does not show: the 4 hotel requests in the first 12 were already learned from an earlier run, so they did not test learning from scratch; one row (AgentProof /mcp) was predicted to be asked and was approved, because the seller shares an address Ellai had already seen approved, which is by design; no row tested a recipient with exactly one approval or a request far from anything approved; no money moved, so it checks decisions and not sellers' behaviour after payment; and it used one owner and one person's labels. Rows, links and the rerun command are in [the learning test](https://ellai-pay.vercel.app/docs/learning-results) and [LABELS-RESULTS.md](LABELS-RESULTS.md).
 
+## Found while building
+
+While building Ellai we found a bug in the Walrus Memory SDK: `recall()` could hang without end, because `requestTimeoutMs` did not bound one Sui read inside `buildSealSession`. We filed [MystenLabs/walrus-memory#1367](https://github.com/MystenLabs/walrus-memory/issues/1367) on 2 November 2026 with a script that reproduces it. The Walrus Memory team reproduced it on SDK 0.1.12, confirmed the cause and opened a fix in [MystenLabs/walrus-memory#1368](https://github.com/MystenLabs/walrus-memory/pull/1368).
+
+Until the fix ships, Ellai bounds every recall it makes while deciding a payment at 15 seconds (`LIMITS.decideRecallTimeoutMs`), and a recall that runs out never pays: Ellai asks the owner instead, or refuses when too many questions are already waiting. The whole story is on the [proof page](https://ellai-pay.vercel.app/proof#walrus-finding) and in the docs at [What we found in Walrus Memory](https://ellai-pay.vercel.app/docs/walrus-finding).
+
 ## Real test counts
 
 | Suite | Test files | Tests | Run on |
 |---|---|---|---|
 | core (includes live Tatum reads on Sui Mainnet) | 9 | 300 passed | 3 November 2026 |
 | proof | 1 | 8 passed | 3 November 2026 |
-| web | 25 | 800 passed | 3 November 2026 |
+| web | 27 | 831 passed | 3 November 2026 |
 
 All three come from `npm test` in each package on 3 November 2026, with no failures, the root typecheck clean and the production web build clean. Core's live reads need a Tatum key in `.env`.
 
@@ -521,9 +528,9 @@ packages/
   web/     The Next.js app
     src/server/   agent, auth, db, decide, http, jobs, mcp, memory, onboarding, pay, public, seller
     src/app/      owner app (/app), landing (/), proof (/proof), docs (/docs), API routes (/api)
-    src/ui/       landing, memory map scene, app screens, docs components
-    content/docs/ the eight docs pages
-docs/security/threat-model.md   The 40 numbered security rules, C1 to C40
+    src/ui/       landing and proof page (site/), app screens (app/), docs components (docs/)
+    content/docs/ the nine docs pages
+docs/security/threat-model.md   The 45 numbered security rules, C1 to C45
 ARCHITECTURE.md                 The three diagrams and the decision rules
 LABELS.md, LABELS-RESULTS.md    The learning test: the 24 labels and the live results
 .github/workflows/jobs-tick.yml Scheduled backup for the background work
@@ -541,7 +548,7 @@ LABELS.md, LABELS-RESULTS.md    The learning test: the 24 labels and the live re
 | Chain reads and sends | Tatum Sui gateway, gRPC (native transport, server only) and GraphQL |
 | Sui SDK | `@mysten/sui` 2.37.0, `@mysten/dapp-kit` 1.1.17 |
 | App | Next.js 16.4.3, React 19.3.1, TypeScript 7.0.2, Tailwind CSS 4.3.3 |
-| Landing scene | three.js 0.186.1, React Three Fiber 9.8.1, GSAP 3.15.0, Lenis 1.3.26, Motion 14.2.0 |
+| Landing motion | GSAP 3.15.0, Lenis 1.3.26, Motion 14.2.0; the limit ring is SVG and CSS |
 | Docs | Fumadocs 16.17.2, Mermaid 12.2.0 |
 | Database | Postgres on Neon, Drizzle ORM 0.45.4, PGlite for local work |
 | Built-in agent | Claude Haiku (`claude-haiku-5-5`) through `@anthropic-ai/sdk` 1.3.0 |
@@ -551,7 +558,7 @@ LABELS.md, LABELS-RESULTS.md    The learning test: the 24 labels and the live re
 
 ## Security
 
-The written standard is the [threat model](docs/security/threat-model.md). It lists 40 numbered rules, C1 to C40, and it was written before any payment code. In short:
+The written standard is the [threat model](docs/security/threat-model.md). It lists 45 numbered rules, C1 to C45, and it was written before any payment code. In short:
 
 - No AI model decides about money. Every rule is fixed code, applied in a set order. The first rule that matches decides.
 - Sui holds the allowance terms. Ellai's code holds the per-payment maximum, the daily budget and the purse float.
