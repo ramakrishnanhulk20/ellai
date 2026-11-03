@@ -153,7 +153,7 @@ export function SignIn() {
 
         <motion.div className="relative z-10" {...rise(0)}>
           <h1 className="font-display text-[10vw] font-bold leading-[0.95] tracking-[-0.04em] lg:text-[clamp(2.75rem,5vw,5rem)]">
-            Give your agent
+            Give your agent{' '}
             <br />
             a <span className="text-[#8c9bff]">limit.</span>
           </h1>

@@ -318,7 +318,13 @@ function Strip({ nodes, figures, still }: { nodes: TimelineNode[]; figures: Earl
 
       <div className="mt-8">
         <p className="text-[15px] leading-[1.5] text-ink-soft">
-          Each mark is one of the {count} most recent public decisions, oldest on the left.
+          Each mark is one of the {count} most recent public decisions, oldest on the left. Approved on its own means
+          Ellai would have paid without asking you; in the learning test no money moved, and the real payments are on
+          the{' '}
+          <Link href="/proof" className="nav-sweep font-medium text-ink">
+            proof page
+          </Link>
+          .
         </p>
         <Link href="/proof" className="nav-sweep mt-4 font-grotesk text-base font-medium text-ink">
           See every payment and memory

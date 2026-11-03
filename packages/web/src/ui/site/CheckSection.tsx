@@ -2,7 +2,7 @@
 
 import Link from 'next/link';
 import { animate, motion, useInView } from 'motion/react';
-import { useLayoutEffect, useRef, type ReactNode } from 'react';
+import { Fragment, useLayoutEffect, useRef, type ReactNode } from 'react';
 import { atomicToUsdc, formatAgo, shortId } from '../proof-format.js';
 import type { Proof, ProofMemory, ProofPayment } from '../proof.js';
 import { usePrefersReducedMotion } from '../useMediaQuery.js';
@@ -228,6 +228,16 @@ function OutArrow({ small = false }: { small?: boolean }) {
   );
 }
 
+/** A seller host can be one long word, so a break chance goes after every dot, hyphen and slash. */
+export function breakAtDots(text: string): ReactNode {
+  return text.split(/([.\-/])/).map((part, index) => (
+    <Fragment key={index}>
+      {part}
+      {index % 2 === 1 ? <wbr /> : null}
+    </Fragment>
+  ));
+}
+
 /**
  * One row of a list. The link stretches over the whole row, so the hover fill, the underline on the
  * short id and the click area all belong to the same thing.
@@ -247,7 +257,7 @@ function ProofRow({
 }) {
   return (
     <li className="group/row relative grid grid-cols-[1fr_auto] items-baseline gap-4 border-t border-mist py-[14px] transition-colors duration-[160ms] ease-out last:border-b hover:bg-bone motion-reduce:transition-none">
-      <p className="min-w-0 text-base leading-[1.4] text-ink [overflow-wrap:anywhere]">{title}</p>
+      <p className="min-w-0 text-base leading-[1.4] text-ink [overflow-wrap:break-word]">{breakAtDots(title)}</p>
       <div className="flex flex-col items-end text-right font-plex text-xs">
         <span className="text-ink-soft">{when}</span>
         <a

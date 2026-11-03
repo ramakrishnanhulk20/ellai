@@ -5,12 +5,14 @@ import type { ReactNode } from 'react';
 import { badgeFor, reasonFor } from '../DecisionCard.js';
 import { shortId } from '../proof-format.js';
 import { usePrefersReducedMotion } from '../useMediaQuery.js';
+import { breakAtDots } from './CheckSection.js';
 import { formatDay, type CitedMemory, type Journey } from './journey-model.js';
 
 export const EASE_OUT_EXPO = [0.16, 1, 0.3, 1] as const;
 
 const LABEL = 'font-plex text-xs font-medium uppercase tracking-[0.06em] text-ink-soft';
 const WRAP = '[overflow-wrap:anywhere]';
+const HOST_WRAP = '[overflow-wrap:break-word]';
 const FOOTER = 'mt-4 border-t border-mist pt-3';
 const BADGE = 'rounded-[6px] px-2 py-1 font-plex text-xs font-medium uppercase leading-4';
 
@@ -96,7 +98,7 @@ function PaywallCard({ journey }: { journey: Journey }) {
           <p className={`mt-4 font-grotesk text-[40px] font-bold leading-none tracking-[-0.03em] text-ink ${WRAP}`}>
             {example.amount} USDC
           </p>
-          <p className={`mt-2 text-base text-ink-soft ${WRAP}`}>to {example.host}</p>
+          <p className={`mt-2 text-base text-ink-soft ${HOST_WRAP}`}>to {breakAtDots(example.host)}</p>
         </>
       ) : (
         <p className="mt-4 text-base text-ink">A seller asks to be paid first.</p>
@@ -143,7 +145,7 @@ function RecallRow({ entry, flashDelay }: { entry: CitedMemory; flashDelay: numb
       className={`-mx-2 rounded-[6px] px-2 ${flashDelay === null ? '' : 'journey-flash'}`}
       style={flashDelay === null ? undefined : { animationDelay: `${flashDelay}ms` }}
     >
-      <p className={`text-[15px] leading-[1.35] text-ink ${WRAP}`}>{line}</p>
+      <p className={`text-[15px] leading-[1.35] text-ink ${HOST_WRAP}`}>{breakAtDots(line)}</p>
       <BlobLine blobId={entry.blobId} at={entry.at} />
     </li>
   );
@@ -188,7 +190,7 @@ function SettledCard({ journey }: { journey: Journey }) {
       <p className={`mt-[14px] font-grotesk text-[40px] font-bold leading-none tracking-[-0.03em] text-ink ${WRAP}`}>
         {example.amount} USDC
       </p>
-      <p className={`mt-2 text-base text-ink-soft ${WRAP}`}>to {example.host}</p>
+      <p className={`mt-2 text-base text-ink-soft ${HOST_WRAP}`}>to {breakAtDots(example.host)}</p>
       <div className="mt-[14px] flex items-center gap-3 text-[15px] text-ink">
         <CheckSquare />
         <span>Read back from Sui through Tatum</span>
@@ -210,8 +212,8 @@ function LoopCard({ journey }: { journey: Journey }) {
       {asked ? (
         <div>
           <p className={LABEL}>Anything new, it asks you</p>
-          <p className={`mt-2 text-[15px] leading-[1.35] text-ink ${WRAP}`}>
-            {asked.amount} USDC to {asked.host}
+          <p className={`mt-2 text-[15px] leading-[1.35] text-ink ${HOST_WRAP}`}>
+            {asked.amount} USDC to {breakAtDots(asked.host)}
           </p>
           <div className="mt-2 flex items-center gap-3">
             <span className={`bg-bone text-ink ${BADGE}`}>Asked you</span>
@@ -225,8 +227,8 @@ function LoopCard({ journey }: { journey: Journey }) {
           <p className={LABEL}>
             {answer.forAsked ? 'The answer for this seller, on Walrus' : 'The newest answer, on Walrus'}
           </p>
-          <p className={`mt-2 text-[15px] leading-[1.35] text-ink ${WRAP}`}>
-            {verdictLine(answer.memory.verdict, answer.memory.host)}
+          <p className={`mt-2 text-[15px] leading-[1.35] text-ink ${HOST_WRAP}`}>
+            {breakAtDots(verdictLine(answer.memory.verdict, answer.memory.host))}
           </p>
           <div className="mt-1">
             <BlobLine blobId={answer.memory.blobId} at={answer.memory.at} />
