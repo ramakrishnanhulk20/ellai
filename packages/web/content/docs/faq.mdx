@@ -52,6 +52,10 @@ Replace `YOUR_AGENT_KEY` with your key. Claude Code then has two tools, `paid_fe
 
 Sui Agent Pass is a Mysten Labs product, shown in October 2026, and Ellai and Agent Pass come from the same family of ideas: both are built on Sui's native `sui::allowance`, and both say an agent should act only inside limits the owner set. They do different jobs. Agent Pass bounds an agent's DeFi actions, such as transfers, swaps, lending and staking, to recipients, pools and validators that the owner lists in advance. Ellai pays web sellers that an agent finds at run time over x402, where no list can be written in advance, and it learns from the owner's answers which of those sellers the owner trusts. As read on 27 October 2026, Agent Pass was a mainnet test build at version 0.1.10, and its package does not mention x402, Walrus, Tatum or memory.
 
+## How is Ellai different from Sui Agent Payments?
+
+[Sui Agent Payments](https://www.sui.io/agentpayments), Mysten's paid-API gateway (on testnet as of 3 November 2026), checks each request against an on-chain grant the owner sets for listed services, and settles USDC on Sui over x402 or MPP. Ellai pays any x402 seller its agent meets, on mainnet today, from the owner's own allowance, and learns from the owner's answers in Walrus Memory which new sellers to trust.
+
 ## What happens when Walrus Memory is down?
 
 Ellai never pays on its own. If a search errors, times out or comes back empty, the rule is to ask, or to refuse when the agent already has 5 questions waiting. Refusals still hold, because Ellai finds them by exact lookup in its own records and does not need the search. Your new answers are saved in Ellai's database at once, a refusal binds at once, and the background job retries the Walrus write until it succeeds or ends in a visible failed state.

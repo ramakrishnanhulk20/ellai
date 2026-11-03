@@ -577,6 +577,8 @@ What it does not cover, in plain words. Ellai holds every purse key, derived fro
 
 Sui Agent Pass is a Mysten Labs product, shown at Sui Basecamp in October 2026. It comes from the same family of ideas as Ellai: both are built on Sui's native `sui::allowance`, and both say an agent should act only inside limits the owner set. They do different jobs. Agent Pass bounds an agent's DeFi actions, such as transfers, swaps, lending and staking, to recipients, pools and validators that the owner lists in advance. Ellai pays web sellers that an agent finds at run time over x402, where no list can be written in advance, and it learns from the owner's answers which of those sellers the owner trusts. As read on 27 October 2026, Agent Pass was a mainnet test build at version 0.1.10, and its package does not mention x402, Walrus, Tatum or memory.
 
+[Sui Agent Payments](https://www.sui.io/agentpayments), Mysten's paid-API gateway (on testnet as of 3 November 2026), checks each request against an on-chain grant the owner sets for listed services, and settles USDC on Sui over x402 or MPP. Ellai pays any x402 seller its agent meets, on mainnet today, from the owner's own allowance, and learns from the owner's answers in Walrus Memory which new sellers to trust.
+
 ## Licence
 
 MIT. See [LICENSE](LICENSE).
