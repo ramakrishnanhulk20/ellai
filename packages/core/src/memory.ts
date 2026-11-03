@@ -13,7 +13,7 @@ import { LIMITS } from './limits.js';
 export const WALRUS_MEMORY_PACKAGE_ID = '0xe7c16fbea0560e7057e2bf7422feaa4fb313749fc69c9e9092fac7a33b81d7f5';
 /**
  * The shared registry that maps each owner address to its one account. The relayer's
- * /config does not publish it (MemWal issue #1152); its type was read from chain.
+ * /config did not publish it until recently (MemWal issue #1152); this value was read from chain.
  */
 export const WALRUS_MEMORY_REGISTRY_ID = '0x8bf82c9e09e36b8d1c38298f68b7cb68e7b8762887e7592add9986d5e9cf199f';
 export const DEFAULT_RELAYER_URL = 'https://relayer.memory.walrus.xyz';
@@ -37,6 +37,8 @@ const RELAYER_ID_PATTERN = /^[A-Za-z0-9_-]{1,128}$/;
 const NAMESPACE_PATTERN = /^[a-z0-9][a-z0-9._-]*$/;
 const TIMESTAMP_PATTERN = /^[0-9T:.+Z-]{1,40}$/;
 // The relayer rejects blank text, and a lone zero-width space hangs it (MemWal issue #1156).
+// SDK 0.1.10 and later refuse the same characters before signing too; core still checks first,
+// so the refusal names the sentence instead of reading as the relayer's HTTP 400.
 const INVISIBLE = /[\s​-‍⁠﻿]/gu;
 
 export type MemoryErrorCode = 'ACCOUNT' | 'DELEGATE' | 'WRITE' | 'RECALL' | 'TIMEOUT' | 'RATE_LIMITED' | 'UPSTREAM';
@@ -674,7 +676,7 @@ async function cappedRelayerBody(response: Response): Promise<Uint8Array<ArrayBu
 
 /**
  * Caps every response body from a registered relayer origin at LIMITS.memwalMaxResponseBytes.
- * SDK 0.1.8 calls the global fetch and takes no fetch of its own, so the cap has to sit
+ * SDK 0.1.12 calls the global fetch and takes no fetch of its own, so the cap has to sit
  * there. Requests to any other origin pass through untouched.
  */
 function capRelayerResponses(origin: string): void {
@@ -933,8 +935,16 @@ export function createMemoryClient(args: { delegate: Ed25519Keypair; accountId: 
   }
   capRelayerResponses(relayer.origin);
   // A private copy of the seed, so client.destroy() can wipe it without touching the keypair.
+  // SDK 0.1.11 and later copy a Uint8Array key themselves, so this copy is no longer needed;
+  // it is harmless and stays until a change that removes it.
   const { secretKey } = decodeSuiPrivateKey(args.delegate.getSecretKey());
-  const client = MemWal.create({ key: Uint8Array.from(secretKey), accountId, serverUrl: relayer.origin, requestTimeoutMs: LIMITS.memwalRequestTimeoutMs });
+  const client = MemWal.create({
+    key: Uint8Array.from(secretKey),
+    accountId,
+    serverUrl: relayer.origin,
+    requestTimeoutMs: LIMITS.memwalRequestTimeoutMs,
+    preflightTimeoutMs: LIMITS.memwalPreflightTimeoutMs,
+  });
   clientDelegateKeys.set(client, toHex(args.delegate.getPublicKey().toRawBytes()));
   return client;
 }
@@ -943,8 +953,10 @@ export function createMemoryClient(args: { delegate: Ed25519Keypair; accountId: 
  * Stores each sentence as its own memory in `namespace` with one bulk write, then waits
  * until every job is done, and returns each sentence with its blob id and job id, in order.
  * Spends relayer points through a pace per delegate key, waiting for room, so it never runs past
- * the relayer's per-minute limit. The write is sent once and never resent: SDK 0.1.8 sends no
- * idempotency key on bulk writes, so a resend would store every sentence twice.
+ * the relayer's per-minute limit. The write is sent once and never resent: from SDK 0.1.9 a bulk
+ * write carries an idempotency key built from its sentences and a fixed 30-minute window, so a
+ * resend inside the window gets the same jobs back, but one across the window's edge would store
+ * every sentence twice.
  *
  * Throws MemoryError: WRITE for no sentences, more than LIMITS.memwalBulkMaxItems, an
  * empty, oversized or repeated sentence, a bad namespace, or any failed job; TIMEOUT when
@@ -974,8 +986,9 @@ export async function rememberSentences(
  * relayer's job ids in sentence order, without waiting for the jobs: read them later with
  * checkJobs. Same checks and the same per-key pace as rememberSentences, except that with
  * `pacing.waitForPoints` false a key with no points left is refused rather than waited for. The
- * write is sent once and never resent, because SDK 0.1.8 sends no idempotency key on bulk writes
- * and a resend would store every sentence twice.
+ * write is sent once and never resent: from SDK 0.1.9 a bulk write carries an idempotency key
+ * built from its sentences and a fixed 30-minute window, so a resend inside the window gets the
+ * same jobs back, but one across the window's edge would store every sentence twice.
  *
  * Throws MemoryError: WRITE for no sentences, more than LIMITS.memwalBulkMaxItems, an
  * empty, oversized or repeated sentence, a bad namespace, a relayer refusal, or an accepted
@@ -1092,8 +1105,8 @@ export async function recallSentences(
   await spendRelayerPoints(client, LIMITS.memwalRequestPoints, pacing);
   let result: unknown;
   try {
-    // maxDistance is applied below, not by the SDK: 0.1.8 filters with
-    // `distance < maxDistance`, which silently drops a hit whose distance is missing,
+    // maxDistance is applied below, not by the SDK: 0.1.12 keeps only hits with a finite
+    // numeric distance under it, which silently drops a hit whose distance is missing,
     // the very hit that must fail the call.
     result = await withinCallCeiling(client.recall({ query, limit: opts.limit, namespace: label }));
   } catch (error) {

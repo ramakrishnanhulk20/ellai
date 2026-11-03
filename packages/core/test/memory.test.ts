@@ -254,7 +254,7 @@ describe('recallSentences', () => {
       const error = await caught(recallSentences(asMemWal, NAMESPACE, 'which fact matches?', { limit: 5, maxDistance: 0.8 }));
       expect(error.code).toBe('RECALL');
       expect(error.message).toContain('hit 2 has no numeric distance');
-      // SDK 0.1.8 drops `distance < maxDistance` misses itself, which would hide a missing distance.
+      // Given maxDistance, SDK 0.1.12 keeps only hits with a finite numeric distance under it, which would hide a missing distance.
       expect(client.recall.mock.calls[0]?.[0]).not.toHaveProperty('maxDistance');
     }
   });

@@ -16,7 +16,7 @@
   },
   "dependencies": {
     "@ellai/core": "*",
-    "@mysten-incubation/memwal": "0.1.8",
+    "@mysten-incubation/memwal": "0.1.12",
     "@mysten/sui": "2.37.0",
     "zod": "4.6.7"
   },

@@ -57,17 +57,19 @@ async function ownerClient(db: Database, ownerId: string, masterSecretHex: strin
 
 type SendState = 'not_sent' | 'sending' | 'unsent' | 'refused' | 'answered';
 
-// The steps SDK 0.1.8 takes inside a signed request before the request itself goes out: the
-// relayer's version check, and the SEAL session, which reads GET /config and then Sui.
+// The steps SDK 0.1.12 takes inside a signed request before the request itself goes out: the
+// relayer's version check, and, on every call but a job status read, the SEAL session, which reads
+// GET /config and then Sui.
 const SETUP_STEPS = ['ensureCompatibleRelayer', 'buildSealSession'] as const;
 
 /**
  * Counts the failures of this client's setup steps (SETUP_STEPS). A call during which the count
  * rose failed before its request went out, so the relayer never saw it and the failure says
- * nothing about the rows, the jobs or the key. SDK 0.1.8's own setup errors (GET /version,
- * /health, /config) carry their status only in the message, but the SEAL session reads Sui
- * through @mysten/sui's JSON-RPC client, whose SuiHTTPStatusError carries the fullnode's HTTP
- * status, which core would otherwise read as the relayer refusing the request.
+ * nothing about the rows, the jobs or the key. Under SDK 0.1.12 a GET /version, /health or /config
+ * that answers with an error carries its status only in the message, but when the SEAL session's
+ * Sui read falls back from the gRPC endpoint /config names to @mysten/sui's JSON-RPC client, that
+ * client's SuiHTTPStatusError carries the fullnode's HTTP status, which core would otherwise read
+ * as the relayer refusing the request.
  */
 function watchSetupSteps(client: MemoryClient): () => number {
   let failures = 0;
@@ -330,9 +332,11 @@ async function releaseLease(tx: Pick<Database, 'update'>, rows: Claimed[], now: 
  * claims its rows in a short committed transaction (claimWrite: SELECT ... FOR UPDATE SKIP
  * LOCKED, then submitted_at set to `now` as a lease of LIMITS.memoryWriteLeaseMs), calls the
  * relayer with no transaction open, and records the outcome in a new short transaction. A row
- * with a job id is never claimed again, because the relayer has no idempotency on SDK 0.1.8's
- * bulk writes; the record only touches rows still pending with no job id, so a late record can
- * never overwrite another pass's.
+ * with a job id is never claimed again: from SDK 0.1.9 a bulk write carries an idempotency key
+ * built from its sentences and a fixed 30-minute window, so a resend inside the window gets the
+ * same jobs back, but one across the window's edge would store every sentence twice. The record
+ * only touches rows still pending with no job id, so a late record can never overwrite another
+ * pass's.
  *
  * A row that has never been refused goes in one bulk write with the other such rows. A row that
  * was in a write refused as written goes alone, so one row the relayer will never take cannot
@@ -353,7 +357,7 @@ async function releaseLease(tx: Pick<Database, 'update'>, rows: Claimed[], now: 
  *   out, whatever status it carries (watchBulkWrites): nothing is spent, the rows stay pending under
  *   their lease, and the pass ends.
  *   A row still unsent LIMITS.memoryWriteMaxAgeMs after created_at is 'failed' (C33). A timeout or
- *   a lost answer may have stored the write; sending it again then leaves an orphan blob.
+ *   a lost answer may have stored the write; sending it again can then leave an orphan blob.
  * - Answered without one usable job id per row: the relayer took them and they cannot be followed,
  *   so they are 'failed' rather than sent twice, the pass ends, and MemoryServiceError
  *   SEND_UNCERTAIN is thrown.
@@ -366,7 +370,7 @@ async function releaseLease(tx: Pick<Database, 'update'>, rows: Claimed[], now: 
  *
  * A write the relayer accepted whose job ids were never recorded (the function was killed after
  * the answer, or the record failed) keeps its lease and no job id, so once the lease has passed a
- * later pass sends it again. The first copy is then an orphan blob that no row names: decide maps
+ * later pass sends it again. The first copy may then be an orphan blob that no row names: decide maps
  * recall hits to Ellai's rows by blob id, so it never counts (C9), and only takes a recall slot.
  *
  * Throws MemoryServiceError: BAD_INPUT, OWNER, NO_ACCOUNT (before touching any row),

@@ -176,10 +176,18 @@ export const LIMITS = {
   /** Ceiling on one relayer request. The SDK's own recall deadline is 15 seconds and stays below it. */
   memwalRequestTimeoutMs: 30_000,
   /**
+   * Ceiling on each of the SDK's reads of the relayer before a request: GET /version, /health and
+   * /config. The SDK's default fell from 30 s to 5 s in 0.1.9 without a release note; Ellai keeps
+   * the 30 s its live runs were proven on, and three of these with the request still fit inside
+   * memwalCallTimeoutMs.
+   */
+  memwalPreflightTimeoutMs: 30_000,
+  /**
    * Ceiling on one whole SDK call to the relayer (C21). Before its request the SDK may check the
-   * relayer's version, then its health, and fetch its config, each up to memwalRequestTimeoutMs,
-   * and build a SEAL session whose read of Sui has no limit of its own. Four requests at the
-   * request ceiling is the slowest call that is still working.
+   * relayer's version, then its health, and fetch its config, each up to memwalPreflightTimeoutMs,
+   * and build a SEAL session whose read of Sui has no limit of its own (MemWal issue #1367, not
+   * fixed in any release up to 0.1.12). Those three and the request at their ceilings is the
+   * slowest call that is still working.
    */
   memwalCallTimeoutMs: 120_000,
   /** Largest relayer response body read. Ellai's sentences are at most 4 KiB, so 20 recall hits fit with room. */

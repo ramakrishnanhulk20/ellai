@@ -364,8 +364,8 @@ describe('submitPendingMemories', () => {
     ] as const) {
       const owner = await newOwner();
       const ids = [await pendingMemory(owner), await pendingMemory(owner)];
-      // As SDK 0.1.8 does: every bulk write builds its SEAL session first, and the session reads Sui
-      // through the JSON-RPC client, whose error carries the fullnode's status.
+      // As SDK 0.1.12 does: every bulk write builds its SEAL session first, and when the session's Sui
+      // read falls back from gRPC to the JSON-RPC client, that client's error carries the fullnode's status.
       const sealFails = (async () => Promise.reject(new SuiHTTPStatusError(`Unexpected status code: ${status}`, status, 'refused'))) as Method;
       const client = relayer({
         buildSealSession: sealFails,

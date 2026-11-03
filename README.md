@@ -81,7 +81,7 @@ Two things do not change as Ellai learns. It always asks about a seller address 
 
 - Ellai pays one x402 form today: version 1, as t2000 sellers send it. x402 version 2 is read but refused. MPP is not supported.
 - The app has no way to take back a refusal.
-- Walrus Memory SDK 0.1.9 (bulk idempotency keys) is not adopted yet. Ellai pins 0.1.8.
+- Walrus Memory SDK 0.1.12, which Ellai pins, does not yet put a time limit on the Sui read behind its Seal session (issue #1367, fix in review), so Ellai keeps its own 120-second limit on every relayer call.
 
 ## Architecture
 
@@ -493,11 +493,11 @@ What the test does not show: the 4 hotel requests in the first 12 were already l
 
 | Suite | Test files | Tests | Run on |
 |---|---|---|---|
-| core (includes live Tatum reads on Sui Mainnet) | 9 | 298 passed | 2 November 2026 |
-| proof | 1 | 8 passed | 2 November 2026 |
-| web | 25 | 800 passed | 2 November 2026 |
+| core (includes live Tatum reads on Sui Mainnet) | 9 | 300 passed | 3 November 2026 |
+| proof | 1 | 8 passed | 3 November 2026 |
+| web | 25 | 800 passed | 3 November 2026 |
 
-All three come from `npm test` in each package on 2 November 2026, with no failures, the root typecheck clean and the production web build clean. Core's live reads need a Tatum key in `.env`.
+All three come from `npm test` in each package on 3 November 2026, with no failures, the root typecheck clean and the production web build clean. Core's live reads need a Tatum key in `.env`.
 
 ## What it costs
 
@@ -537,7 +537,7 @@ LABELS.md, LABELS-RESULTS.md    The learning test: the 24 labels and the live re
 |---|---|
 | Chain | Sui Mainnet, USDC, the native `sui::allowance`, gasless stablecoin transfers |
 | Payments | x402 version 1, as t2000 sellers send it |
-| Memory | Walrus Memory through `@mysten-incubation/memwal` 0.1.8 (pinned), with `@mysten/seal` 1.5.1 |
+| Memory | Walrus Memory through `@mysten-incubation/memwal` 0.1.12 (pinned), with `@mysten/seal` 1.5.1 |
 | Chain reads and sends | Tatum Sui gateway, gRPC (native transport, server only) and GraphQL |
 | Sui SDK | `@mysten/sui` 2.37.0, `@mysten/dapp-kit` 1.1.17 |
 | App | Next.js 16.4.3, React 19.3.1, TypeScript 7.0.2, Tailwind CSS 4.3.3 |
