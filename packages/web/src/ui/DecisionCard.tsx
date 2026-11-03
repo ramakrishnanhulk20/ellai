@@ -1,9 +1,4 @@
-'use client';
-
-import { AnimatePresence, motion } from 'motion/react';
-import { formatUsdc } from './format-usdc.js';
 import type { MapDecision } from './memory-map.js';
-import { usePrefersReducedMotion } from './useMediaQuery.js';
 
 /**
  * The badge a public decision wears. "Paid" needs a digest, which the server sets only for a payment it
@@ -55,65 +50,4 @@ export function reasonFor(decision: MapDecision): string | null {
     default:
       return null;
   }
-}
-
-function CardBody({ decision }: { decision: MapDecision }) {
-  const badge = badgeFor(decision);
-  const reason = reasonFor(decision);
-  return (
-    <>
-      <p className="label-mono text-muted">AGENT WANTS TO PAY</p>
-      <p className="mt-2 text-[20px] leading-[1.25] text-fg">
-        {formatUsdc(decision.amountUsdc)} USDC to
-        <span title={decision.host} className="block truncate text-[20px] leading-[1.25] text-fg">
-          {decision.host}
-        </span>
-      </p>
-      <p
-        className={`label-mono mt-3 inline-flex h-6 items-center rounded-button border px-2 ${badge.tone}`}
-      >
-        {badge.label}
-      </p>
-      {reason ? <p className="mt-3 text-[14px] leading-[1.4] text-muted">{reason}</p> : null}
-      {decision.digest ? (
-        <p className="mt-3">
-          <a
-            href={`https://suiscan.xyz/mainnet/tx/${encodeURIComponent(decision.digest)}`}
-            target="_blank"
-            rel="noopener"
-            className="label-mono link-draw text-fg"
-          >
-            See it on Sui
-          </a>
-        </p>
-      ) : null}
-    </>
-  );
-}
-
-/**
- * Shows the decision the scene is replaying. Content cross-fades when the decision changes. The
- * box is as tall as the tallest card (a paid one with a two-line reason and the Sui link), so it
- * never changes height between decisions.
- */
-export function DecisionCard({ decision, className = '' }: { decision: MapDecision | null; className?: string }) {
-  const reduced = usePrefersReducedMotion();
-  if (!decision) return null;
-  return (
-    <div
-      className={`relative min-h-[236px] rounded-card border border-line bg-[rgba(8,9,10,0.72)] p-4 backdrop-blur-[12px] ${className}`}
-    >
-      <AnimatePresence mode="wait">
-        <motion.div
-          key={decision.id}
-          initial={{ opacity: 0, y: reduced ? 0 : 8 }}
-          animate={{ opacity: 1, y: 0 }}
-          exit={{ opacity: 0, y: reduced ? 0 : -8 }}
-          transition={{ duration: 0.3, ease: 'easeOut' }}
-        >
-          <CardBody decision={decision} />
-        </motion.div>
-      </AnimatePresence>
-    </div>
-  );
 }

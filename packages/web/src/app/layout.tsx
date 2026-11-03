@@ -1,13 +1,18 @@
-import { Bricolage_Grotesque } from 'next/font/google';
-import { GeistMono } from 'geist/font/mono';
-import { GeistSans } from 'geist/font/sans';
+import { IBM_Plex_Mono, Space_Grotesk } from 'next/font/google';
 import type { ReactNode } from 'react';
 import './globals.css';
 
-const bricolage = Bricolage_Grotesque({
+const spaceGrotesk = Space_Grotesk({
   subsets: ['latin'],
-  axes: ['opsz'],
-  variable: '--font-bricolage',
+  weight: ['400', '500', '600', '700'],
+  variable: '--font-space-grotesk',
+  display: 'swap',
+});
+
+const plexMono = IBM_Plex_Mono({
+  subsets: ['latin'],
+  weight: ['400', '500'],
+  variable: '--font-plex-mono',
   display: 'swap',
 });
 
@@ -16,16 +21,13 @@ export const metadata = {
 };
 
 export const viewport = {
-  themeColor: '#08090A',
-  colorScheme: 'dark',
+  themeColor: '#ffffff',
+  colorScheme: 'light',
 };
 
 export default function RootLayout({ children }: { children: ReactNode }) {
   return (
-    <html
-      lang="en"
-      className={`${bricolage.variable} ${GeistSans.variable} ${GeistMono.variable}`}
-    >
+    <html lang="en" className={`${spaceGrotesk.variable} ${plexMono.variable}`}>
       <body>{children}</body>
     </html>
   );
