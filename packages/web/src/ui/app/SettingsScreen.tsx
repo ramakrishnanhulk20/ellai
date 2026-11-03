@@ -34,6 +34,7 @@ import { APP_KEY, ONBOARDING_KEY, usePatchOverview, useReloadOverview, useSessio
 import { Summary, Waiting } from './setup-parts.js';
 import { StepUpDialog } from './StepUpDialog.js';
 import { Button, Card, ErrorLine, PageShell, Skeleton } from './ui.js';
+import { usePrefersReducedMotion } from '../useMediaQuery.js';
 import { DECLINED } from './wallet-messages.js';
 
 const SETTINGS_KEY = [APP_KEY, 'settings'] as const;
@@ -42,6 +43,20 @@ const CONFIRM_WINDOW_MS = 6_000;
 const POLL_MS = 5_000;
 const MAX_CHECKS = 6;
 const EXPLORER_TX = 'https://suiscan.xyz/mainnet/tx/';
+
+const SMALL_CAPS = 'font-mono text-[12px] font-medium uppercase leading-[1.5] tracking-[0.06em]';
+
+const SECTIONS = [
+  { id: 'settings-spending', title: 'Spending' },
+  { id: 'settings-allowance', title: 'Allowance' },
+  { id: 'settings-learning', title: 'Learning' },
+  { id: 'settings-automatic-payments', title: 'Automatic payments' },
+  { id: 'settings-public-proof', title: 'Public proof' },
+  { id: 'settings-sessions', title: 'Sessions' },
+] as const;
+
+// Cards sit under the 72px sticky top bar, so a jump to one stops 24px below it.
+const CARD_CLASS = 'max-w-[720px] scroll-mt-[96px]';
 
 function failure(caught: unknown): string {
   return isApiError(caught) ? caught.message : 'Something went wrong. Try again.';
@@ -109,14 +124,19 @@ function useSaveChange(settings: Settings, onSaved: (next: Settings) => void) {
 
 function Saved({ show }: { show: boolean }) {
   return show ? (
-    <span role="status" className="font-mono text-[12px] leading-none text-accent">
+    <span role="status" className="font-mono text-[12px] leading-none text-[#2f45c8]">
       Saved
     </span>
   ) : null;
 }
 
 function CardTitle({ children }: { children: ReactNode }) {
-  return <h2 className="text-[18px] font-medium leading-[1.4] text-fg">{children}</h2>;
+  return (
+    <h2 className="flex items-start gap-3 font-display text-[22px] font-semibold leading-[1.3] text-fg">
+      <span aria-hidden="true" className="mt-[10px] h-2 w-2 shrink-0 bg-accent" />
+      {children}
+    </h2>
+  );
 }
 
 function SaveRow({
@@ -169,7 +189,7 @@ function SpendingCard({ settings }: { settings: Settings }) {
   const changed = Object.keys(change).length > 0;
 
   return (
-    <Card className="max-w-[720px]">
+    <Card id={SECTIONS[0].id} className={CARD_CLASS}>
       <CardTitle>Spending</CardTitle>
       <div className="mt-4 grid gap-4 sm:grid-cols-2">
         <TextField
@@ -220,7 +240,7 @@ function sleep(ms: number): Promise<void> {
 function EndedBody({ digest }: { digest: string }) {
   return (
     <div className="mt-3">
-      <p role="status" className="label-mono text-accent">
+      <p role="status" className={`${SMALL_CAPS} text-[#2f45c8]`}>
         ENDED
       </p>
       <p className="mt-2 text-[15px] leading-[1.5] text-fg">
@@ -476,7 +496,7 @@ function AllowanceCard() {
   }
 
   return (
-    <Card className="max-w-[720px]">
+    <Card id={SECTIONS[1].id} className={CARD_CLASS}>
       <CardTitle>Allowance</CardTitle>
       {body}
       {error ? (
@@ -505,10 +525,10 @@ function LearningCard({ settings }: { settings: Settings }) {
   const changed = Object.keys(change).length > 0;
 
   return (
-    <Card className="max-w-[720px]">
+    <Card id={SECTIONS[2].id} className={CARD_CLASS}>
       <CardTitle>Learning</CardTitle>
       <div className="mt-4">
-        <p className="label-mono text-muted">PAYS ON ITS OWN AFTER</p>
+        <p className={`${SMALL_CAPS} text-muted`}>PAYS ON ITS OWN AFTER</p>
         <div className="mt-3 flex flex-wrap items-center gap-x-4 gap-y-2">
           <Stepper value={approvals} min={1} max={10} onChange={setApprovals} label="Yeses needed before Ellai pays on its own" />
           <span className="text-[13px] text-faint">{yesesLikeIt(approvals)}</span>
@@ -516,7 +536,7 @@ function LearningCard({ settings }: { settings: Settings }) {
       </div>
       <div className="mt-6">
         <div className="flex items-baseline justify-between gap-4">
-          <p className="label-mono text-muted">HOW ALIKE</p>
+          <p className={`${SMALL_CAPS} text-muted`}>HOW ALIKE</p>
           <p className="font-mono text-[15px] leading-none tabular-nums text-fg">{cutoffText(cutoff)}</p>
         </div>
         <div className="mt-2">
@@ -543,7 +563,7 @@ function AutomaticPaymentsCard({ settings }: { settings: Settings }) {
   const on = !settings.paused;
   const reason = settings.autoPausedReason;
   return (
-    <Card className="max-w-[720px]">
+    <Card id={SECTIONS[3].id} className={CARD_CLASS}>
       <div className="flex items-center justify-between gap-4">
         <CardTitle>Automatic payments</CardTitle>
         <div className="flex items-center gap-3">
@@ -583,7 +603,7 @@ const PUBLIC_PROOF_TEXT =
 function PublicProofCard({ settings }: { settings: Settings }) {
   const { save, busy, error, saved, dialog } = useSaveChange(settings, () => {});
   return (
-    <Card className="max-w-[720px]">
+    <Card id={SECTIONS[4].id} className={CARD_CLASS}>
       <CardTitle>Public proof</CardTitle>
       <div className="mt-3 flex items-center justify-between gap-4">
         <p className="min-w-0 text-[15px] leading-[1.5] text-muted">{PUBLIC_PROOF_TEXT}</p>
@@ -641,7 +661,7 @@ function SessionsCard() {
   }
 
   return (
-    <Card className="max-w-[720px]">
+    <Card id={SECTIONS[5].id} className={CARD_CLASS}>
       <CardTitle>Sessions</CardTitle>
       <p className="mt-3 text-[15px] leading-[1.5] text-muted">
         Signed in on another device you do not trust? End every session at once.
@@ -665,19 +685,103 @@ function SessionsCard() {
   );
 }
 
+/** The section list beside the cards. The card under the middle of the screen lights up; a click scrolls to its card. */
+function SectionIndex() {
+  const [active, setActive] = useState<string>(SECTIONS[0].id);
+  const reduceMotion = usePrefersReducedMotion();
+  // After a click the chosen section stays lit while the page glides there, until the reader scrolls by hand.
+  const pinned = useRef(false);
+
+  useEffect(() => {
+    // The last card is short and the page ends below the middle band, so it never crosses it. At the very bottom it lights up instead.
+    const atEnd = () => window.innerHeight + window.scrollY >= document.documentElement.scrollHeight - 4;
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (pinned.current) return;
+        for (const entry of entries) {
+          if (entry.isIntersecting) setActive(atEnd() ? SECTIONS[5].id : entry.target.id);
+        }
+      },
+      { rootMargin: '-40% 0px -55% 0px' },
+    );
+    for (const section of SECTIONS) {
+      const card = document.getElementById(section.id);
+      if (card) observer.observe(card);
+    }
+    let frame = 0;
+    function checkEnd() {
+      frame = 0;
+      if (!pinned.current && atEnd()) setActive(SECTIONS[5].id);
+    }
+    function onScroll() {
+      if (frame === 0) frame = requestAnimationFrame(checkEnd);
+    }
+    function release() {
+      pinned.current = false;
+    }
+    window.addEventListener('scroll', onScroll, { passive: true });
+    window.addEventListener('wheel', release, { passive: true });
+    window.addEventListener('touchstart', release, { passive: true });
+    window.addEventListener('keydown', release);
+    return () => {
+      observer.disconnect();
+      window.removeEventListener('scroll', onScroll);
+      window.removeEventListener('wheel', release);
+      window.removeEventListener('touchstart', release);
+      window.removeEventListener('keydown', release);
+      if (frame !== 0) cancelAnimationFrame(frame);
+    };
+  }, []);
+
+  return (
+    <nav aria-label="Settings sections" className="sticky top-[96px] hidden lg:block">
+      <ul className="flex flex-col">
+        {SECTIONS.map((section) => {
+          const current = section.id === active;
+          return (
+            <li key={section.id}>
+              <a
+                href={`#${section.id}`}
+                aria-current={current ? 'location' : undefined}
+                onClick={(event) => {
+                  event.preventDefault();
+                  pinned.current = true;
+                  setActive(section.id);
+                  document
+                    .getElementById(section.id)
+                    ?.scrollIntoView({ behavior: reduceMotion ? 'auto' : 'smooth', block: 'start' });
+                }}
+                className={`relative block py-2 pl-4 font-sans text-[15px] transition-colors duration-[160ms] ease-out hover:text-fg ${
+                  current ? 'text-fg' : 'text-muted'
+                }`}
+              >
+                {current ? <span aria-hidden="true" className="absolute inset-y-0 left-0 w-0.5 bg-accent" /> : null}
+                {section.title}
+              </a>
+            </li>
+          );
+        })}
+      </ul>
+    </nav>
+  );
+}
+
 export function SettingsScreen() {
   const query = useQuery({ queryKey: SETTINGS_KEY, queryFn: fetchSettings, gcTime: 0, refetchOnMount: 'always' });
   const settings = query.data;
   return (
     <PageShell label="SETTINGS" title="Your limits">
       {settings ? (
-        <div className="flex flex-col gap-4">
-          <SpendingCard settings={settings} />
-          <AllowanceCard />
-          <LearningCard settings={settings} />
-          <AutomaticPaymentsCard settings={settings} />
-          <PublicProofCard settings={settings} />
-          <SessionsCard />
+        <div className="lg:grid lg:grid-cols-[200px_minmax(0,1fr)] lg:items-start lg:gap-12">
+          <SectionIndex />
+          <div className="flex flex-col gap-4">
+            <SpendingCard settings={settings} />
+            <AllowanceCard />
+            <LearningCard settings={settings} />
+            <AutomaticPaymentsCard settings={settings} />
+            <PublicProofCard settings={settings} />
+            <SessionsCard />
+          </div>
         </div>
       ) : query.isError ? (
         <div className="flex flex-col items-start gap-2">

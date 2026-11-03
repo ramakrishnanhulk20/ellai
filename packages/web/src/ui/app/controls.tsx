@@ -4,7 +4,7 @@ import { useId, type ComponentProps, type CSSProperties } from 'react';
 import { MinusIcon, PlusIcon } from './icons.js';
 
 const INPUT =
-  'block h-12 w-full rounded-button border border-line bg-bg px-3 text-[16px] leading-none text-fg transition-[border-color] duration-[160ms] ease-out placeholder:text-faint hover:border-fg/40 focus:border-accent focus-visible:outline-none disabled:cursor-not-allowed disabled:opacity-60';
+  'block h-12 w-full rounded-button border border-line bg-panel px-4 font-sans text-[16px] text-fg transition-[border-color,box-shadow] duration-150 placeholder:text-faint enabled:hover:border-fg/40 focus:border-accent focus:outline-none focus:shadow-[0_0_0_3px_color-mix(in_srgb,var(--accent)_18%,transparent)] disabled:cursor-not-allowed disabled:bg-[#f7f7f6] disabled:text-faint';
 
 /** A labelled text input. The hint under it turns red when the value is outside what it allows. */
 export function TextField({
@@ -22,7 +22,7 @@ export function TextField({
   const id = useId();
   return (
     <div className={`min-w-0 ${className}`}>
-      <label htmlFor={id} className="label-mono block text-muted">
+      <label htmlFor={id} className="block font-mono text-[12px] font-medium uppercase tracking-[0.06em] text-muted">
         {label}
       </label>
       <input
@@ -61,11 +61,11 @@ export function Switch({
       aria-label={label}
       disabled={disabled}
       onClick={() => onChange(!checked)}
-      className="group relative h-6 w-11 shrink-0 rounded-full border border-line bg-[rgba(242,242,238,0.06)] transition-[background-color,border-color] duration-[160ms] ease-out hover:border-fg/60 disabled:cursor-not-allowed disabled:opacity-60 aria-checked:border-accent aria-checked:bg-accent"
+      className="group relative h-6 w-11 shrink-0 rounded-full border border-line bg-[#dedfdf] transition-[background-color,border-color] duration-[160ms] ease-out hover:border-fg/60 disabled:cursor-not-allowed disabled:opacity-60 aria-checked:border-accent aria-checked:bg-accent"
     >
       <span
         aria-hidden="true"
-        className="absolute left-[2px] top-[2px] h-[18px] w-[18px] rounded-full bg-fg transition-[translate,background-color] duration-200 ease-[cubic-bezier(0.22,1,0.36,1)] motion-reduce:transition-none group-aria-checked:translate-x-5 group-aria-checked:bg-accent-ink"
+        className="absolute left-[2px] top-[2px] h-[18px] w-[18px] rounded-full bg-white shadow-[0_1px_2px_rgba(26,26,26,0.2)] transition-[translate] duration-200 ease-[cubic-bezier(0.22,1,0.36,1)] motion-reduce:transition-none group-aria-checked:translate-x-5"
       />
     </button>
   );
@@ -86,7 +86,7 @@ export function Stepper({
   label: string;
 }) {
   const side =
-    'grid h-10 w-10 place-items-center rounded-button border border-line text-fg transition-[border-color,background-color] duration-[160ms] ease-out enabled:hover:border-fg enabled:hover:bg-[rgba(242,242,238,0.06)] disabled:cursor-not-allowed disabled:opacity-40';
+    'grid h-10 w-10 place-items-center rounded-button border border-line bg-panel text-fg transition-[border-color] duration-[160ms] ease-out enabled:hover:border-fg disabled:cursor-not-allowed disabled:opacity-40';
   return (
     <div role="group" aria-label={label} className="inline-flex items-center gap-3">
       <button type="button" aria-label="One less" disabled={value <= min} onClick={() => onChange(value - 1)} className={side}>
@@ -137,8 +137,8 @@ export function Slider({
         style={{ '--fill': fill } as CSSProperties}
       />
       <div className="mt-1 flex justify-between">
-        <span className="label-mono text-muted">{low}</span>
-        <span className="label-mono text-muted">{high}</span>
+        <span className="font-mono text-[12px] font-medium uppercase tracking-[0.06em] text-muted">{low}</span>
+        <span className="font-mono text-[12px] font-medium uppercase tracking-[0.06em] text-muted">{high}</span>
       </div>
     </div>
   );

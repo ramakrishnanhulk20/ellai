@@ -141,7 +141,9 @@ export function StepUpDialog({ request, send, onDone, onCancel, handoff }: Props
 
       {phase === 'requesting' || issued !== null ? (
         <div className="mt-6">
-          <p className="label-mono text-muted">YOUR WALLET WILL SHOW THIS</p>
+          <p className="font-mono text-[12px] font-medium uppercase leading-[1.5] tracking-[0.06em] text-muted">
+            YOUR WALLET WILL SHOW THIS
+          </p>
           {issued === null ? (
             <div role="status" aria-label="Asking for the message" className="mt-2 grid h-24 place-items-center text-accent">
               <div className="h-8 w-8">
@@ -149,7 +151,7 @@ export function StepUpDialog({ request, send, onDone, onCancel, handoff }: Props
               </div>
             </div>
           ) : (
-            <div className="mt-2 max-h-[240px] overflow-y-auto whitespace-pre-wrap rounded-button border border-line bg-bg p-3 font-mono text-[13px] leading-[1.5] text-fg [overflow-wrap:anywhere]">
+            <div className="mt-2 max-h-[240px] overflow-y-auto whitespace-pre-wrap rounded-[8px] border border-line bg-[#f7f7f6] p-4 font-mono text-[13px] leading-[1.5] text-fg [overflow-wrap:anywhere]">
               {issued.message}
             </div>
           )}

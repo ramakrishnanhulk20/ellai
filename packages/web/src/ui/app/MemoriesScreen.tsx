@@ -14,7 +14,7 @@ import {
   LoadMore,
   RowList,
 } from './rows.js';
-import { Badge, Button, ErrorLine, PageShell, When } from './ui.js';
+import { Badge, Button, ChainLink, ErrorLine, Figure, PageShell, VerdictSquare, When, type Verdict } from './ui.js';
 
 function describe(memory: MemoryRow): string | null {
   const { amountAtomic, sellerHost } = memory;
@@ -23,27 +23,37 @@ function describe(memory: MemoryRow): string | null {
   return sellerHost;
 }
 
+// An outcome row carries no delivered flag in the API, so it gets the neutral mark rather than a colour it cannot back up.
+function squareFor(memory: MemoryRow): Verdict {
+  if (memory.kind === 'outcome') return 'neutral';
+  return memory.verdict === 'approve' ? 'approved' : 'refused';
+}
+
+function Summary({ rows }: { rows: MemoryRow[] | null }) {
+  const count = (status: MemoryRow['status']) => (rows === null ? null : rows.filter((memory) => memory.status === status).length);
+  return (
+    <div className="mb-6 grid grid-cols-2 gap-4 md:grid-cols-3">
+      <Figure label="On Walrus" value={count('confirmed')} tone="paid" />
+      <Figure label="Waiting" value={count('pending')} />
+      <Figure label="Failed" value={count('failed')} className="max-md:col-span-2" />
+    </div>
+  );
+}
+
 function SaveState({ memory }: { memory: MemoryRow }) {
-  if (memory.status === 'failed') return <span className="text-refused">Not saved</span>;
+  if (memory.status === 'failed') return <Badge tone="refused">Not saved</Badge>;
   if (memory.status === 'pending') {
     return (
-      <span className="inline-flex items-center gap-2 text-muted">
-        <span aria-hidden="true" className="save-pulse h-1.5 w-1.5 rounded-full bg-accent" />
+      <Badge tone="muted">
+        <span aria-hidden="true" className="save-pulse mr-2 h-1.5 w-1.5 rounded-full bg-accent" />
         Saving to Walrus
-      </span>
+      </Badge>
     );
   }
   return memory.blobId === null ? (
     <span className="text-fg">On Walrus</span>
   ) : (
-    <a
-      href={walruscanUrl(memory.blobId)}
-      target="_blank"
-      rel="noopener"
-      className="app-underline text-fg transition-colors duration-[160ms] ease-out hover:text-accent"
-    >
-      On Walrus
-    </a>
+    <ChainLink href={walruscanUrl(memory.blobId)}>blob {memory.blobId.slice(0, 6)}...</ChainLink>
   );
 }
 
@@ -51,11 +61,14 @@ function MemoryRowView({ memory }: { memory: MemoryRow }) {
   const line = describe(memory);
   return (
     <ExpandableRow
-      columns="xl:grid-cols-[120px_130px_minmax(0,1fr)_110px]"
+      columns="xl:grid-cols-[140px_130px_minmax(0,1fr)_110px]"
       aside={<SaveState memory={memory} />}
       summary={
         <>
-          <When iso={memory.createdAt} className={`${CELL_TIME} text-[14px] leading-[1.4] text-muted`} />
+          <span className={`${CELL_TIME} flex items-center gap-2`}>
+            <VerdictSquare verdict={squareFor(memory)} />
+            <When iso={memory.createdAt} className="text-[14px] leading-[1.4] text-muted" />
+          </span>
           <span className={`${CELL_LABEL} text-[14px] leading-[1.4] text-fg`}>
             {memory.kind === 'owner_decision' ? 'Your answer' : 'Outcome'}
           </span>
@@ -85,7 +98,6 @@ export function MemoriesScreen() {
     gcTime: 0,
   });
   const rows = query.data?.pages.flatMap((page) => page.memories) ?? [];
-  const count = (status: MemoryRow['status']) => rows.filter((memory) => memory.status === status).length;
 
   return (
     <PageShell
@@ -94,7 +106,10 @@ export function MemoriesScreen() {
       intro="These live in your own Walrus Memory account. Ellai reads them to decide, and you own them."
     >
       {query.isPending ? (
-        <ListSkeleton />
+        <>
+          <Summary rows={null} />
+          <ListSkeleton />
+        </>
       ) : query.isError && !query.data ? (
         <div className="flex flex-col items-start gap-2">
           <ErrorLine>{query.error.message}</ErrorLine>
@@ -104,8 +119,10 @@ export function MemoriesScreen() {
         <p className="text-[16px] leading-[1.5] text-muted">No memories yet. Each answer you give becomes one.</p>
       ) : (
         <>
-          <p className="label-mono mb-6 text-muted">
-            {count('confirmed')} ON WALRUS / {count('pending')} WAITING / {count('failed')} FAILED
+          <Summary rows={rows} />
+          <p className="-mt-2 mb-6 text-[14px] leading-[1.4] text-muted">
+            Counted from the {rows.length} memories loaded below.
+            {query.hasNextPage ? ' Load more to count older ones.' : ''}
           </p>
           <RowList>
             {rows.map((memory) => (

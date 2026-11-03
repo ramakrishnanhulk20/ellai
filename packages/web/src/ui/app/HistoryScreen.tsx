@@ -15,7 +15,20 @@ import {
   LoadMore,
   RowList,
 } from './rows.js';
-import { AgentQuote, Badge, Button, ErrorLine, MemoryChips, PageShell, When, type Tone } from './ui.js';
+import {
+  AgentQuote,
+  Badge,
+  Button,
+  ChainLink,
+  ErrorLine,
+  Figure,
+  MemoryChips,
+  PageShell,
+  VerdictSquare,
+  When,
+  type Tone,
+  type Verdict,
+} from './ui.js';
 
 type Kind = 'own' | 'yes' | 'asked' | 'refused' | 'approved';
 
@@ -25,6 +38,14 @@ const BADGE: Record<Kind, { label: string; tone: Tone }> = {
   asked: { label: 'ASKED YOU', tone: 'asked' },
   refused: { label: 'REFUSED', tone: 'refused' },
   approved: { label: 'APPROVED', tone: 'muted' },
+};
+
+const VERDICT: Record<Kind, Verdict> = {
+  own: 'approved',
+  yes: 'approved',
+  asked: 'asked',
+  refused: 'refused',
+  approved: 'approved',
 };
 
 // Ellai's first verdict never changes, so "paid" is read from the status: an approval that was
@@ -59,18 +80,24 @@ const STATUS_WORDS: Record<DecisionStatus, string> = {
 // The explorer link comes from the server, but a link is only built when it names a transaction page on Suiscan.
 const EXPLORER_PREFIX = 'https://suiscan.xyz/mainnet/tx/';
 
+// The figures use the same test as the filters, so each number is what its filter would show.
+function Summary({ rows }: { rows: Decision[] | null }) {
+  const count = (filter: Filter) => (rows === null ? null : rows.filter((decision) => matches(decision, filter)).length);
+  return (
+    <div className="mb-6 grid grid-cols-2 gap-4 md:grid-cols-4">
+      <Figure label="Decisions shown" value={count('all')} />
+      <Figure label="Paid on its own" value={count('own')} />
+      <Figure label="Asked you" value={count('asked')} />
+      <Figure label="Refused" value={count('refused')} />
+    </div>
+  );
+}
+
 function PaymentState({ paid }: { paid: NonNullable<Decision['paid']> }) {
   switch (paid.settlement) {
     case 'verified':
       return paid.explorerUrl.startsWith(EXPLORER_PREFIX) ? (
-        <a
-          href={paid.explorerUrl}
-          target="_blank"
-          rel="noopener"
-          className="app-underline text-fg transition-colors duration-[160ms] ease-out hover:text-accent"
-        >
-          Verified on Sui
-        </a>
+        <ChainLink href={paid.explorerUrl}>Verified on Sui</ChainLink>
       ) : (
         <span className="text-fg">Verified on Sui</span>
       );
@@ -89,13 +116,16 @@ function DecisionRow({ decision }: { decision: Decision }) {
   const line = `${atomicToUsdc(decision.payment.amountAtomic)} USDC to ${decision.payment.sellerHost}`;
   return (
     <ExpandableRow
-      columns="xl:grid-cols-[120px_160px_minmax(0,1fr)_280px]"
+      columns="xl:grid-cols-[150px_160px_minmax(0,1fr)_280px]"
       aside={decision.paid ? <PaymentState paid={decision.paid} /> : null}
       summary={
         <>
-          <When iso={decision.createdAt} className={`${CELL_TIME} text-[14px] leading-[1.4] text-muted`} />
+          <span className={`${CELL_TIME} flex items-center gap-2`}>
+            <VerdictSquare verdict={VERDICT[kind]} />
+            <When iso={decision.createdAt} className="font-mono text-[13px] leading-[1.4] text-muted" />
+          </span>
           <span
-            className={`${CELL_LABEL} truncate text-[14px] leading-[1.4] text-fg ${decision.paid ? 'max-xl:pr-36' : ''}`}
+            className={`${CELL_LABEL} truncate text-[15px] leading-[1.4] text-muted ${decision.paid ? 'max-xl:pr-36' : ''}`}
             title={decision.agent.label}
           >
             {decision.agent.label}
@@ -105,9 +135,15 @@ function DecisionRow({ decision }: { decision: Decision }) {
           </span>
           <span className={`${CELL_BADGE} flex flex-wrap items-center justify-end gap-x-2 gap-y-1 xl:justify-start`}>
             <Badge tone={badge.tone}>{badge.label}</Badge>
-            {kind === 'approved' ? <span className="text-[13px] text-muted">{STATUS_WORDS[decision.status]}</span> : null}
-            {decision.answer === 'approve' ? <span className="text-[13px] text-paid">You approved</span> : null}
-            {decision.answer === 'refuse' ? <span className="text-[13px] text-refused">You refused</span> : null}
+            {kind === 'approved' ? (
+              <span className="whitespace-nowrap text-[14px] text-muted">{STATUS_WORDS[decision.status]}</span>
+            ) : null}
+            {decision.answer === 'approve' ? (
+              <span className="whitespace-nowrap text-[14px] text-paid">You approved</span>
+            ) : null}
+            {decision.answer === 'refuse' ? (
+              <span className="whitespace-nowrap text-[14px] text-refused">You refused</span>
+            ) : null}
           </span>
         </>
       }
@@ -141,7 +177,10 @@ export function HistoryScreen() {
   return (
     <PageShell label="HISTORY" title="Every decision">
       {query.isPending ? (
-        <ListSkeleton />
+        <>
+          <Summary rows={null} />
+          <ListSkeleton />
+        </>
       ) : query.isError && !query.data ? (
         <div className="flex flex-col items-start gap-2">
           <ErrorLine>{query.error.message}</ErrorLine>
@@ -151,15 +190,24 @@ export function HistoryScreen() {
         <p className="text-[16px] leading-[1.5] text-muted">No decisions yet. They appear here as your agents ask to pay.</p>
       ) : (
         <>
-          <div role="group" aria-label="Filter decisions" className="mb-6 flex flex-wrap gap-2">
+          <Summary rows={rows} />
+          <p className="-mt-2 mb-6 text-[14px] leading-[1.4] text-muted">
+            Counted from the {rows.length} decisions loaded below.
+            {query.hasNextPage ? ' Load more to count older ones.' : ''}
+          </p>
+          <div
+            role="group"
+            aria-label="Filter decisions"
+            className="mb-6 inline-flex max-w-full flex-wrap gap-y-1 rounded-button border border-line bg-panel p-1"
+          >
             {FILTERS.map((item) => (
               <button
                 key={item.id}
                 type="button"
                 aria-pressed={filter === item.id}
                 onClick={() => setFilter(item.id)}
-                className={`h-8 rounded-button border border-line px-3 font-mono text-[12px] leading-none transition-[background-color,color,border-color] duration-[160ms] ease-out hover:border-fg hover:text-fg ${
-                  filter === item.id ? 'bg-[rgba(242,242,238,0.06)] text-fg' : 'text-muted'
+                className={`h-8 rounded-[6px] px-3 font-mono text-[12px] font-medium uppercase leading-none tracking-[0.06em] transition-colors duration-[160ms] ease-out ${
+                  filter === item.id ? 'bg-fg text-white' : 'text-muted hover:text-fg'
                 }`}
               >
                 {item.label}

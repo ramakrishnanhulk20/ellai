@@ -13,7 +13,7 @@ export const CELL_MAIN = 'col-span-2 row-start-2 xl:col-auto xl:row-auto';
 export const CELL_LABEL = 'col-span-2 row-start-3 xl:col-auto xl:row-auto';
 
 export function RowList({ children }: { children: ReactNode }) {
-  return <ul className="flex flex-col max-xl:gap-3 xl:border-t xl:border-line">{children}</ul>;
+  return <ul className="divide-y divide-line border-y border-line">{children}</ul>;
 }
 
 /**
@@ -34,8 +34,8 @@ export function ExpandableRow({
   const [open, setOpen] = useState(false);
   const toggle = () => setOpen((current) => !current);
   return (
-    <li className="max-xl:rounded-card max-xl:border max-xl:border-line max-xl:bg-panel xl:border-b xl:border-line">
-      <div className="relative transition-colors duration-[160ms] ease-out hover:bg-[rgba(242,242,238,0.04)] max-xl:rounded-card xl:flex xl:items-center">
+    <li>
+      <div className="relative transition-colors duration-[160ms] ease-out hover:bg-[color-mix(in_srgb,var(--fg)_3%,transparent)] xl:flex xl:items-center">
         <button
           type="button"
           aria-expanded={open}
@@ -66,7 +66,9 @@ export function ExpandableRow({
       </div>
       <div className="app-expand" data-open={open || undefined}>
         <div>
-          <div className="flex flex-col items-start gap-3 px-4 pb-5 pt-1 xl:max-w-[820px]">{children}</div>
+          <div className="border-t border-line bg-[#fafaf9]">
+            <div className="flex flex-col items-start gap-3 px-4 pb-5 pt-4 xl:max-w-[820px]">{children}</div>
+          </div>
         </div>
       </div>
     </li>

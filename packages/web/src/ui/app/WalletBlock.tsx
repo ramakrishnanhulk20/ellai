@@ -158,8 +158,8 @@ function MoveUsdc({ coinsText, onMoved, onReread }: { coinsText: string; onMoved
 function Row({ label, children }: { label: string; children: ReactNode }) {
   return (
     <div className="flex flex-wrap items-baseline justify-between gap-x-4 gap-y-1">
-      <p className="label-mono text-muted">{label}</p>
-      <p className="text-[20px] leading-[1.3] tabular-nums text-fg">{children}</p>
+      <p className="font-mono text-[12px] font-medium uppercase leading-[1.5] tracking-[0.06em] text-muted">{label}</p>
+      <p className="font-display text-[20px] font-semibold leading-[1.3] tabular-nums text-fg">{children}</p>
     </div>
   );
 }
@@ -202,7 +202,7 @@ export function WalletBlock() {
   const suiTotal = funds ? amount(funds.suiAddressMist) + amount(funds.suiCoinMist) : 0n;
 
   return (
-    <div className="flex flex-col gap-4 rounded-card border border-line p-4">
+    <div className="flex flex-col gap-4 rounded-card border border-line bg-[#fafaf9] p-4">
       <p className="text-[15px] font-medium leading-[1.4] text-fg">Your wallet</p>
 
       {funds ? (
@@ -234,7 +234,7 @@ export function WalletBlock() {
             </div>
           ) : null}
 
-          {moved ? <p role="status" className="font-mono text-[12px] leading-none text-accent">Moved.</p> : null}
+          {moved ? <p role="status" className="font-mono text-[12px] leading-none text-[#2f45c8]">Moved.</p> : null}
         </>
       ) : query.isError ? null : (
         <div className="flex flex-col gap-3">

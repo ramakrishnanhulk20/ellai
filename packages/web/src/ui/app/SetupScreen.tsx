@@ -21,7 +21,7 @@ import { ALLOWANCE_HINTS, checkAllowance, type AllowanceInput } from './limits.j
 import { ConnectWalletButton, WrongWalletNote, useOwnerWallet } from './OwnerWallet.js';
 import { ONBOARDING_KEY, usePatchOverview, useReloadOverview } from './session.js';
 import { Summary, Waiting } from './setup-parts.js';
-import { Button, Card, ErrorLine, PageShell, Ring, Skeleton } from './ui.js';
+import { Badge, Button, Card, ErrorLine, PageShell, Ring, Skeleton } from './ui.js';
 import { DECLINED } from './wallet-messages.js';
 import { WalletBlock } from './WalletBlock.js';
 
@@ -350,6 +350,40 @@ function StepFlow({
   );
 }
 
+type CardState = 'done' | 'active' | 'locked';
+
+const MARKER_STYLE: Record<CardState, string> = {
+  done: 'bg-accent text-white',
+  active: 'border-2 border-accent text-[#2f45c8]',
+  locked: 'border border-line text-faint',
+};
+
+function Marker({ index, state }: { index: number; state: CardState }) {
+  return (
+    <span
+      className={`grid h-10 w-10 shrink-0 place-items-center rounded-[8px] font-mono text-[13px] leading-none ${MARKER_STYLE[state]}`}
+    >
+      {state === 'done' ? <CheckIcon size={18} strokeWidth={2} /> : `0${index + 1}`}
+    </span>
+  );
+}
+
+function ProgressRow({ steps }: { steps: readonly boolean[] }) {
+  const done = steps.filter(Boolean).length;
+  return (
+    <div className="mb-6 flex flex-wrap items-center gap-x-6 gap-y-3">
+      <p className="font-mono text-[12px] font-medium uppercase leading-[1.5] tracking-[0.06em] text-muted">
+        {done} of {steps.length} done
+      </p>
+      <div aria-hidden="true" className="flex w-[240px] max-w-full gap-1">
+        {steps.map((isDone, index) => (
+          <span key={index} className={`h-1 flex-1 rounded-[2px] ${isDone ? 'bg-accent' : 'bg-[#dedfdf]'}`} />
+        ))}
+      </div>
+    </div>
+  );
+}
+
 function StepCard({
   index,
   info,
@@ -363,18 +397,19 @@ function StepCard({
   locked: boolean;
   onFinished: () => Promise<void>;
 }) {
+  const state: CardState = done ? 'done' : locked ? 'locked' : 'active';
   return (
-    <Card className={`max-w-[720px] transition-opacity duration-300 ease-out ${locked ? 'opacity-50' : ''}`}>
+    <Card
+      className={`relative max-w-[720px] overflow-hidden transition-opacity duration-300 ease-out ${locked ? 'opacity-60' : ''}`}
+      style={state === 'active' ? undefined : { boxShadow: 'none' }}
+    >
+      {state === 'active' ? <span aria-hidden="true" className="absolute inset-y-0 left-0 w-[3px] bg-accent" /> : null}
       <div className="flex items-start gap-4">
-        <span
-          className={`grid h-8 w-8 shrink-0 place-items-center rounded-full font-mono text-[14px] leading-none ${
-            done ? 'bg-accent text-accent-ink' : 'border border-line text-muted'
-          }`}
-        >
-          {done ? <CheckIcon size={16} strokeWidth={2} /> : index + 1}
-        </span>
+        <Marker index={index} state={state} />
         <div className="min-w-0 flex-1">
-          <h2 className="text-[18px] font-medium leading-8 text-fg">{info.title}</h2>
+          <h2 className="flex min-h-10 items-center font-display text-[20px] font-semibold leading-[1.3] text-fg sm:text-[22px]">
+            {info.title}
+          </h2>
           {done ? null : (
             <>
               <p className="mt-1 text-[15px] leading-[1.5] text-muted">{info.text}</p>
@@ -385,7 +420,11 @@ function StepCard({
             </>
           )}
         </div>
-        {done ? <span className="font-mono text-[12px] leading-8 text-accent">Done</span> : null}
+        {done ? (
+          <div className="flex h-10 items-center">
+            <Badge tone="paid">Done</Badge>
+          </div>
+        ) : null}
       </div>
     </Card>
   );
@@ -397,7 +436,7 @@ function ReadyCard() {
       <div className="h-12 w-12 text-accent">
         <Ring stroke={1.5} />
       </div>
-      <h2 className="mt-5 font-display text-[28px] font-medium leading-[1.2] text-fg">Ellai is ready.</h2>
+      <h2 className="mt-5 font-display text-[28px] font-bold leading-[1.2] text-fg">Ellai is ready.</h2>
       <p className="mt-2 max-w-[520px] text-[15px] leading-[1.5] text-muted">
         Ellai tops up your purse right after, usually within a minute or two. Then give your agent a key, or try the built-in agent.
       </p>
@@ -445,21 +484,24 @@ export function SetupScreen() {
       intro="Each step is one signature in your wallet. Ellai sends it to Sui through Tatum and checks that it landed."
     >
       {data ? (
-        <div className="flex flex-col gap-4">
-          {STEPS.map((info, index) => {
-            const done = data[info.key] === 'present';
-            return (
-              <StepCard
-                key={info.step}
-                index={index}
-                info={info}
-                done={done}
-                locked={!done && firstMissing !== -1 && index > firstMissing}
-                onFinished={finished}
-              />
-            );
-          })}
-          {firstMissing === -1 ? <ReadyCard /> : null}
+        <div>
+          <ProgressRow steps={STEPS.map((info) => data[info.key] === 'present')} />
+          <div className="flex flex-col gap-4">
+            {STEPS.map((info, index) => {
+              const done = data[info.key] === 'present';
+              return (
+                <StepCard
+                  key={info.step}
+                  index={index}
+                  info={info}
+                  done={done}
+                  locked={!done && firstMissing !== -1 && index > firstMissing}
+                  onFinished={finished}
+                />
+              );
+            })}
+            {firstMissing === -1 ? <ReadyCard /> : null}
+          </div>
         </div>
       ) : state.isError ? (
         <div className="flex flex-col items-start gap-2">

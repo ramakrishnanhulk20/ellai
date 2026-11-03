@@ -5,7 +5,7 @@ import { Ring } from './ui.js';
 export function Summary({ rows }: { rows: BuiltStep['summary'] }) {
   return (
     <div>
-      <p className="label-mono text-muted">WHAT YOU WILL SIGN</p>
+      <p className="font-mono text-[12px] font-medium uppercase leading-[1.5] tracking-[0.06em] text-muted">WHAT YOU WILL SIGN</p>
       <dl className="mt-2 rounded-button border border-line bg-bg px-4">
         {rows.map((row, index) => (
           <div

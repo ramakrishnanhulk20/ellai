@@ -69,9 +69,79 @@ export function Button({
 
 export function Card({ className = '', children, ...rest }: ComponentProps<'section'>) {
   return (
-    <section className={`rounded-panel border border-line bg-panel p-6 ${className}`} {...rest}>
+    <section
+      className={`rounded-[12px] border border-line bg-panel p-6 shadow-[0_1px_2px_rgba(26,26,26,0.05),0_12px_28px_-8px_rgba(26,26,26,0.10)] lg:p-7 ${className}`}
+      {...rest}
+    >
       {children}
     </section>
+  );
+}
+
+/** A big count over its small caps label. A null value means the count is still loading, so it shows three dots and no number. */
+export function Figure({
+  value,
+  label,
+  tone,
+  className = '',
+}: {
+  value: number | null;
+  label: string;
+  tone?: Tone;
+  className?: string;
+}) {
+  return (
+    <Card className={`p-5! ${className}`}>
+      <p className={`font-display text-[36px] font-bold leading-none tabular-nums ${tone ? TONE_TEXT[tone] : 'text-fg'}`}>
+        {value === null ? <span className="opacity-40">{'···'}</span> : value}
+      </p>
+      <p className="mt-2 font-mono text-[12px] font-medium uppercase tracking-[0.06em] text-muted">{label}</p>
+    </Card>
+  );
+}
+
+export type Verdict = 'approved' | 'refused' | 'asked' | 'neutral';
+
+/**
+ * The small square at the start of a row: accent when approved, red when refused, hollow while the question still
+ * waits on the owner, and grey for a row whose data carries no verdict. The grey is decoration, not a status.
+ */
+export function VerdictSquare({ verdict }: { verdict: Verdict }) {
+  const look =
+    verdict === 'asked'
+      ? 'border-[1.5px] border-fg'
+      : verdict === 'refused'
+        ? 'bg-refused'
+        : verdict === 'neutral'
+          ? 'bg-[#a7aaaa]'
+          : 'bg-accent';
+  return <span aria-hidden="true" className={`h-2 w-2 shrink-0 rounded-[2px] ${look}`} />;
+}
+
+/** A link out to a transaction or a blob, with the arrow that says it leaves the app. */
+export function ChainLink({ href, children }: { href: string; children: ReactNode }) {
+  return (
+    <a
+      href={href}
+      target="_blank"
+      rel="noopener"
+      className="inline-flex items-center gap-1 font-mono text-[12px] leading-[1.4] text-[#2f45c8] underline-offset-2 hover:underline"
+    >
+      {children}
+      <svg
+        width="12"
+        height="12"
+        viewBox="0 0 12 12"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="1.5"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        aria-hidden="true"
+      >
+        <path d="M3.5 8.5l5-5M4.5 3.5h4v4" />
+      </svg>
+    </a>
   );
 }
 
@@ -103,11 +173,16 @@ export function PageShell({
 }) {
   return (
     <div>
-      <header className="mb-8 flex flex-wrap items-end justify-between gap-x-6 gap-y-4">
+      <header className="mb-10 flex flex-wrap items-end justify-between gap-x-8 gap-y-4">
         <div className="min-w-0">
-          <p className="label-mono text-muted">{label}</p>
-          <h1 className="mt-3 font-display text-[44px] font-medium leading-[1.05] tracking-[-0.01em] text-fg">{title}</h1>
-          {intro ? <p className="mt-4 max-w-[640px] text-[16px] leading-[1.5] text-muted">{intro}</p> : null}
+          <p className="flex items-center gap-3 font-mono text-[13px] font-medium uppercase tracking-[0.06em] text-muted md:text-[14px]">
+            <span aria-hidden="true" className="h-2 w-2 shrink-0 bg-accent" />
+            {label}
+          </p>
+          <h1 className="mt-4 font-display text-[clamp(2.25rem,4.4vw,3.75rem)] font-bold leading-[1.04] tracking-[-0.03em] text-fg">
+            {title}
+          </h1>
+          {intro ? <p className="mt-4 max-w-[40rem] text-[17px] leading-[1.6] text-muted md:text-[18px]">{intro}</p> : null}
         </div>
         {action}
       </header>
@@ -149,7 +224,7 @@ export function CopyButton({ text, label }: { text: string; label: string }) {
       onClick={() => void copy()}
       aria-label={copied ? 'Copied' : label}
       title={copied ? 'Copied' : label}
-      className="grid h-7 w-7 shrink-0 place-items-center rounded-button text-muted transition-[background-color,color] duration-[160ms] ease-out hover:bg-[rgba(242,242,238,0.06)] hover:text-fg"
+      className="grid h-7 w-7 shrink-0 place-items-center rounded-button text-muted transition-[background-color,color] duration-[160ms] ease-out hover:bg-[color-mix(in_srgb,var(--fg)_6%,transparent)] hover:text-fg"
     >
       {copied ? <CheckIcon className="text-accent" /> : <CopyIcon />}
     </button>
@@ -170,7 +245,7 @@ export function MemoryChips({ memories, className = '' }: { memories: CitedMemor
             href={walruscanUrl(blobId)}
             target="_blank"
             rel="noopener"
-            className="inline-flex h-7 items-center rounded-button border border-line px-3 font-mono text-[12px] leading-none text-fg transition-[border-color,background-color] duration-[160ms] ease-out hover:border-fg hover:bg-[rgba(242,242,238,0.06)]"
+            className="inline-flex h-7 items-center rounded-button border border-line px-3 font-mono text-[12px] leading-none text-fg transition-[border-color,background-color] duration-[160ms] ease-out hover:border-fg hover:bg-[color-mix(in_srgb,var(--fg)_6%,transparent)]"
           >
             Memory {blobId.slice(0, 6)}
           </a>
@@ -194,17 +269,17 @@ export function AgentQuote({ purpose }: { purpose: string }) {
 export type Tone = 'accent' | 'paid' | 'asked' | 'refused' | 'muted';
 
 const TONE: Record<Tone, string> = {
-  accent: 'border-accent text-accent',
-  paid: 'border-paid text-paid',
-  asked: 'border-asked text-asked',
-  refused: 'border-refused text-refused',
-  muted: 'border-muted text-muted',
+  accent: 'bg-[color-mix(in_srgb,var(--accent)_10%,#ffffff)] text-[#2f45c8]',
+  paid: 'bg-[color-mix(in_srgb,var(--paid)_10%,#ffffff)] text-paid',
+  asked: 'bg-[color-mix(in_srgb,var(--asked)_10%,#ffffff)] text-asked',
+  refused: 'bg-[#fdeceb] text-refused',
+  muted: 'bg-[#f1f1f1] text-muted',
 };
 
 export function Badge({ tone, children }: { tone: Tone; children: ReactNode }) {
   return (
     <span
-      className={`label-mono inline-flex h-6 shrink-0 items-center whitespace-nowrap rounded-button border px-2 ${TONE[tone]}`}
+      className={`inline-flex h-6 shrink-0 items-center whitespace-nowrap rounded-[6px] px-2 font-mono text-[11px] font-medium uppercase tracking-[0.06em] ${TONE[tone]}`}
     >
       {children}
     </span>

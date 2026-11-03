@@ -14,11 +14,12 @@ export const AUTO_PAUSE_TEXT: Record<string, string> = {
     "A refill to your purse landed that did not match what Ellai built, so refills stay stopped until it is checked on Ellai's side. Resuming in Settings lets Ellai pay only from refills it verified before this one.",
 };
 
-function Banner({ border, title, text, action }: { border: string; title: string; text?: string; action?: ReactNode }) {
+function Banner({ bar, title, text, action }: { bar: string; title: string; text?: string; action?: ReactNode }) {
   return (
-    <div className={`flex flex-wrap items-center justify-between gap-x-6 gap-y-3 rounded-panel border bg-panel px-6 py-4 ${border}`}>
+    <div className="relative flex flex-wrap items-center justify-between gap-x-6 gap-y-3 overflow-hidden rounded-[12px] border border-line bg-panel py-4 pl-7 pr-6">
+      <span aria-hidden="true" className={`absolute inset-y-0 left-0 w-[3px] ${bar}`} />
       <div className="min-w-0 flex-1 basis-[280px]">
-        <p className="text-[16px] font-medium leading-[1.4] text-fg">{title}</p>
+        <p className="font-sans text-[16px] font-semibold leading-[1.4] text-fg">{title}</p>
         {text ? <p className="mt-1 text-[15px] leading-[1.5] text-muted">{text}</p> : null}
       </div>
       {action}
@@ -49,7 +50,7 @@ export function Banners() {
     owner.paused ? (
       <Banner
         key="paused"
-        border="border-asked"
+        bar="bg-asked"
         title="Automatic payments are paused"
         text="You paused them. Ellai refuses every payment until you resume in Settings."
         action={<SettingsLink />}
@@ -58,7 +59,7 @@ export function Banners() {
     owner.autoPausedReason !== null ? (
       <Banner
         key="auto-paused"
-        border="border-refused"
+        bar="bg-refused"
         title="Automatic payments are paused"
         text={AUTO_PAUSE_TEXT[owner.autoPausedReason]}
         action={<SettingsLink />}
@@ -67,7 +68,7 @@ export function Banners() {
     done < 3 && pathname !== '/app/setup' ? (
       <Banner
         key="setup"
-        border="border-accent/40"
+        bar="bg-accent"
         title="Finish setting up Ellai"
         text={`${done} of 3 steps done: your Walrus Memory account, Ellai's key on it, and your spending allowance.`}
         action={<ButtonLink href="/app/setup" variant="primary">Continue setup</ButtonLink>}

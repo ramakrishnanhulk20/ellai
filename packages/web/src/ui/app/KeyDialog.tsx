@@ -29,7 +29,7 @@ function useCopy(text: string) {
 }
 
 const COPY_BUTTON =
-  'label-mono inline-flex h-8 min-w-8 shrink-0 items-center justify-center gap-2 rounded-button border border-line px-[7px] text-fg transition-[border-color,background-color] duration-[160ms] ease-out hover:border-fg hover:bg-[rgba(242,242,238,0.06)]';
+  'label-mono inline-flex h-8 min-w-8 shrink-0 items-center justify-center gap-2 rounded-button border border-line px-[7px] text-fg transition-[border-color,background-color] duration-[160ms] ease-out hover:border-fg hover:bg-[color-mix(in_srgb,var(--fg)_6%,transparent)]';
 
 function CopyLabelButton({ copied, onClick, label }: { copied: boolean; onClick: () => void; label: string }) {
   return (
@@ -43,8 +43,8 @@ function CopyLabelButton({ copied, onClick, label }: { copied: boolean; onClick:
 function TokenBlock({ token }: { token: string }) {
   const { copied, copy } = useCopy(token);
   return (
-    <div className="flex items-start justify-between gap-3 rounded-button border border-line bg-bg p-3">
-      <p className="min-w-0 break-all font-mono text-[15px] leading-[1.5] text-fg">{token}</p>
+    <div className="flex items-start justify-between gap-3 rounded-[8px] border border-line bg-[#f7f7f6] p-4">
+      <p className="min-w-0 break-all font-mono text-[14px] leading-[1.5] text-fg">{token}</p>
       <CopyLabelButton copied={copied} onClick={() => void copy()} label="Copy the agent key" />
     </div>
   );
@@ -88,7 +88,7 @@ function ConnectTabs({ token }: { token: string }) {
   }
 
   return (
-    <div className="min-w-0 rounded-button border border-line bg-bg">
+    <div className="min-w-0 rounded-[8px] border border-line bg-[#f7f7f6]">
       <div className="flex items-center justify-between gap-2 border-b border-line pr-1.5">
         <div role="tablist" aria-label="How to connect" className="flex h-10 min-w-0 overflow-x-auto [scrollbar-width:none]">
           {SNIPPETS.map((entry, index) => {
@@ -127,7 +127,7 @@ function ConnectTabs({ token }: { token: string }) {
           role="region"
           aria-label="Code, scrolls sideways"
           tabIndex={0}
-          className="overflow-x-auto p-4 font-mono text-[13px] leading-[1.6] whitespace-pre text-fg"
+          className="overflow-x-auto p-4 font-mono text-[14px] leading-[1.6] whitespace-pre text-fg"
         >
           <code>{text}</code>
         </pre>
@@ -147,9 +147,12 @@ export function KeyDialog({ token, onClose }: { token: string; onClose: () => vo
       <div className="mt-4 flex flex-col gap-4">
         <TokenBlock token={token} />
         <ConnectTabs token={token} />
-        <p className="rounded-button border border-asked p-3 text-[14px] leading-[1.5] text-fg">
-          Ellai shows this key once. Put it in your agent now. If you lose it, revoke it and create another.
-        </p>
+        <div className="relative overflow-hidden rounded-[8px] bg-[color-mix(in_srgb,var(--accent)_6%,#ffffff)] px-4 py-3">
+          <span aria-hidden="true" className="absolute inset-y-0 left-0 w-[3px] bg-accent" />
+          <p className="text-[15px] leading-[1.5] text-fg">
+            Ellai shows this key once. Put it in your agent now. If you lose it, revoke it and create another.
+          </p>
+        </div>
         <Button variant="primary" size="lg" full onClick={onClose}>
           I&apos;ve saved it
         </Button>

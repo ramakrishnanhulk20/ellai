@@ -1,13 +1,13 @@
 'use client';
 
-import { useQuery, useQueryClient } from '@tanstack/react-query';
+import { useQuery, useQueryClient, type UseQueryResult } from '@tanstack/react-query';
 import { useEffect, useRef, useState } from 'react';
 import { createAgent, fetchAgents, isApiError, revokeAgent, type Agent, type ApiError } from './api.js';
 import { TextField } from './controls.js';
 import { KeyDialog } from './KeyDialog.js';
 import { APP_KEY } from './session.js';
 import { StepUpDialog } from './StepUpDialog.js';
-import { Button, Card, ErrorLine, PageShell, Skeleton, When } from './ui.js';
+import { Badge, Button, Card, ErrorLine, Figure, PageShell, Skeleton, When } from './ui.js';
 
 const AGENTS_KEY = [APP_KEY, 'agents'] as const;
 const LABEL_MAX = 60;
@@ -18,6 +18,17 @@ const FIELD_ERRORS = new Set(['bad_input', 'too_many_agents', 'too_many_agent_cr
 
 function normalise(label: string): string {
   return label.trim().replace(/ {2,}/g, ' ');
+}
+
+function Summary({ agents }: { agents: Agent[] | null }) {
+  const count = (kind: Agent['kind']) => (agents === null ? null : agents.filter((agent) => agent.kind === kind).length);
+  return (
+    <div className="mb-6 grid grid-cols-2 gap-4 md:grid-cols-3">
+      <Figure label="Agents" value={agents === null ? null : agents.length} />
+      <Figure label="Built-in" value={count('builtin')} />
+      <Figure label="External" value={count('external')} className="max-md:col-span-2" />
+    </div>
+  );
 }
 
 function AddAgent({ onCreated }: { onCreated: (token: string) => void }) {
@@ -42,7 +53,7 @@ function AddAgent({ onCreated }: { onCreated: (token: string) => void }) {
   }
 
   return (
-    <Card className="max-w-[720px]">
+    <Card className="lg:sticky lg:top-[96px]">
       <h2 className="text-[18px] font-medium leading-[1.4] text-fg">Add an agent</h2>
       <form
         className="mt-4"
@@ -53,7 +64,7 @@ function AddAgent({ onCreated }: { onCreated: (token: string) => void }) {
           setAsking(clean);
         }}
       >
-        <div className="flex flex-col gap-3 sm:flex-row sm:items-start">
+        <div className="flex flex-col gap-3 sm:flex-row sm:items-start lg:flex-col lg:items-stretch">
           <TextField
             className="flex-1"
             label="AGENT NAME"
@@ -67,7 +78,7 @@ function AddAgent({ onCreated }: { onCreated: (token: string) => void }) {
             type="submit"
             variant="primary"
             size="lg"
-            className="min-w-[140px] sm:mt-[26px]"
+            className="min-w-[140px] sm:mt-[26px] lg:mt-0 lg:w-full"
             disabled={clean === ''}
           >
             Create key
@@ -96,14 +107,15 @@ function AddAgent({ onCreated }: { onCreated: (token: string) => void }) {
 function StatusCell({ agent }: { agent: Agent }) {
   if (agent.revokedAt !== null) {
     return (
-      <span className="text-[14px] leading-[1.4] text-muted">
-        Revoked <When iso={agent.revokedAt} />
+      <span className="inline-flex items-center gap-2">
+        <Badge tone="muted">Revoked</Badge>
+        <When iso={agent.revokedAt} className="font-mono text-[12px] leading-[1.4] text-muted" />
       </span>
     );
   }
   return (
     <span className="inline-flex items-center gap-2 text-[14px] leading-[1.4] text-fg">
-      <span aria-hidden="true" className="h-2 w-2 rounded-full bg-accent" />
+      <span aria-hidden="true" className="h-1.5 w-1.5 bg-accent" />
       Active
     </span>
   );
@@ -145,7 +157,7 @@ function RevokeControl({ agentId, onRevoked }: { agentId: string; onRevoked: () 
   return (
     <div className="flex flex-col items-end gap-2">
       <div className="flex items-center gap-3">
-        <Button variant="danger" busy={busy} onClick={() => void press()}>
+        <Button variant="refuse" busy={busy} className="h-9!" onClick={() => void press()}>
           {confirming ? 'Revoke for good?' : 'Revoke'}
         </Button>
         {confirming && !busy ? (
@@ -163,31 +175,22 @@ function AgentRow({ agent, onRevoked }: { agent: Agent; onRevoked: () => Promise
   const revoked = agent.revokedAt !== null;
   const external = agent.kind === 'external';
   return (
-    <li
-      className={`border-line max-xl:rounded-card max-xl:border max-xl:bg-panel max-xl:p-4 xl:border-b xl:py-0 ${
-        revoked ? 'opacity-50' : ''
-      }`}
-    >
-      <div className="flex flex-col gap-3 xl:min-h-16 xl:grid xl:grid-cols-[minmax(0,1fr)_80px_130px_120px_340px] xl:items-center xl:gap-x-4 xl:gap-y-0">
-        <div className="flex items-baseline justify-between gap-3 xl:contents">
-          <span className="min-w-0 text-[15px] leading-[1.4] text-fg [overflow-wrap:anywhere]" title={agent.label}>
+    <li className={`px-5 py-4 ${revoked ? 'opacity-50' : ''}`}>
+      <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-3">
+        <div className="min-w-0 flex-1 basis-[200px]">
+          <p className="text-[16px] font-medium leading-[1.4] text-fg [overflow-wrap:anywhere]" title={agent.label}>
             {agent.label}
-          </span>
-          <span className="xl:hidden">
-            <StatusCell agent={agent} />
-          </span>
+          </p>
+          <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1">
+            <Badge tone="muted">{external ? 'External' : 'Built-in'}</Badge>
+            {external ? (
+              <span className="font-mono text-[12px] leading-[1.4] text-muted">{agent.displayPrefix}...</span>
+            ) : null}
+            <When iso={agent.createdAt} className="font-mono text-[12px] leading-[1.4] text-muted" />
+          </div>
         </div>
-        <div className="flex flex-wrap items-baseline gap-x-4 gap-y-1 xl:contents">
-          <span className="font-mono text-[12px] leading-none text-muted">{external ? 'External' : 'Built-in'}</span>
-          <span className={`font-mono text-[13px] leading-none text-muted ${external ? '' : 'max-xl:hidden'}`}>
-            {external ? `${agent.displayPrefix}...` : ''}
-          </span>
-          <When iso={agent.createdAt} className="text-[14px] leading-[1.4] text-muted" />
-        </div>
-        <div className="flex items-center justify-between gap-3 xl:justify-end">
-          <span className="max-xl:hidden">
-            <StatusCell agent={agent} />
-          </span>
+        <div className="flex items-center gap-4">
+          <StatusCell agent={agent} />
           {external && !revoked ? <RevokeControl agentId={agent.agentId} onRevoked={onRevoked} /> : null}
         </div>
       </div>
@@ -195,9 +198,10 @@ function AgentRow({ agent, onRevoked }: { agent: Agent; onRevoked: () => Promise
   );
 }
 
-function AgentList() {
+type AgentsQuery = UseQueryResult<{ agents: Agent[] }>;
+
+function AgentList({ query }: { query: AgentsQuery }) {
   const queryClient = useQueryClient();
-  const query = useQuery({ queryKey: AGENTS_KEY, queryFn: fetchAgents, gcTime: 0, refetchOnMount: 'always' });
 
   async function reload() {
     await queryClient.refetchQueries({ queryKey: AGENTS_KEY });
@@ -205,45 +209,57 @@ function AgentList() {
 
   if (query.isPending) {
     return (
-      <div className="flex flex-col gap-3">
-        <Skeleton className="h-16" />
-        <Skeleton className="h-16" />
-      </div>
+      <Card className="p-0!">
+        <div className="flex flex-col gap-3 p-5">
+          <Skeleton className="h-16" />
+          <Skeleton className="h-16" />
+        </div>
+      </Card>
     );
   }
   if (query.isError && !query.data) {
     return (
-      <div className="flex flex-col items-start gap-2">
-        <ErrorLine>{query.error.message}</ErrorLine>
-        <Button onClick={() => void query.refetch()}>Try again</Button>
-      </div>
+      <Card className="p-0!">
+        <div className="flex flex-col items-start gap-2 p-5">
+          <ErrorLine>{query.error.message}</ErrorLine>
+          <Button onClick={() => void query.refetch()}>Try again</Button>
+        </div>
+      </Card>
     );
   }
   const agents = query.data?.agents ?? [];
   if (agents.length === 0) {
-    return <p className="text-[16px] leading-[1.5] text-muted">No agents yet. Create a key above and give it to your agent.</p>;
+    return (
+      <Card className="p-0!">
+        <p className="p-5 text-[16px] leading-[1.5] text-muted">No agents yet. Create a key with the form on this page and give it to your agent.</p>
+      </Card>
+    );
   }
   return (
-    <ul className="flex flex-col max-xl:gap-3 xl:border-t xl:border-line">
-      {agents.map((agent) => (
-        <AgentRow key={agent.agentId} agent={agent} onRevoked={reload} />
-      ))}
-    </ul>
+    <Card className="p-0!">
+      <ul className="divide-y divide-line">
+        {agents.map((agent) => (
+          <AgentRow key={agent.agentId} agent={agent} onRevoked={reload} />
+        ))}
+      </ul>
+    </Card>
   );
 }
 
 export function AgentsScreen() {
   // The key is held here only until the person says they have saved it.
   const [token, setToken] = useState<string | null>(null);
+  const query = useQuery({ queryKey: AGENTS_KEY, queryFn: fetchAgents, gcTime: 0, refetchOnMount: 'always' });
   return (
     <PageShell
       label="AGENTS"
       title="Who can ask Ellai to pay"
       intro="Each agent gets its own key. What Ellai learns from your answers applies to all of them, and so does every refusal."
     >
-      <div className="flex flex-col gap-8">
+      {query.isPending || query.data ? <Summary agents={query.data?.agents ?? null} /> : null}
+      <div className="grid gap-6 lg:grid-cols-[minmax(0,5fr)_minmax(0,7fr)] lg:items-start">
         <AddAgent onCreated={setToken} />
-        <AgentList />
+        <AgentList query={query} />
       </div>
       {token !== null ? <KeyDialog token={token} onClose={() => setToken(null)} /> : null}
     </PageShell>
