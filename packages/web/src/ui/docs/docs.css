@@ -1,51 +1,68 @@
 /*
- * Ellai's skin over Fumadocs. Fumadocs' own stylesheet is loaded first and sits in a CSS layer, so these
- * plain rules win without any !important. Everything that styles page content hangs off .ellai-docs,
- * and the colour variables go on :root because the search box opens outside that wrapper.
+ * Ellai's skin over Fumadocs. Fumadocs' own stylesheet is loaded first and its utility classes sit in a CSS
+ * layer, so these plain rules win without any !important. Page content hangs off .ellai-docs, and the colour
+ * variables go on :root because the search box opens outside that wrapper.
  */
 
 :root {
-  --color-fd-background: #08090a;
-  --color-fd-foreground: #f2f2ee;
-  --color-fd-card: #0d0f11;
-  --color-fd-card-foreground: #f2f2ee;
-  --color-fd-popover: #0d0f11;
-  --color-fd-popover-foreground: #f2f2ee;
-  --color-fd-muted: #0d0f11;
-  --color-fd-muted-foreground: rgba(242, 242, 238, 0.56);
-  --color-fd-border: rgba(242, 242, 238, 0.12);
-  --color-fd-primary: #c8ff3d;
-  --color-fd-primary-foreground: #08090a;
-  --color-fd-secondary: rgba(242, 242, 238, 0.06);
-  --color-fd-secondary-foreground: #f2f2ee;
-  --color-fd-accent: rgba(242, 242, 238, 0.06);
-  --color-fd-accent-foreground: #f2f2ee;
-  --color-fd-ring: #c8ff3d;
-  --color-fd-overlay: rgba(8, 9, 10, 0.64);
+  --color-fd-background: #ffffff;
+  --color-fd-foreground: #1a1a1a;
+  --color-fd-card: #f7f7f6;
+  --color-fd-card-foreground: #1a1a1a;
+  --color-fd-popover: #ffffff;
+  --color-fd-popover-foreground: #1a1a1a;
+  --color-fd-muted: #f1f1f1;
+  --color-fd-muted-foreground: #656b6b;
+  --color-fd-border: #dedfdf;
+  --color-fd-primary: #4a63ff;
+  --color-fd-primary-foreground: #ffffff;
+  --color-fd-secondary: #f1f1f1;
+  --color-fd-secondary-foreground: #1a1a1a;
+  --color-fd-accent: rgba(26, 26, 26, 0.04);
+  --color-fd-accent-foreground: #1a1a1a;
+  --color-fd-ring: #4a63ff;
+  --color-fd-overlay: rgba(26, 26, 26, 0.4);
 
-  /* Fumadocs' stylesheet resets these fonts to system fonts. Putting back the app's own keeps every page the same. */
-  --font-sans: var(--font-geist-sans), ui-sans-serif, system-ui, sans-serif;
-  --font-mono: var(--font-geist-mono), ui-monospace, monospace;
+  /* Fumadocs' stylesheet resets these fonts to system fonts. Putting back the site's own keeps every page the same. */
+  --font-sans: var(--font-space-grotesk), ui-sans-serif, system-ui, sans-serif;
+  --font-mono: var(--font-plex-mono), ui-monospace, monospace;
 }
 
-/* The film grain belongs to the landing page and the app, not to a page people read for a while. */
-body:has(.ellai-docs)::after {
-  display: none;
+/* The search box is drawn straight into the body, outside the wrapper, so the body takes the page colours and font.
+   The cobalt accent here is what the site-wide focus ring reads, so rings in the search box match the rest of the page. */
+body:has(.ellai-docs) {
+  --accent: #4a63ff;
+  color: #1a1a1a;
+  font-family: var(--font-space-grotesk), ui-sans-serif, system-ui, sans-serif;
 }
 
 .ellai-docs {
-  /* Tells Fumadocs how tall the bar above its layout is, so the sidebar and the page contents stick below it. */
-  --fd-banner-height: 56px;
-  font-family: var(--font-geist-sans), ui-sans-serif, system-ui, sans-serif;
+  /* The site header is fixed, so this is its height. Fumadocs reads it to place the sidebar and the page contents. */
+  --fd-banner-height: 60px;
+  padding-top: var(--fd-banner-height);
+  font-family: var(--font-space-grotesk), ui-sans-serif, system-ui, sans-serif;
 }
 
-.ellai-docs-bar {
-  background-color: rgba(8, 9, 10, 0.72);
-  -webkit-backdrop-filter: blur(12px);
-  backdrop-filter: blur(12px);
+@media (min-width: 768px) {
+  .ellai-docs {
+    --fd-banner-height: 72px;
+  }
 }
 
-/* Sidebar: the same rows as the app's sidebar. The open page has the lime bar and the soft fill. */
+/* Fumadocs' stylesheet loads after the app's and has its own .hidden, which beats the header's md:flex.
+   Without this the header's links stay hidden on wide screens. */
+@media (min-width: 768px) {
+  .site-header nav[aria-label='Main'] {
+    display: flex;
+  }
+}
+
+/* The padding above already pushes the layout down by the header height, so the layout is that much shorter. */
+.ellai-docs #nd-docs-layout {
+  min-height: calc(100dvh - var(--fd-banner-height));
+}
+
+/* Sidebar: the open page has the cobalt bar and the soft grey fill. */
 #nd-sidebar a[data-active],
 #nd-sidebar-mobile a[data-active] {
   position: relative;
@@ -53,7 +70,7 @@ body:has(.ellai-docs)::after {
   padding: 0 12px;
   border-radius: 8px;
   font-size: 15px;
-  color: var(--muted);
+  color: #656b6b;
   transition:
     color 160ms ease-out,
     background-color 160ms ease-out;
@@ -61,14 +78,16 @@ body:has(.ellai-docs)::after {
 
 #nd-sidebar a[data-active]:hover,
 #nd-sidebar-mobile a[data-active]:hover {
-  background-color: rgba(242, 242, 238, 0.04);
-  color: var(--fg);
+  background-color: rgba(26, 26, 26, 0.04);
+  color: #1a1a1a;
 }
 
 #nd-sidebar a[data-active='true'],
-#nd-sidebar-mobile a[data-active='true'] {
-  background-color: rgba(242, 242, 238, 0.06);
-  color: var(--fg);
+#nd-sidebar-mobile a[data-active='true'],
+#nd-sidebar a[data-active='true']:hover,
+#nd-sidebar-mobile a[data-active='true']:hover {
+  background-color: #f1f1f1;
+  color: #1a1a1a;
 }
 
 #nd-sidebar a[data-active='true']::before,
@@ -77,141 +96,293 @@ body:has(.ellai-docs)::after {
   position: absolute;
   inset: 8px auto 8px 0;
   width: 2px;
-  border-radius: 9999px;
-  background-color: var(--accent);
+  background-color: #4a63ff;
 }
 
 .ellai-sidebar-title {
-  font-family: var(--font-bricolage), ui-sans-serif, system-ui, sans-serif;
-  font-weight: 600;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-family: var(--font-plex-mono), ui-monospace, monospace;
+  font-size: 12px;
+  font-weight: 500;
+  line-height: 1.5;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: #656b6b;
+  transition: color 160ms ease-out;
 }
 
-/* Page text. Paragraphs and lists stop at 72 characters. Code, tables and diagrams use the whole column. */
-.ellai-docs .prose {
-  --tw-prose-body: var(--fg);
-  --tw-prose-headings: var(--fg);
-  --tw-prose-bold: var(--fg);
-  --tw-prose-links: var(--accent);
-  --tw-prose-counters: var(--muted);
-  --tw-prose-bullets: var(--muted);
-  --tw-prose-code: var(--fg);
-  font-size: 16px;
-  line-height: 1.65;
+.ellai-sidebar-title::before {
+  content: '';
+  width: 8px;
+  height: 8px;
+  flex-shrink: 0;
+  background-color: #4a63ff;
 }
 
-.ellai-docs .prose > p,
-.ellai-docs .prose > ul,
-.ellai-docs .prose > ol,
-.ellai-docs .prose > h2,
-.ellai-docs .prose > h3 {
-  max-width: 72ch;
+a:hover > .ellai-sidebar-title {
+  color: #1a1a1a;
 }
 
-.ellai-docs .prose strong {
-  font-weight: 600;
-}
-
+/* Page title and the line under it. */
 .ellai-docs #nd-page h1 {
-  font-family: var(--font-bricolage), ui-sans-serif, system-ui, sans-serif;
-  font-size: 44px;
-  font-weight: 600;
+  font-family: var(--font-space-grotesk), ui-sans-serif, system-ui, sans-serif;
+  font-size: clamp(2.25rem, 4vw, 3.25rem);
+  font-weight: 700;
   line-height: 1.05;
+  letter-spacing: -0.03em;
+  color: #1a1a1a;
 }
 
 .ellai-docs #nd-page > p {
   max-width: 72ch;
+  font-size: 18px;
+  line-height: 1.6;
+  color: #656b6b;
 }
 
-.ellai-docs .prose h2,
-.ellai-docs .prose h3 {
-  font-family: var(--font-bricolage), ui-sans-serif, system-ui, sans-serif;
+/* Page text. Paragraphs and lists stop at 72 characters. Code, tables and diagrams use the whole column. */
+.ellai-docs #nd-page .prose {
+  --tw-prose-body: #1a1a1a;
+  --tw-prose-headings: #1a1a1a;
+  --tw-prose-bold: #1a1a1a;
+  --tw-prose-links: #1a1a1a;
+  --tw-prose-counters: #656b6b;
+  --tw-prose-bullets: #4a63ff;
+  --tw-prose-hr: #dedfdf;
+  --tw-prose-quotes: #1a1a1a;
+  --tw-prose-quote-borders: #1a1a1a;
+  --tw-prose-code: #1a1a1a;
+  font-size: 16px;
+  line-height: 1.7;
+}
+
+.ellai-docs #nd-page .prose > p,
+.ellai-docs #nd-page .prose > ul,
+.ellai-docs #nd-page .prose > ol,
+.ellai-docs #nd-page .prose > h2,
+.ellai-docs #nd-page .prose > h3 {
+  max-width: 72ch;
+}
+
+.ellai-docs #nd-page .prose strong {
   font-weight: 600;
+}
+
+.ellai-docs #nd-page .prose h2,
+.ellai-docs #nd-page .prose h3 {
+  font-family: var(--font-space-grotesk), ui-sans-serif, system-ui, sans-serif;
   scroll-margin-top: calc(var(--fd-docs-row-3, 0px) + 24px);
 }
 
-.ellai-docs .prose h2 {
+.ellai-docs #nd-page .prose h2 {
+  margin-top: 56px;
   font-size: 28px;
+  font-weight: 700;
   line-height: 1.2;
+  letter-spacing: -0.02em;
 }
 
-.ellai-docs .prose h3 {
+.ellai-docs #nd-page .prose h3 {
+  margin-top: 40px;
   font-size: 20px;
+  font-weight: 600;
   line-height: 1.3;
 }
 
-.ellai-docs .prose h2 code,
-.ellai-docs .prose h3 code {
+.ellai-docs #nd-page .prose h2 code,
+.ellai-docs #nd-page .prose h3 code {
   font-size: 0.8em;
 }
 
+/* Links: ink text with a light underline that turns cobalt on hover. */
+.ellai-docs #nd-page .prose a:not([data-card]) {
+  color: #1a1a1a;
+  text-decoration-line: underline;
+  text-decoration-color: #dedfdf;
+  text-decoration-thickness: 2px;
+  text-underline-offset: 4px;
+  transition: text-decoration-color 160ms ease-out;
+}
+
+.ellai-docs #nd-page .prose a:not([data-card]):hover {
+  opacity: 1;
+  text-decoration-color: #4a63ff;
+}
+
+/* Bullets are 6px cobalt squares, the same mark as the site's section labels. */
+.ellai-docs #nd-page .prose ul {
+  list-style: none;
+  padding-inline-start: 0;
+}
+
+.ellai-docs #nd-page .prose ul > li {
+  position: relative;
+  padding-inline-start: 22px;
+}
+
+.ellai-docs #nd-page .prose ul > li::before {
+  content: '';
+  position: absolute;
+  inset-inline-start: 4px;
+  top: calc(0.85em - 3px);
+  width: 6px;
+  height: 6px;
+  background-color: #4a63ff;
+}
+
 /* Inline code */
-.ellai-docs .prose :not(pre) > code {
-  font-family: var(--font-geist-mono), ui-monospace, monospace;
-  font-size: 0.875em;
+.ellai-docs #nd-page .prose :not(pre) > code {
+  font-family: var(--font-plex-mono), ui-monospace, monospace;
+  font-size: 13px;
+  color: #1a1a1a;
+  border: 1px solid #dedfdf;
   border-radius: 6px;
-  background: var(--panel);
-  border-color: var(--line);
+  background: #f7f7f6;
   overflow-wrap: anywhere;
 }
 
 /* A link made of inline code keeps the link's colour and underline. */
-.ellai-docs .prose a > code {
+.ellai-docs #nd-page .prose a > code {
   color: inherit;
   text-decoration: inherit;
 }
 
-/* Code blocks */
+/* Code blocks. The build colours tokens with a light theme, so they read on the bone background. */
 .ellai-docs figure.shiki {
   margin: 24px 0;
-  border: 1px solid var(--line);
-  border-radius: 8px;
-  background: var(--panel);
-  font-family: var(--font-geist-mono), ui-monospace, monospace;
-  font-size: 14px;
-  line-height: 1.6;
+  border: 1px solid #dedfdf;
+  border-radius: 12px;
+  background: #f7f7f6;
+  color: #1a1a1a;
+  font-family: var(--font-plex-mono), ui-monospace, monospace;
+  font-size: 13px;
+  line-height: 1.7;
 }
 
 .ellai-docs figure.shiki > div[role='region'] {
-  font-size: 14px;
+  font-size: 13px;
 }
 
 .ellai-docs figure.shiki pre,
 .ellai-docs figure.shiki code {
-  font-family: var(--font-geist-mono), ui-monospace, monospace;
-  font-size: 14px;
+  font-family: var(--font-plex-mono), ui-monospace, monospace;
+  font-size: 13px;
 }
 
 /* Tables scroll inside their own wrapper, so a wide one never widens the page. */
-.ellai-docs .prose table {
+.ellai-docs #nd-page .prose table {
   margin: 0;
-  border-radius: 8px;
-  background: transparent;
+  border: 1px solid #dedfdf;
+  border-radius: 12px;
+  background: #ffffff;
 }
 
-.ellai-docs .prose th {
-  background: var(--panel);
-  font-family: var(--font-geist-mono), ui-monospace, monospace;
+.ellai-docs #nd-page .prose th,
+.ellai-docs #nd-page .prose td {
+  padding: 12px 16px;
+  border-inline-start: 0;
+  vertical-align: top;
+}
+
+.ellai-docs #nd-page .prose th {
+  background: #f7f7f6;
+  border-bottom: 1px solid #dedfdf;
+  font-family: var(--font-plex-mono), ui-monospace, monospace;
   font-size: 12px;
-  font-weight: 400;
+  font-weight: 500;
   line-height: 1.5;
-  letter-spacing: 0.12em;
+  letter-spacing: 0.06em;
   text-transform: uppercase;
-  color: var(--muted);
+  color: #656b6b;
   white-space: nowrap;
 }
 
-.ellai-docs .prose td,
-.ellai-docs .prose th {
-  vertical-align: top;
+.ellai-docs #nd-page .prose td {
+  font-size: 15px;
+  line-height: 1.6;
+  color: #1a1a1a;
+}
+
+.ellai-docs #nd-page .prose tbody tr:not(:last-child) td {
+  border-bottom: 1px solid #dedfdf;
+}
+
+/* Quotes */
+.ellai-docs #nd-page .prose blockquote {
+  padding-inline-start: 20px;
+  border-inline-start: 2px solid #1a1a1a;
+  font-size: 17px;
+  font-style: italic;
+  font-weight: 400;
+}
+
+/* Callouts, if a page ever uses one. Fumadocs gives each a colour bar; here the bar is always cobalt. */
+.ellai-docs #nd-page .prose [style*='--callout-color'] {
+  border: 1px solid #dedfdf;
+  border-radius: 12px;
+  background: #f7f7f6;
+}
+
+.ellai-docs #nd-page .prose [style*='--callout-color'] > div[role='none'] {
+  width: 3px;
+  background-color: #4a63ff;
+}
+
+/* "On this page": the list on the right. The current item is ink with a 2px cobalt bar. */
+#nd-toc a[href^='#'] {
+  color: #656b6b;
+}
+
+#nd-toc a[href^='#']:hover {
+  color: #1a1a1a;
+}
+
+#nd-toc a[href^='#'][data-active='true'] {
+  color: #1a1a1a;
+}
+
+#nd-toc path.stroke-fd-primary {
+  stroke-width: 2px;
+}
+
+#nd-toc [class*='offset-distance'] {
+  display: none;
+}
+
+/* Search: a light popover, and the input takes the site's cobalt focus ring. */
+[role='dialog'][class*='bg-fd-popover'] {
+  border-radius: 12px;
+  box-shadow:
+    0 1px 2px rgba(26, 26, 26, 0.05),
+    0 12px 28px -8px rgba(26, 26, 26, 0.14);
+}
+
+input[role='combobox'][aria-controls='fd-search-list'] {
+  padding: 8px 12px;
+  border: 1px solid #dedfdf;
+  border-radius: 8px;
+  background: #ffffff;
+  transition:
+    border-color 160ms ease-out,
+    box-shadow 160ms ease-out;
+}
+
+input[role='combobox'][aria-controls='fd-search-list']:focus,
+input[role='combobox'][aria-controls='fd-search-list']:focus-visible {
+  outline: none;
+  border-color: #4a63ff;
+  box-shadow: 0 0 0 3px rgba(74, 99, 255, 0.18);
 }
 
 /* Diagrams */
 .ellai-mermaid {
   margin: 24px 0;
   padding: 24px 16px;
-  border: 1px solid var(--line);
-  border-radius: 8px;
-  background: var(--panel);
+  border: 1px solid #dedfdf;
+  border-radius: 12px;
+  background: #ffffff;
   min-height: 160px;
   overflow-x: auto;
 }
@@ -237,25 +408,26 @@ body:has(.ellai-docs)::after {
     display: block;
     margin-top: 12px;
     text-align: center;
-    font-family: var(--font-geist-mono), ui-monospace, monospace;
+    font-family: var(--font-plex-mono), ui-monospace, monospace;
     font-size: 12px;
+    font-weight: 500;
     line-height: 1.5;
-    letter-spacing: 0.12em;
+    letter-spacing: 0.06em;
     text-transform: uppercase;
-    color: var(--muted);
+    color: #656b6b;
   }
 }
 
 .ellai-mermaid-source {
   margin: 24px 0;
   padding: 16px;
-  border: 1px solid var(--line);
-  border-radius: 8px;
-  background: var(--panel);
-  color: var(--muted);
-  font-family: var(--font-geist-mono), ui-monospace, monospace;
-  font-size: 14px;
-  line-height: 1.6;
+  border: 1px solid #dedfdf;
+  border-radius: 12px;
+  background: #f7f7f6;
+  color: #656b6b;
+  font-family: var(--font-plex-mono), ui-monospace, monospace;
+  font-size: 13px;
+  line-height: 1.7;
   overflow-x: auto;
 }
 

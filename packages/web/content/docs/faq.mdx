@@ -18,7 +18,7 @@ The chain still bounds the loss. Your main balance stays at your own address and
 
 Your yes and no answers should belong to you, not to Ellai. In Walrus Memory you own the account, you can read it from other tools that sign in to it (Claude Code is one), you can check each memory as a Walrus blob on Sui, and you can remove Ellai's key at any time. Walrus Memory also does the meaning-based search that learning needs: given a new payment, it returns the closest past decisions with a distance.
 
-The costs. Walrus's relayer operator and the service that turns text into search vectors can read the memory text, and the delegate key holder can too. A memory is stored for a fixed storage period, and it leaves the public proof page when that period ends. And if Walrus Memory is down, Ellai asks you instead of paying.
+The costs. Walrus's relayer operator and the service that turns text into search vectors can read the memory text, and the delegate key holder can too. A memory is stored for a fixed storage period, and it leaves the public proof page when that period ends. And if Walrus Memory is down, Ellai never pays on its own: it asks you, or refuses when too many of your questions are already waiting.
 
 ## Why Tatum?
 
@@ -54,7 +54,7 @@ Sui Agent Pass is a Mysten Labs product, shown in October 2026, and Ellai and Ag
 
 ## What happens when Walrus Memory is down?
 
-Ellai asks you instead of paying. If a search errors, times out or comes back empty, the rule is to ask. Refusals still hold, because Ellai finds them by exact lookup in its own records and does not need the search. Your new answers are saved in Ellai's database at once, a refusal binds at once, and the background job retries the Walrus write until it succeeds or ends in a visible failed state.
+Ellai never pays on its own. If a search errors, times out or comes back empty, the rule is to ask, or to refuse when the agent already has 5 questions waiting. Refusals still hold, because Ellai finds them by exact lookup in its own records and does not need the search. Your new answers are saved in Ellai's database at once, a refusal binds at once, and the background job retries the Walrus write until it succeeds or ends in a visible failed state.
 
 ## Does Ellai hold my money?
 

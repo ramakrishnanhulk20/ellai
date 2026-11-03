@@ -1,0 +1,28 @@
+---
+title: What we found in Walrus Memory
+description: A bug in the Walrus Memory SDK that could hang a memory search, how we reported it, what the Walrus team confirmed, and how Ellai stays safe until the fix ships.
+---
+
+## What broke
+
+Walrus Memory's `recall()` could hang without end. The SDK's `requestTimeoutMs` did not bound one Sui read inside `buildSealSession`, the step that sets up the encrypted session before a search, so when that read stalled, the whole search stalled with it. The issue's title says it exactly: "requestTimeoutMs does not bound the Sui read inside buildSealSession, so recall() can hang".
+
+## How we reported it
+
+We filed [MystenLabs/walrus-memory#1367](https://github.com/MystenLabs/walrus-memory/issues/1367) on 2 November 2026 with a script that reproduces the hang.
+
+## What the Walrus team confirmed
+
+On 2 November the Walrus Memory team reproduced it on SDK 0.1.12 and confirmed the cause: `SessionKey.create`, called while the SEAL session is built, ran without a deadline, so a stalled Sui endpoint could block recall indefinitely. They opened a fix the same day.
+
+## The fix
+
+Pull request [MystenLabs/walrus-memory#1368](https://github.com/MystenLabs/walrus-memory/pull/1368), "bound SessionKey.create during SEAL session construction", open as of 3 November 2026.
+
+## How Ellai stays safe meanwhile
+
+Ellai never trusts a search to finish. Every recall Ellai makes while deciding a payment has its own limit of 15 seconds (`LIMITS.decideRecallTimeoutMs` in `packages/core/src/limits.ts`). A search that runs out counts as a failed search, and a failed search never pays: Ellai asks you instead, or refuses when too many of your questions are already waiting. The rules behind that are laid out in [how Ellai decides](/docs/how-it-works).
+
+## See it on the proof page
+
+[The proof page shows the same story step by step.](/proof#walrus-finding)

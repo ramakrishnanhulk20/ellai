@@ -65,9 +65,9 @@ Ellai's own code reads and sends on Sui only through Tatum's Sui gateway, using 
 
 Every Tatum request goes through one meter, `packages/web/src/server/http/tatum-meter.ts`. A live check on 26 October 2026 showed each gRPC and GraphQL request reaching the meter, and showed a refusing meter sending nothing. The daily budgets are on the [Security](/docs/security) page.
 
-## The public proof page and memory map
+## The public proof page and the landing page
 
-The `/proof` page and the memory map on the landing page show what Ellai actually did. They read two public routes: `/api/public/proof` and `/api/public/memory-map`.
+The `/proof` page and the landing page's journey and learning sections show what Ellai actually did. They read two public routes: `/api/public/proof` and `/api/public/memory-map`.
 
 Who appears. Only owners who turned on Public proof in Settings, which is off by default, and only once they have a verified payment or a memory confirmed on chain.
 
