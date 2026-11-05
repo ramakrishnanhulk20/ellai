@@ -349,6 +349,9 @@ Each invariant names the risk it closes. Every backend work order carries the in
 - **C45. Review-only routes.** A route that exists only for local review and reads owner data answers 404 in a production build, proven in the finishing sweep by building and requesting it.
 - **C46. Write identity.** Every relayer write the product makes for an owner carries a key built from Ellai's own row ids, never from its text, so two identical answers stay two memories; `prove:visit --twice` proves it live. The one-off proof script `prove:memory` writes fixed, distinct sentences and is outside this rule.
 - **C47. Stated bounds.** Every limit Ellai relies on from the Walrus Memory SDK is passed explicitly, never inherited from its default. Database connections rely on the Neon driver's own defaults; that is outside this rule.
+- **C48. Browser storage.** Anything read from browser storage passes an exact check against a closed set before use, and storage never holds a session, a key or a money fact.
+- **C49. Display choice stays in the browser.** No request, cookie, cache key or log carries a display preference, and public pages stay the same for every visitor, so C22 holds.
+- **C50. Readable in every mode.** Every block the owner answers or signs from keeps AA contrast in every display mode, proven on computed styles in a real browser, not on token values. A block that is locked or already answered may be dimmed, because nothing can be done from it.
 
 **1. Primitives over lists**
 - **Addresses and coin types:** one normaliser from the Sui SDK on every side (`normalizeSuiAddress`, `normalizeStructTag`).

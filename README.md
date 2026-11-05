@@ -502,7 +502,7 @@ Until the fix ships, Ellai bounds every recall it makes while deciding a payment
 |---|---|---|---|
 | core (includes live Tatum reads on Sui Mainnet) | 9 | 303 passed | 5 November 2026 |
 | proof | 1 | 8 passed | 5 November 2026 |
-| web | 28 | 841 passed | 5 November 2026 |
+| web | 29 | 959 passed | 5 November 2026 |
 
 All three come from `npm test` in each package on 5 November 2026, with no failures, the root typecheck clean and the production web build clean. Core's live reads need a Tatum key in `.env`.
 
@@ -530,7 +530,7 @@ packages/
     src/app/      owner app (/app), landing (/), proof (/proof), docs (/docs), API routes (/api)
     src/ui/       landing and proof page (site/), app screens (app/), docs components (docs/)
     content/docs/ the nine docs pages
-docs/security/threat-model.md   The 47 numbered security rules, C1 to C47
+docs/security/threat-model.md   The 50 numbered security rules, C1 to C50
 ARCHITECTURE.md                 The three diagrams and the decision rules
 LABELS.md, LABELS-RESULTS.md    The learning test: the 24 labels and the live results
 .github/workflows/jobs-tick.yml Scheduled backup for the background work
@@ -558,7 +558,7 @@ LABELS.md, LABELS-RESULTS.md    The learning test: the 24 labels and the live re
 
 ## Security
 
-The written standard is the [threat model](docs/security/threat-model.md). It lists 47 numbered rules, C1 to C47, and it was written before any payment code. In short:
+The written standard is the [threat model](docs/security/threat-model.md). It lists 50 numbered rules, C1 to C50, and it was written before any payment code. In short:
 
 - No AI model decides about money. Every rule is fixed code, applied in a set order. The first rule that matches decides.
 - Sui holds the allowance terms. Ellai's code holds the per-payment maximum, the daily budget and the purse float.
