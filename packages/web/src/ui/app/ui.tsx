@@ -103,8 +103,8 @@ export function Figure({
 export type Verdict = 'approved' | 'refused' | 'asked' | 'neutral';
 
 /**
- * The small square at the start of a row: accent when approved, red when refused, hollow while the question still
- * waits on the owner, and grey for a row whose data carries no verdict. The grey is decoration, not a status.
+ * The small square at the start of a row: accent when approved, red when refused, hollow when Ellai asked (whatever
+ * happened next), and grey for a row whose data carries no verdict. The grey is decoration, not a status.
  */
 export function VerdictSquare({ verdict }: { verdict: Verdict }) {
   const look =

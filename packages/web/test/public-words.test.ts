@@ -3,7 +3,9 @@
 // counter counting only learned approvals, the hero picking its example only from approvals
 // with a verified payment, a learned one before any other rule, and the seller host /proof and
 // the memory map both write, on PGlite: the learning test's stand-in host by name, any host
-// outside plain DNS as "this seller", and no host for a memory that names none.
+// outside plain DNS as "this seller", and no host for a memory that names none. Also that a bad
+// link address on /proof (such as #%E0) is ignored instead of throwing, and that a map row whose
+// time is not a date is dropped, so the timeline never formats one.
 // Does NOT cover: how the components lay these words out, or what the server writes into a
 // decision (memory-map.test.ts and decide.test.ts), or which rows the public reads list
 // (routes-public.test.ts and memory-map.test.ts).
@@ -17,8 +19,9 @@ import { agents, decisions, memories, owners, payments } from '../src/server/db/
 import { readMemoryMap, readPublicProof } from '../src/server/public/proof.js';
 import { badgeFor, reasonFor } from '../src/ui/DecisionCard.js';
 import { exampleSignature, pickExample } from '../src/ui/decide-model.js';
-import type { MapDecision } from '../src/ui/memory-map.js';
-import { buildTimeline, tallyThrough, timelineSignature } from '../src/ui/timeline-model.js';
+import { parseMemoryMap, type MapDecision } from '../src/ui/memory-map.js';
+import { hashTargetId } from '../src/ui/site/ProofBoard.js';
+import { buildTimeline, formatWhen, tallyThrough, timelineSignature } from '../src/ui/timeline-model.js';
 
 const DIGEST = '4Hq9c2DigestOfAVerifiedPayment';
 
@@ -203,6 +206,67 @@ describe('pickExample', () => {
     expect(exampleSignature(pickExample([decision({ digest: 'another' })]))).not.toBe(base);
     expect(exampleSignature(pickExample([decision({ rule: 'grant', digest: DIGEST })]))).not.toBe(base);
     expect(exampleSignature(pickExample([decision()]))).toBe('none');
+  });
+});
+
+describe('the link address on /proof', () => {
+  it('reads an address that is written as a percent code', () => {
+    expect(hashTargetId('#walrus-finding')).toBe('walrus-finding');
+    expect(hashTargetId('#walrus%2Dfinding')).toBe('walrus-finding');
+    expect(hashTargetId('')).toBe('');
+    expect(hashTargetId('#')).toBe('');
+  });
+
+  it('ignores an address that is not valid, instead of throwing', () => {
+    expect(() => hashTargetId('#%E0')).not.toThrow();
+    expect(hashTargetId('#%E0')).toBe('');
+    expect(hashTargetId('#%E0%A4%A')).toBe('');
+    expect(hashTargetId('#%')).toBe('');
+  });
+});
+
+describe('a map row with a time that is not a date', () => {
+  const GOOD_AT = '2026-10-01T10:00:00.000Z';
+  const memory = (blobId: string, at: string) => ({
+    blobId,
+    verdict: 'approve',
+    host: 'hotels.example',
+    amountUsdc: '0.100000',
+    at,
+  });
+  const asked = (id: string, at: string) => ({
+    id,
+    at,
+    outcome: 'asked',
+    rule: 'no_match',
+    host: 'hotels.example',
+    amountUsdc: '0.100000',
+    digest: null,
+    citations: [],
+  });
+  const body = (memories: unknown[], decisions: unknown[]) => ({
+    generatedAt: GOOD_AT,
+    memories,
+    decisions,
+    totals: { memories: memories.length, learnedApprovals: 0, questionsAsked: decisions.length },
+  });
+
+  it('is dropped from the memories and the decisions, and the other rows stay', () => {
+    const parsed = parseMemoryMap(
+      body(
+        [memory('good', GOOD_AT), memory('bad-text', 'not a date'), memory('bad-empty', '')],
+        [asked('keep', GOOD_AT), asked('bad-text', 'yesterday'), asked('bad-empty', '')],
+      ),
+    );
+    expect(parsed?.memories.map((row) => row.blobId)).toEqual(['good']);
+    expect(parsed?.decisions.map((row) => row.id)).toEqual(['keep']);
+  });
+
+  it('never reaches the timeline, which formats every time it draws', () => {
+    const parsed = parseMemoryMap(body([], [asked('keep', GOOD_AT), asked('bad', 'Invalid Date')]));
+    const nodes = buildTimeline(parsed?.decisions ?? []);
+    expect(nodes.map((node) => node.id)).toEqual(['keep']);
+    expect(nodes.map((node) => formatWhen(node.at))).toEqual(['1 Oct, 10:00 UTC']);
   });
 });
 

@@ -175,7 +175,7 @@ export function HistoryScreen() {
   const shown = rows.filter((decision) => matches(decision, filter));
 
   return (
-    <PageShell label="HISTORY" title="Every decision">
+    <PageShell label="HISTORY" title="Decisions">
       {query.isPending ? (
         <>
           <Summary rows={null} />

@@ -93,11 +93,11 @@ function Header({ still }: { still: boolean }) {
         {...rise(shown, still, 0.08)}
         className="mt-6 max-w-[12ch] font-grotesk text-[clamp(2.25rem,6.1vw,5rem)] font-bold leading-[1.05] tracking-[-0.03em] text-ink"
       >
-        Any agent. One tool.
+        Any agent. Two tools.
       </motion.h2>
       <motion.p {...rise(shown, still, 0.16)} className="mt-6 max-w-[36rem] text-lg leading-[1.6] text-ink-soft md:text-xl">
-        Give your agent its own key in Ellai. It calls one tool, paid_fetch, with a URL and a plain reason. Ellai pays,
-        refuses, or asks you first, and the agent never holds your money.
+        Give your agent its own key in Ellai. It calls paid_fetch with a URL and a plain reason, and check_decision to
+        follow up on a question. Ellai pays, refuses, or asks you first, and the agent never holds your money.
       </motion.p>
     </div>
   );
@@ -361,7 +361,7 @@ function ConnectColumn({ still }: { still: boolean }) {
   );
 }
 
-/** Landing section 5. One tool, three possible results, and the exact text to paste to connect an agent. */
+/** Landing section 5. Two tools, three possible results, and the exact text to paste to connect an agent. */
 export function ConnectSection() {
   const still = usePrefersReducedMotion();
   return (

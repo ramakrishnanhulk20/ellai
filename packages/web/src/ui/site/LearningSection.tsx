@@ -327,7 +327,7 @@ function Strip({ nodes, figures, still }: { nodes: TimelineNode[]; figures: Earl
           .
         </p>
         <Link href="/proof" className="nav-sweep mt-4 font-grotesk text-base font-medium text-ink">
-          See every payment and memory
+          See the latest payments and memories
           <span className="ml-2 inline-block align-[-2px]">
             <ArrowRight />
           </span>

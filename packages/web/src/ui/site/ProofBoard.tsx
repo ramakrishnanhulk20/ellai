@@ -27,18 +27,27 @@ function ProofHeader() {
         {...rise(shown, still, 0.08)}
         className="mt-6 max-w-[14ch] font-grotesk text-[clamp(2.75rem,7.2vw,6.5rem)] font-bold leading-[1.02] tracking-[-0.035em] text-ink"
       >
-        Every payment, every memory.
+        Latest payments and memories.
       </motion.h1>
       <motion.p
         {...rise(shown, still, 0.16)}
         className="mt-7 max-w-[40rem] text-lg leading-[1.6] text-ink-soft md:text-xl"
       >
         Payments settled on Sui and read back through Tatum, and memories stored on Walrus, for every Ellai owner who
-        chose to show them. Nothing here comes from anyone&apos;s word. The totals count every one; the lists show up
-        to the 20 newest of each.
+        chose to show them. Nothing here comes from anyone&apos;s word. The totals count every payment and owner
+        answer; the lists show up to the 20 newest of each.
       </motion.p>
     </div>
   );
+}
+
+/** The element id a link's hash points at. A hash that is not valid percent text, such as #%E0, points at nothing. */
+export function hashTargetId(hash: string): string {
+  try {
+    return decodeURIComponent(hash.slice(1));
+  } catch {
+    return '';
+  }
 }
 
 /**
@@ -67,7 +76,7 @@ function KeepHashTargetInView() {
 
   useEffect(() => {
     if (!settled || visitorMoved.current) return;
-    const id = decodeURIComponent(window.location.hash.slice(1));
+    const id = hashTargetId(window.location.hash);
     const target = id ? document.getElementById(id) : null;
     target?.scrollIntoView({ block: 'start', behavior: 'instant' });
   }, [settled]);
@@ -81,7 +90,7 @@ function FullLists() {
   if (state.status === 'error') return null;
   return (
     <div className="mt-24">
-      <h2 className="sr-only">Every payment and memory</h2>
+      <h2 className="sr-only">Latest payments and memories</h2>
       <LatestLists limit={Infinity} />
     </div>
   );

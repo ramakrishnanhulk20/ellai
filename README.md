@@ -394,7 +394,7 @@ Then fill in the rest of `.env`:
 - `SESSION_SECRET` and `JOBS_SECRET`: 64 hex characters each. Generate each with `node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"`.
 - `APP_ORIGIN`: `http://localhost:3001` for local work. If you set `PORT`, use the same port here, because wallet sign-in checks the address.
 - `DATABASE_URL`: `pglite:./local-db` for local work. It is a file database that the app creates and migrates inside `packages/web` the first time a page reads data, so no Postgres is needed.
-- `ANTHROPIC_API_KEY`: optional. Only the built-in agent needs it.
+- `ANTHROPIC_API_KEY`: optional. Only the built-in agent needs it. Create one at [console.anthropic.com](https://console.anthropic.com).
 
 Start the app:
 
@@ -500,11 +500,11 @@ Until the fix ships, Ellai bounds every recall it makes while deciding a payment
 
 | Suite | Test files | Tests | Run on |
 |---|---|---|---|
-| core (includes live Tatum reads on Sui Mainnet) | 9 | 300 passed | 3 November 2026 |
-| proof | 1 | 8 passed | 3 November 2026 |
-| web | 27 | 831 passed | 3 November 2026 |
+| core (includes live Tatum reads on Sui Mainnet) | 9 | 303 passed | 5 November 2026 |
+| proof | 1 | 8 passed | 5 November 2026 |
+| web | 28 | 841 passed | 5 November 2026 |
 
-All three come from `npm test` in each package on 3 November 2026, with no failures, the root typecheck clean and the production web build clean. Core's live reads need a Tatum key in `.env`.
+All three come from `npm test` in each package on 5 November 2026, with no failures, the root typecheck clean and the production web build clean. Core's live reads need a Tatum key in `.env`.
 
 ## What it costs
 
@@ -530,7 +530,7 @@ packages/
     src/app/      owner app (/app), landing (/), proof (/proof), docs (/docs), API routes (/api)
     src/ui/       landing and proof page (site/), app screens (app/), docs components (docs/)
     content/docs/ the nine docs pages
-docs/security/threat-model.md   The 45 numbered security rules, C1 to C45
+docs/security/threat-model.md   The 47 numbered security rules, C1 to C47
 ARCHITECTURE.md                 The three diagrams and the decision rules
 LABELS.md, LABELS-RESULTS.md    The learning test: the 24 labels and the live results
 .github/workflows/jobs-tick.yml Scheduled backup for the background work
@@ -558,7 +558,7 @@ LABELS.md, LABELS-RESULTS.md    The learning test: the 24 labels and the live re
 
 ## Security
 
-The written standard is the [threat model](docs/security/threat-model.md). It lists 45 numbered rules, C1 to C45, and it was written before any payment code. In short:
+The written standard is the [threat model](docs/security/threat-model.md). It lists 47 numbered rules, C1 to C47, and it was written before any payment code. In short:
 
 - No AI model decides about money. Every rule is fixed code, applied in a set order. The first rule that matches decides.
 - Sui holds the allowance terms. Ellai's code holds the per-payment maximum, the daily budget and the purse float.
@@ -577,7 +577,7 @@ What it does not cover, in plain words. Ellai holds every purse key, derived fro
 
 Sui Agent Pass is a Mysten Labs product, shown at Sui Basecamp in October 2026. It comes from the same family of ideas as Ellai: both are built on Sui's native `sui::allowance`, and both say an agent should act only inside limits the owner set. They do different jobs. Agent Pass bounds an agent's DeFi actions, such as transfers, swaps, lending and staking, to recipients, pools and validators that the owner lists in advance. Ellai pays web sellers that an agent finds at run time over x402, where no list can be written in advance, and it learns from the owner's answers which of those sellers the owner trusts. As read on 27 October 2026, Agent Pass was a mainnet test build at version 0.1.10, and its package does not mention x402, Walrus, Tatum or memory.
 
-[Sui Agent Payments](https://www.sui.io/agentpayments), Mysten's paid-API gateway (on testnet as of 3 November 2026), checks each request against an on-chain grant the owner sets for listed services, and settles USDC on Sui over x402 or MPP. Ellai pays any x402 seller its agent meets, on mainnet today, from the owner's own allowance, and learns from the owner's answers in Walrus Memory which new sellers to trust.
+[Sui Agent Payments](https://www.sui.io/agentpayments), Mysten's paid-API gateway (on testnet as of 3 November 2026), checks each request against an on-chain grant the owner sets for listed services, and settles USDC on Sui over x402 or MPP. Ellai pays any x402 version 1 seller its agent meets, the form t2000 sells over, on mainnet today, from the owner's own allowance, and learns from the owner's answers in Walrus Memory which new sellers to trust.
 
 ## Licence
 

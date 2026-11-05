@@ -39,6 +39,11 @@ function isRecord(value: unknown): value is Json {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
+/** A time that Date cannot read would make the date formatter throw when the timeline draws it. */
+function hasReadableTime(at: string): boolean {
+  return !Number.isNaN(Date.parse(at));
+}
+
 function parseMemory(value: unknown): MapMemory | null {
   if (!isRecord(value)) return null;
   const { blobId, verdict, host, amountUsdc, at } = value;
@@ -80,7 +85,8 @@ function parseDecision(value: unknown): MapDecision | null {
 
 /**
  * Checks a response body against the memory-map contract. Any mismatch returns null so the
- * screen shows its empty state instead of drawing half-understood data.
+ * screen shows its error state instead of drawing half-understood data. The one exception is a row
+ * whose time is not a date: that row is left out and the others still show.
  */
 export function parseMemoryMap(value: unknown): MemoryMap | null {
   if (!isRecord(value)) return null;
@@ -92,12 +98,14 @@ export function parseMemoryMap(value: unknown): MemoryMap | null {
   for (const entry of memories) {
     const memory = parseMemory(entry);
     if (!memory) return null;
+    if (!hasReadableTime(memory.at)) continue;
     parsedMemories.push(memory);
   }
   const parsedDecisions: MapDecision[] = [];
   for (const entry of decisions) {
     const decision = parseDecision(entry);
     if (!decision) return null;
+    if (!hasReadableTime(decision.at)) continue;
     parsedDecisions.push(decision);
   }
 
