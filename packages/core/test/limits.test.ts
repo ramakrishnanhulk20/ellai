@@ -1,9 +1,9 @@
 // Covers: the bounds of an owner's visit, the background work an owner's own request starts, and
 // how they sit against the route ceiling and the tick's time budget they run under; the read
 // spacings and the refills share that keep visits at request rate to the tick's own cadence; and
-// the Walrus Memory preflight ceiling against the whole-call ceiling.
+// the Walrus Memory preflight and recall ceilings against the whole-call ceiling and decide's wait.
 // Does NOT cover: any other limit (each is held by the tests of the code that uses it), the visit
-// itself (packages/web's visit.test.ts), or that memory.ts hands the preflight ceiling to the SDK.
+// itself (packages/web's visit.test.ts), or that memory.ts hands these ceilings to the SDK (memory.test.ts).
 import { describe, expect, it } from 'vitest';
 import { LIMITS } from '../src/limits.js';
 
@@ -70,5 +70,13 @@ describe('Walrus Memory preflight ceiling', () => {
 
   it('fits the three preflight reads and the request inside the whole-call ceiling', () => {
     expect(3 * LIMITS.memwalPreflightTimeoutMs + LIMITS.memwalRequestTimeoutMs).toBeLessThanOrEqual(LIMITS.memwalCallTimeoutMs);
+  });
+});
+
+describe('Walrus Memory recall ceiling', () => {
+  it('is the 15 s the SDK gives today, equal to the wait decide will give it, and under the general request ceiling', () => {
+    expect(LIMITS.memwalRecallTimeoutMs).toBe(15_000);
+    expect(LIMITS.memwalRecallTimeoutMs).toBe(LIMITS.decideRecallTimeoutMs);
+    expect(LIMITS.memwalRecallTimeoutMs).toBeLessThan(LIMITS.memwalRequestTimeoutMs);
   });
 });

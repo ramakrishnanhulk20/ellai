@@ -1,7 +1,8 @@
 // Checks that a running Ellai site answers a stranger: the landing page, /proof, the docs, the
-// app's first screen and the two public JSON reads the pages draw from. Every check must answer
+// app's first screen and the two public JSON reads the pages draw from. Each of those must answer
 // 200 without a redirect, the pages as HTML and the JSON reads in the exact shape the pages
-// expect. Prints one line per check, with counts only, and exits 1 if any check fails.
+// expect. The review-only routes must answer 404 (C45), so point this at a production build: a dev
+// server serves them. Prints one line per check, with counts only, and exits 1 if any check fails.
 //   npm run smoke -w packages/web -- https://your-site.vercel.app
 // Reads nothing from .env and sends no cookie, so it sees exactly what a first-time visitor sees.
 import { z } from 'zod';
@@ -11,6 +12,7 @@ import type { MemoryMap, PublicProof } from '../src/server/public/proof.js';
 // A dev server compiles a route on its first request, which can take most of a minute.
 const TIMEOUT_MS = 90_000;
 const PAGES = ['/', '/proof', '/docs', '/docs/how-it-works', '/app'] as const;
+const REVIEW_ONLY_PAGES = ['/lab', '/lab/question'] as const;
 
 const count = z.number().int().nonnegative();
 const atomicString = z.string().regex(/^\d+$/);
@@ -88,6 +90,14 @@ async function checkPage(origin: string, path: string): Promise<CheckResult> {
   return { path, status: '200', ms, ok: true, detail: `HTML, ${Math.round(body.length / 1024)} KB` };
 }
 
+async function checkAbsent(origin: string, path: string): Promise<CheckResult> {
+  const { response, ms, failure } = await get(origin, path);
+  if (response === null) return { path, status: '-', ms, ok: false, detail: failure };
+  await response.body?.cancel();
+  if (response.status !== 404) return { path, status: String(response.status), ms, ok: false, detail: 'expected 404: this route is for local review only' };
+  return { path, status: '404', ms, ok: true, detail: 'hidden' };
+}
+
 async function checkJson<T>(origin: string, path: string, schema: z.ZodType<T>, describe: (value: T) => string): Promise<CheckResult> {
   const { response, ms, failure } = await get(origin, path);
   if (response === null) return { path, status: '-', ms, ok: false, detail: failure };
@@ -128,6 +138,7 @@ async function main(): Promise<void> {
   console.log(`Ellai smoke test against ${origin}\n`);
   const rows: CheckResult[] = [];
   for (const path of PAGES) rows.push(await checkPage(origin, path));
+  for (const path of REVIEW_ONLY_PAGES) rows.push(await checkAbsent(origin, path));
   rows.push(
     await checkJson(origin, '/api/public/proof', proofSchema, (proof) =>
       [
@@ -147,7 +158,7 @@ async function main(): Promise<void> {
   printTable(rows);
   const failed = rows.filter((row) => !row.ok).length;
   if (failed === 0) {
-    console.log(`\nPASS: all ${rows.length} checks answered 200 in the expected shape.`);
+    console.log(`\nPASS: all ${rows.length} checks answered as expected.`);
   } else {
     console.log(`\nFAIL: ${failed} of ${rows.length} checks failed.`);
     process.exitCode = 1;

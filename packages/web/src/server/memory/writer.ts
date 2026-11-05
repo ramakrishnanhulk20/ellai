@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { LIMITS } from '@ellai/core/limits';
 import { MemoryError, type RelayerPacing, checkJobs, submitSentences } from '@ellai/core/memory';
 import { type SQL, and, asc, eq, gt, inArray, isNotNull, isNull, lte, or, sql } from 'drizzle-orm';
@@ -103,11 +104,11 @@ function watchBulkWrites(client: MemoryClient): { start: () => void; state: () =
   let state: SendState = 'not_sent';
   const setupFailures = watchSetupSteps(client);
   const send = client.rememberBulk.bind(client);
-  client.rememberBulk = async (items) => {
+  client.rememberBulk = async (items, options) => {
     const before = setupFailures();
     state = 'sending';
     try {
-      const accepted = await send(items);
+      const accepted = await send(items, options);
       state = 'answered';
       return accepted;
     } catch (error) {
@@ -140,7 +141,18 @@ type Attempt =
   /** The relayer answered the write, so it took the rows, but not with one usable job id each, so they cannot be followed. */
   | { kind: 'untrackable' };
 
-async function attemptWrite(client: MemoryClient, watch: ReturnType<typeof watchBulkWrites>, rows: Array<{ sentence: string }>, pacing: RelayerPacing): Promise<Attempt> {
+/**
+ * The relayer key of one bulk write: the SHA-256 hex of its rows' sorted ids, so two rows with one
+ * sentence are two writes (C46) and a resend of the same rows reaches the jobs they already have,
+ * at any later time. The relayer reads one key per call and keys each item by the key and its
+ * position, so a resend must keep the order; claimWrite's fixed order does.
+ */
+function writeKey(rows: Array<{ id: string }>): string {
+  const ids = rows.map((row) => row.id).sort();
+  return createHash('sha256').update(ids.join(','), 'utf8').digest('hex');
+}
+
+async function attemptWrite(client: MemoryClient, watch: ReturnType<typeof watchBulkWrites>, rows: Array<{ id: string; sentence: string }>, pacing: RelayerPacing): Promise<Attempt> {
   watch.start();
   try {
     return {
@@ -149,6 +161,7 @@ async function attemptWrite(client: MemoryClient, watch: ReturnType<typeof watch
         client,
         MEMORY_NAMESPACE,
         rows.map((row) => row.sentence),
+        writeKey(rows),
         pacing,
       ),
     };
@@ -332,11 +345,10 @@ async function releaseLease(tx: Pick<Database, 'update'>, rows: Claimed[], now: 
  * claims its rows in a short committed transaction (claimWrite: SELECT ... FOR UPDATE SKIP
  * LOCKED, then submitted_at set to `now` as a lease of LIMITS.memoryWriteLeaseMs), calls the
  * relayer with no transaction open, and records the outcome in a new short transaction. A row
- * with a job id is never claimed again: from SDK 0.1.9 a bulk write carries an idempotency key
- * built from its sentences and a fixed 30-minute window, so a resend inside the window gets the
- * same jobs back, but one across the window's edge would store every sentence twice. The record
- * only touches rows still pending with no job id, so a late record can never overwrite another
- * pass's.
+ * with a job id is never claimed again. Each bulk write carries a key built from its rows' ids,
+ * never from their text (writeKey), so two rows with one sentence stay two memories (C46). The
+ * record only touches rows still pending with no job id, so a late record can never overwrite
+ * another pass's.
  *
  * A row that has never been refused goes in one bulk write with the other such rows. A row that
  * was in a write refused as written goes alone, so one row the relayer will never take cannot
@@ -370,8 +382,10 @@ async function releaseLease(tx: Pick<Database, 'update'>, rows: Claimed[], now: 
  *
  * A write the relayer accepted whose job ids were never recorded (the function was killed after
  * the answer, or the record failed) keeps its lease and no job id, so once the lease has passed a
- * later pass sends it again. The first copy may then be an orphan blob that no row names: decide maps
- * recall hits to Ellai's rows by blob id, so it never counts (C9), and only takes a recall slot.
+ * later pass sends it again. The same rows carry the same key and get the same jobs back. Rows
+ * sent in a different group carry a new key and are stored again, so the first copy is an orphan
+ * blob that no row names: decide maps recall hits to Ellai's rows by blob id, so it never counts
+ * (C9), and only takes a recall slot.
  *
  * Throws MemoryServiceError: BAD_INPUT, OWNER, NO_ACCOUNT (before touching any row),
  * SEND_UNCERTAIN; MemoryError from core.

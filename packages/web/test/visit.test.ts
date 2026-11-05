@@ -678,6 +678,9 @@ describe('runOwnerVisit', () => {
    * neither the Walrus epoch reading nor the Sui epoch reading is kept between visits. Returns what
    * the meter charged the owner's jobs and refills shares, the error codes, and the payment's end.
    */
+  // A simulated day is hundreds of visits against a real in-memory Postgres; on a slower machine that outlasts the 30 s default.
+  const DAY_TEST_TIMEOUT_MS = 180_000;
+
   async function dayOfVisits(startIso: string, freshProcess: boolean) {
     // One UTC day, so the meter's daily counts cover exactly this run.
     const start = new Date(startIso).getTime();
@@ -738,13 +741,13 @@ describe('runOwnerVisit', () => {
     const day = await dayOfVisits('2026-10-31T00:00:00Z', false);
     expect(day).toEqual({ jobs: 143, refills: 70, codes: [], settled: 'verified' });
     expect([day.jobs <= N_ONE_PROCESS, day.refills <= M]).toEqual([true, true]);
-  });
+  }, DAY_TEST_TIMEOUT_MS);
 
   it('keeps the same day inside the many-instance N when every visit lands on a fresh server instance, which keeps no epoch reading, and under the jobs share (C22, C28, C34, C40)', async () => {
     const day = await dayOfVisits('2026-11-01T00:00:00Z', true);
     expect(day).toEqual({ jobs: 191, refills: 70, codes: [], settled: 'verified' });
     expect([day.jobs <= N_FRESH_INSTANCES, day.jobs < LIMITS.tatumCallsJobsPerOwnerPerDay, day.refills <= M]).toEqual([true, true, true]);
-  });
+  }, DAY_TEST_TIMEOUT_MS);
 
   it('spaces the refused write attempts that fail a memory at LIMITS.closedWindowReadSpacingMs, so five take at least 40 minutes at request rate (C33, C40)', async () => {
     const w = await world(db, { memwalAccountId: randomAddress() });

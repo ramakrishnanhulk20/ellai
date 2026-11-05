@@ -5,7 +5,7 @@
 // before the request leaves (even with a 4xx from the Sui read behind the SEAL session) until the age ceiling, sends
 // a row from a refused write alone so another row still goes, fails a row at the attempt ceiling,
 // marks rows failed when the relayer took them without usable job ids, counts and fails nothing
-// on a refused delegate key, and holds back a repeated sentence; confirmMemoryJobs maps done, failed and
+// on a refused delegate key, holds back a repeated sentence and keys every bulk write by its rows' ids (C46); confirmMemoryJobs maps done, failed and
 // pending, fails one malformed or clashing job alone, fails no job when a setup step fails before
 // the status request leaves, fails a job past the age ceiling, and on a refused delegate key
 // fails only jobs past that ceiling; neither holds a transaction across a relayer call,
@@ -22,7 +22,7 @@
 // `npm run prove:loop`), the real SDK's HTTP layer (core's tests cover the client), the jobs
 // tick's own handling of what is thrown (jobs.test), or two connections racing for one row:
 // PGlite serves one connection, so SKIP LOCKED is issued but never skips anything here.
-import { randomBytes } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import type { CanonicalPayment } from '@ellai/core/challenge';
 import { deriveMemwalDelegateKeypair } from '@ellai/core/keys';
 import { LIMITS } from '@ellai/core/limits';
@@ -476,6 +476,57 @@ describe('submitPendingMemories', () => {
     expect(await stalled).toEqual({ submitted: 0 });
     expect(await row(lost)).toMatchObject({ status: 'pending', jobId: kept });
     expect(relay.texts()).toEqual([[(await row(lost)).sentence], [(await row(lost)).sentence]]);
+  });
+});
+
+/**
+ * A stand-in for the relayer's own rule (remember_bulk in remember.rs): a write under a key it has
+ * seen gets that key's job back, position by position, and each job has one blob. A call naming no
+ * key is keyed by its text and the time window, as the SDK does; the window is the same for the
+ * whole test here, so the text alone stands for it.
+ */
+function keyedRelayer() {
+  return relayer({
+    rememberBulk: (async (items: Array<{ text: string }>, options?: { idempotencyKey?: string }) => ({
+      job_ids: items.map((item, index) => `job-${createHash('sha256').update(`${options?.idempotencyKey ?? item.text}:${index}`).digest('hex').slice(0, 32)}`),
+      total: items.length,
+      status: 'running',
+    })) as Method,
+    getRememberBulkStatus: (async (ids: string[]) => ({ results: ids.map((id) => ({ job_id: id, status: 'done', blob_id: `blob-${id}` })) })) as Method,
+  });
+}
+
+describe('write identity (C46)', () => {
+  it('makes two identical answers two confirmed memories, each with its own blob', async () => {
+    const owner = await newOwner();
+    const sentence = 'On 2026-10-24 the owner approved paying 0.010000 USDC to the seller at hotels.example for "a room".';
+    const first = await pendingMemory(owner, { sentence });
+    const second = await pendingMemory(owner, { sentence });
+    keyedRelayer();
+
+    expect(await submitPendingMemories(writer(owner))).toEqual({ submitted: 1 });
+    expect(await submitPendingMemories(writer(owner))).toEqual({ submitted: 1 });
+    expect(await confirmMemoryJobs(writer(owner))).toEqual({ confirmed: 2, failed: 0, pending: 0 });
+
+    const [a, b] = [await row(first), await row(second)];
+    expect([a.status, b.status]).toEqual(['confirmed', 'confirmed']);
+    expect(a.blobId).not.toBeNull();
+    expect(b.blobId).not.toBeNull();
+    expect(a.blobId).not.toBe(b.blobId);
+  });
+
+  it("keys a bulk write by its rows' sorted ids, never its text, and a resend of the same rows carries the same key", async () => {
+    const owner = await newOwner();
+    const ids = [await pendingMemory(owner), await pendingMemory(owner)];
+    const expected = createHash('sha256').update([...ids].sort().join(','), 'utf8').digest('hex');
+    expect(Buffer.byteLength(expected)).toBeLessThanOrEqual(LIMITS.memwalWriteKeyMaxBytes);
+
+    const lost = relayer({ rememberBulk: () => Promise.reject(Object.assign(new Error('internal'), { status: 500 })) });
+    await expect(submitPendingMemories(writer(owner))).rejects.toMatchObject({ name: 'MemoryError', code: 'UPSTREAM' });
+    const resent = relayer({ rememberBulk: accepted });
+    expect(await submitPendingMemories(writer(owner, tickOn(1)))).toEqual({ submitted: 2 });
+
+    for (const client of [lost, resent]) expect(client.rememberBulk.mock.calls[0]?.[1]).toEqual({ idempotencyKey: expected });
   });
 });
 

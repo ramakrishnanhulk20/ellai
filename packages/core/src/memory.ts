@@ -943,6 +943,7 @@ export function createMemoryClient(args: { delegate: Ed25519Keypair; accountId: 
     accountId,
     serverUrl: relayer.origin,
     requestTimeoutMs: LIMITS.memwalRequestTimeoutMs,
+    recallTimeoutMs: LIMITS.memwalRecallTimeoutMs,
     preflightTimeoutMs: LIMITS.memwalPreflightTimeoutMs,
   });
   clientDelegateKeys.set(client, toHex(args.delegate.getPublicKey().toRawBytes()));
@@ -986,23 +987,29 @@ export async function rememberSentences(
  * relayer's job ids in sentence order, without waiting for the jobs: read them later with
  * checkJobs. Same checks and the same per-key pace as rememberSentences, except that with
  * `pacing.waitForPoints` false a key with no points left is refused rather than waited for. The
- * write is sent once and never resent: from SDK 0.1.9 a bulk write carries an idempotency key
- * built from its sentences and a fixed 30-minute window, so a resend inside the window gets the
- * same jobs back, but one across the window's edge would store every sentence twice.
+ * write is sent once and never resent here.
+ *
+ * `idempotencyKey` is required, because the SDK's default is built from the text and a 30-minute
+ * window, which folds two identical sentences sent separately into one job (C46). The caller
+ * builds it from what makes this write its own. It covers the whole call: the relayer keys each
+ * sentence by the key and its position, and hands back the existing job for a pair it has seen.
  *
  * Throws MemoryError: WRITE for no sentences, more than LIMITS.memwalBulkMaxItems, an
- * empty, oversized or repeated sentence, a bad namespace, a relayer refusal, or an accepted
- * write that did not return one distinct job id per sentence; RATE_LIMITED, with nothing sent,
- * for a key with no points left when told not to wait; TIMEOUT, DELEGATE, RATE_LIMITED or
- * UPSTREAM from the relayer.
+ * empty, oversized or repeated sentence, a bad namespace, an empty key or one over
+ * LIMITS.memwalWriteKeyMaxBytes, a relayer refusal, or an accepted write that did not return one
+ * distinct job id per sentence; RATE_LIMITED, with nothing sent, for a key with no points left
+ * when told not to wait; TIMEOUT, DELEGATE, RATE_LIMITED or UPSTREAM from the relayer.
  */
-export async function submitSentences(client: MemWal, namespace: string, sentences: string[], pacing: RelayerPacing = {}): Promise<string[]> {
+export async function submitSentences(client: MemWal, namespace: string, sentences: string[], idempotencyKey: string, pacing: RelayerPacing = {}): Promise<string[]> {
   const label = checkNamespace(namespace, 'WRITE');
   const texts = checkSentences(sentences);
+  if (typeof idempotencyKey !== 'string' || idempotencyKey === '' || Buffer.byteLength(idempotencyKey, 'utf8') > LIMITS.memwalWriteKeyMaxBytes) {
+    throw new MemoryError('WRITE', `the write key must be 1 to ${LIMITS.memwalWriteKeyMaxBytes} bytes`);
+  }
   await spendRelayerPoints(client, LIMITS.memwalBulkPoints, pacing);
   let accepted: unknown;
   try {
-    accepted = await withinCallCeiling(client.rememberBulk(texts.map((text) => ({ text, namespace: label }))));
+    accepted = await withinCallCeiling(client.rememberBulk(texts.map((text) => ({ text, namespace: label })), { idempotencyKey }));
   } catch (error) {
     throw relayerFailure(error, 'WRITE');
   }

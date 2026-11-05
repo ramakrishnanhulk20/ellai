@@ -173,8 +173,15 @@ export const LIMITS = {
   memwalReadAfterWriteDelayMs: 3_000,
   /** Delegate keys one Walrus Memory account can hold. The contract refuses the 21st. */
   memwalMaxDelegateKeys: 20,
-  /** Ceiling on one relayer request. The SDK's own recall deadline is 15 seconds and stays below it. */
+  /** Ceiling on one relayer request. Recall has a shorter one of its own, memwalRecallTimeoutMs. */
   memwalRequestTimeoutMs: 30_000,
+  /**
+   * Ceiling on the recall request itself: 15 s, the SDK's default today, stated here so a release
+   * cannot move it unseen (C47). Recall runs while a paid request waits, and decide stops waiting
+   * at decideRecallTimeoutMs, so a longer one would only leave a search running after decide has
+   * asked, and a shorter one would turn slow answers into questions for the owner.
+   */
+  memwalRecallTimeoutMs: 15_000,
   /**
    * Ceiling on each of the SDK's reads of the relayer before a request: GET /version, /health and
    * /config. The SDK's default fell from 30 s to 5 s in 0.1.9 without a release note; Ellai keeps
@@ -194,6 +201,8 @@ export const LIMITS = {
   memwalMaxResponseBytes: 2_097_152,
   /** Most sentences in one bulk write. The SDK and the relayer refuse more. */
   memwalBulkMaxItems: 20,
+  /** Longest idempotency key the relayer takes (MAX_IDEMPOTENCY_KEY_BYTES in its remember.rs). */
+  memwalWriteKeyMaxBytes: 255,
   /**
    * Longest sentence stored, in UTF-8 bytes. The relayer embeds a summary instead of the
    * text above 8 KiB, which would make search miss words the sentence contains.

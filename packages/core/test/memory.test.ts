@@ -4,7 +4,7 @@
 // secret or upstream text (C19), the relayer URL rule, the relayer response size cap (C21), the
 // delegate key length check, and relayer points paced per delegate key across clients, waited for
 // or refused at once when told not to wait (on fake timers).
-// submitSentences sending exactly once without waiting, and checkJobs mapping each relayer
+// submitSentences sending exactly once without waiting and carrying the key it is given, and checkJobs mapping each relayer
 // state and refusing every malformed status answer. Against a stand-in chain: a gRPC refusal wrapped in a SimulationError keeping the failing
 // step's own code, Tatum being paced at the anonymous rate only without an API key, and a Tatum
 // rate limit waited out for seconds with a key and for the full minute only without one (on fake
@@ -23,7 +23,7 @@ import { decodeSuiPrivateKey } from '@mysten/sui/cryptography';
 import { Ed25519Keypair } from '@mysten/sui/keypairs/ed25519';
 import { Inputs, Transaction, type TransactionDataBuilder } from '@mysten/sui/transactions';
 import { deriveDynamicFieldID, normalizeStructTag, normalizeSuiAddress, toBase64, toHex } from '@mysten/sui/utils';
-import { type MemWal, MemWalMock } from '@mysten-incubation/memwal';
+import { MemWal, MemWalMock } from '@mysten-incubation/memwal';
 import { RpcError } from '@protobuf-ts/runtime-rpc';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { type Chain, ChainError } from '../src/chain.js';
@@ -47,6 +47,7 @@ import {
 
 const NAMESPACE = 'ellai-test-v1';
 const ACCOUNT_ID = `0x${'ab'.repeat(32)}`;
+const WRITE_KEY = 'a'.repeat(64);
 
 function distinctSentences(count: number): string[] {
   return Array.from({ length: count }, (_, index) => `Test fact number ${index + 1} about the Ellai setup.`);
@@ -158,7 +159,7 @@ describe('submitSentences', () => {
     const bulk = vi.spyOn(mock, 'rememberBulk');
     const status = vi.spyOn(mock, 'getRememberBulkStatus');
     const sentences = distinctSentences(3);
-    const jobIds = await submitSentences(mock as unknown as MemWal, NAMESPACE, sentences);
+    const jobIds = await submitSentences(mock as unknown as MemWal, NAMESPACE, sentences, WRITE_KEY);
     expect(bulk).toHaveBeenCalledTimes(1);
     expect(bulk.mock.calls[0]?.[0]).toEqual(sentences.map((text) => ({ text, namespace: NAMESPACE })));
     expect(jobIds).toHaveLength(3);
@@ -167,20 +168,35 @@ describe('submitSentences', () => {
     expect(status).not.toHaveBeenCalled();
   });
 
+  it('carries the key it is given: one sentence is two jobs under two keys, and the same job under the same key (C46)', async () => {
+    const mock = MemWalMock.create({ namespace: 'default' });
+    const bulk = vi.spyOn(mock, 'rememberBulk');
+    const client = mock as unknown as MemWal;
+    const [first] = await submitSentences(client, NAMESPACE, ['A fact.'], 'key-one');
+    const [other] = await submitSentences(client, NAMESPACE, ['A fact.'], 'key-two');
+    const [resent] = await submitSentences(client, NAMESPACE, ['A fact.'], 'key-one');
+    expect(first).toBeDefined();
+    expect(other).not.toBe(first);
+    expect(resent).toBe(first);
+    expect(bulk.mock.calls[0]?.[1]).toEqual({ idempotencyKey: 'key-one' });
+  });
+
   it('refuses bad input before sending, and never sends again after a failed send', async () => {
     const { client, asMemWal } = stubClient({});
-    expect((await caught(submitSentences(asMemWal, NAMESPACE, distinctSentences(LIMITS.memwalBulkMaxItems + 1)))).code).toBe('WRITE');
-    expect((await caught(submitSentences(asMemWal, NAMESPACE, ['Same fact.', 'same fact.']))).code).toBe('WRITE');
-    expect((await caught(submitSentences(asMemWal, 'Has Spaces', ['A fact.']))).code).toBe('WRITE');
+    expect((await caught(submitSentences(asMemWal, NAMESPACE, ['A fact.'], ''))).code).toBe('WRITE');
+    expect((await caught(submitSentences(asMemWal, NAMESPACE, ['A fact.'], 'k'.repeat(LIMITS.memwalWriteKeyMaxBytes + 1)))).code).toBe('WRITE');
+    expect((await caught(submitSentences(asMemWal, NAMESPACE, distinctSentences(LIMITS.memwalBulkMaxItems + 1), WRITE_KEY))).code).toBe('WRITE');
+    expect((await caught(submitSentences(asMemWal, NAMESPACE, ['Same fact.', 'same fact.'], WRITE_KEY))).code).toBe('WRITE');
+    expect((await caught(submitSentences(asMemWal, 'Has Spaces', ['A fact.'], WRITE_KEY))).code).toBe('WRITE');
     expect(client.rememberBulk).not.toHaveBeenCalled();
 
     const timeout = Object.assign(new Error('deadline'), { name: 'MemWalRequestTimeout' });
     const timedOut = stubClient({ rememberBulk: () => Promise.reject(timeout) });
-    expect((await caught(submitSentences(timedOut.asMemWal, NAMESPACE, ['A fact.']))).code).toBe('TIMEOUT');
+    expect((await caught(submitSentences(timedOut.asMemWal, NAMESPACE, ['A fact.'], WRITE_KEY))).code).toBe('TIMEOUT');
     expect(timedOut.client.rememberBulk).toHaveBeenCalledTimes(1);
 
     const short = stubClient({ rememberBulk: async () => ({ job_ids: ['job-a'], total: 1, status: 'running' }) });
-    const error = await caught(submitSentences(short.asMemWal, NAMESPACE, ['A fact.', 'Another fact.']));
+    const error = await caught(submitSentences(short.asMemWal, NAMESPACE, ['A fact.', 'Another fact.'], WRITE_KEY));
     expect(error.message).toContain('did not return 2 distinct job ids');
     expect(short.client.rememberBulk).toHaveBeenCalledTimes(1);
   });
@@ -345,6 +361,20 @@ describe('createMemoryClient', () => {
     expect(DEFAULT_RELAYER_URL).toBe('https://relayer.memory.walrus.xyz');
   });
 
+  it('hands the SDK every deadline Ellai relies on from LIMITS, leaving none to its defaults (C47)', () => {
+    const create = vi.spyOn(MemWal, 'create');
+    try {
+      createMemoryClient({ delegate: Ed25519Keypair.generate(), accountId: ACCOUNT_ID }).destroy();
+      expect(create.mock.calls[0]?.[0]).toMatchObject({
+        requestTimeoutMs: LIMITS.memwalRequestTimeoutMs,
+        recallTimeoutMs: LIMITS.memwalRecallTimeoutMs,
+        preflightTimeoutMs: LIMITS.memwalPreflightTimeoutMs,
+      });
+    } finally {
+      create.mockRestore();
+    }
+  });
+
   it('refuses a relayer URL that is not a bare https origin', () => {
     const delegate = Ed25519Keypair.generate();
     for (const url of ['http://relayer.memory.walrus.xyz', 'https://relayer.example/base', 'https://user:pw@relayer.example', 'not a url']) {
@@ -389,15 +419,15 @@ describe('relayer pacing', () => {
     const otherKey = pacedClient(Ed25519Keypair.generate());
     vi.useFakeTimers();
     try {
-      for (let write = 0; write < 3; write++) await submitSentences(first.client, NAMESPACE, [`Fact number ${write}.`]);
+      for (let write = 0; write < 3; write++) await submitSentences(first.client, NAMESPACE, [`Fact number ${write}.`], WRITE_KEY);
       // Told not to wait, the same key is refused at once and nothing is sent.
-      const refused = await caught(submitSentences(second.client, NAMESPACE, ['Another fact.'], { waitForPoints: false }));
+      const refused = await caught(submitSentences(second.client, NAMESPACE, ['Another fact.'], WRITE_KEY, { waitForPoints: false }));
       expect(refused.code).toBe('RATE_LIMITED');
       expect(second.rememberBulk).not.toHaveBeenCalled();
       // Another delegate key has a window of its own.
-      expect(await submitSentences(otherKey.client, NAMESPACE, ['A third fact.'], { waitForPoints: false })).toEqual(['job-0']);
+      expect(await submitSentences(otherKey.client, NAMESPACE, ['A third fact.'], WRITE_KEY, { waitForPoints: false })).toEqual(['job-0']);
 
-      const waiting = submitSentences(second.client, NAMESPACE, ['Another fact.']);
+      const waiting = submitSentences(second.client, NAMESPACE, ['Another fact.'], WRITE_KEY);
       await vi.advanceTimersByTimeAsync(LIMITS.memwalPacingWindowMs - 1);
       expect(second.rememberBulk).not.toHaveBeenCalled();
       await vi.advanceTimersByTimeAsync(1);
