@@ -1,6 +1,8 @@
 'use client';
 
 import { Space_Grotesk } from 'next/font/google';
+import { useEffect } from 'react';
+import { THEME_SCRIPT, restoreTheme } from '../ui/site/theme.js';
 import './globals.css';
 
 const spaceGrotesk = Space_Grotesk({
@@ -15,8 +17,16 @@ const spaceGrotesk = Space_Grotesk({
  * brings its own html and body, and plain anchors because the router may be what broke.
  */
 export default function RootError({ reset }: { reset: () => void }) {
+  // React draws a new <html> for this page, which loses data-theme and the dark class the head script set.
+  useEffect(() => {
+    restoreTheme();
+  }, []);
+
   return (
-    <html lang="en" className={spaceGrotesk.variable}>
+    <html lang="en" className={spaceGrotesk.variable} suppressHydrationWarning>
+      <head>
+        <script dangerouslySetInnerHTML={{ __html: THEME_SCRIPT }} />
+      </head>
       <body>
         <div data-site className="flex min-h-screen items-center bg-paper">
           <main className="mx-auto w-full max-w-[100rem] px-5 py-24 sm:px-8 lg:px-14">

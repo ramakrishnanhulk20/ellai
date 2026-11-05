@@ -18,14 +18,14 @@ const MARK_LOOK: Record<NodeKind, string> = {
   asked: 'border-[1.5px] border-ink bg-paper',
   learned: 'bg-accent',
   grant: 'bg-ink',
-  refused: 'bg-[#E5342A]',
+  refused: 'bg-refused-mark',
 };
 
 const BADGE_TONE: Record<NodeKind, string> = {
   learned: 'bg-accent-wash text-accent-text',
   asked: 'bg-bone text-ink',
   grant: 'bg-bone text-ink',
-  refused: 'bg-[#FDECEB] text-[#B42318]',
+  refused: 'bg-refused-wash text-refused',
 };
 
 const LEGEND: Record<NodeKind, string> = {
@@ -129,12 +129,11 @@ function Numbers({ figures, still }: { figures: EarlyLate; still: boolean }) {
           height="24"
           viewBox="0 0 64 24"
           fill="none"
-          stroke="#A7AAAA"
           strokeWidth="1.5"
           strokeLinecap="round"
           strokeLinejoin="round"
           aria-hidden="true"
-          className="mb-[15px] hidden self-end md:col-start-2 md:row-start-1 md:block"
+          className="mb-[15px] hidden self-end stroke-ink-faint md:col-start-2 md:row-start-1 md:block"
         >
           <motion.path
             d="M2 12h58M50 4l10 8-10 8"
@@ -176,7 +175,7 @@ function Tooltip({ node, center, still }: { node: TimelineNode; center: number; 
   return (
     <motion.div
       aria-hidden
-      className="pointer-events-none absolute z-20 w-[220px] rounded-[12px] border border-mist bg-paper px-[14px] py-3 shadow-[0_1px_2px_rgba(26,26,26,0.05),0_12px_28px_-8px_rgba(26,26,26,0.14)] [--tip-w:220px] md:w-[260px] md:[--tip-w:260px]"
+      className="pointer-events-none absolute z-20 w-[220px] rounded-[12px] border border-mist bg-paper px-[14px] py-3 card-shadow [--tip-w:220px] md:w-[260px] md:[--tip-w:260px]"
       style={
         {
           bottom: 'calc(100% + 12px)',

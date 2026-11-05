@@ -70,7 +70,7 @@ export function Button({
 export function Card({ className = '', children, ...rest }: ComponentProps<'section'>) {
   return (
     <section
-      className={`rounded-[12px] border border-line bg-panel p-6 shadow-[0_1px_2px_rgba(26,26,26,0.05),0_12px_28px_-8px_rgba(26,26,26,0.10)] lg:p-7 ${className}`}
+      className={`rounded-[12px] border border-line bg-panel p-6 app-shadow-panel lg:p-7 ${className}`}
       {...rest}
     >
       {children}
@@ -113,7 +113,7 @@ export function VerdictSquare({ verdict }: { verdict: Verdict }) {
       : verdict === 'refused'
         ? 'bg-refused'
         : verdict === 'neutral'
-          ? 'bg-[#a7aaaa]'
+          ? 'bg-ink-faint'
           : 'bg-accent';
   return <span aria-hidden="true" className={`h-2 w-2 shrink-0 rounded-[2px] ${look}`} />;
 }
@@ -125,7 +125,7 @@ export function ChainLink({ href, children }: { href: string; children: ReactNod
       href={href}
       target="_blank"
       rel="noopener"
-      className="inline-flex items-center gap-1 font-mono text-[12px] leading-[1.4] text-[#2f45c8] underline-offset-2 hover:underline"
+      className="inline-flex items-center gap-1 font-mono text-[12px] leading-[1.4] text-accent-text underline-offset-2 hover:underline"
     >
       {children}
       <svg
@@ -269,11 +269,11 @@ export function AgentQuote({ purpose }: { purpose: string }) {
 export type Tone = 'accent' | 'paid' | 'asked' | 'refused' | 'muted';
 
 const TONE: Record<Tone, string> = {
-  accent: 'bg-[color-mix(in_srgb,var(--accent)_10%,#ffffff)] text-[#2f45c8]',
-  paid: 'bg-[color-mix(in_srgb,var(--paid)_10%,#ffffff)] text-paid',
-  asked: 'bg-[color-mix(in_srgb,var(--asked)_10%,#ffffff)] text-asked',
-  refused: 'bg-[#fdeceb] text-refused',
-  muted: 'bg-[#f1f1f1] text-muted',
+  accent: 'bg-[color-mix(in_srgb,var(--accent)_10%,var(--panel))] text-accent-text',
+  paid: 'bg-[color-mix(in_srgb,var(--paid)_10%,var(--panel))] text-paid',
+  asked: 'bg-[color-mix(in_srgb,var(--asked)_10%,var(--panel))] text-asked',
+  refused: 'bg-refused-wash text-refused',
+  muted: 'bg-bone text-muted',
 };
 
 export function Badge({ tone, children }: { tone: Tone; children: ReactNode }) {

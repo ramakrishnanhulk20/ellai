@@ -1,6 +1,6 @@
 'use client';
 
-import { SuiClientProvider, WalletProvider, type ThemeVars } from '@mysten/dapp-kit';
+import { SuiClientProvider, WalletProvider, type DynamicTheme, type ThemeVars } from '@mysten/dapp-kit';
 import { getJsonRpcFullnodeUrl } from '@mysten/sui/jsonRpc';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { useState, type ReactNode } from 'react';
@@ -13,10 +13,26 @@ const NETWORKS = {
   mainnet: { url: getJsonRpcFullnodeUrl('mainnet'), network: 'mainnet' },
 } as const;
 
-// The wallet pop-up is drawn outside the app's wrapper, so the page tokens do not reach it: every
-// colour here is a literal value taken from the light palette.
-const WALLET_THEME: ThemeVars = {
+// The wallet pop-up is drawn outside the app's wrapper and reads its colours from its own variables, so it gets
+// a palette for each mode. The light one is used unless the page says data-theme is dark; the third entry covers a
+// visitor without scripts whose device is dark. Values match the page tokens in globals.css.
+const WALLET_SHAPE: Pick<ThemeVars, 'blurs' | 'radii' | 'shadows' | 'fontWeights' | 'fontSizes' | 'typography'> = {
   blurs: { modalOverlay: 'blur(8px)' },
+  radii: { small: '8px', medium: '8px', large: '8px', xlarge: '12px' },
+  shadows: { primaryButton: 'none', walletItemSelected: 'none' },
+  fontWeights: { normal: '400', medium: '500', bold: '600' },
+  fontSizes: { small: '14px', medium: '16px', large: '18px', xlarge: '20px' },
+  typography: {
+    // The font loader gives Space Grotesk a private family name, so the page's font variable comes first.
+    fontFamily: 'var(--font-space-grotesk), "Space Grotesk", ui-sans-serif, system-ui, sans-serif',
+    fontStyle: 'normal',
+    lineHeight: '1.4',
+    letterSpacing: '0',
+  },
+};
+
+const WALLET_LIGHT: ThemeVars = {
+  ...WALLET_SHAPE,
   backgroundColors: {
     primaryButton: '#4a63ff',
     primaryButtonHover: '#3049e8',
@@ -40,18 +56,40 @@ const WALLET_THEME: ThemeVars = {
     bodyDanger: '#b42318',
     iconButton: '#1a1a1a',
   },
-  radii: { small: '8px', medium: '8px', large: '8px', xlarge: '12px' },
-  shadows: { primaryButton: 'none', walletItemSelected: 'none' },
-  fontWeights: { normal: '400', medium: '500', bold: '600' },
-  fontSizes: { small: '14px', medium: '16px', large: '18px', xlarge: '20px' },
-  typography: {
-    // The font loader gives Space Grotesk a private family name, so the page's font variable comes first.
-    fontFamily: 'var(--font-space-grotesk), "Space Grotesk", ui-sans-serif, system-ui, sans-serif',
-    fontStyle: 'normal',
-    lineHeight: '1.4',
-    letterSpacing: '0',
+};
+
+const WALLET_DARK: ThemeVars = {
+  ...WALLET_SHAPE,
+  backgroundColors: {
+    primaryButton: '#7a8dff',
+    primaryButtonHover: '#9aa9ff',
+    outlineButtonHover: 'rgba(242, 242, 238, 0.08)',
+    walletItemHover: 'rgba(242, 242, 238, 0.08)',
+    walletItemSelected: 'rgba(242, 242, 238, 0.08)',
+    modalOverlay: 'rgba(0, 0, 0, 0.6)',
+    modalPrimary: '#131417',
+    modalSecondary: '#0b0c0e',
+    iconButton: 'transparent',
+    iconButtonHover: 'rgba(242, 242, 238, 0.08)',
+    dropdownMenu: '#131417',
+    dropdownMenuSeparator: '#2a2c31',
+  },
+  borderColors: { outlineButton: '#2a2c31' },
+  colors: {
+    primaryButton: '#0b0c0e',
+    outlineButton: '#f2f2ee',
+    body: '#f2f2ee',
+    bodyMuted: '#a8adad',
+    bodyDanger: '#ff8a7a',
+    iconButton: '#f2f2ee',
   },
 };
+
+const WALLET_THEME: DynamicTheme[] = [
+  { variables: WALLET_LIGHT },
+  { selector: "html[data-theme='dark']", variables: WALLET_DARK },
+  { selector: 'html:not([data-theme])', mediaQuery: '(prefers-color-scheme: dark)', variables: WALLET_DARK },
+];
 
 // A 4xx answer is a decision by the server, so asking again changes nothing. A dropped connection
 // or a server fault gets one more try.

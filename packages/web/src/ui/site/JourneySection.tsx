@@ -15,8 +15,9 @@ const BEAT_TOTAL = String(BEATS.length).padStart(2, '0');
 /** Where each beat's card hangs under the route: the node the payment rests on, and the owner for the last beat. */
 const CARD_ANCHOR = [0.25, 0.5, 0.75, 1, YOU_X] as const;
 
+// The black in the mask is only a stencil: the mask reads its alpha, so it is the same in both modes.
 const DOT_GRID: CSSProperties = {
-  backgroundImage: 'radial-gradient(#DEDFDF 1.4px, transparent 1.4px)',
+  backgroundImage: 'radial-gradient(var(--mist) 1.4px, transparent 1.4px)',
   backgroundSize: '14px 14px',
   maskImage: 'radial-gradient(ellipse 80% 70% at 50% 55%, #000 35%, transparent 100%)',
   WebkitMaskImage: 'radial-gradient(ellipse 80% 70% at 50% 55%, #000 35%, transparent 100%)',

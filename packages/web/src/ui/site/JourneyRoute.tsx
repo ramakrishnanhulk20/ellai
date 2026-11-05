@@ -3,7 +3,7 @@ import { NODES, YOU_X } from './journey-model.js';
 
 const LAST_NODE = NODES.length - 1;
 const EASE = 'ease-[cubic-bezier(0.16,1,0.3,1)]';
-const DASHED_LINE = 'linear-gradient(to right, #DEDFDF 50%, transparent 50%)';
+const DASHED_LINE = 'linear-gradient(to right, var(--mist) 50%, transparent 50%)';
 
 /** The node the payment chip rests on once a beat has finished travelling. The last beat stays on Sui. */
 function restingNode(beat: number): number {
@@ -95,7 +95,7 @@ export function JourneyRoute({ beat, amount }: { beat: number; amount: string | 
         style={{ left: 'calc(var(--tx, 0) * 100%)', transform: 'translateY(calc(-50% - 22px))' }}
       >
         <span
-          className="block w-max whitespace-nowrap rounded-[6px] bg-accent px-2 py-1 font-plex text-xs font-medium leading-3 text-accent-ink shadow-[0_1px_2px_rgba(26,26,26,0.08),0_8px_20px_-8px_rgba(74,99,255,0.45)]"
+          className="block w-max whitespace-nowrap rounded-[6px] bg-accent px-2 py-1 font-plex text-xs font-medium leading-3 text-accent-ink chip-shadow"
           style={{ transform: 'translateX(calc(var(--tx, 0) * -100%))' }}
         >
           {amount ? `${amount} USDC` : 'USDC'}

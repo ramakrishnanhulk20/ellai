@@ -4,7 +4,7 @@ import { EllaiMark } from '../EllaiMark.js';
 /** The last dark band. It runs on from the closing poster, split from it by one thin rule. */
 export function SiteFooter() {
   return (
-    <footer className="bg-night text-night-fg [--focus:#F4F2EC]">
+    <footer className="bg-night text-night-fg [--focus:var(--night-fg)]">
       <div className="mx-auto w-full max-w-[100rem] px-5 sm:px-8 lg:px-14">
         <div className="border-t border-night-fg/[0.14] pb-10 pt-12">
           <div className="grid grid-cols-1 gap-8 md:grid-cols-[1fr_auto_1fr] md:items-start">
@@ -13,7 +13,7 @@ export function SiteFooter() {
                 <EllaiMark />
                 <span className="font-grotesk text-[15px] font-bold tracking-[0.08em]">ELLAI</span>
               </Link>
-              <p className="mt-3 text-sm leading-[1.5] text-night-fg/[0.56]">Ellai means limit in Tamil.</p>
+              <p className="mt-3 text-sm leading-[1.5] text-night-fg/(--poster-text-mid)">Ellai means limit in Tamil.</p>
             </div>
 
             <nav aria-label="Footer" className="flex flex-wrap gap-x-7 gap-y-3 font-grotesk text-[15px] font-medium">
@@ -36,7 +36,7 @@ export function SiteFooter() {
               </a>
             </nav>
 
-            <p className="font-plex text-xs font-medium uppercase leading-[1.7] tracking-[0.06em] text-night-fg/50 md:text-right">
+            <p className="font-plex text-xs font-medium uppercase leading-[1.7] tracking-[0.06em] text-night-fg/(--poster-text-soft) md:text-right">
               <span className="block">Built for Total Recall</span>
               <span className="block">
                 Tatum <span className="normal-case">x</span> Walrus
@@ -44,7 +44,7 @@ export function SiteFooter() {
             </p>
           </div>
 
-          <p className="mt-10 font-plex text-[11px] uppercase tracking-[0.06em] text-night-fg/[0.36]">
+          <p className="mt-10 font-plex text-[11px] uppercase tracking-[0.06em] text-night-fg/(--poster-text-soft)">
             Walrus Memory / Tatum Sui RPC / Sui Mainnet / <span className="normal-case">x402</span>
           </p>
         </div>

@@ -202,7 +202,7 @@ export function WalletBlock() {
   const suiTotal = funds ? amount(funds.suiAddressMist) + amount(funds.suiCoinMist) : 0n;
 
   return (
-    <div className="flex flex-col gap-4 rounded-card border border-line bg-[#fafaf9] p-4">
+    <div className="flex flex-col gap-4 rounded-card border border-line bg-[var(--app-softer)] p-4">
       <p className="text-[15px] font-medium leading-[1.4] text-fg">Your wallet</p>
 
       {funds ? (
@@ -234,7 +234,7 @@ export function WalletBlock() {
             </div>
           ) : null}
 
-          {moved ? <p role="status" className="font-mono text-[12px] leading-none text-[#2f45c8]">Moved.</p> : null}
+          {moved ? <p role="status" className="font-mono text-[12px] leading-none text-accent-text">Moved.</p> : null}
         </>
       ) : query.isError ? null : (
         <div className="flex flex-col gap-3">

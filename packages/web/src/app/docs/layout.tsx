@@ -9,7 +9,7 @@ import '../../ui/docs/docs.css';
 export default function DocsRootLayout({ children }: { children: ReactNode }) {
   return (
     <div data-site className="ellai-docs">
-      {/* The theme switch is off: the docs use the site's one light look. Search reads the index file the build writes. */}
+      {/* Fumadocs' own theme switch is off, so the site's one switch runs the docs too. Search reads the index file the build writes. */}
       <RootProvider theme={{ enabled: false }} search={{ options: { type: 'static', api: '/docs/search-index' } }}>
         <SiteHeader overPoster={false} />
         <DocsLayout

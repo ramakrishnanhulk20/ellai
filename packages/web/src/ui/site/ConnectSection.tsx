@@ -15,7 +15,7 @@ const NOTE_MS = 1500;
 
 const SMALL_CAPS = 'font-plex text-xs font-medium uppercase tracking-[0.06em] text-ink-soft';
 
-const CARD_SHADOW = 'shadow-[0_1px_2px_rgba(26,26,26,0.05),0_12px_28px_-8px_rgba(26,26,26,0.14)]';
+const CARD_SHADOW = 'card-shadow';
 
 // The marks match the legend in the learning section, so one colour means one outcome across the page.
 const RESULTS = [
@@ -26,7 +26,7 @@ const RESULTS = [
     lead: 'Asked:',
     rest: 'the agent gets a decision id and checks back after you answer.',
   },
-  { id: 'refused', mark: 'bg-[#E5342A]', lead: 'Refused:', rest: "the agent gets Ellai's reason." },
+  { id: 'refused', mark: 'bg-refused-mark', lead: 'Refused:', rest: "the agent gets Ellai's reason." },
 ] as const;
 
 function subscribeNever(): () => void {
@@ -311,7 +311,7 @@ function ConnectCard({ still }: { still: boolean }) {
           initial={swaps === 0 || still ? false : { opacity: 0 }}
           animate={{ opacity: 1 }}
           transition={{ duration: still ? 0 : 0.2 }}
-          className="mr-14 overflow-x-auto px-5 pb-6 pt-5 font-plex text-[13px] leading-[1.7] whitespace-pre text-ink [scrollbar-color:#A7AAAA_transparent] [scrollbar-width:thin] focus-visible:outline-offset-[-2px]"
+          className="mr-14 overflow-x-auto px-5 pb-6 pt-5 font-plex text-[13px] leading-[1.7] whitespace-pre text-ink [scrollbar-color:var(--ink-faint)_transparent] [scrollbar-width:thin] focus-visible:outline-offset-[-2px]"
         >
           <code>{highlight(text)}</code>
         </motion.pre>

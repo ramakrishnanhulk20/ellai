@@ -8,17 +8,131 @@
   --faint: #6e7373;
   --line: #dedfdf;
 
+  --paper: #ffffff;
+  --bone: #f1f1f1;
+  --mist: #dedfdf;
+  --ink: #1a1a1a;
+  --ink-soft: #656b6b;
+  --ink-faint: #a7aaaa;
+  /* night and night-fg are the poster surface and its text. They follow the mode: near-black in dark, white in light. */
+  --night: #ffffff;
+  --night-fg: #1a1a1a;
+  /* How strong the accent glows on the poster are. Full in dark; in light they are 40% so they read as soft light on paper. */
+  --poster-glow: 0.4;
+  /* How solid the quieter poster text is. Dark ink on white needs more weight than light text on near-black to stay as readable. Percentages, because color-mix drops a bare number. */
+  --poster-text-strong: 82%;
+  --poster-text-mid: 68%;
+  --poster-text-soft: 62%;
+  --poster-text-faint: 47%;
+
   --accent: #4a63ff;
+  --accent-deep: #3049e8;
+  --accent-text: #2f45c8;
+  --accent-wash: #eef1ff;
   --accent-ink: #ffffff;
+  --focus: #1a1a1a;
 
   --paid: #2f45c8;
   --asked: #6e56cf;
   --refused: #b42318;
+  --refused-mark: #e5342a;
+  --refused-wash: #fdeceb;
+
+  --shadow-card: 0 1px 2px rgba(26, 26, 26, 0.05), 0 12px 28px -8px rgba(26, 26, 26, 0.14);
+  --shadow-chip: 0 1px 2px rgba(26, 26, 26, 0.08), 0 8px 20px -8px rgba(74, 99, 255, 0.45);
+  --shadow-sheet: 0 -24px 60px -20px rgba(26, 26, 26, 0.14);
 
   --r-button: 8px;
   --r-card: 12px;
 
   color-scheme: light;
+}
+
+:root[data-theme='dark'] {
+  --bg: #0b0c0e;
+  --panel: #131417;
+  --fg: #f2f2ee;
+  --muted: #a8adad;
+  --faint: #8b9090;
+  --line: #2a2c31;
+
+  --paper: #131417;
+  --bone: #1b1c20;
+  --mist: #2a2c31;
+  --ink: #f2f2ee;
+  --ink-soft: #a8adad;
+  --ink-faint: #7b8080;
+  --night: #07080a;
+  --night-fg: #f4f2ec;
+  --poster-glow: 1;
+  --poster-text-strong: 72%;
+  --poster-text-mid: 56%;
+  --poster-text-soft: 50%;
+  --poster-text-faint: 36%;
+
+  --accent: #7a8dff;
+  --accent-deep: #9aa9ff;
+  --accent-text: #aab6ff;
+  --accent-wash: #1c2140;
+  --accent-ink: #0b0c0e;
+  --focus: #f2f2ee;
+
+  --paid: #8fa0ff;
+  --asked: #b4a2f0;
+  --refused: #ff8a7a;
+  --refused-mark: #ff8a7a;
+  --refused-wash: #2b1715;
+
+  --shadow-card: 0 1px 2px rgba(0, 0, 0, 0.4), 0 12px 28px -8px rgba(0, 0, 0, 0.55);
+  --shadow-chip: 0 1px 2px rgba(0, 0, 0, 0.5), 0 8px 20px -8px rgba(122, 141, 255, 0.45);
+  --shadow-sheet: 0 -24px 60px -20px rgba(0, 0, 0, 0.55);
+
+  color-scheme: dark;
+}
+
+/* With no script and nothing stored, the page still follows the device. The values repeat the dark block above; a test keeps the two equal. */
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme]) {
+    --bg: #0b0c0e;
+    --panel: #131417;
+    --fg: #f2f2ee;
+    --muted: #a8adad;
+    --faint: #8b9090;
+    --line: #2a2c31;
+
+    --paper: #131417;
+    --bone: #1b1c20;
+    --mist: #2a2c31;
+    --ink: #f2f2ee;
+    --ink-soft: #a8adad;
+    --ink-faint: #7b8080;
+    --night: #07080a;
+    --night-fg: #f4f2ec;
+    --poster-glow: 1;
+    --poster-text-strong: 72%;
+    --poster-text-mid: 56%;
+    --poster-text-soft: 50%;
+    --poster-text-faint: 36%;
+
+    --accent: #7a8dff;
+    --accent-deep: #9aa9ff;
+    --accent-text: #aab6ff;
+    --accent-wash: #1c2140;
+    --accent-ink: #0b0c0e;
+    --focus: #f2f2ee;
+
+    --paid: #8fa0ff;
+    --asked: #b4a2f0;
+    --refused: #ff8a7a;
+    --refused-mark: #ff8a7a;
+    --refused-wash: #2b1715;
+
+    --shadow-card: 0 1px 2px rgba(0, 0, 0, 0.4), 0 12px 28px -8px rgba(0, 0, 0, 0.55);
+    --shadow-chip: 0 1px 2px rgba(0, 0, 0, 0.5), 0 8px 20px -8px rgba(122, 141, 255, 0.45);
+    --shadow-sheet: 0 -24px 60px -20px rgba(0, 0, 0, 0.55);
+
+    color-scheme: dark;
+  }
 }
 
 @theme inline {
@@ -34,14 +148,16 @@
   --color-asked: var(--asked);
   --color-refused: var(--refused);
 
-  --color-paper: #ffffff;
-  --color-bone: #f1f1f1;
-  --color-mist: #dedfdf;
-  --color-ink: #1a1a1a;
-  --color-ink-soft: #656b6b;
-  --color-ink-faint: #a7aaaa;
-  --color-night: #07080a;
-  --color-night-fg: #f4f2ec;
+  --color-paper: var(--paper);
+  --color-bone: var(--bone);
+  --color-mist: var(--mist);
+  --color-ink: var(--ink);
+  --color-ink-soft: var(--ink-soft);
+  --color-ink-faint: var(--ink-faint);
+  --color-night: var(--night);
+  --color-night-fg: var(--night-fg);
+  --color-refused-mark: var(--refused-mark);
+  --color-refused-wash: var(--refused-wash);
   --color-accent-deep: var(--accent-deep);
   --color-accent-text: var(--accent-text);
   --color-accent-wash: var(--accent-wash);
@@ -57,17 +173,38 @@
 }
 
 html {
-  background: #ffffff;
+  background: var(--paper);
 }
 
 body {
-  background: #ffffff;
+  background: var(--paper);
   color: var(--fg);
   font-family: var(--font-space-grotesk), ui-sans-serif, system-ui, sans-serif;
   font-size: 16px;
   line-height: 1.5;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
+  transition:
+    background-color 200ms ease-out,
+    color 200ms ease-out;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  body {
+    transition: none;
+  }
+}
+
+@utility card-shadow {
+  box-shadow: var(--shadow-card);
+}
+
+@utility chip-shadow {
+  box-shadow: var(--shadow-chip);
+}
+
+@utility sheet-shadow {
+  box-shadow: var(--shadow-sheet);
 }
 
 :focus-visible {
@@ -132,16 +269,10 @@ html.lenis body {
   overflow: clip;
 }
 
-/* The redesigned look is opt-in: only a page that renders a [data-site] root gets the white paper, the new fonts and the light page chrome. */
+/* The redesigned look is opt-in: only a page that renders a [data-site] root gets the paper surface, the new fonts and the page chrome. The colours come from the mode tokens at the top. */
 [data-site] {
-  --accent: #4a63ff;
-  --accent-deep: #3049e8;
-  --accent-text: #2f45c8;
-  --accent-wash: #eef1ff;
-  --accent-ink: #ffffff;
-  --focus: #1a1a1a;
-  background: #ffffff;
-  color: #1a1a1a;
+  background: var(--paper);
+  color: var(--ink);
   font-family: var(--font-space-grotesk), ui-sans-serif, system-ui, sans-serif;
   font-variant-numeric: tabular-nums;
 }
@@ -313,18 +444,18 @@ html.lenis body {
 
 .site-header[data-tone='poster'] {
   background-color: transparent;
-  color: #f4f2ec;
+  color: var(--night-fg);
   border-bottom-color: transparent;
-  --focus: #f4f2ec;
+  --focus: var(--night-fg);
 }
 
 .site-header[data-tone='paper'] {
-  background-color: rgba(255, 255, 255, 0.92);
+  background-color: color-mix(in srgb, var(--paper) 92%, transparent);
   -webkit-backdrop-filter: blur(12px);
   backdrop-filter: blur(12px);
-  color: #1a1a1a;
-  border-bottom-color: #dedfdf;
-  --focus: #1a1a1a;
+  color: var(--ink);
+  border-bottom-color: var(--mist);
+  --focus: var(--ink);
 }
 
 .nav-sweep {
@@ -431,14 +562,13 @@ html.lenis body {
   }
 }
 
-/* The app sits on a warm grey page instead of white. Dialogs are drawn straight into the page body, outside the wrapper, so the body takes the same value. */
+/* The app sits on the grey page colour instead of paper. Dialogs are drawn straight into the page body, outside the wrapper, so the body takes the same value. */
 [data-app],
 html:has([data-app]) body {
-  --bg: #f5f5f4;
   background: var(--bg);
 }
 
 html:has([data-app]),
 html:has([data-app]) body {
-  background: #f5f5f4;
+  background: var(--bg);
 }

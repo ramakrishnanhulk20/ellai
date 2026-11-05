@@ -4,6 +4,7 @@ import Link from 'next/link';
 import { usePathname } from 'next/navigation';
 import { useCallback, useEffect, useId, useRef, useState, type ComponentType, type ReactNode } from 'react';
 import { EllaiMark } from '../EllaiMark.js';
+import { ThemeToggle } from '../site/ThemeToggle.js';
 import { isApiError, logout } from './api.js';
 import { shortAddress } from './format.js';
 import {
@@ -192,7 +193,7 @@ function WalletMenu({
           ref={panel}
           id={panelId}
           tabIndex={-1}
-          className="menu-drop absolute right-0 top-[calc(100%+8px)] w-[260px] rounded-[12px] border border-line bg-panel p-2 shadow-[0_1px_2px_rgba(26,26,26,0.05),0_12px_28px_-8px_rgba(26,26,26,0.14)] outline-none"
+          className="menu-drop absolute right-0 top-[calc(100%+8px)] w-[260px] rounded-[12px] border border-line bg-panel p-2 card-shadow outline-none"
         >
           {address ? (
             <>
@@ -256,7 +257,7 @@ function MoreSheet({
 
   return (
     <div className="fixed inset-0 z-40 lg:hidden">
-      <div className="sheet-backdrop absolute inset-0 bg-[rgba(26,26,26,0.32)]" onClick={onClose} aria-hidden="true" />
+      <div className="sheet-backdrop absolute inset-0 bg-[var(--app-scrim-light)]" onClick={onClose} aria-hidden="true" />
       <div
         ref={panel}
         role="dialog"
@@ -325,7 +326,8 @@ export function Frame({ children }: { children: ReactNode }) {
               <TopLink key={item.href} item={item} active={isActive(pathname, item.href)} count={count} />
             ))}
           </nav>
-          <div className="ml-auto">
+          <div className="ml-auto flex items-center gap-3">
+            <ThemeToggle />
             <WalletMenu
               address={address}
               pathname={pathname}
@@ -340,6 +342,9 @@ export function Frame({ children }: { children: ReactNode }) {
       <header className="app-glass sticky top-0 z-20 flex h-[60px] items-center gap-[10px] border-b border-line px-5 sm:px-8 lg:hidden">
         <EllaiMark />
         <span className="font-sans text-[16px] font-semibold text-fg">{title}</span>
+        <div className="ml-auto">
+          <ThemeToggle />
+        </div>
       </header>
 
       <main className="mx-auto w-full max-w-[100rem] px-5 pb-28 pt-6 sm:px-8 lg:px-14 lg:pb-32 lg:pt-12">

@@ -353,8 +353,8 @@ function StepFlow({
 type CardState = 'done' | 'active' | 'locked';
 
 const MARKER_STYLE: Record<CardState, string> = {
-  done: 'bg-accent text-white',
-  active: 'border-2 border-accent text-[#2f45c8]',
+  done: 'bg-accent text-accent-ink',
+  active: 'border-2 border-accent text-accent-text',
   locked: 'border border-line text-faint',
 };
 
@@ -377,7 +377,7 @@ function ProgressRow({ steps }: { steps: readonly boolean[] }) {
       </p>
       <div aria-hidden="true" className="flex w-[240px] max-w-full gap-1">
         {steps.map((isDone, index) => (
-          <span key={index} className={`h-1 flex-1 rounded-[2px] ${isDone ? 'bg-accent' : 'bg-[#dedfdf]'}`} />
+          <span key={index} className={`h-1 flex-1 rounded-[2px] ${isDone ? 'bg-accent' : 'bg-mist'}`} />
         ))}
       </div>
     </div>

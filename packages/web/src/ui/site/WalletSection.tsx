@@ -28,7 +28,7 @@ const SMALL_CAPS = 'font-plex text-xs font-medium uppercase tracking-[0.06em]';
 const BIG = 'mt-5 font-grotesk text-[40px] font-bold leading-[1.1] tracking-[-0.03em] text-ink';
 const FOOT = 'mt-3 text-sm leading-[1.5] text-ink-soft';
 const CARD =
-  'flex flex-col justify-between rounded-[12px] bg-paper p-6 shadow-[0_1px_2px_rgba(26,26,26,0.05),0_12px_28px_-8px_rgba(26,26,26,0.14)] lg:min-h-[200px] lg:self-stretch';
+  'flex flex-col justify-between rounded-[12px] bg-paper p-6 card-shadow lg:min-h-[200px] lg:self-stretch';
 
 /** Seconds a card takes to settle, so a line can start drawing as the card to its left lands. */
 const LINE_AFTER_CARD = 0.3;

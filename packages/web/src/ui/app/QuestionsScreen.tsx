@@ -200,7 +200,7 @@ function QuestionCard({
             </div>
           </div>
 
-          <div className="flex min-w-0 flex-col gap-6 border-t border-line bg-[#fafaf9] p-7 lg:border-l lg:border-t-0">
+          <div className="flex min-w-0 flex-col gap-6 border-t border-line bg-[var(--app-softer)] p-7 lg:border-l lg:border-t-0">
             <div>
               <BlockLabel>The agent says</BlockLabel>
               <div className="mt-3">
@@ -223,7 +223,7 @@ function Empty() {
       className="flex max-w-[960px] flex-col items-center text-center"
       style={{
         padding: '64px 24px',
-        backgroundImage: 'radial-gradient(#dedfdf 1.4px, transparent 1.4px)',
+        backgroundImage: 'radial-gradient(var(--mist) 1.4px, transparent 1.4px)',
         backgroundSize: '14px 14px',
       }}
     >

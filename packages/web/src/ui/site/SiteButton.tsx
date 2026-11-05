@@ -9,7 +9,7 @@ type ArrowKind = 'right' | 'down' | 'none';
 const VARIANT: Record<Variant, string> = {
   primary: 'bg-accent text-accent-ink hover:bg-accent-deep',
   'ghost-dark':
-    'border border-night-fg/[0.36] text-night-fg hover:border-night-fg hover:bg-[rgba(244,242,236,0.06)]',
+    'border border-night-fg/(--poster-text-faint) text-night-fg hover:border-night-fg hover:bg-night-fg/[0.06]',
   ghost: 'border border-ink text-ink hover:bg-bone',
 };
 

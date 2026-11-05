@@ -25,14 +25,14 @@ export function PosterHero() {
       ref={sectionRef}
       aria-labelledby="poster-title"
       data-poster
-      className="sticky top-0 z-0 h-[100svh] min-h-[600px] overflow-hidden bg-night text-night-fg [--focus:#F4F2EC]"
+      className="sticky top-0 z-0 h-[100svh] min-h-[600px] overflow-hidden bg-night text-night-fg [--focus:var(--night-fg)]"
     >
       <div
         aria-hidden
         className="pointer-events-none absolute inset-0"
         style={{
           background:
-            'radial-gradient(60% 55% at 64% 48%, color-mix(in srgb, var(--accent) 10%, transparent) 0%, transparent 70%)',
+            'radial-gradient(60% 55% at 64% 48%, color-mix(in srgb, var(--accent) calc(10% * var(--poster-glow)), transparent) 0%, transparent 70%)',
         }}
       />
       <div aria-hidden className="poster-ring pointer-events-none absolute inset-0">
@@ -41,14 +41,14 @@ export function PosterHero() {
       <div
         aria-hidden
         className="pointer-events-none absolute inset-0 hidden md:block"
-        style={{ background: 'linear-gradient(to right, rgba(7,8,10,0.72) 0%, rgba(7,8,10,0) 48%)' }}
+        style={{ background: 'linear-gradient(to right, color-mix(in srgb, var(--night) 72%, transparent) 0%, transparent 48%)' }}
       />
       <div
         aria-hidden
         className="pointer-events-none absolute inset-0"
         style={{
           background:
-            'linear-gradient(to top, rgba(7,8,10,0.94) 0%, rgba(7,8,10,0.62) 30%, rgba(7,8,10,0) 60%)',
+            'linear-gradient(to top, color-mix(in srgb, var(--night) 94%, transparent) 0%, color-mix(in srgb, var(--night) 62%, transparent) 30%, transparent 60%)',
         }}
       />
       <div
@@ -73,8 +73,8 @@ export function PosterHero() {
             className="enter-rise mt-6 flex items-center justify-between md:mt-10"
             style={{ animationDelay: '120ms' }}
           >
-            <SquareLabel className="text-night-fg/[0.72]">Agent payments on Sui Mainnet</SquareLabel>
-            <p className="hidden font-plex text-[13px] font-medium uppercase tracking-[0.06em] text-night-fg/[0.56] md:block">
+            <SquareLabel className="text-night-fg/(--poster-text-strong)">Agent payments on Sui Mainnet</SquareLabel>
+            <p className="hidden font-plex text-[13px] font-medium uppercase tracking-[0.06em] text-night-fg/(--poster-text-mid) md:block">
               Ellai: Tamil for limit
             </p>
           </div>
@@ -96,7 +96,7 @@ export function PosterHero() {
         </h1>
 
         <p
-          className="enter-rise mt-6 max-w-[38rem] text-pretty font-grotesk text-[17px] leading-[1.6] text-night-fg/[0.72] md:mt-8 md:text-xl"
+          className="enter-rise mt-6 max-w-[38rem] text-pretty font-grotesk text-[17px] leading-[1.6] text-night-fg/(--poster-text-strong) md:mt-8 md:text-xl"
           style={{ animationDelay: '520ms' }}
         >
           {POSTER_SUB}

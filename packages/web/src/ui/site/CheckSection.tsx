@@ -420,7 +420,7 @@ function GithubLink({
       target="_blank"
       rel="noreferrer"
       {...rise(shown, still, delay)}
-      className="group flex items-center justify-between gap-4 rounded-[12px] border border-mist bg-paper px-5 py-[18px] shadow-[0_1px_2px_rgba(26,26,26,0.05),0_12px_28px_-8px_rgba(26,26,26,0.14)] transition-[border-color] duration-200 ease-[cubic-bezier(0.16,1,0.3,1)] hover:border-accent"
+      className="group flex items-center justify-between gap-4 rounded-[12px] border border-mist bg-paper px-5 py-[18px] card-shadow transition-[border-color] duration-200 ease-[cubic-bezier(0.16,1,0.3,1)] hover:border-accent"
     >
       <span className="min-w-0">
         <span className={`block ${SMALL_CAPS_12}`}>{kicker}</span>

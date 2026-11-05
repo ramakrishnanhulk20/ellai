@@ -14,8 +14,8 @@ import { Button, Card, ErrorLine, PageShell, Skeleton, When, place } from './ui.
 const REFRESH_COOLDOWN_MS = 10_000;
 const EASE_OUT_EXPO: [number, number, number, number] = [0.16, 1, 0.3, 1];
 
-// The band is always dark, so its text colours are literal values and do not follow the page tokens.
-const BAND_MUTED = 'text-[rgba(244,242,236,0.56)]';
+// The band is the poster surface, so its text follows the poster tokens and flips with the mode.
+const BAND_MUTED = 'text-night-fg/(--poster-text-mid)';
 
 function RefreshButton({ fetching, failed, onRefresh }: { fetching: boolean; failed: boolean; onRefresh: () => void }) {
   const [cooling, setCooling] = useState(false);
@@ -83,14 +83,14 @@ function StatusBand({ overview }: { overview: Overview }) {
   });
 
   const figures = [
-    { label: 'Paid and verified, 30 days', value: counts.paid, color: 'text-[#8c9bff]' },
-    { label: 'Approved, 30 days', value: counts.approved, color: 'text-[#f4f2ec]' },
-    { label: 'Questions asked, 30 days', value: counts.asked, color: 'text-[#f4f2ec]' },
+    { label: 'Paid and verified, 30 days', value: counts.paid, color: 'text-accent' },
+    { label: 'Approved, 30 days', value: counts.approved, color: 'text-night-fg' },
+    { label: 'Questions asked, 30 days', value: counts.asked, color: 'text-night-fg' },
   ];
 
   return (
     <motion.div
-      className="relative isolate min-h-[300px] overflow-hidden rounded-[16px] bg-[#07080a] p-6 text-[#f4f2ec] sm:p-10"
+      className="relative isolate min-h-[300px] overflow-hidden rounded-[16px] border border-[var(--app-band-border)] bg-night p-6 text-night-fg sm:p-10"
       initial={reduced ? false : { opacity: 0 }}
       animate={{ opacity: 1 }}
       transition={{ duration: 0.4, ease: 'easeOut' }}
@@ -100,7 +100,7 @@ function StatusBand({ overview }: { overview: Overview }) {
         className="pointer-events-none absolute inset-0"
         style={{
           background:
-            'radial-gradient(60% 70% at 80% 40%, color-mix(in srgb, var(--accent) 16%, transparent) 0%, transparent 70%)',
+            'radial-gradient(60% 70% at 80% 40%, color-mix(in srgb, var(--accent) calc(16% * var(--poster-glow)), transparent) 0%, transparent 70%)',
         }}
       />
       {/* Below 1024px the ring is hidden with visibility, not display: with display none the ring did not paint in headless Chrome. */}
@@ -125,7 +125,7 @@ function StatusBand({ overview }: { overview: Overview }) {
           {figures.map((figure, index) => (
             <motion.div
               key={figure.label}
-              className={index === 0 ? '' : 'sm:border-l sm:border-[rgba(244,242,236,0.14)] sm:pl-6'}
+              className={index === 0 ? '' : 'sm:border-l sm:border-night-fg/[0.14] sm:pl-6'}
               {...rise(0.1 + (index + 1) * 0.08)}
             >
               <p className={`font-display text-[40px] font-bold leading-none tabular-nums ${figure.color}`}>

@@ -151,7 +151,7 @@ export function StepUpDialog({ request, send, onDone, onCancel, handoff }: Props
               </div>
             </div>
           ) : (
-            <div className="mt-2 max-h-[240px] overflow-y-auto whitespace-pre-wrap rounded-[8px] border border-line bg-[#f7f7f6] p-4 font-mono text-[13px] leading-[1.5] text-fg [overflow-wrap:anywhere]">
+            <div className="mt-2 max-h-[240px] overflow-y-auto whitespace-pre-wrap rounded-[8px] border border-line bg-[var(--app-soft)] p-4 font-mono text-[13px] leading-[1.5] text-fg [overflow-wrap:anywhere]">
               {issued.message}
             </div>
           )}

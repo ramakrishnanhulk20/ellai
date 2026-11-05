@@ -12,6 +12,7 @@ import { useState, type ReactNode } from 'react';
 import { fetchOverview, isApiError, isSignedOut, requestNonce, verifySignIn } from './api.js';
 import { EllaiMark } from '../EllaiMark.js';
 import { PosterRing } from '../site/PosterRing.js';
+import { ThemeToggle } from '../site/ThemeToggle.js';
 import { usePrefersReducedMotion } from '../useMediaQuery.js';
 import { shortAddress } from './format.js';
 import { CheckIcon } from './icons.js';
@@ -43,7 +44,7 @@ function Step({
     <li className="flex gap-3">
       <span
         className={`mt-px grid h-6 w-6 shrink-0 place-items-center rounded-[6px] font-mono text-[12px] leading-none ${
-          done ? 'bg-accent text-accent-ink' : active ? 'bg-accent text-white' : 'border border-line text-muted'
+          done ? 'bg-accent text-accent-ink' : active ? 'bg-accent text-accent-ink' : 'border border-line text-muted'
         }`}
       >
         {done ? <CheckIcon size={14} strokeWidth={2} /> : number}
@@ -122,14 +123,14 @@ export function SignIn() {
     <main className="flex min-h-svh flex-col lg:grid lg:grid-cols-[minmax(0,1fr)_minmax(0,1fr)]">
       <section
         aria-label="Ellai"
-        className="relative isolate flex min-h-[46svh] flex-col justify-between overflow-hidden bg-[#07080a] p-6 text-[#f4f2ec] [--focus:#f4f2ec] lg:min-h-0 lg:p-14"
+        className="relative isolate flex min-h-[46svh] flex-col justify-between overflow-hidden border border-[var(--app-band-border)] bg-night p-6 text-night-fg [--focus:var(--night-fg)] lg:min-h-0 lg:p-14"
       >
         <div
           aria-hidden="true"
           className="pointer-events-none absolute inset-0"
           style={{
             background:
-              'radial-gradient(60% 60% at 60% 40%, color-mix(in srgb, var(--accent) 16%, transparent) 0%, transparent 70%)',
+              'radial-gradient(60% 60% at 60% 40%, color-mix(in srgb, var(--accent) calc(16% * var(--poster-glow)), transparent) 0%, transparent 70%)',
           }}
         />
         <div
@@ -141,7 +142,7 @@ export function SignIn() {
         <div
           aria-hidden="true"
           className="pointer-events-none absolute inset-0"
-          style={{ background: 'linear-gradient(to top, rgba(7,8,10,0.92) 0%, rgba(7,8,10,0) 55%)' }}
+          style={{ background: 'linear-gradient(to top, color-mix(in srgb, var(--night) 92%, transparent) 0%, transparent 55%)' }}
         />
 
         <div className="relative z-10">
@@ -155,16 +156,16 @@ export function SignIn() {
           <h1 className="font-display text-[10vw] font-bold leading-[0.95] tracking-[-0.04em] lg:text-[clamp(2.75rem,5vw,5rem)]">
             Give your agent{' '}
             <br />
-            a <span className="text-[#8c9bff]">limit.</span>
+            a <span className="text-accent">limit.</span>
           </h1>
-          <p className="mt-6 max-w-[30rem] text-[17px] leading-[1.6] text-[rgba(244,242,236,0.72)]">
+          <p className="mt-6 max-w-[30rem] text-[17px] leading-[1.6] text-night-fg/(--poster-text-strong)">
             Sign in with your Sui wallet. Your wallet signs a one-time message, so Ellai never sees your keys, and your
             money stays in your wallet.
           </p>
         </motion.div>
       </section>
 
-      <section className="relative flex flex-col items-center justify-center bg-[#f5f5f4] px-5 py-8 lg:p-14">
+      <section className="relative flex flex-col items-center justify-center bg-bg px-5 py-8 lg:p-14">
         <motion.div className="w-full max-w-[420px]" {...rise(0.12)}>
           <Card className="w-full">
             <h2 className="font-display text-[28px] font-bold leading-[1.2] text-fg">Sign in</h2>
@@ -222,6 +223,7 @@ export function SignIn() {
         </motion.div>
 
         <nav aria-label="Ellai pages" className="mt-8 flex items-center gap-6 lg:absolute lg:right-8 lg:top-6 lg:mt-0">
+          <ThemeToggle />
           <a href="/proof" className={SIDE_LINK}>
             Proof
           </a>

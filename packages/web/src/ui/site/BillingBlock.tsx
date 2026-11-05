@@ -27,7 +27,7 @@ export function BillingBlock() {
         : null;
 
   return (
-    <div className="border-t border-night-fg/[0.14] pb-5 pt-5 text-center font-plex text-xs font-medium uppercase leading-[1.7] tracking-[0.1em] text-night-fg/50 md:pb-6">
+    <div className="border-t border-night-fg/[0.14] pb-5 pt-5 text-center font-plex text-xs font-medium uppercase leading-[1.7] tracking-[0.1em] text-night-fg/(--poster-text-soft) md:pb-6">
       {counts ? (
         <p>
           <Count value={counts.payments} /> {counts.payments === 1 ? 'payment' : 'payments'} settled on Sui Mainnet
@@ -45,7 +45,7 @@ export function BillingBlock() {
           Every one read back through Tatum
         </p>
       )}
-      <p className="mt-1 text-night-fg/[0.36]">
+      <p className="mt-1 text-night-fg/(--poster-text-soft)">
         Walrus Memory / Tatum Sui RPC / Sui allowance / <span className="normal-case">x402</span>
       </p>
     </div>

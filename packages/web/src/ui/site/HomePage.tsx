@@ -12,7 +12,7 @@ import { SiteHeader } from './SiteHeader.js';
 import { WalletSection } from './WalletSection.js';
 
 /**
- * The home page, in Ram's approved order. The poster stays pinned under the white page, so
+ * The home page, in Ram's approved order. The poster stays pinned under the page, so
  * the closing band and the footer sit outside its parent: the poster stops sticking where they begin.
  */
 export function HomePage() {
@@ -26,7 +26,7 @@ export function HomePage() {
               <PosterHero />
               <div
                 id="journey"
-                className="relative z-10 bg-paper text-ink shadow-[0_-24px_60px_-20px_rgba(0,0,0,0.55)]"
+                className="relative z-10 bg-paper text-ink sheet-shadow"
               >
                 <JourneySection />
                 <LearningSection />

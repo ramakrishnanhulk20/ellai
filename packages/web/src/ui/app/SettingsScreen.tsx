@@ -124,7 +124,7 @@ function useSaveChange(settings: Settings, onSaved: (next: Settings) => void) {
 
 function Saved({ show }: { show: boolean }) {
   return show ? (
-    <span role="status" className="font-mono text-[12px] leading-none text-[#2f45c8]">
+    <span role="status" className="font-mono text-[12px] leading-none text-accent-text">
       Saved
     </span>
   ) : null;
@@ -240,7 +240,7 @@ function sleep(ms: number): Promise<void> {
 function EndedBody({ digest }: { digest: string }) {
   return (
     <div className="mt-3">
-      <p role="status" className={`${SMALL_CAPS} text-[#2f45c8]`}>
+      <p role="status" className={`${SMALL_CAPS} text-accent-text`}>
         ENDED
       </p>
       <p className="mt-2 text-[15px] leading-[1.5] text-fg">

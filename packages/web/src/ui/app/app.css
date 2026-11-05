@@ -1,5 +1,58 @@
 /* Styles for the /app screens that Tailwind classes cannot express. The colour tokens come from globals.css. */
 
+/*
+ * A few colours only the app needs, in both modes. They sit beside the tokens in globals.css and follow the same
+ * rule: the light values here, the dark ones under data-theme, and the dark ones again in the no-script block so a
+ * visitor without scripts still follows the device. A test keeps the two dark blocks equal.
+ */
+:root {
+  /* Wells for code, keys and detail panels; and the page behind a loading block. */
+  --app-soft: #f7f7f6;
+  --app-softer: #fafaf9;
+  --app-skeleton: #efefee;
+  --app-skeleton-sweep: #f7f7f6;
+  /* The knob of a switch and of the slider. It stays light in both modes so it reads against either track. */
+  --app-thumb: #ffffff;
+  /* What dims the page behind a dialog and behind the More sheet. */
+  --app-scrim: rgba(26, 26, 26, 0.4);
+  --app-scrim-light: rgba(26, 26, 26, 0.32);
+  --app-shadow-panel: 0 1px 2px rgba(26, 26, 26, 0.05), 0 12px 28px -8px rgba(26, 26, 26, 0.1);
+  --app-shadow-dialog: 0 2px 4px rgba(26, 26, 26, 0.06), 0 28px 60px -20px rgba(26, 26, 26, 0.22);
+  --app-shadow-knob: 0 1px 2px rgba(26, 26, 26, 0.2);
+  /* The purse band and the sign-in panel follow the poster surface. On white they need a hairline to read as a band. */
+  --app-band-border: var(--mist);
+}
+
+:root[data-theme='dark'] {
+  --app-soft: #17181b;
+  --app-softer: #15161a;
+  --app-skeleton: #1b1c20;
+  --app-skeleton-sweep: #26272c;
+  --app-thumb: #f2f2ee;
+  --app-scrim: rgba(0, 0, 0, 0.6);
+  --app-scrim-light: rgba(0, 0, 0, 0.5);
+  --app-shadow-panel: 0 1px 2px rgba(0, 0, 0, 0.4), 0 12px 28px -8px rgba(0, 0, 0, 0.45);
+  --app-shadow-dialog: 0 2px 4px rgba(0, 0, 0, 0.5), 0 28px 60px -20px rgba(0, 0, 0, 0.7);
+  --app-shadow-knob: 0 1px 2px rgba(0, 0, 0, 0.5);
+  --app-band-border: transparent;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme]) {
+    --app-soft: #17181b;
+    --app-softer: #15161a;
+    --app-skeleton: #1b1c20;
+    --app-skeleton-sweep: #26272c;
+    --app-thumb: #f2f2ee;
+    --app-scrim: rgba(0, 0, 0, 0.6);
+    --app-scrim-light: rgba(0, 0, 0, 0.5);
+    --app-shadow-panel: 0 1px 2px rgba(0, 0, 0, 0.4), 0 12px 28px -8px rgba(0, 0, 0, 0.45);
+    --app-shadow-dialog: 0 2px 4px rgba(0, 0, 0, 0.5), 0 28px 60px -20px rgba(0, 0, 0, 0.7);
+    --app-shadow-knob: 0 1px 2px rgba(0, 0, 0, 0.5);
+    --app-band-border: transparent;
+  }
+}
+
 /* Page change: the new page fades in and rises 8px. */
 @keyframes app-enter {
   from {
@@ -181,7 +234,7 @@
   }
 }
 
-/* The cutoff slider: a thin track filled with the accent up to the thumb, a pale ring so the white thumb reads on white, and a halo on hover. */
+/* The cutoff slider: a thin track filled with the accent up to the thumb, a hairline ring so the thumb reads on the page, and a halo on hover. */
 .app-range {
   -webkit-appearance: none;
   appearance: none;
@@ -219,10 +272,10 @@
   margin-top: -8px;
   border: 0;
   border-radius: 50%;
-  background: #ffffff;
+  background: var(--app-thumb);
   box-shadow:
-    0 0 0 1px #dedfdf,
-    0 1px 2px rgba(26, 26, 26, 0.2),
+    0 0 0 1px var(--mist),
+    var(--app-shadow-knob),
     0 0 0 0 transparent;
   transition: box-shadow 160ms ease-out;
 }
@@ -232,10 +285,10 @@
   height: 20px;
   border: 0;
   border-radius: 50%;
-  background: #ffffff;
+  background: var(--app-thumb);
   box-shadow:
-    0 0 0 1px #dedfdf,
-    0 1px 2px rgba(26, 26, 26, 0.2),
+    0 0 0 1px var(--mist),
+    var(--app-shadow-knob),
     0 0 0 0 transparent;
   transition: box-shadow 160ms ease-out;
 }
@@ -243,27 +296,40 @@
 .app-range:hover::-webkit-slider-thumb,
 .app-range:focus-visible::-webkit-slider-thumb {
   box-shadow:
-    0 0 0 1px #dedfdf,
-    0 1px 2px rgba(26, 26, 26, 0.2),
+    0 0 0 1px var(--mist),
+    var(--app-shadow-knob),
     0 0 0 4px color-mix(in srgb, var(--accent) 24%, transparent);
 }
 
 .app-range:hover::-moz-range-thumb,
 .app-range:focus-visible::-moz-range-thumb {
   box-shadow:
-    0 0 0 1px #dedfdf,
-    0 1px 2px rgba(26, 26, 26, 0.2),
+    0 0 0 1px var(--mist),
+    var(--app-shadow-knob),
     0 0 0 4px color-mix(in srgb, var(--accent) 24%, transparent);
 }
 
-/* White glass for the top bar, the phone top bar and the tab bar. */
+/* Shadows from the tokens above. Plain classes, so the long values stay out of the markup. */
+.app-shadow-panel {
+  box-shadow: var(--app-shadow-panel);
+}
+
+.app-shadow-dialog {
+  box-shadow: var(--app-shadow-dialog);
+}
+
+.app-shadow-knob {
+  box-shadow: var(--app-shadow-knob);
+}
+
+/* Frosted glass for the top bar, the phone top bar and the tab bar, in the panel colour. */
 .app-glass {
-  background-color: color-mix(in srgb, #ffffff 92%, transparent);
+  background-color: color-mix(in srgb, var(--panel) 92%, transparent);
   -webkit-backdrop-filter: blur(12px);
   backdrop-filter: blur(12px);
 }
 
-/* A bone-coloured block with a soft light sweeping across it while a list loads. */
+/* A quiet block with a soft light sweeping across it while a list loads. */
 @keyframes skeleton-sweep {
   from {
     background-position: 150% 0;
@@ -274,8 +340,8 @@
 }
 
 .app-skeleton {
-  background-color: #efefee;
-  background-image: linear-gradient(100deg, transparent 35%, #f7f7f6 50%, transparent 65%);
+  background-color: var(--app-skeleton);
+  background-image: linear-gradient(100deg, transparent 35%, var(--app-skeleton-sweep) 50%, transparent 65%);
   background-repeat: no-repeat;
   background-size: 200% 100%;
   border-radius: 8px;

@@ -1,5 +1,6 @@
 import { IBM_Plex_Mono, Space_Grotesk } from 'next/font/google';
 import type { ReactNode } from 'react';
+import { THEME_SCRIPT } from '../ui/site/theme.js';
 import './globals.css';
 
 const spaceGrotesk = Space_Grotesk({
@@ -21,13 +22,20 @@ export const metadata = {
 };
 
 export const viewport = {
-  themeColor: '#ffffff',
-  colorScheme: 'light',
+  themeColor: [
+    { media: '(prefers-color-scheme: light)', color: '#f5f5f4' },
+    { media: '(prefers-color-scheme: dark)', color: '#0b0c0e' },
+  ],
+  colorScheme: 'light dark',
 };
 
 export default function RootLayout({ children }: { children: ReactNode }) {
   return (
-    <html lang="en" className={`${spaceGrotesk.variable} ${plexMono.variable}`}>
+    <html lang="en" className={`${spaceGrotesk.variable} ${plexMono.variable}`} suppressHydrationWarning>
+      <head>
+        {/* Sets the mode before anything paints, so a dark visitor never sees a flash of light. */}
+        <script dangerouslySetInnerHTML={{ __html: THEME_SCRIPT }} />
+      </head>
       <body>{children}</body>
     </html>
   );

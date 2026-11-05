@@ -43,7 +43,7 @@ function CopyLabelButton({ copied, onClick, label }: { copied: boolean; onClick:
 function TokenBlock({ token }: { token: string }) {
   const { copied, copy } = useCopy(token);
   return (
-    <div className="flex items-start justify-between gap-3 rounded-[8px] border border-line bg-[#f7f7f6] p-4">
+    <div className="flex items-start justify-between gap-3 rounded-[8px] border border-line bg-[var(--app-soft)] p-4">
       <p className="min-w-0 break-all font-mono text-[14px] leading-[1.5] text-fg">{token}</p>
       <CopyLabelButton copied={copied} onClick={() => void copy()} label="Copy the agent key" />
     </div>
@@ -88,7 +88,7 @@ function ConnectTabs({ token }: { token: string }) {
   }
 
   return (
-    <div className="min-w-0 rounded-[8px] border border-line bg-[#f7f7f6]">
+    <div className="min-w-0 rounded-[8px] border border-line bg-[var(--app-soft)]">
       <div className="flex items-center justify-between gap-2 border-b border-line pr-1.5">
         <div role="tablist" aria-label="How to connect" className="flex h-10 min-w-0 overflow-x-auto [scrollbar-width:none]">
           {SNIPPETS.map((entry, index) => {
@@ -147,7 +147,7 @@ export function KeyDialog({ token, onClose }: { token: string; onClose: () => vo
       <div className="mt-4 flex flex-col gap-4">
         <TokenBlock token={token} />
         <ConnectTabs token={token} />
-        <div className="relative overflow-hidden rounded-[8px] bg-[color-mix(in_srgb,var(--accent)_6%,#ffffff)] px-4 py-3">
+        <div className="relative overflow-hidden rounded-[8px] bg-[color-mix(in_srgb,var(--accent)_6%,var(--panel))] px-4 py-3">
           <span aria-hidden="true" className="absolute inset-y-0 left-0 w-[3px] bg-accent" />
           <p className="text-[15px] leading-[1.5] text-fg">
             Ellai shows this key once. Put it in your agent now. If you lose it, revoke it and create another.

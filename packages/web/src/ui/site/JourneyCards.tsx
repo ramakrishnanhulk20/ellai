@@ -30,7 +30,7 @@ function blobUrl(blobId: string): string {
 function CheckSquare() {
   return (
     <span aria-hidden className="grid size-5 shrink-0 place-items-center bg-accent">
-      <svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="#FFFFFF" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <svg width="20" height="20" viewBox="0 0 20 20" fill="none" className="stroke-accent-ink" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
         <path d="M5 10.5l3 3 7-7" />
       </svg>
     </span>
@@ -79,7 +79,7 @@ function verdictLine(verdict: 'approve' | 'refuse', host: string): string {
 
 function Shell({ children }: { children: ReactNode }) {
   return (
-    <div className="w-full min-w-0 rounded-[12px] border border-mist bg-paper p-5 shadow-[0_1px_2px_rgba(26,26,26,0.05),0_12px_28px_-8px_rgba(26,26,26,0.14)] lg:p-6">
+    <div className="w-full min-w-0 rounded-[12px] border border-mist bg-paper p-5 card-shadow lg:p-6">
       {children}
     </div>
   );

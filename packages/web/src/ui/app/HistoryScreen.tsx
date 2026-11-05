@@ -207,7 +207,7 @@ export function HistoryScreen() {
                 aria-pressed={filter === item.id}
                 onClick={() => setFilter(item.id)}
                 className={`h-8 rounded-[6px] px-3 font-mono text-[12px] font-medium uppercase leading-none tracking-[0.06em] transition-colors duration-[160ms] ease-out ${
-                  filter === item.id ? 'bg-fg text-white' : 'text-muted hover:text-fg'
+                  filter === item.id ? 'bg-fg text-paper' : 'text-muted hover:text-fg'
                 }`}
               >
                 {item.label}

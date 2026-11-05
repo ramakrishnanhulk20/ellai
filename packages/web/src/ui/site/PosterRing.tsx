@@ -4,7 +4,8 @@ const RING_PATH = 'M695.45 80.85 A462.5 462.5 0 1 0 919.15 304.55';
 
 /**
  * Keeps the tight glow off the gap so the ring reads as open there. The wide haze stays whole: masked,
- * it left a dark wedge that read as a shadow where the beam should read as light.
+ * it left a dark wedge that read as a shadow where the beam should read as light. The black in the
+ * masks is only a stencil: a mask reads alpha, not colour, so it is the same in both modes.
  */
 const GAP_MASK = 'conic-gradient(from 0deg, #000 0deg 22deg, transparent 30deg 60deg, #000 68deg 360deg)';
 
@@ -25,7 +26,7 @@ export function PosterRing() {
         className="enter-fade absolute -inset-[25%] blur-[28px] md:blur-[48px]"
         style={{
           background:
-            'radial-gradient(circle closest-side, transparent 46.67%, color-mix(in srgb, var(--accent) 18%, transparent) 61.67%, transparent 66.67%)',
+            'radial-gradient(circle closest-side, transparent 46.67%, color-mix(in srgb, var(--accent) calc(18% * var(--poster-glow)), transparent) 61.67%, transparent 66.67%)',
           animationDuration: '1400ms',
           animationDelay: '900ms',
         }}
@@ -34,7 +35,7 @@ export function PosterRing() {
         className="enter-fade absolute -inset-[25%] blur-[12px] md:blur-[18px]"
         style={{
           background:
-            'radial-gradient(circle closest-side, transparent 57.33%, color-mix(in srgb, var(--accent) 55%, transparent) 61.67%, transparent 66%)',
+            'radial-gradient(circle closest-side, transparent 57.33%, color-mix(in srgb, var(--accent) calc(55% * var(--poster-glow)), transparent) 61.67%, transparent 66%)',
           maskImage: GAP_MASK,
           WebkitMaskImage: GAP_MASK,
           animationDuration: '1400ms',
@@ -47,7 +48,7 @@ export function PosterRing() {
           width: 'calc(var(--ring-d) * 2.4)',
           height: 'calc(var(--ring-d) * 2.4)',
           background:
-            'conic-gradient(from 0deg at 50% 50%, transparent 0deg 20deg, color-mix(in srgb, var(--accent) 30%, transparent) 45deg, transparent 70deg 360deg)',
+            'conic-gradient(from 0deg at 50% 50%, transparent 0deg 20deg, color-mix(in srgb, var(--accent) calc(30% * var(--poster-glow)), transparent) 45deg, transparent 70deg 360deg)',
           maskImage: 'radial-gradient(circle closest-side at 50% 50%, transparent 38%, #000 42%, transparent 100%)',
           WebkitMaskImage: 'radial-gradient(circle closest-side at 50% 50%, transparent 38%, #000 42%, transparent 100%)',
           animationDuration: '1200ms',
@@ -57,7 +58,7 @@ export function PosterRing() {
       <svg viewBox="0 0 1000 1000" className="absolute inset-0 h-full w-full overflow-visible">
         <defs>
           <radialGradient id={haloId}>
-            <stop offset="0%" style={{ stopColor: 'var(--accent)', stopOpacity: 0.55 }} />
+            <stop offset="0%" style={{ stopColor: 'var(--accent)', stopOpacity: 'calc(0.55 * var(--poster-glow))' }} />
             <stop offset="100%" style={{ stopColor: 'var(--accent)', stopOpacity: 0 }} />
           </radialGradient>
         </defs>
@@ -80,7 +81,7 @@ export function PosterRing() {
         />
         <g className="poster-orbit">
           <circle cx="695.45" cy="80.85" r="26" fill={`url(#${haloId})`} />
-          <circle cx="695.45" cy="80.85" r="6" fill="#F4F2EC" />
+          <circle cx="695.45" cy="80.85" r="6" className="fill-night-fg" />
         </g>
         <circle
           className="poster-pulse stroke-accent"

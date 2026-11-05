@@ -2,6 +2,10 @@
  * Ellai's skin over Fumadocs. Fumadocs' own stylesheet is loaded first and its utility classes sit in a CSS
  * layer, so these plain rules win without any !important. Page content hangs off .ellai-docs, and the colour
  * variables go on :root because the search box opens outside that wrapper.
+ *
+ * Two modes: the light values here, and the dark ones under data-theme. The dark values repeat in the
+ * no-script block, so a visitor without scripts still follows the device; a test keeps the two equal.
+ * Fumadocs' own dark rules read the `dark` class, which the page sets whenever data-theme is dark.
  */
 
 :root {
@@ -23,16 +27,68 @@
   --color-fd-ring: #4a63ff;
   --color-fd-overlay: rgba(26, 26, 26, 0.4);
 
+  /* GitHub's dark comment colour is about 3.7:1 on the dark card, under AA, so dark mode swaps it for this lighter grey. Unused in light mode. */
+  --docs-code-comment: #8b949e;
+
   /* Fumadocs' stylesheet resets these fonts to system fonts. Putting back the site's own keeps every page the same. */
   --font-sans: var(--font-space-grotesk), ui-sans-serif, system-ui, sans-serif;
   --font-mono: var(--font-plex-mono), ui-monospace, monospace;
 }
 
-/* The search box is drawn straight into the body, outside the wrapper, so the body takes the page colours and font.
-   The cobalt accent here is what the site-wide focus ring reads, so rings in the search box match the rest of the page. */
+:root[data-theme='dark'] {
+  --color-fd-background: #131417;
+  --color-fd-foreground: #f2f2ee;
+  --color-fd-card: #17181b;
+  --color-fd-card-foreground: #f2f2ee;
+  --color-fd-popover: #17181b;
+  --color-fd-popover-foreground: #f2f2ee;
+  --color-fd-muted: #1b1c20;
+  --color-fd-muted-foreground: #a8adad;
+  --color-fd-border: #2a2c31;
+  --color-fd-primary: #7a8dff;
+  --color-fd-primary-foreground: #0b0c0e;
+  --color-fd-secondary: #1b1c20;
+  --color-fd-secondary-foreground: #f2f2ee;
+  --color-fd-accent: rgba(242, 242, 238, 0.06);
+  --color-fd-accent-foreground: #f2f2ee;
+  --color-fd-ring: #7a8dff;
+  --color-fd-overlay: rgba(0, 0, 0, 0.6);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme]) {
+    --color-fd-background: #131417;
+    --color-fd-foreground: #f2f2ee;
+    --color-fd-card: #17181b;
+    --color-fd-card-foreground: #f2f2ee;
+    --color-fd-popover: #17181b;
+    --color-fd-popover-foreground: #f2f2ee;
+    --color-fd-muted: #1b1c20;
+    --color-fd-muted-foreground: #a8adad;
+    --color-fd-border: #2a2c31;
+    --color-fd-primary: #7a8dff;
+    --color-fd-primary-foreground: #0b0c0e;
+    --color-fd-secondary: #1b1c20;
+    --color-fd-secondary-foreground: #f2f2ee;
+    --color-fd-accent: rgba(242, 242, 238, 0.06);
+    --color-fd-accent-foreground: #f2f2ee;
+    --color-fd-ring: #7a8dff;
+    --color-fd-overlay: rgba(0, 0, 0, 0.6);
+  }
+
+  /* With no script nothing sets the `dark` class, so Fumadocs' own dark rule never matches. These two do its job for a dark device. */
+  :root:not([data-theme]) .ellai-docs figure.shiki code span {
+    color: var(--shiki-dark);
+  }
+
+  :root:not([data-theme]) .ellai-docs figure.shiki code span[style*='--shiki-dark:#6a737d' i] {
+    color: var(--docs-code-comment);
+  }
+}
+
+/* The search box is drawn straight into the body, outside the wrapper, so the body takes the page colours and font. */
 body:has(.ellai-docs) {
-  --accent: #4a63ff;
-  color: #1a1a1a;
+  color: var(--color-fd-foreground);
   font-family: var(--font-space-grotesk), ui-sans-serif, system-ui, sans-serif;
 }
 
@@ -70,7 +126,7 @@ body:has(.ellai-docs) {
   padding: 0 12px;
   border-radius: 8px;
   font-size: 15px;
-  color: #656b6b;
+  color: var(--color-fd-muted-foreground);
   transition:
     color 160ms ease-out,
     background-color 160ms ease-out;
@@ -78,16 +134,16 @@ body:has(.ellai-docs) {
 
 #nd-sidebar a[data-active]:hover,
 #nd-sidebar-mobile a[data-active]:hover {
-  background-color: rgba(26, 26, 26, 0.04);
-  color: #1a1a1a;
+  background-color: var(--color-fd-accent);
+  color: var(--color-fd-foreground);
 }
 
 #nd-sidebar a[data-active='true'],
 #nd-sidebar-mobile a[data-active='true'],
 #nd-sidebar a[data-active='true']:hover,
 #nd-sidebar-mobile a[data-active='true']:hover {
-  background-color: #f1f1f1;
-  color: #1a1a1a;
+  background-color: var(--color-fd-muted);
+  color: var(--color-fd-foreground);
 }
 
 #nd-sidebar a[data-active='true']::before,
@@ -96,7 +152,7 @@ body:has(.ellai-docs) {
   position: absolute;
   inset: 8px auto 8px 0;
   width: 2px;
-  background-color: #4a63ff;
+  background-color: var(--color-fd-primary);
 }
 
 .ellai-sidebar-title {
@@ -109,7 +165,7 @@ body:has(.ellai-docs) {
   line-height: 1.5;
   letter-spacing: 0.06em;
   text-transform: uppercase;
-  color: #656b6b;
+  color: var(--color-fd-muted-foreground);
   transition: color 160ms ease-out;
 }
 
@@ -118,11 +174,11 @@ body:has(.ellai-docs) {
   width: 8px;
   height: 8px;
   flex-shrink: 0;
-  background-color: #4a63ff;
+  background-color: var(--color-fd-primary);
 }
 
 a:hover > .ellai-sidebar-title {
-  color: #1a1a1a;
+  color: var(--color-fd-foreground);
 }
 
 /* Page title and the line under it. */
@@ -132,28 +188,28 @@ a:hover > .ellai-sidebar-title {
   font-weight: 700;
   line-height: 1.05;
   letter-spacing: -0.03em;
-  color: #1a1a1a;
+  color: var(--color-fd-foreground);
 }
 
 .ellai-docs #nd-page > p {
   max-width: 72ch;
   font-size: 18px;
   line-height: 1.6;
-  color: #656b6b;
+  color: var(--color-fd-muted-foreground);
 }
 
 /* Page text. Paragraphs and lists stop at 72 characters. Code, tables and diagrams use the whole column. */
 .ellai-docs #nd-page .prose {
-  --tw-prose-body: #1a1a1a;
-  --tw-prose-headings: #1a1a1a;
-  --tw-prose-bold: #1a1a1a;
-  --tw-prose-links: #1a1a1a;
-  --tw-prose-counters: #656b6b;
-  --tw-prose-bullets: #4a63ff;
-  --tw-prose-hr: #dedfdf;
-  --tw-prose-quotes: #1a1a1a;
-  --tw-prose-quote-borders: #1a1a1a;
-  --tw-prose-code: #1a1a1a;
+  --tw-prose-body: var(--color-fd-foreground);
+  --tw-prose-headings: var(--color-fd-foreground);
+  --tw-prose-bold: var(--color-fd-foreground);
+  --tw-prose-links: var(--color-fd-foreground);
+  --tw-prose-counters: var(--color-fd-muted-foreground);
+  --tw-prose-bullets: var(--color-fd-primary);
+  --tw-prose-hr: var(--color-fd-border);
+  --tw-prose-quotes: var(--color-fd-foreground);
+  --tw-prose-quote-borders: var(--color-fd-foreground);
+  --tw-prose-code: var(--color-fd-foreground);
   font-size: 16px;
   line-height: 1.7;
 }
@@ -198,9 +254,9 @@ a:hover > .ellai-sidebar-title {
 
 /* Links: ink text with a light underline that turns cobalt on hover. */
 .ellai-docs #nd-page .prose a:not([data-card]) {
-  color: #1a1a1a;
+  color: var(--color-fd-foreground);
   text-decoration-line: underline;
-  text-decoration-color: #dedfdf;
+  text-decoration-color: var(--color-fd-border);
   text-decoration-thickness: 2px;
   text-underline-offset: 4px;
   transition: text-decoration-color 160ms ease-out;
@@ -208,7 +264,7 @@ a:hover > .ellai-sidebar-title {
 
 .ellai-docs #nd-page .prose a:not([data-card]):hover {
   opacity: 1;
-  text-decoration-color: #4a63ff;
+  text-decoration-color: var(--color-fd-primary);
 }
 
 /* Bullets are 6px cobalt squares, the same mark as the site's section labels. */
@@ -229,17 +285,17 @@ a:hover > .ellai-sidebar-title {
   top: calc(0.85em - 3px);
   width: 6px;
   height: 6px;
-  background-color: #4a63ff;
+  background-color: var(--color-fd-primary);
 }
 
 /* Inline code */
 .ellai-docs #nd-page .prose :not(pre) > code {
   font-family: var(--font-plex-mono), ui-monospace, monospace;
   font-size: 13px;
-  color: #1a1a1a;
-  border: 1px solid #dedfdf;
+  color: var(--color-fd-foreground);
+  border: 1px solid var(--color-fd-border);
   border-radius: 6px;
-  background: #f7f7f6;
+  background: var(--color-fd-card);
   overflow-wrap: anywhere;
 }
 
@@ -249,13 +305,13 @@ a:hover > .ellai-sidebar-title {
   text-decoration: inherit;
 }
 
-/* Code blocks. The build colours tokens with a light theme, so they read on the bone background. */
+/* Code blocks. The build colours every token with a light and a dark theme. The light set reads on the card as it is, and the `dark` class on the page picks the dark set. */
 .ellai-docs figure.shiki {
   margin: 24px 0;
-  border: 1px solid #dedfdf;
+  border: 1px solid var(--color-fd-border);
   border-radius: 12px;
-  background: #f7f7f6;
-  color: #1a1a1a;
+  background: var(--color-fd-card);
+  color: var(--color-fd-foreground);
   font-family: var(--font-plex-mono), ui-monospace, monospace;
   font-size: 13px;
   line-height: 1.7;
@@ -271,12 +327,17 @@ a:hover > .ellai-sidebar-title {
   font-size: 13px;
 }
 
+/* The one swap: the dark theme's comment grey is under AA on the dark card. The value matches the inline colour Shiki writes, so the selector needs the longer chain to beat Fumadocs' own dark rule. */
+.dark .ellai-docs figure.shiki code span[style*='--shiki-dark:#6a737d' i] {
+  color: var(--docs-code-comment);
+}
+
 /* Tables scroll inside their own wrapper, so a wide one never widens the page. */
 .ellai-docs #nd-page .prose table {
   margin: 0;
-  border: 1px solid #dedfdf;
+  border: 1px solid var(--color-fd-border);
   border-radius: 12px;
-  background: #ffffff;
+  background: var(--color-fd-background);
 }
 
 .ellai-docs #nd-page .prose th,
@@ -287,32 +348,32 @@ a:hover > .ellai-sidebar-title {
 }
 
 .ellai-docs #nd-page .prose th {
-  background: #f7f7f6;
-  border-bottom: 1px solid #dedfdf;
+  background: var(--color-fd-card);
+  border-bottom: 1px solid var(--color-fd-border);
   font-family: var(--font-plex-mono), ui-monospace, monospace;
   font-size: 12px;
   font-weight: 500;
   line-height: 1.5;
   letter-spacing: 0.06em;
   text-transform: uppercase;
-  color: #656b6b;
+  color: var(--color-fd-muted-foreground);
   white-space: nowrap;
 }
 
 .ellai-docs #nd-page .prose td {
   font-size: 15px;
   line-height: 1.6;
-  color: #1a1a1a;
+  color: var(--color-fd-foreground);
 }
 
 .ellai-docs #nd-page .prose tbody tr:not(:last-child) td {
-  border-bottom: 1px solid #dedfdf;
+  border-bottom: 1px solid var(--color-fd-border);
 }
 
 /* Quotes */
 .ellai-docs #nd-page .prose blockquote {
   padding-inline-start: 20px;
-  border-inline-start: 2px solid #1a1a1a;
+  border-inline-start: 2px solid var(--color-fd-foreground);
   font-size: 17px;
   font-style: italic;
   font-weight: 400;
@@ -320,27 +381,27 @@ a:hover > .ellai-sidebar-title {
 
 /* Callouts, if a page ever uses one. Fumadocs gives each a colour bar; here the bar is always cobalt. */
 .ellai-docs #nd-page .prose [style*='--callout-color'] {
-  border: 1px solid #dedfdf;
+  border: 1px solid var(--color-fd-border);
   border-radius: 12px;
-  background: #f7f7f6;
+  background: var(--color-fd-card);
 }
 
 .ellai-docs #nd-page .prose [style*='--callout-color'] > div[role='none'] {
   width: 3px;
-  background-color: #4a63ff;
+  background-color: var(--color-fd-primary);
 }
 
 /* "On this page": the list on the right. The current item is ink with a 2px cobalt bar. */
 #nd-toc a[href^='#'] {
-  color: #656b6b;
+  color: var(--color-fd-muted-foreground);
 }
 
 #nd-toc a[href^='#']:hover {
-  color: #1a1a1a;
+  color: var(--color-fd-foreground);
 }
 
 #nd-toc a[href^='#'][data-active='true'] {
-  color: #1a1a1a;
+  color: var(--color-fd-foreground);
 }
 
 #nd-toc path.stroke-fd-primary {
@@ -354,16 +415,14 @@ a:hover > .ellai-sidebar-title {
 /* Search: a light popover, and the input takes the site's cobalt focus ring. */
 [role='dialog'][class*='bg-fd-popover'] {
   border-radius: 12px;
-  box-shadow:
-    0 1px 2px rgba(26, 26, 26, 0.05),
-    0 12px 28px -8px rgba(26, 26, 26, 0.14);
+  box-shadow: var(--shadow-card);
 }
 
 input[role='combobox'][aria-controls='fd-search-list'] {
   padding: 8px 12px;
-  border: 1px solid #dedfdf;
+  border: 1px solid var(--color-fd-border);
   border-radius: 8px;
-  background: #ffffff;
+  background: var(--color-fd-background);
   transition:
     border-color 160ms ease-out,
     box-shadow 160ms ease-out;
@@ -372,17 +431,17 @@ input[role='combobox'][aria-controls='fd-search-list'] {
 input[role='combobox'][aria-controls='fd-search-list']:focus,
 input[role='combobox'][aria-controls='fd-search-list']:focus-visible {
   outline: none;
-  border-color: #4a63ff;
-  box-shadow: 0 0 0 3px rgba(74, 99, 255, 0.18);
+  border-color: var(--color-fd-primary);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--color-fd-primary) 18%, transparent);
 }
 
 /* Diagrams */
 .ellai-mermaid {
   margin: 24px 0;
   padding: 24px 16px;
-  border: 1px solid #dedfdf;
+  border: 1px solid var(--color-fd-border);
   border-radius: 12px;
-  background: #ffffff;
+  background: var(--color-fd-background);
   min-height: 160px;
   overflow-x: auto;
 }
@@ -414,17 +473,17 @@ input[role='combobox'][aria-controls='fd-search-list']:focus-visible {
     line-height: 1.5;
     letter-spacing: 0.06em;
     text-transform: uppercase;
-    color: #656b6b;
+    color: var(--color-fd-muted-foreground);
   }
 }
 
 .ellai-mermaid-source {
   margin: 24px 0;
   padding: 16px;
-  border: 1px solid #dedfdf;
+  border: 1px solid var(--color-fd-border);
   border-radius: 12px;
-  background: #f7f7f6;
-  color: #656b6b;
+  background: var(--color-fd-card);
+  color: var(--color-fd-muted-foreground);
   font-family: var(--font-plex-mono), ui-monospace, monospace;
   font-size: 13px;
   line-height: 1.7;

@@ -82,7 +82,7 @@ export function Modal({
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4 max-md:items-end max-md:p-0">
       <div
         aria-hidden="true"
-        className="dialog-backdrop absolute inset-0 bg-[rgba(26,26,26,0.4)] backdrop-blur-[2px]"
+        className="dialog-backdrop absolute inset-0 bg-[var(--app-scrim)] backdrop-blur-[2px]"
       />
       <div
         ref={panel}
@@ -90,7 +90,7 @@ export function Modal({
         aria-modal="true"
         aria-labelledby={titleId}
         tabIndex={-1}
-        className="dialog-panel relative max-h-[calc(100svh-32px)] w-full max-w-[480px] overflow-y-auto rounded-[16px] border border-line bg-panel p-5 shadow-[0_2px_4px_rgba(26,26,26,0.06),0_28px_60px_-20px_rgba(26,26,26,0.22)] outline-none sm:p-7 max-md:max-h-[92svh] max-md:max-w-none max-md:rounded-b-none max-sm:pb-[calc(20px+env(safe-area-inset-bottom))] sm:max-md:pb-[calc(28px+env(safe-area-inset-bottom))]"
+        className="dialog-panel relative max-h-[calc(100svh-32px)] w-full max-w-[480px] overflow-y-auto rounded-[16px] border border-line bg-panel p-5 app-shadow-dialog outline-none sm:p-7 max-md:max-h-[92svh] max-md:max-w-none max-md:rounded-b-none max-sm:pb-[calc(20px+env(safe-area-inset-bottom))] sm:max-md:pb-[calc(28px+env(safe-area-inset-bottom))]"
       >
         <h2 id={titleId} className="font-display text-[24px] font-semibold leading-[1.2] text-fg">
           {title}

@@ -7,7 +7,7 @@ export default defineConfig({
   mdxOptions: {
     // Turns every mermaid code block into a <Mermaid chart="..." /> element that the page draws on the client.
     remarkPlugins: [remarkMdxMermaid],
-    // The docs are light only, so both theme slots get the same light colours and no theme class is needed on the page.
-    rehypeCodeOptions: { themes: { light: 'github-light', dark: 'github-light' } },
+    // The `dark` class on the page picks the dark set of code colours.
+    rehypeCodeOptions: { themes: { light: 'github-light', dark: 'github-dark' } },
   },
 });

@@ -66,7 +66,7 @@ export function ExpandableRow({
       </div>
       <div className="app-expand" data-open={open || undefined}>
         <div>
-          <div className="border-t border-line bg-[#fafaf9]">
+          <div className="border-t border-line bg-[var(--app-softer)]">
             <div className="flex flex-col items-start gap-3 px-4 pb-5 pt-4 xl:max-w-[820px]">{children}</div>
           </div>
         </div>

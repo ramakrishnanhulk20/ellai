@@ -38,7 +38,7 @@ const OUTCOME: Record<RunStep['outcome'], { label: string; tone: Tone }> = {
 // A digest from the server is plain base58. A link is only built from one that looks like it.
 const DIGEST = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
 
-const DOT_GRID = { backgroundImage: 'radial-gradient(#dedfdf 1.4px, transparent 1.4px)', backgroundSize: '14px 14px' };
+const DOT_GRID = { backgroundImage: 'radial-gradient(var(--mist) 1.4px, transparent 1.4px)', backgroundSize: '14px 14px' };
 
 function NeedsKey() {
   return (
@@ -51,7 +51,7 @@ function NeedsKey() {
       </p>
       <a
         href="/docs"
-        className="app-underline mt-5 inline-block text-[15px] font-medium text-fg transition-colors duration-[160ms] ease-out hover:text-[#2f45c8]"
+        className="app-underline mt-5 inline-block text-[15px] font-medium text-fg transition-colors duration-[160ms] ease-out hover:text-accent-text"
       >
         How agents connect
       </a>

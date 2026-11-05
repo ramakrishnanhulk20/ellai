@@ -53,7 +53,7 @@ function StepCard({ step, index, still, inRow }: { step: Step; index: number; st
     <motion.li
       ref={card}
       {...rise(shown, still, delay)}
-      className="relative overflow-hidden rounded-[12px] border border-mist bg-paper p-5 shadow-[0_1px_2px_rgba(26,26,26,0.05),0_12px_28px_-8px_rgba(26,26,26,0.14)]"
+      className="relative overflow-hidden rounded-[12px] border border-mist bg-paper p-5 card-shadow"
     >
       <span aria-hidden className={`absolute inset-x-0 top-0 h-[2px] ${step.today ? 'bg-ink' : 'bg-accent'}`} />
       <p className="font-plex text-xs font-medium uppercase tracking-[0.06em] text-ink-soft">{step.date}</p>

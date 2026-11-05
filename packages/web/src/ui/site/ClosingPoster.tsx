@@ -40,7 +40,7 @@ export function ClosingPoster() {
   return (
     <section
       aria-labelledby="closing-title"
-      className="relative isolate flex min-h-[max(88svh,640px)] items-center overflow-hidden bg-night text-night-fg [--focus:#F4F2EC]"
+      className="relative isolate flex min-h-[max(88svh,640px)] items-center overflow-hidden bg-night text-night-fg [--focus:var(--night-fg)]"
     >
       <div
         aria-hidden
@@ -51,14 +51,14 @@ export function ClosingPoster() {
       <div
         aria-hidden
         className="pointer-events-none absolute inset-0 hidden md:block"
-        style={{ background: 'linear-gradient(to right, rgba(7,8,10,0.72) 0%, rgba(7,8,10,0) 48%)' }}
+        style={{ background: 'linear-gradient(to right, color-mix(in srgb, var(--night) 72%, transparent) 0%, transparent 48%)' }}
       />
       <div
         aria-hidden
         className="pointer-events-none absolute inset-0"
         style={{
           background:
-            'linear-gradient(to top, rgba(7,8,10,0.94) 0%, rgba(7,8,10,0.62) 30%, rgba(7,8,10,0) 60%)',
+            'linear-gradient(to top, color-mix(in srgb, var(--night) 94%, transparent) 0%, color-mix(in srgb, var(--night) 62%, transparent) 30%, transparent 60%)',
         }}
       />
       <div
@@ -75,7 +75,7 @@ export function ClosingPoster() {
       <div className="relative z-10 mx-auto w-full max-w-[100rem] px-5 sm:px-8 lg:px-14">
         <div ref={copy} data-seen={seen} className="group/closing py-24 md:py-32">
           <div className={RISE}>
-            <SquareLabel className="text-night-fg/[0.72]">Ellai: Tamil for limit</SquareLabel>
+            <SquareLabel className="text-night-fg/(--poster-text-strong)">Ellai: Tamil for limit</SquareLabel>
           </div>
 
           <h2
@@ -99,7 +99,7 @@ export function ClosingPoster() {
           </h2>
 
           <div className={`mt-7 ${RISE}`} style={{ transitionDelay: '480ms' }}>
-            <p className="max-w-[34rem] text-pretty text-lg leading-[1.6] text-night-fg/[0.72] md:text-xl">
+            <p className="max-w-[34rem] text-pretty text-lg leading-[1.6] text-night-fg/(--poster-text-strong) md:text-xl">
               Sign in with your Sui wallet, set your limits and give your agent its key. Your USDC stays in your
               wallet, and only a few cents wait in the purse.
             </p>
