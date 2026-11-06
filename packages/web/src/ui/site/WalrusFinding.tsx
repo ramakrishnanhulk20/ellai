@@ -35,9 +35,9 @@ const STEPS: readonly Step[] = [
     text: 'The Walrus Memory team reproduced it on SDK 0.1.12, confirmed the cause and opened a fix.',
   },
   {
-    date: 'Today',
+    date: 'Until the fix ships',
     title: 'Ellai stays safe meanwhile',
-    text: 'Ellai waits at most 15 seconds for a memory search. When a search runs out, Ellai never pays on its own: it asks you, or refuses if too many questions are already waiting.',
+    text: 'Ellai waits at most 15 seconds for a memory search while it decides a payment, inside the 120-second ceiling on every SDK call. When a search runs out, Ellai never pays on its own: it asks you, or refuses if too many questions are already waiting.',
     today: true,
   },
 ];

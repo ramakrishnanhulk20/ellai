@@ -106,10 +106,23 @@ body:has(.ellai-docs) {
 }
 
 /* Fumadocs' stylesheet loads after the app's and has its own .hidden, which beats the header's md:flex.
-   Without this the header's links stay hidden on wide screens. */
+   Without this the header's links stay hidden on wide screens. Its plain gap-4 also beats the header's
+   md:gap-8, so the 32px the other pages have is set here. */
 @media (min-width: 768px) {
   .site-header nav[aria-label='Main'] {
     display: flex;
+    gap: 32px;
+  }
+
+  .site-header div:has(> nav[aria-label='Main']) {
+    gap: 24px;
+  }
+}
+
+/* Fumadocs' stylesheet repeats the plain gap-4 after the app's, and it beats the header's phone gap. Under 400px the tighter gap is set here instead. */
+@media (max-width: 399px) {
+  .site-header nav[aria-label='Main'] {
+    gap: 8px;
   }
 }
 
@@ -317,7 +330,9 @@ a:hover > .ellai-sidebar-title {
   line-height: 1.7;
 }
 
+/* Fumadocs puts the copy button 8px from the right edge, over the top corner of the code. The gutter keeps the scrolling text from ever running under it. */
 .ellai-docs figure.shiki > div[role='region'] {
+  margin-right: 44px;
   font-size: 13px;
 }
 
@@ -454,6 +469,14 @@ input[role='combobox'][aria-controls='fd-search-list']:focus-visible {
 
 .ellai-mermaid-hint {
   display: none;
+}
+
+/* From 1024px the diagram scales down to fit its box, so nothing needs a sideways scroll. */
+@media (min-width: 1024px) {
+  .ellai-mermaid-svg svg {
+    max-width: 100%;
+    height: auto;
+  }
 }
 
 /* On phones the whole diagram fits the width, and the reader pinches in to read it. */

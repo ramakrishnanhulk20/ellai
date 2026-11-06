@@ -98,6 +98,18 @@ async function checkAbsent(origin: string, path: string): Promise<CheckResult> {
   return { path, status: '404', ms, ok: true, detail: 'hidden' };
 }
 
+/** Other sites may not frame a page where owners answer and sign, and the browser may not guess a file's type. */
+async function checkHeaders(origin: string): Promise<CheckResult> {
+  const path = '/ (headers)';
+  const { response, ms, failure } = await get(origin, '/');
+  if (response === null) return { path, status: '-', ms, ok: false, detail: failure };
+  await response.body?.cancel();
+  const framing = (response.headers.get('content-security-policy') ?? '').includes("frame-ancestors 'none'");
+  const sniffing = response.headers.get('x-content-type-options') === 'nosniff';
+  if (!framing || !sniffing) return { path, status: String(response.status), ms, ok: false, detail: 'missing frame-ancestors or nosniff' };
+  return { path, status: String(response.status), ms, ok: true, detail: 'frame-ancestors and nosniff set' };
+}
+
 async function checkJson<T>(origin: string, path: string, schema: z.ZodType<T>, describe: (value: T) => string): Promise<CheckResult> {
   const { response, ms, failure } = await get(origin, path);
   if (response === null) return { path, status: '-', ms, ok: false, detail: failure };
@@ -139,6 +151,7 @@ async function main(): Promise<void> {
   const rows: CheckResult[] = [];
   for (const path of PAGES) rows.push(await checkPage(origin, path));
   for (const path of REVIEW_ONLY_PAGES) rows.push(await checkAbsent(origin, path));
+  rows.push(await checkHeaders(origin));
   rows.push(
     await checkJson(origin, '/api/public/proof', proofSchema, (proof) =>
       [

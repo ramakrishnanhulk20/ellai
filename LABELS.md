@@ -1,16 +1,16 @@
-# Ellai learning test: your answers
+# Ellai learning test: the labels
 
-Ellai learns from your yes and no. This test checks it learns the right thing, using real sellers and real prices on Sui.
+Ellai learns from its owner's yes and no. This test checks it learns the right thing, using real sellers and real prices on Sui. The 24 labels below were fixed before the run.
 
-How it runs: Ellai sees the "Learn" requests one by one and asks you each time; your answer below becomes a memory in your Walrus Memory account. Then Ellai decides the "Test" requests on its own, without asking you, and we score it against your answers below.
+How it runs: Ellai sees the "Learn" requests one by one and asks the owner each time; the answer below becomes a memory in the owner's Walrus Memory account. Then Ellai decides the "Test" requests on its own, without asking, and is scored against the answers below.
 
 Two scores:
-- **Bad payments let through:** a Test request you would refuse, but Ellai paid. This must be 0.
-- **Questions saved:** of the Test requests you would approve, how many Ellai approved without asking you.
+- **Bad payments let through:** a Test request the owner would refuse, but Ellai paid. This must be 0.
+- **Questions saved:** of the Test requests the owner would approve, how many Ellai approved without asking.
 
-What to do: read each row. My guess of your answer is filled in. If you disagree, change the word in the "Your answer" column to `approve` or `refuse`. Nothing else needs editing. Then tell me "labels done".
+How the labels were set: a first guess was filled in for every row, and Ram, who built Ellai, read each one and accepted it. The "Your answer" column holds the result.
 
-One rule to know: if you refuse a seller once, Ellai refuses every later payment to that seller until you change it (a refusal always wins). So refuse a row only if you would refuse that seller for anything.
+One rule to know: once an owner refuses a seller, Ellai refuses every later payment to that seller until the owner changes it (a refusal always wins).
 
 | # | Phase | Seller | What the agent wants | Price | Your answer |
 |---|---|---|---|---|---|
@@ -42,5 +42,5 @@ One rule to know: if you refuse a seller once, Ellai refuses every later payment
 Notes for reading the results honestly:
 - Row 22 should be asked, not approved: Ellai never trusts a seller it has not seen approved before, whatever the price. That counts as a question not saved, by design.
 - Row 18 is above the default 0.05 USDC per-payment limit, so Ellai refuses it on the limit alone.
-- Row 24 tests that your refusal in row 10 wins: Ellai must refuse it without asking.
+- Row 24 tests that the refusal in row 10 wins: Ellai must refuse it without asking.
 - The agent verification seller (agentproof) currently fails after accepting payment. This test only checks Ellai's decisions; no money moves.

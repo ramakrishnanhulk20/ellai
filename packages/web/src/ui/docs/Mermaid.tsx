@@ -76,9 +76,9 @@ async function draw(chart: string, id: string, mode: Theme): Promise<string> {
     mermaid.initialize({
       startOnLoad: false,
       securityLevel: 'strict',
-      // On wide screens diagrams keep their real size and scroll inside their own box, because shrunk to the column the wide ones are too small to read. On phones the stylesheet fits them to the width instead.
+      // The library draws each diagram at a fixed size. The stylesheet scales it to the box from 1024px up and on phones, and between those widths it keeps its size and scrolls inside the box. The sequence diagram is drawn tighter so the scaled text stays readable.
       flowchart: { useMaxWidth: false },
-      sequence: { useMaxWidth: false },
+      sequence: { useMaxWidth: false, width: 120, actorMargin: 24 },
       theme: 'base',
       themeVariables: {
         ...diagramColours(),

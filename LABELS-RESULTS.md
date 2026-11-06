@@ -1,6 +1,6 @@
 # Ellai learning test: results
 
-Run from 2026-10-27T05:10:13.983Z to 2026-10-27T05:22:28.768Z by packages/web/scripts/learning-eval.ts, against Sui Mainnet and the hosted Walrus Memory relayer, on scratchpad/dev-db (backup in scratchpad/dev-db-before-eval). The answers are Ram's, read from LABELS.md at run time.
+Run from 2026-10-27T05:10:13.983Z to 2026-10-27T05:22:28.768Z by packages/web/scripts/learning-eval.ts, against Sui Mainnet and the hosted Walrus Memory relayer, on a local copy of Ellai's database. The answers are Ram's, read from LABELS.md at run time.
 
 ## Scores
 

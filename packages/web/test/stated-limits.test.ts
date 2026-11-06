@@ -1,5 +1,5 @@
 // Covers: each limit the public copy states in numbers holds the value the code enforces: the
-// purse float in WalletSection (0.20 USDC), the recall wait in WalrusFinding (15 seconds), the
+// purse float in WalletSection (0.20 USDC), the recall wait and the SDK call ceiling in WalrusFinding (15 and 120 seconds), the
 // length of the /proof lists in ProofBoard (20 newest), and the number of yeses in the journey
 // beat (two, the default every new owner gets). A limit changed in core or the schema fails here
 // until the copy is changed to match.
@@ -35,6 +35,11 @@ describe('limits stated in the public copy', () => {
   it('WalrusFinding states the recall wait, LIMITS.decideRecallTimeoutMs, in seconds', () => {
     const seconds = LIMITS.decideRecallTimeoutMs / 1000;
     expect(siteSource('WalrusFinding.tsx')).toContain(`waits at most ${seconds} seconds for a memory search`);
+  });
+
+  it('WalrusFinding states the ceiling on every SDK call, LIMITS.memwalCallTimeoutMs, in seconds', () => {
+    const seconds = LIMITS.memwalCallTimeoutMs / 1000;
+    expect(siteSource('WalrusFinding.tsx')).toContain(`inside the ${seconds}-second ceiling on every SDK call`);
   });
 
   it('ProofBoard states how many rows each list shows, LIMITS.publicProofLatest', () => {

@@ -12,7 +12,7 @@ export default async function DocsContentPage({ params }: PageProps) {
 
   const Body = page.data.body;
   return (
-    <DocsPage toc={page.data.toc}>
+    <DocsPage toc={page.data.toc} full={page.data.full}>
       <DocsTitle>{page.data.title}</DocsTitle>
       <DocsDescription>{page.data.description}</DocsDescription>
       <DocsBody>

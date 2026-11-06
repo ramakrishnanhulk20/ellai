@@ -388,7 +388,7 @@ npm run setup -w packages/proof
 
 `npm run setup -w packages/proof` adds the wallet keys and the master secret that every purse derives from at the bottom of `.env`, and prints the test owner, gas wallet and purse addresses. It never changes a line that is already there, so the blank lines with the same names copied from `.env.example` stay; they do nothing, because the last value of a name wins. Back up the `.env` file: losing the master secret strands any money in the purses.
 
-Then fill in the rest of `.env`:
+Then fill in the rest of `.env`, editing the lines already there:
 
 - `TATUM_API_KEY`: your Tatum Mainnet key, or leave it blank to read anonymously and slowly.
 - `SESSION_SECRET` and `JOBS_SECRET`: 64 hex characters each. Generate each with `node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"`.
@@ -402,7 +402,7 @@ Start the app:
 node packages/web/scripts/dev.mjs
 ```
 
-It serves on port 3001 (set `PORT` to change it) and reads the root `.env`. A fresh local copy starts empty: the numbers on the live site come from the live site's own records. To run the live proofs, fund the addresses the setup script printed: a few dollars of USDC and about 0.5 SUI to the test owner, and about 0.5 SUI to the gas wallet. That was enough for every proof in this repo. No SUI or USDC yet? Buy them on an exchange that supports withdrawals on the Sui network and send them to the printed addresses.
+It serves on port 3001 (set `PORT` to change it) and reads the root `.env`. A fresh local copy starts empty: the numbers on the live site come from the live site's own records. To run the live proofs, fund the addresses the setup script printed: a few dollars of native USDC on Sui and about 0.5 SUI to the test owner, and about 0.5 SUI to the gas wallet. Native means Circle's own coin, `0xdba34672e30cb065b1f93e3ab55318768fd6fef66c15942c9f7cb846e2f900e7::usdc::USDC`, not a bridged one. That was enough for every proof in this repo. No SUI or USDC yet? Buy them on an exchange that supports withdrawals on the Sui network and send them to the printed addresses.
 
 ## Connect an agent
 
@@ -500,11 +500,11 @@ Until the fix ships, Ellai bounds every recall it makes while deciding a payment
 
 | Suite | Test files | Tests | Run on |
 |---|---|---|---|
-| core (includes live Tatum reads on Sui Mainnet) | 9 | 303 passed | 5 November 2026 |
-| proof | 1 | 8 passed | 5 November 2026 |
-| web | 29 | 959 passed | 5 November 2026 |
+| core (includes live Tatum reads on Sui Mainnet) | 9 | 303 passed | 6 November 2026 |
+| proof | 1 | 8 passed | 6 November 2026 |
+| web | 29 | 960 passed | 6 November 2026 |
 
-All three come from `npm test` in each package on 5 November 2026, with no failures, the root typecheck clean and the production web build clean. Core's live reads need a Tatum key in `.env`.
+All three come from `npm test` in each package on 6 November 2026, with no failures, the root typecheck clean and the production web build clean. Core's live reads need a Tatum key in `.env`.
 
 ## What it costs
 

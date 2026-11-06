@@ -301,17 +301,17 @@ function ConnectCard({ still }: { still: boolean }) {
         className="relative overflow-hidden bg-bone"
         style={{ height: sized ? panelHeight : 'auto' }}
       >
-        {/* At every width the code stops short of the copy button, so a long first line never runs under it. */}
+        {/* At every width the code stops short of the copy button, so a long first line never runs under it. On phones the command wraps instead of scrolling, so the whole command shows. */}
         <motion.pre
           key={snippet.id}
           ref={code}
           role="region"
-          aria-label="Code, scrolls sideways"
+          aria-label="Code"
           tabIndex={0}
           initial={swaps === 0 || still ? false : { opacity: 0 }}
           animate={{ opacity: 1 }}
           transition={{ duration: still ? 0 : 0.2 }}
-          className="mr-14 overflow-x-auto px-5 pb-6 pt-5 font-plex text-[13px] leading-[1.7] whitespace-pre text-ink [scrollbar-color:var(--ink-faint)_transparent] [scrollbar-width:thin] focus-visible:outline-offset-[-2px]"
+          className="mr-14 overflow-x-auto px-5 pb-6 pt-5 font-plex text-[13px] leading-[1.7] whitespace-pre-wrap [overflow-wrap:anywhere] text-ink md:whitespace-pre md:[overflow-wrap:normal] [scrollbar-color:var(--ink-faint)_transparent] [scrollbar-width:thin] focus-visible:outline-offset-[-2px]"
         >
           <code>{highlight(text)}</code>
         </motion.pre>

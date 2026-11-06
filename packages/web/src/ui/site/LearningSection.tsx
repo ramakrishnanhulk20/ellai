@@ -39,9 +39,20 @@ const KIND_ORDER: readonly NodeKind[] = ['asked', 'learned', 'grant', 'refused']
 
 const SMALL_CAPS = 'font-plex text-xs font-medium uppercase tracking-[0.06em] text-ink-soft';
 
+const MARKS_START_SECONDS = 0.2;
+const MARK_GROW_SECONDS = 0.4;
+const MARKS_BUDGET_SECONDS = 1.5;
+const MARK_STAGGER_SECONDS = 0.025;
+
+/** Seconds between one mark starting to grow and the next. A long strip starts them closer together, so the last mark is done inside the budget. */
+function markStagger(count: number): number {
+  const room = MARKS_BUDGET_SECONDS - MARKS_START_SECONDS - MARK_GROW_SECONDS;
+  return Math.min(MARK_STAGGER_SECONDS, room / Math.max(1, count - 1));
+}
+
 /** Seconds from the strip coming into view until its last mark has finished growing. */
 function marksDoneAfter(count: number): number {
-  return 0.2 + Math.max(0, count - 1) * 0.025 + 0.4;
+  return MARKS_START_SECONDS + Math.max(0, count - 1) * markStagger(count) + MARK_GROW_SECONDS;
 }
 
 function Header({ still }: { still: boolean }) {
@@ -257,7 +268,11 @@ function Strip({ nodes, figures, still }: { nodes: TimelineNode[]; figures: Earl
               shown
                 ? {
                     scaleY: 1,
-                    transition: { duration: still ? 0 : 0.4, ease: EASE, delay: still ? 0 : 0.2 + index * 0.025 },
+                    transition: {
+                      duration: still ? 0 : MARK_GROW_SECONDS,
+                      ease: EASE,
+                      delay: still ? 0 : MARKS_START_SECONDS + index * markStagger(count),
+                    },
                   }
                 : { scaleY: 0 }
             }
@@ -323,7 +338,11 @@ function Strip({ nodes, figures, still }: { nodes: TimelineNode[]; figures: Earl
           <Link href="/proof" className="nav-sweep font-medium text-ink">
             proof page
           </Link>
-          .
+          . The{' '}
+          <Link href="/docs/learning-results" className="nav-sweep font-medium text-ink">
+            labelled test in the docs
+          </Link>{' '}
+          counts its own requests, so its numbers differ from these.
         </p>
         <Link href="/proof" className="nav-sweep mt-4 font-grotesk text-base font-medium text-ink">
           See the latest payments and memories
