@@ -342,12 +342,33 @@ a:hover > .ellai-sidebar-title {
   font-size: 13px;
 }
 
+/* On phones code wraps inside its box, so a long command shows whole. The copy button takes it from the text, so the wrap never reaches the clipboard. */
+@media (max-width: 767px) {
+  .ellai-docs figure.shiki pre {
+    width: auto;
+    min-width: 0;
+  }
+
+  .ellai-docs figure.shiki code {
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+  }
+}
+
 /* The one swap: the dark theme's comment grey is under AA on the dark card. The value matches the inline colour Shiki writes, so the selector needs the longer chain to beat Fumadocs' own dark rule. */
 .dark .ellai-docs figure.shiki code span[style*='--shiki-dark:#6a737d' i] {
   color: var(--docs-code-comment);
 }
 
 /* Tables scroll inside their own wrapper, so a wide one never widens the page. */
+/* A table already scrolls inside its own box on phones, so a code name in a cell stays whole. */
+@media (max-width: 767px) {
+  .ellai-docs #nd-page .prose td code {
+    overflow-wrap: normal;
+    white-space: nowrap;
+  }
+}
+
 .ellai-docs #nd-page .prose table {
   margin: 0;
   border: 1px solid var(--color-fd-border);
