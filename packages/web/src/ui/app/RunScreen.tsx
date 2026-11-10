@@ -11,7 +11,7 @@ const SMALL_CAPS = 'font-mono text-[12px] font-medium uppercase leading-[1.5] tr
 const EXAMPLES = [
   'Find me a hotel in Lisbon for 20 November under 120 euros',
   'Check whether my Sui wallet has a Walrus Memory account',
-  'Classify this email as spam or not: You won a free cruise',
+  'Give me a short market read on SUI',
 ] as const;
 
 const STATUS = {
