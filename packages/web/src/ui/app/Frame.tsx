@@ -317,7 +317,7 @@ export function Frame({ children }: { children: ReactNode }) {
     <div className="min-h-svh">
       <header className="app-glass sticky top-0 z-30 hidden h-[72px] border-b border-line lg:block">
         <div className="mx-auto flex h-full max-w-[100rem] items-center gap-8 px-14 xl:gap-10">
-          <Link href="/app" className="flex shrink-0 items-center gap-[10px] transition-opacity duration-[160ms] ease-out hover:opacity-80">
+          <Link href="/" aria-label="Ellai home" className="flex shrink-0 items-center gap-[10px] transition-opacity duration-[160ms] ease-out hover:opacity-80">
             <EllaiMark />
             <span className="font-display text-[17px] font-bold tracking-[0.08em] text-fg">ELLAI</span>
           </Link>
@@ -340,7 +340,9 @@ export function Frame({ children }: { children: ReactNode }) {
       </header>
 
       <header className="app-glass sticky top-0 z-20 flex h-[60px] items-center gap-[10px] border-b border-line px-5 sm:px-8 lg:hidden">
-        <EllaiMark />
+        <Link href="/" aria-label="Ellai home" className="-m-2 p-2">
+          <EllaiMark />
+        </Link>
         <span className="font-sans text-[16px] font-semibold text-fg">{title}</span>
         <div className="ml-auto">
           <ThemeToggle />
